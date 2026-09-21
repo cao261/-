@@ -1026,6 +1026,8 @@
         // Stored in localStorage so it persists across sessions.
         // Read order: live input box first (so edits show immediately),
         // then fall back to localStorage (so it survives reloads).
+        // NOTE: these helpers are referenced from inline oninput/onchange
+        // attributes, so they MUST be reachable from the global scope.
         function getObsidianVaultName() {
           const liveInput = document.getElementById("obsidian-vault-name");
           if (liveInput && liveInput.value && liveInput.value.trim()) {
@@ -1066,11 +1068,15 @@
           }
           return `/api/vault/file?relative_path=${encodeURIComponent(relPath)}`;
         }
+        // Expose to window so inline oninput/onchange attributes can find them.
+        window.getObsidianVaultName = getObsidianVaultName;
+        window.saveObsidianVaultName = saveObsidianVaultName;
+        window.updateObsidianStatus = updateObsidianStatus;
+        window.buildOpenUrl = buildOpenUrl;
 
         // Render recent feed (called from loadDashboardStats and toggle change)
         window._feedCache = null; // last fetched literature_list
         function renderRecentFeed(literatureList) {
-          const feed = document.getElementById("recent-feed-container");
           const includeQA = document.getElementById("feed-include-qa")
             && document.getElementById("feed-include-qa").checked;
           const items = (literatureList || []).filter(it => {
@@ -1111,6 +1117,8 @@
             </div>
           `;}).join('');
         }
+        // Expose to window so inline onchange attribute on the QA toggle can find it.
+        window.renderRecentFeed = renderRecentFeed;
 
         // Render recent feed
         window._feedCache = data.literature_list || [];
