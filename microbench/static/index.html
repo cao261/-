@@ -1077,6 +1077,7 @@
         // Render recent feed (called from loadDashboardStats and toggle change)
         window._feedCache = null; // last fetched literature_list
         function renderRecentFeed(literatureList) {
+          const feed = document.getElementById("recent-feed-container");
           const includeQA = document.getElementById("feed-include-qa")
             && document.getElementById("feed-include-qa").checked;
           const items = (literatureList || []).filter(it => {
