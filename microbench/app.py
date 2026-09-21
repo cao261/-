@@ -152,7 +152,7 @@ class ExplainSelectionRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=1000,
                           description="用户针对该片段提出的问题")
     paper_title: Optional[str] = Field(default="", max_length=300)
-    surrounding_context: Optional[str] = Field(default="", max_length=20000,
+    surrounding_context: Optional[str] = Field(default="", max_length=50000,
                                                 description="上下文背景 (如所在章节或页面文本)")
     source_type: Optional[str] = Field(default="pdf", max_length=50,
                                        description="pdf / translation / original")
@@ -1189,7 +1189,7 @@ async def api_explain_selection(req: ExplainSelectionRequest):
         f"【用户划选片段 ({source_desc})】:\n```text\n{req.selected_text.strip()}\n```",
     ]
     if req.surrounding_context:
-        ctx_snippet = req.surrounding_context.strip()[:4000]
+        ctx_snippet = req.surrounding_context.strip()[:10000]
         user_msg_parts.append(f"【该片段所在的章节/页面上下文背景】:\n{ctx_snippet}")
 
     user_msg_parts.append(f"【用户的问题】:\n{req.question.strip()}")
