@@ -967,7 +967,13 @@
               <div class="craft-box-title">最新文献 <em>&</em> 进度流</div>
               <div style="font-size:12px; color:var(--text-subtle); margin-top:2px;">实时同步 Obsidian 仓库内近期研究动态</div>
             </div>
-            <div class="craft-box-tag">FEED</div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <label style="display:flex; gap:4px; align-items:center; font-size:10.5px; color:var(--text-muted); cursor:pointer;" title="是否在 Feed 中显示导出的 AI 划词答疑卡">
+                <input type="checkbox" id="feed-include-qa" style="accent-color:var(--accent-olive);" onchange="renderRecentFeed(_feedCache)">
+                <span>含 AI 答疑</span>
+              </label>
+              <div class="craft-box-tag">FEED</div>
+            </div>
           </div>
 
           <div id="recent-feed-container">
@@ -1009,24 +1015,50 @@
         document.getElementById("stat-trouble").innerText = data.troubleshoot_count;
         document.getElementById("stat-weekly").innerText = data.weekly_count;
 
-        // Render recent feed
-        const feed = document.getElementById("recent-feed-container");
-        if (data.literature_list && data.literature_list.length > 0) {
-          feed.innerHTML = data.literature_list.slice(0, 5).map(item => `
-            <div class="archive-item">
+        // Render recent feed (called from loadDashboardStats and toggle change)
+        window._feedCache = null; // last fetched literature_list
+        function renderRecentFeed(literatureList) {
+          const feed = document.getElementById("recent-feed-container");
+          const includeQA = document.getElementById("feed-include-qa")
+            && document.getElementById("feed-include-qa").checked;
+          const items = (literatureList || []).filter(it => {
+            if (!includeQA) {
+              const rel = String(it.path || "").replace(/\\/g, "/");
+              if (/04_AI划词答疑/.test(rel)) return false;
+            }
+            return true;
+          }).slice(0, 5);
+          if (items.length === 0) {
+            feed.innerHTML = '<div style="font-size:13px; color:var(--text-subtle); padding: 12px 0;">'
+              + (includeQA ? '暂无文献，请在左侧录入第一篇。' : '暂无非答疑文献。勾选「含 AI 答疑」可一并显示导出的答疑卡。')
+              + '</div>';
+            return;
+          }
+          feed.innerHTML = items.map(item => {
+            const relPath = String(item.path || "").replace(/\\/g, "/");
+            const fileUrl = relPath ? "../" + relPath : "";
+            const isQA = /04_AI划词答疑/.test(relPath);
+            const isBilingual = /双语精读/.test(item.title) || /双语精读/.test(relPath);
+            const badge = isQA ? "AI 划词答疑" : isBilingual ? "双语精读" : "文献速览";
+            return `
+            <div class="archive-item" style="cursor:pointer;" title="点击在新标签页打开 Markdown 源文件"
+                 onclick="${fileUrl ? `window.open('${escapeHtml(fileUrl)}', '_blank')` : 'void(0)'}">
               <div>
                 <div class="archive-item-title">${escapeHtml(item.title)}</div>
                 <div class="archive-item-meta">
                   <span class="badge-terracotta">${escapeHtml(String(item.category).replace(/^\d+_/, ''))}</span>
+                  <span style="background:var(--card-bg-subtle); padding:1px 6px; border-radius:8px; font-size:10.5px;">${escapeHtml(badge)}</span>
                   <span>${escapeHtml(item.mtime)}</span>
                 </div>
               </div>
               <span style="font-size:12px; color:var(--text-subtle);">📁 Obsidian</span>
             </div>
-          `).join('');
-        } else {
-          feed.innerHTML = '<div style="font-size:13px; color:var(--text-subtle); padding: 12px 0;">暂无文献，请在左侧录入第一篇。</div>';
+          `;}).join('');
         }
+
+        // Render recent feed
+        window._feedCache = data.literature_list || [];
+        renderRecentFeed(window._feedCache);
       } catch (err) {
         console.error("加载统计数据失败", err);
       }
