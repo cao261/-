@@ -1024,7 +1024,13 @@
 
         // Obsidian integration: vault name → use obsidian://open?vault=...&file=...
         // Stored in localStorage so it persists across sessions.
+        // Read order: live input box first (so edits show immediately),
+        // then fall back to localStorage (so it survives reloads).
         function getObsidianVaultName() {
+          const liveInput = document.getElementById("obsidian-vault-name");
+          if (liveInput && liveInput.value && liveInput.value.trim()) {
+            return liveInput.value.trim();
+          }
           return (localStorage.getItem("obsidian_vault_name") || "").trim();
         }
         function saveObsidianVaultName(v) {
