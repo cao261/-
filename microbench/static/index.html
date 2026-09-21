@@ -1036,7 +1036,9 @@
           }
           feed.innerHTML = items.map(item => {
             const relPath = String(item.path || "").replace(/\\/g, "/");
-            const fileUrl = relPath ? "../" + relPath : "";
+            // Route via /api/vault/file so FastAPI serves the file safely
+            // (file:// has security restrictions in browsers).
+            const fileUrl = relPath ? `/api/vault/file?relative_path=${encodeURIComponent(relPath)}` : "";
             const isQA = /04_AI划词答疑/.test(relPath);
             const isBilingual = /双语精读/.test(item.title) || /双语精读/.test(relPath);
             const badge = isQA ? "AI 划词答疑" : isBilingual ? "双语精读" : "文献速览";

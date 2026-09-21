@@ -1334,6 +1334,52 @@ def test_paper_serve_pdf_endpoint_validates_relative_path():
            f"绝对 Windows 路径必须拒绝 (实际 {r.status_code})")
 
 
+def test_vault_file_endpoint_serves_markdown():
+    """Regression guard: /api/vault/file serves .md/.txt from inside BASE_DIR
+    but rejects traversal and non-text file types. Used by dashboard feed."""
+    print("\n[29c] /api/vault/file serves .md safely")
+    from fastapi.testclient import TestClient
+    from microbench import app as mb_app
+    client = TestClient(mb_app.app)
+
+    # 1) Non-existent file → 404
+    r = client.get("/api/vault/file", params={"relative_path": "01_Literature/_nope_.md"})
+    _check(r.status_code == 404, f"不存在文件 → 404 (实际 {r.status_code})")
+
+    # 2) Path traversal → 400
+    for bad in ["../app.py", "01_Literature/../../../etc/passwd"]:
+        r = client.get("/api/vault/file", params={"relative_path": bad})
+        _check(r.status_code == 400,
+               f"路径穿越 '{bad}' 必须 400 (实际 {r.status_code})")
+
+    # 3) Absolute Windows path → 400
+    r = client.get("/api/vault/file", params={"relative_path": "C:\\Windows\\win.ini"})
+    _check(r.status_code == 400,
+           f"绝对路径必须 400 (实际 {r.status_code})")
+
+    # 4) Unsupported file type → 400 (must NOT serve arbitrary files)
+    # We test by attempting a PDF path
+    r = client.get("/api/vault/file", params={"relative_path": "01_Literature/01_Device_TCAD_器件仿真/01_论文原文_PDF/nope.pdf"})
+    # Could be 400 (type) or 404 (missing), either is acceptable
+    _check(r.status_code in (400, 404),
+           f"PDF 类型必须非 200 (实际 {r.status_code})")
+
+    # 5) If any .md exists in vault, /api/vault/file should serve it
+    from pathlib import Path
+    any_md = next(iter([p for p in Path(BASE_DIR).rglob("*.md")
+                        if "/.git/" not in str(p)]), None)
+    if any_md:
+        rel = str(any_md.relative_to(BASE_DIR)).replace("\\", "/")
+        r = client.get("/api/vault/file", params={"relative_path": rel})
+        _check(r.status_code == 200,
+               f"vault .md '{rel}' 应 200 (实际 {r.status_code})")
+        if r.status_code == 200:
+            _check(len(r.text) > 0,
+                   f"vault .md 内容非空 (实际 {len(r.text)} chars)")
+            _check("text/markdown" in r.headers.get("content-type", ""),
+                   f"Content-Type 是 markdown (实际 {r.headers.get('content-type')})")
+
+
 def test_dual_model_status_and_probe_endpoints():
     print("\n[28] /api/llm/status and /api/llm/probe endpoints")
     from fastapi.testclient import TestClient

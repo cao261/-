@@ -380,6 +380,41 @@ async def api_serve_pdf(
     )
 
 
+@app.get("/api/vault/file")
+async def api_vault_file(
+    relative_path: str = Query(..., min_length=3, max_length=500,
+                                description="相对 BASE_DIR 的 .md / .txt 路径"),
+):
+    """
+    Serve a text file from inside the vault (safe path validation).
+
+    Used by the dashboard feed to open literature / QA / bilingual notes
+    in a new browser tab. Only .md / .txt files inside BASE_DIR are
+    served; PDFs and other binaries must use /api/paper/serve_pdf.
+    """
+    from .generator import _safe_path
+    try:
+        file_path = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
+    suffix = file_path.suffix.lower()
+    if suffix not in (".md", ".markdown", ".txt"):
+        raise HTTPException(status_code=400,
+                            detail=f"不支持的文件类型: {suffix} (仅支持 .md/.txt)")
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        content = file_path.read_text(encoding="gbk", errors="replace")
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        content,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/paper/find_pdf")
 async def api_find_pdf(
     title: str = Query(..., min_length=1, max_length=300,
