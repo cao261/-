@@ -1267,6 +1267,73 @@ def test_cache_stats_endpoint():
            "cache_stats 含 size/hits/misses 字段")
 
 
+def test_llm_chat_propagates_max_retries_to_primary():
+    """Regression guard: chat(max_retries=N) must drive the primary model's
+    retry count, not a hardcoded `max_retries=1`. Without this, the
+    SSL/timeout retry test would only run 2 attempts instead of N."""
+    print("\n[27c] llm.chat() max_retries is propagated to primary")
+    import re as _re
+    import inspect
+    from microbench import llm
+    src = inspect.getsource(llm.chat)
+    # Locate the primary invocation block
+    primary_call = _re.search(r"_invoke_model\(\s*primary[^)]*max_retries\s*=\s*([^,)\s]+)", src, _re.DOTALL)
+    _check(primary_call is not None, "找到 primary 调用并提取 max_retries 表达式")
+    if primary_call:
+        expr = primary_call.group(1).strip()
+        _check(expr == "max_retries",
+               f"primary 调用的 max_retries 必须是 chat() 入参(当前 '{expr}',不可硬编码 1)")
+        # Also ensure the value isn't wrapped in a constant
+        _check(expr not in ("1", "2"),
+               f"primary 不应使用硬编码 max_retries='{expr}'")
+
+
+def test_llm_retry_exception_classes_include_ssl_and_chunked():
+    """Regression guard: RETRYABLE_EXC must include SSLError +
+    ChunkedEncodingError, otherwise long-context translations silently 502."""
+    print("\n[27d] RETRYABLE_EXC covers SSL/ChunkedEncodingError")
+    import inspect
+    from microbench import llm
+    src = inspect.getsource(llm._invoke_model)
+    _check("SSLError" in src, "_invoke_model 引用 SSLError")
+    _check("ChunkedEncodingError" in src, "_invoke_model 引用 ChunkedEncodingError")
+    _check("ConnectionError" in src, "_invoke_model 引用 ConnectionError")
+
+
+def test_paper_serve_pdf_endpoint_validates_relative_path():
+    """Regression guard: /api/paper/serve_pdf must reject traversal in the
+    relative_path query param (vault leak prevention)."""
+    print("\n[29b] /api/paper/serve_pdf rejects ../ traversal")
+    from fastapi.testclient import TestClient
+    from microbench import app as mb_app
+    client = TestClient(mb_app.app)
+
+    # 1) Normal request should not 500
+    r = client.get("/api/paper/serve_pdf", params={"relative_path": "01_Literature"})
+    _check(r.status_code in (200, 404),
+           f"正常路径返回 200/404 (实际 {r.status_code})")
+
+    # 2) ../ traversal must be blocked — return 400 (validation), never 200
+    for bad in [
+        "../../../Windows/System32/drivers/etc/hosts",
+        "..%2F..%2Fetc%2Fpasswd",
+        "01_Literature/../../../etc/passwd",
+    ]:
+        r = client.get("/api/paper/serve_pdf", params={"relative_path": bad})
+        _check(r.status_code in (400, 403, 404),
+               f"路径穿越 '{bad}' 必须非 200 (实际 {r.status_code})")
+        if r.status_code == 200:
+            # CRITICAL: leak. Verify body is not Windows/system file content.
+            body = r.text
+            _check("root:" not in body and "[fonts]" not in body,
+                   f"CRITICAL: 路径穿越成功, 返回了系统文件内容")
+
+    # 3) Absolute Windows path must be blocked
+    r = client.get("/api/paper/serve_pdf", params={"relative_path": "C:\\Windows\\win.ini"})
+    _check(r.status_code in (400, 403, 404),
+           f"绝对 Windows 路径必须拒绝 (实际 {r.status_code})")
+
+
 def test_dual_model_status_and_probe_endpoints():
     print("\n[28] /api/llm/status and /api/llm/probe endpoints")
     from fastapi.testclient import TestClient
