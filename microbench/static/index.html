@@ -967,9 +967,16 @@
               <div class="craft-box-title">最新文献 <em>&</em> 进度流</div>
               <div style="font-size:12px; color:var(--text-subtle); margin-top:2px;">实时同步 Obsidian 仓库内近期研究动态</div>
             </div>
-            <div style="display:flex; gap:6px; align-items:center;">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
+              <div style="display:flex; gap:4px; align-items:center;" title="填写后在 Obsidian 里打开(留空则浏览器新标签)">
+                <span style="font-size:10.5px; color:var(--text-muted);">📓 Obsidian vault:</span>
+                <input type="text" id="obsidian-vault-name" placeholder="留空 = 浏览器"
+                       style="width:120px; padding:3px 8px; font-size:11px; border:1px solid var(--card-border); border-radius:6px; background:var(--card-bg);"
+                       onchange="saveObsidianVaultName(this.value)" oninput="saveObsidianVaultName(this.value)">
+                <span id="obsidian-status-dot" style="font-size:11px; color:var(--text-subtle);" title=""></span>
+              </div>
               <label style="display:flex; gap:4px; align-items:center; font-size:10.5px; color:var(--text-muted); cursor:pointer;" title="是否在 Feed 中显示导出的 AI 划词答疑卡">
-                <input type="checkbox" id="feed-include-qa" style="accent-color:var(--accent-olive);" onchange="renderRecentFeed(_feedCache)">
+                <input type="checkbox" id="feed-include-qa" style="accent-color:var(--accent-olive);" onchange="renderRecentFeed(window._feedCache)">
                 <span>含 AI 答疑</span>
               </label>
               <div class="craft-box-tag">FEED</div>
@@ -1015,6 +1022,45 @@
         document.getElementById("stat-trouble").innerText = data.troubleshoot_count;
         document.getElementById("stat-weekly").innerText = data.weekly_count;
 
+        // Obsidian integration: vault name → use obsidian://open?vault=...&file=...
+        // Stored in localStorage so it persists across sessions.
+        function getObsidianVaultName() {
+          return (localStorage.getItem("obsidian_vault_name") || "").trim();
+        }
+        function saveObsidianVaultName(v) {
+          const trimmed = (v || "").trim();
+          localStorage.setItem("obsidian_vault_name", trimmed);
+          updateObsidianStatus();
+          // Re-render feed so click handlers pick up the new vault name
+          renderRecentFeed(window._feedCache);
+        }
+        function updateObsidianStatus() {
+          const dot = document.getElementById("obsidian-status-dot");
+          const input = document.getElementById("obsidian-vault-name");
+          if (!dot) return;
+          if (!input) return;
+          input.value = getObsidianVaultName();
+          dot.textContent = getObsidianVaultName() ? "🟢" : "⚪";
+          dot.title = getObsidianVaultName()
+            ? `点击将在 Obsidian 打开 (vault: ${getObsidianVaultName()})`
+            : "留空 = 浏览器新标签打开";
+        }
+        /**
+         * Build an open URL for a vault-relative path.
+         * If an Obsidian vault name is configured, returns obsidian://open URL
+         * which the OS will hand to Obsidian. Otherwise returns the
+         * FastAPI vault-file endpoint URL.
+         */
+        function buildOpenUrl(relPath) {
+          const vault = getObsidianVaultName();
+          if (vault) {
+            // obsidian://open?vault=NAME&file=PATH  — Obsidian picks it up
+            // via registered URL scheme on Windows / macOS / Linux.
+            return `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(relPath)}`;
+          }
+          return `/api/vault/file?relative_path=${encodeURIComponent(relPath)}`;
+        }
+
         // Render recent feed (called from loadDashboardStats and toggle change)
         window._feedCache = null; // last fetched literature_list
         function renderRecentFeed(literatureList) {
@@ -1036,15 +1082,17 @@
           }
           feed.innerHTML = items.map(item => {
             const relPath = String(item.path || "").replace(/\\/g, "/");
-            // Route via /api/vault/file so FastAPI serves the file safely
-            // (file:// has security restrictions in browsers).
-            const fileUrl = relPath ? `/api/vault/file?relative_path=${encodeURIComponent(relPath)}` : "";
+            const openUrl = relPath ? buildOpenUrl(relPath) : "";
             const isQA = /04_AI划词答疑/.test(relPath);
             const isBilingual = /双语精读/.test(item.title) || /双语精读/.test(relPath);
             const badge = isQA ? "AI 划词答疑" : isBilingual ? "双语精读" : "文献速览";
+            const isObsidian = !!getObsidianVaultName();
+            const titleHint = isObsidian
+              ? `点击在 Obsidian 打开 (vault: ${escapeHtml(getObsidianVaultName())})`
+              : "点击在浏览器新标签打开 Markdown 源文件";
             return `
-            <div class="archive-item" style="cursor:pointer;" title="点击在新标签页打开 Markdown 源文件"
-                 onclick="${fileUrl ? `window.open('${escapeHtml(fileUrl)}', '_blank')` : 'void(0)'}">
+            <div class="archive-item" style="cursor:pointer;" title="${titleHint}"
+                 onclick="${openUrl ? `window.open('${escapeHtml(openUrl)}', '_blank')` : 'void(0)'}">
               <div>
                 <div class="archive-item-title">${escapeHtml(item.title)}</div>
                 <div class="archive-item-meta">
@@ -1053,13 +1101,15 @@
                   <span>${escapeHtml(item.mtime)}</span>
                 </div>
               </div>
-              <span style="font-size:12px; color:var(--text-subtle);">📁 Obsidian</span>
+              <span style="font-size:12px; color:var(--text-subtle);">${isObsidian ? '📓 Obsidian' : '🌐 Browser'}</span>
             </div>
           `;}).join('');
         }
 
         // Render recent feed
         window._feedCache = data.literature_list || [];
+        // Restore vault name from localStorage so feed cards honor the setting
+        updateObsidianStatus();
         renderRecentFeed(window._feedCache);
       } catch (err) {
         console.error("加载统计数据失败", err);
