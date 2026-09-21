@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MicroBench specific
+# LLM API keys (NEVER commit)
+.env
+
+# Local debug / smoke test artifacts
+_test_*.py
+_debug_*.py
+_smoke_*.py
+_v*_smoke*.py
+_liu_*.py
+
+# Vault contents (user actual notes/literature) — keep on disk only
+00_Dashboard/
+01_Literature/
+02_Reproduction/
+03_Knowledge/
+04_Weekly_Reports/
+_Templates/
+.obsidian/
+
+# Generated audit/scratch artifacts (not source)
+_*.py
+_*.txt
+_audit_*.md
+
+# Audit report produced by security-audit skill (kept locally, never in repo)
+AUDIT_REPORT.md

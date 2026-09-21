@@ -1,0 +1,3246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MicroBench | 研途静界 · 微电子与半导体科研工坊</title>
+  <meta name="version" content="v1.2.1-arxiv-https-fix">
+  <!-- v1.2.1: arXiv 抓取改 HTTPS 优先 + Semantic Scholar 兜底; 静态资源禁缓存 -->
+  <!-- Google Fonts: Cormorant Garamond (Editorial Serif), Plus Jakarta Sans (Clean Modern Sans), JetBrains Mono (Code) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <!-- KaTeX for math rendering -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
+  <!-- PDF.js for the dual-column reader (v1.2.2 — matches worker integrity) -->
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/web/pdf_viewer.css">
+  
+  <style>
+    :root {
+      /* Warm Linen / Quiet Luxury Palette */
+      --bg-canvas: #F6F3EC;
+      --bg-canvas-subtle: #ECE7DD;
+      --card-bg: #FFFFFF;
+      --card-bg-subtle: #FAFAF7;
+      --card-border: #E5DFD3;
+      --card-border-subtle: #ECE8DE;
+      
+      /* Typography Colors */
+      --text-main: #1C1A17;
+      --text-muted: #6D675E;
+      --text-subtle: #9E9689;
+      --text-light: #F7F5F0;
+      
+      /* Accents */
+      --accent-terracotta: #B25336;
+      --accent-terracotta-hover: #964228;
+      --accent-terracotta-subtle: #F6ECE7;
+      --accent-olive: #5B6B52;
+      --accent-sand: #D5C8B5;
+      
+      /* Dark Module (Studio Mode) */
+      --dark-bg: #161513;
+      --dark-surface: #221F1B;
+      --dark-surface-hover: #2B2723;
+      --dark-border: #332E27;
+      --dark-text: #EFECE6;
+      --dark-text-muted: #9E978C;
+
+      /* Typography */
+      --font-serif: 'Cormorant Garamond', Garamond, 'Songti SC', 'SimSun', serif;
+      --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      /* Chinese body text: 优先 macOS 黑体, Win 微软雅黑, Linux Source Han Sans */
+      --font-cn: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", "Source Han Sans CN", "Noto Sans CJK SC", sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+
+      --transition-smooth: all 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-canvas);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      padding-bottom: 90px;
+    }
+
+    /* Top Decorative Bar */
+    .top-meta-banner {
+      border-bottom: 1px solid var(--card-border);
+      padding: 9px 48px;
+      font-size: 11px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--text-subtle);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--bg-canvas);
+    }
+    .top-meta-banner span { display: inline-flex; align-items: center; gap: 8px; }
+
+    /* Navigation */
+    header {
+      padding: 24px 48px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      border-bottom: 1px solid var(--card-border);
+      background: rgba(246, 243, 236, 0.9);
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .brand-title {
+      font-family: var(--font-serif);
+      font-size: 34px;
+      font-weight: 500;
+      letter-spacing: -0.5px;
+      line-height: 1;
+      color: var(--text-main);
+    }
+    .brand-title em {
+      font-style: italic;
+      font-weight: 400;
+      color: var(--accent-terracotta);
+    }
+    .brand-meta {
+      font-size: 12px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-top: 6px;
+    }
+    .header-pills {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .pill-badge {
+      border: 1px solid var(--card-border);
+      background: var(--card-bg);
+      padding: 6px 16px;
+      border-radius: 999px;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .pill-badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-olive);
+    }
+
+    /* Main Container */
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 48px 48px;
+    }
+
+    /* Hero Section - The Editorial Banner */
+    .hero-editorial {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 64px;
+      align-items: center;
+      padding-bottom: 56px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 48px;
+    }
+    .hero-eyebrow {
+      font-size: 11.5px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--accent-terracotta);
+      font-weight: 600;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .hero-eyebrow::before {
+      content: "";
+      display: inline-block;
+      width: 24px;
+      height: 1px;
+      background: var(--accent-terracotta);
+    }
+    .hero-headline {
+      font-family: var(--font-serif);
+      font-size: 58px;
+      line-height: 1.08;
+      font-weight: 400;
+      letter-spacing: -1px;
+      color: var(--text-main);
+      margin-bottom: 24px;
+    }
+    .hero-headline em {
+      font-style: italic;
+      font-family: var(--font-serif);
+      color: var(--accent-terracotta);
+      font-weight: 400;
+    }
+    .hero-desc {
+      font-size: 16px;
+      color: var(--text-muted);
+      max-width: 540px;
+      line-height: 1.7;
+      margin-bottom: 28px;
+    }
+    .hero-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 24px;
+      padding-top: 24px;
+      border-top: 1px solid var(--card-border);
+    }
+    .metric-item {
+      display: flex;
+      flex-direction: column;
+    }
+    .metric-val {
+      font-family: var(--font-serif);
+      font-size: 40px;
+      line-height: 1;
+      font-weight: 400;
+      color: var(--text-main);
+    }
+    .metric-label {
+      font-size: 11px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--text-subtle);
+      margin-top: 6px;
+    }
+
+    /* Hero Right Highlight Card */
+    .hero-preview-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      padding: 36px;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.03);
+      position: relative;
+      overflow: hidden;
+    }
+    .hero-preview-card::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 140px;
+      height: 140px;
+      background: radial-gradient(circle, rgba(178, 83, 54, 0.08) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .card-eyebrow {
+      font-size: 11px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--text-subtle);
+      margin-bottom: 12px;
+    }
+    .card-editorial-title {
+      font-family: var(--font-serif);
+      font-size: 26px;
+      line-height: 1.25;
+      font-weight: 500;
+      margin-bottom: 14px;
+      color: var(--text-main);
+    }
+    .card-editorial-quote {
+      font-size: 13.5px;
+      color: var(--text-muted);
+      line-height: 1.65;
+      margin-bottom: 24px;
+      font-style: italic;
+    }
+
+    /* Primary Action Button (The "Explore" pill) */
+    .btn-pill {
+      background: var(--text-main);
+      color: var(--text-light);
+      border: 1px solid var(--text-main);
+      padding: 12px 28px;
+      border-radius: 999px;
+      font-size: 13.5px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      transition: var(--transition-smooth);
+      text-decoration: none;
+    }
+    .btn-pill:hover {
+      background: var(--accent-terracotta);
+      border-color: var(--accent-terracotta);
+      transform: translateY(-1px);
+    }
+    .btn-pill-arrow {
+      font-size: 16px;
+      transition: transform 0.2s;
+    }
+    .btn-pill:hover .btn-pill-arrow {
+      transform: translateX(4px);
+    }
+
+    .btn-pill-outline {
+      background: transparent;
+      color: var(--text-main);
+      border: 1px solid var(--card-border);
+      padding: 10px 22px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: var(--transition-smooth);
+    }
+    .btn-pill-outline:hover {
+      border-color: var(--text-main);
+      background: var(--bg-canvas-subtle);
+    }
+
+    /* Sub-strip: Philosophy quotes like the screenshot */
+    .sub-philosophy-strip {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 14px 0;
+      margin-bottom: 48px;
+      border-bottom: 1px solid var(--card-border);
+      font-size: 11px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--text-subtle);
+    }
+    .sub-philosophy-strip span {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .sub-philosophy-strip span::before {
+      content: "•";
+      color: var(--accent-terracotta);
+    }
+
+    /* Main Workspace Grid (Left 1.4fr, Right 1fr) */
+    .workspace-layout {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 40px;
+    }
+
+    /* Editorial Section Box */
+    .craft-box {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 36px;
+      margin-bottom: 32px;
+      transition: var(--transition-smooth);
+      position: relative;
+    }
+    .craft-box:hover {
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.03);
+    }
+    .craft-box-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--card-border-subtle);
+    }
+    .craft-box-title {
+      font-family: var(--font-serif);
+      font-size: 24px;
+      font-weight: 500;
+      color: var(--text-main);
+    }
+    .craft-box-title em {
+      font-style: italic;
+      color: var(--accent-terracotta);
+    }
+    .craft-box-tag {
+      font-size: 11px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--text-subtle);
+    }
+
+    /* Forms with Fine Line Craftsmanship */
+    .field-group {
+      margin-bottom: 20px;
+    }
+    .field-label {
+      display: block;
+      font-size: 12px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+    .field-input, .field-select, .field-textarea {
+      width: 100%;
+      background: var(--bg-canvas);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-family: inherit;
+      font-size: 14px;
+      color: var(--text-main);
+      outline: none;
+      transition: var(--transition-smooth);
+    }
+    .field-input:focus, .field-select:focus, .field-textarea:focus {
+      background: #FFFFFF;
+      border-color: var(--accent-terracotta);
+      box-shadow: 0 0 0 3px rgba(178, 83, 54, 0.1);
+    }
+    .field-textarea {
+      resize: vertical;
+      min-height: 90px;
+      line-height: 1.6;
+    }
+
+    .input-pill-action {
+      display: flex;
+      gap: 10px;
+    }
+    .input-pill-action input {
+      flex: 1;
+    }
+
+    /* Dark Studio Section (Mirroring the bottom right section of reference image) */
+    .studio-dark-card {
+      background: var(--dark-bg);
+      color: var(--dark-text);
+      border-radius: 20px;
+      padding: 40px;
+      margin-bottom: 32px;
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--dark-border);
+    }
+    .studio-dark-card .hero-eyebrow {
+      color: var(--accent-terracotta);
+    }
+    .studio-dark-card .hero-eyebrow::before {
+      background: var(--accent-terracotta);
+    }
+    .studio-title {
+      font-family: var(--font-serif);
+      font-size: 36px;
+      line-height: 1.15;
+      font-weight: 400;
+      color: var(--dark-text);
+      margin-bottom: 16px;
+    }
+    .studio-title em {
+      font-style: italic;
+      color: var(--accent-terracotta);
+    }
+    .studio-desc {
+      font-size: 14px;
+      color: var(--dark-text-muted);
+      line-height: 1.7;
+      margin-bottom: 28px;
+    }
+
+    /* Dark Inputs */
+    .studio-dark-card .field-input, 
+    .studio-dark-card .field-select, 
+    .studio-dark-card .field-textarea {
+      background: var(--dark-surface);
+      border-color: var(--dark-border);
+      color: var(--dark-text);
+    }
+    .studio-dark-card .field-input:focus,
+    .studio-dark-card .field-select:focus,
+    .studio-dark-card .field-textarea:focus {
+      border-color: var(--accent-terracotta);
+      background: #282420;
+    }
+    .studio-dark-card .btn-pill {
+      background: var(--dark-text);
+      color: var(--dark-bg);
+      border-color: var(--dark-text);
+    }
+    .studio-dark-card .btn-pill:hover {
+      background: var(--accent-terracotta);
+      color: #fff;
+      border-color: var(--accent-terracotta);
+    }
+
+    /* Editorial List Items */
+    .archive-item {
+      padding: 16px 0;
+      border-bottom: 1px solid var(--card-border-subtle);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      transition: var(--transition-smooth);
+    }
+    .archive-item:last-child { border-bottom: none; }
+    .archive-item:hover {
+      padding-left: 8px;
+    }
+    .archive-item-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-main);
+      margin-bottom: 4px;
+    }
+    .archive-item-meta {
+      font-size: 12px;
+      color: var(--text-subtle);
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .badge-terracotta {
+      background: var(--accent-terracotta-subtle);
+      color: var(--accent-terracotta);
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      letter-spacing: 0.5px;
+      font-weight: 500;
+    }
+
+    /* Classical Resource Link Tiles */
+    .res-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .res-tile {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      text-decoration: none;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: var(--transition-smooth);
+    }
+    .res-tile:hover {
+      border-color: var(--accent-terracotta);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
+    }
+    .res-tile-name {
+      font-family: var(--font-serif);
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .res-tile-desc {
+      font-size: 11.5px;
+      color: var(--text-subtle);
+      margin-top: 4px;
+      letter-spacing: 0.5px;
+    }
+
+    /* Toast in High-End Pill Style */
+    #toast {
+      position: fixed;
+      bottom: 32px;
+      right: 48px;
+      background: var(--text-main);
+      color: var(--text-light);
+      padding: 14px 28px;
+      border-radius: 999px;
+      font-size: 13.5px;
+      letter-spacing: 0.5px;
+      display: none;
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.2);
+      z-index: 1000;
+      animation: floatIn 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+    }
+    @keyframes floatIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 1024px) {
+      .hero-editorial, .workspace-layout { grid-template-columns: 1fr; gap: 32px; }
+      .container, header, .top-meta-banner { padding-left: 24px; padding-right: 24px; }
+      .hero-headline { font-size: 42px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Metadata Ribbon -->
+  <div class="top-meta-banner">
+    <span>— XI'AN JIAOTONG UNIVERSITY · EST. 1896</span>
+    <span>ELECTRONIC SCIENCE & TECHNOLOGY · GRADUATE WORKBENCH</span>
+    <span>PRECISION · METHODOLOGY · REPRODUCIBILITY</span>
+  </div>
+
+  <!-- Header Navigation -->
+  <header>
+    <div>
+      <div class="brand-title">Micro<em>Bench</em></div>
+      <div class="brand-meta">微电子与半导体物理 · 研途工坊</div>
+    </div>
+    <div class="header-pills">
+      <span class="pill-badge" id="header-model-pill" style="cursor:pointer;" title="点击查看大模型状态或探测升格" onclick="checkOrProbeModel()">
+        <span class="dot" id="header-model-dot"></span>
+        <span id="header-model-text">AI 模型检测中...</span>
+      </span>
+      <span class="pill-badge">
+        <span class="dot"></span>
+        Obsidian 双链本地仓库连通
+      </span>
+      <span class="pill-badge" style="font-family: var(--font-mono); font-size: 11px;">
+        127.0.0.1:5000
+      </span>
+    </div>
+  </header>
+
+  <div class="container">
+
+    <!-- Hero Editorial Section -->
+    <section class="hero-editorial">
+      <div>
+        <div class="hero-eyebrow">The Laboratory Notebook</div>
+        <h1 class="hero-headline">
+          Research that <em>outlives</em> the noise.
+        </h1>
+        <p class="hero-desc">
+          我们为微电子与半导体科研筑基——严谨的 TCAD 物理仿真、前沿的先进制程工艺调研、可追溯的芯片算法复现。拒绝虚无浮躁，让每一次推演都有据可查，沉淀为你的学术第二大脑。
+        </p>
+
+        <!-- Metric Numbers -->
+        <div class="hero-metrics">
+          <div class="metric-item">
+            <div class="metric-val" id="stat-lit">0</div>
+            <div class="metric-label">文献典藏</div>
+          </div>
+          <div class="metric-item">
+            <div class="metric-val" id="stat-repro">0</div>
+            <div class="metric-label">复现工程</div>
+          </div>
+          <div class="metric-item">
+            <div class="metric-val" id="stat-trouble">0</div>
+            <div class="metric-label">避坑沉淀</div>
+          </div>
+          <div class="metric-item">
+            <div class="metric-val" id="stat-weekly">0</div>
+            <div class="metric-label">周报归档</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Card: Editorial Philosophy Card -->
+      <div class="hero-preview-card">
+        <div class="card-eyebrow">— THE ACADEMIC STANDARD</div>
+        <h3 class="card-editorial-title">
+          “每一张网格，都对应真实的泊松方程与能量输运。”
+        </h3>
+        <p class="card-editorial-quote">
+          “在微电子科研中，最致命的不是仿真报错，而是没有基准的盲目调参。先对齐 Baseline，再构建属于你自己的创新物理模型。”
+        </p>
+        <div style="display: flex; gap: 12px; align-items: center;">
+          <button class="btn-pill" onclick="scrollToWork()">
+            <span>开启科研录入</span>
+            <span class="btn-pill-arrow">→</span>
+          </button>
+          <a href="http://127.0.0.1:5000" target="_blank" class="btn-pill-outline">刷新看板</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sub Philosophy Strip -->
+    <div class="sub-philosophy-strip">
+      <span>TCAD MESH REFINEMENT</span>
+      <span>EDA TIMING CLOSURE</span>
+      <span>SPICE COMPACT MODELS</span>
+      <span>STRICT BASELINE ALIGNMENT</span>
+      <span>LOCAL OBSIDIAN SYNC</span>
+    </div>
+
+    <!-- Main Functional Layout -->
+    <div class="workspace-layout" id="workspace-core">
+
+      <!-- Left Column: Primary Ingest & Scaffold Workspaces -->
+      <div class="workspace-col-left">
+
+        <!-- 1. Paper Ingest Card -->
+        <div class="craft-box">
+          <div class="craft-box-header">
+            <div>
+              <div class="craft-box-title">文献一键典藏 <em>&</em> 结构化精读</div>
+              <div style="font-size:12.5px; color:var(--text-subtle); margin-top:2px;">
+                输入 arXiv ID 或 DOI，自动解析元数据并套用交大微电子精读卡片模版
+              </div>
+            </div>
+            <div class="craft-box-tag">ARCHIVE 01</div>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label">输入 arXiv ID (如 2303.15982) 或 DOI (如 10.1038/nature14539)</label>
+            <div class="input-pill-action">
+              <input type="text" id="paper-id-input" class="field-input" placeholder="例如：2303.15982 或 10.1109/TED.2024.xxx">
+              <button class="btn-pill" id="btn-fetch-paper" onclick="handleFetchPaper()">
+                <span>智能抓取</span>
+                <span class="btn-pill-arrow">→</span>
+              </button>
+            </div>
+          </div>
+
+          <div style="display:grid; grid-template-columns: 2fr 1fr; gap: 16px;">
+            <div class="field-group">
+              <label class="field-label">论文标题 (Title)</label>
+              <input type="text" id="paper-title" class="field-input" placeholder="抓取后自动填充或手动输入">
+            </div>
+            <div class="field-group">
+              <label class="field-label">出版年份 (Year)</label>
+              <input type="number" id="paper-year" class="field-input" value="2024">
+            </div>
+          </div>
+
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+            <div class="field-group">
+              <label class="field-label">作者阵容 (Authors)</label>
+              <input type="text" id="paper-authors" class="field-input" placeholder="例如：J. Doe, X. Wang, et al.">
+            </div>
+            <div class="field-group">
+              <label class="field-label">期刊 / 旗舰会议 (Venue)</label>
+              <input type="text" id="paper-venue" class="field-input" placeholder="IEDM / ISSCC / DAC / IEEE TED">
+            </div>
+          </div>
+
+          <div style="display:grid; grid-template-columns: 1.2fr 1fr; gap: 16px;">
+            <div class="field-group">
+              <label class="field-label">学术专题归档 (Category)</label>
+              <select id="paper-category" class="field-select">
+                <option value="01_Device_TCAD_器件仿真">01_Device_TCAD_器件仿真 (GAA/CFET/物性)</option>
+                <option value="02_Circuit_EDA_电路与算法">02_Circuit_EDA_电路与算法 (IC设计/后端/ML4EDA)</option>
+                <option value="03_Materials_Physics_材料物性">03_Materials_Physics_材料物性 (二维/宽禁带/铁电)</option>
+                <option value="04_Survey_综述">04_Survey_综述 (权威教程与前沿综述)</option>
+              </select>
+            </div>
+            <div class="field-group">
+              <label class="field-label">初始精读状态</label>
+              <select id="paper-status" class="field-select">
+                <option value="待精读">待精读 (To Read)</option>
+                <option value="精读中">精读中 (In Progress)</option>
+                <option value="计划复现">计划复现 (Repro Planned)</option>
+                <option value="已精读">已精读 (Archived)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label">研究方向标签 (Tags, 逗号分隔)</label>
+            <input type="text" id="paper-tags" class="field-input" value="TCAD, GAA-Nanosheet, Sub-3nm">
+          </div>
+
+          <div class="field-group">
+            <label class="field-label">论文摘要 (Abstract)</label>
+            <textarea id="paper-abstract" class="field-textarea" placeholder="抓取后自动填充，或在此粘贴核心段落..."></textarea>
+          </div>
+
+          <div style="display:flex; justify-content:flex-end; gap:10px; flex-wrap:wrap;">
+            <input type="file" id="local-pdf-input" accept="application/pdf" style="display:none;" onchange="handleUploadLocalPdf(event)">
+            <button class="btn-pill-outline" onclick="document.getElementById('local-pdf-input').click()" title="直接上传本地 PDF 文件并启动分屏精读与 AI 解答">
+              <span>📤 上传本地 PDF 精读</span>
+            </button>
+            <button class="btn-pill-outline" onclick="handlePasteTextFallback()">
+              <span>📋 粘贴全文文本</span>
+            </button>
+            <button class="btn-pill-outline" onclick="handleFetchFullText()">
+              <span>📖 拉取全文 + 分屏阅读</span>
+            </button>
+            <button class="btn-pill" onclick="handleSavePaper()">
+              <span>生成并保存至 Obsidian 文献库</span>
+              <span class="btn-pill-arrow">→</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 2. Reproduction Project Scaffold -->
+        <div class="craft-box">
+          <div class="craft-box-header">
+            <div>
+              <div class="craft-box-title">实验复现工程 <em>&</em> 脚手架生成</div>
+              <div style="font-size:12.5px; color:var(--text-subtle); margin-top:2px;">
+                一键搭建包含 configs, scripts, data, plots 及标准 Checkpoint 对齐的工程骨架
+              </div>
+            </div>
+            <div class="craft-box-tag">REPRODUCTION 02</div>
+          </div>
+
+          <div style="display:grid; grid-template-columns: 1.4fr 1fr; gap: 16px;">
+            <div class="field-group">
+              <label class="field-label">工程代号 (如 repro_gaa_3nm)</label>
+              <input type="text" id="repro-name" class="field-input" placeholder="repro_cfet_sub3nm">
+            </div>
+            <div class="field-group">
+              <label class="field-label">复现工程类别</label>
+              <select id="repro-type" class="field-select">
+                <option value="TCAD">TCAD 物理仿真 (Sentaurus / Silvaco)</option>
+                <option value="EDA">IC设计 / EDA 算法 (OpenROAD / Cadence)</option>
+              </select>
+            </div>
+          </div>
+
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+            <div class="field-group">
+              <label class="field-label">工具链与仿真器</label>
+              <input type="text" id="repro-toolchain" class="field-input" value="Sentaurus TCAD 2023 (SDE + SDevice)">
+            </div>
+            <div class="field-group">
+              <label class="field-label">关联参考论文</label>
+              <input type="text" id="repro-paper" class="field-input" placeholder="示例_GAA晶体管自热效应">
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label">复现核心指标与简述</label>
+            <input type="text" id="repro-desc" class="field-input" placeholder="复现原论文转移特性曲线与最高晶格温升分布">
+          </div>
+
+          <div style="display:flex; justify-content:flex-end;">
+            <button class="btn-pill" onclick="handleCreateRepro()">
+              <span>初始化标准复现工程</span>
+              <span class="btn-pill-arrow">→</span>
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Right Column: The Dark Studio (Troubleshoot & Weekly) + Classical Resources -->
+      <div class="workspace-col-right">
+
+        <!-- Dark Studio Card (Inspired by reference dark section) -->
+        <div class="studio-dark-card">
+          <div class="hero-eyebrow">— THE RIGOROUS STANDARD</div>
+          <h2 class="studio-title">
+            Forty trials. One <em>unhurried</em> standard.
+          </h2>
+          <p class="studio-desc">
+            数十次非线性求解发散，终换来一次无可挑剔的拟合收敛。记录每一处报错、环境冲突与物理机制推导，让研途踩过的坑成为无可替代的技术护城河。
+          </p>
+
+          <!-- Weekly Report Fast Generation -->
+          <div style="padding-bottom: 24px; border-bottom: 1px solid var(--dark-border); margin-bottom: 24px;">
+            <div style="font-size:12px; letter-spacing:1px; text-transform:uppercase; color:var(--accent-terracotta); margin-bottom:8px; font-weight:600;">
+              — 组会汇报速生
+            </div>
+            <p style="font-size:13px; color:var(--dark-text-muted); margin-bottom:16px;">
+              聚合近 7 天新录入文献、复现工程进度，一键生成规范周报草稿。
+            </p>
+            <button class="btn-pill" style="width:100%; justify-content:center;" onclick="handleGenerateWeekly()">
+              <span>生成本周导师汇报周报</span>
+              <span class="btn-pill-arrow">→</span>
+            </button>
+          </div>
+
+          <!-- Troubleshooting Logger -->
+          <div>
+            <div style="font-size:12px; letter-spacing:1px; text-transform:uppercase; color:var(--accent-terracotta); margin-bottom:12px; font-weight:600;">
+              — 快速沉淀避坑经验
+            </div>
+
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+              <div class="field-group">
+                <label class="field-label" style="color:var(--dark-text-muted);">工具 / 环境</label>
+                <input type="text" id="tb-tool" class="field-input" placeholder="Sentaurus / Cadence">
+              </div>
+              <div class="field-group">
+                <label class="field-label" style="color:var(--dark-text-muted);">分类</label>
+                <select id="tb-category" class="field-select">
+                  <option value="TCAD仿真收敛">TCAD仿真收敛</option>
+                  <option value="EDA环境与授权">EDA环境与授权</option>
+                  <option value="Linux与服务器">Linux与服务器</option>
+                  <option value="Python与CUDA">Python与CUDA</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" style="color:var(--dark-text-muted);">报错现象 / 关键词</label>
+              <input type="text" id="tb-keyword" class="field-input" placeholder="如 SDevice RHS 发散">
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" style="color:var(--dark-text-muted);">解决方案 / 核心参数</label>
+              <textarea id="tb-solution" class="field-textarea" style="min-height:70px;" placeholder="记录解决该问题的关键配置或命令..."></textarea>
+            </div>
+
+            <button class="btn-pill" style="width:100%; justify-content:center;" onclick="handleSaveTroubleshoot()">
+              <span>记录入避坑知识库</span>
+              <span class="btn-pill-arrow">→</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Academic Resource Gallery -->
+        <div class="craft-box">
+          <div class="craft-box-header">
+            <div>
+              <div class="craft-box-title">微电子科研 <em>&</em> 旗舰入口</div>
+              <div style="font-size:12px; color:var(--text-subtle); margin-top:2px;">精选微电子领域公认顶会、开源PDK与在线工具</div>
+            </div>
+            <div class="craft-box-tag">RESOURCES</div>
+          </div>
+
+          <div class="res-grid">
+            <a href="https://ieeexplore.ieee.org" target="_blank" class="res-tile">
+              <div class="res-tile-name">
+                <span>IEEE Xplore</span>
+                <span style="font-size:12px;">↗</span>
+              </div>
+              <div class="res-tile-desc">IEDM / ISSCC / TED 顶刊顶会检索</div>
+            </a>
+
+            <a href="https://arxiv.org/archive/cond-mat" target="_blank" class="res-tile">
+              <div class="res-tile-name">
+                <span>arXiv: cond-mat</span>
+                <span style="font-size:12px;">↗</span>
+              </div>
+              <div class="res-tile-desc">凝聚态物理与新型半导体预印本</div>
+            </a>
+
+            <a href="https://github.com/google/skywater-pdk" target="_blank" class="res-tile">
+              <div class="res-tile-name">
+                <span>SkyWater 130nm</span>
+                <span style="font-size:12px;">↗</span>
+              </div>
+              <div class="res-tile-desc">开源可制造级集成电路工艺 PDK</div>
+            </a>
+
+            <a href="https://theopenroadproject.org" target="_blank" class="res-tile">
+              <div class="res-tile-name">
+                <span>OpenROAD</span>
+                <span style="font-size:12px;">↗</span>
+              </div>
+              <div class="res-tile-desc">无人值守开源数字芯片设计全流程</div>
+            </a>
+
+            <a href="https://next-gen.materialsproject.org" target="_blank" class="res-tile">
+              <div class="res-tile-name">
+                <span>Materials Project</span>
+                <span style="font-size:12px;">↗</span>
+              </div>
+              <div class="res-tile-desc">半导体带隙与晶体第一性原理计算</div>
+            </a>
+
+            <a href="https://automeris.io/WebPlotDigitizer/" target="_blank" class="res-tile">
+              <div class="res-tile-name">
+                <span>WebPlotDigitizer</span>
+                <span style="font-size:12px;">↗</span>
+              </div>
+              <div class="res-tile-desc">论文图表曲线高精度数据点提取</div>
+            </a>
+          </div>
+        </div>
+
+        <!-- Recent Literature Feed -->
+        <div class="craft-box">
+          <div class="craft-box-header">
+            <div>
+              <div class="craft-box-title">最新文献 <em>&</em> 进度流</div>
+              <div style="font-size:12px; color:var(--text-subtle); margin-top:2px;">实时同步 Obsidian 仓库内近期研究动态</div>
+            </div>
+            <div class="craft-box-tag">FEED</div>
+          </div>
+
+          <div id="recent-feed-container">
+            <div style="font-size:13px; color:var(--text-subtle); text-align:center; padding: 24px 0;">
+              正在同步本地文献与复现项目...
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- Toast Notification Pill -->
+  <div id="toast"></div>
+
+  <script>
+    function showToast(msg, isError = false) {
+      const t = document.getElementById("toast");
+      t.innerText = msg;
+      t.style.background = isError ? "#B25336" : "#1C1A17";
+      t.style.display = "block";
+      setTimeout(() => { t.style.display = "none"; }, 3800);
+    }
+
+    function scrollToWork() {
+      document.getElementById("workspace-core").scrollIntoView({ behavior: 'smooth' });
+    }
+
+    async function loadStats() {
+      try {
+        const res = await fetch("/api/stats");
+        if (!res.ok) return;
+        const data = await res.json();
+        document.getElementById("stat-lit").innerText = data.literature_total;
+        document.getElementById("stat-repro").innerText = data.reproduction_total;
+        document.getElementById("stat-trouble").innerText = data.troubleshoot_count;
+        document.getElementById("stat-weekly").innerText = data.weekly_count;
+
+        // Render recent feed
+        const feed = document.getElementById("recent-feed-container");
+        if (data.literature_list && data.literature_list.length > 0) {
+          feed.innerHTML = data.literature_list.slice(0, 5).map(item => `
+            <div class="archive-item">
+              <div>
+                <div class="archive-item-title">${escapeHtml(item.title)}</div>
+                <div class="archive-item-meta">
+                  <span class="badge-terracotta">${escapeHtml(String(item.category).replace(/^\d+_/, ''))}</span>
+                  <span>${escapeHtml(item.mtime)}</span>
+                </div>
+              </div>
+              <span style="font-size:12px; color:var(--text-subtle);">📁 Obsidian</span>
+            </div>
+          `).join('');
+        } else {
+          feed.innerHTML = '<div style="font-size:13px; color:var(--text-subtle); padding: 12px 0;">暂无文献，请在左侧录入第一篇。</div>';
+        }
+      } catch (err) {
+        console.error("加载统计数据失败", err);
+      }
+    }
+
+    async function handleFetchPaper() {
+      const idInput = document.getElementById("paper-id-input").value.trim();
+      if (!idInput) {
+        showToast("请先输入 arXiv ID 或 DOI 识别码", true);
+        return;
+      }
+      const btn = document.getElementById("btn-fetch-paper");
+      btn.disabled = true;
+      btn.innerHTML = '<span>检索中...</span>';
+
+      try {
+        const res = await fetch("/api/paper/fetch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identifier: idInput })
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || "抓取失败");
+
+        const p = result.data;
+        document.getElementById("paper-title").value = p.title || "";
+        document.getElementById("paper-authors").value = p.authors || "";
+        document.getElementById("paper-year").value = p.year || 2024;
+        document.getElementById("paper-venue").value = p.venue || "";
+        document.getElementById("paper-abstract").value = p.abstract || "";
+        showToast(`成功提取: ${p.title.slice(0, 28)}...`);
+      } catch (err) {
+        showToast("抓取失败: " + err.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span>智能抓取</span><span class="btn-pill-arrow">→</span>';
+      }
+    }
+
+    async function handleSavePaper() {
+      const title = document.getElementById("paper-title").value.trim();
+      if (!title) {
+        showToast("论文标题不能为空", true);
+        return;
+      }
+      const rawId = document.getElementById("paper-id-input").value.trim();
+      const payload = {
+        title: title,
+        authors: document.getElementById("paper-authors").value.trim(),
+        year: parseInt(document.getElementById("paper-year").value) || 2024,
+        venue: document.getElementById("paper-venue").value.trim(),
+        topic_category: document.getElementById("paper-category").value,
+        status: document.getElementById("paper-status").value,
+        tags: document.getElementById("paper-tags").value.trim(),
+        abstract: document.getElementById("paper-abstract").value.trim(),
+        doi: rawId.startsWith("10.") ? rawId : "",
+        arxiv: rawId.includes("arxiv") || /^\d{4}\.\d{4,5}/.test(rawId) ? rawId : ""
+      };
+
+      try {
+        const res = await fetch("/api/paper/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || "保存失败");
+        showToast(`✅ 文献卡片已归档至 Obsidian: [${result.folder || '01_Literature'}/${result.file_name}]`);
+        loadStats();
+      } catch (err) {
+        showToast("保存失败: " + err.message, true);
+      }
+    }
+
+    async function handleCreateRepro() {
+      const name = document.getElementById("repro-name").value.trim();
+      if (!name) {
+        showToast("请输入复现工程代号", true);
+        return;
+      }
+      const payload = {
+        project_name: name,
+        project_type: document.getElementById("repro-type").value,
+        toolchain: document.getElementById("repro-toolchain").value.trim(),
+        target_paper: document.getElementById("repro-paper").value.trim(),
+        description: document.getElementById("repro-desc").value.trim()
+      };
+
+      try {
+        const res = await fetch("/api/reproduction/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || "创建失败");
+        showToast(`✅ 复现工程已就绪: [02_Reproduction/${result.project_name}/]`);
+        loadStats();
+      } catch (err) {
+        showToast("创建工程失败: " + err.message, true);
+      }
+    }
+
+    async function handleGenerateWeekly() {
+      try {
+        const res = await fetch("/api/weekly/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" }
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || "生成失败");
+        showToast(`✅ 周报已生成至 Obsidian: [04_Weekly_Reports/${result.filename}]`);
+        loadStats();
+      } catch (err) {
+        showToast("生成周报失败: " + err.message, true);
+      }
+    }
+
+    async function handleSaveTroubleshoot() {
+      const keyword = document.getElementById("tb-keyword").value.trim();
+      const solution = document.getElementById("tb-solution").value.trim();
+      if (!keyword || !solution) {
+        showToast("请填写报错关键词与解决方案", true);
+        return;
+      }
+      const payload = {
+        tool_name: document.getElementById("tb-tool").value.trim() || "TCAD/EDA",
+        category: document.getElementById("tb-category").value,
+        error_keyword: keyword,
+        raw_error: "Log recorded from editorial studio",
+        root_cause: "Observed during simulation/experiment",
+        solution: solution
+      };
+
+      try {
+        const res = await fetch("/api/troubleshoot/add", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || "记录失败");
+        showToast(`✅ 踩坑记录已沉淀至知识库: [03_Knowledge/踩坑与排错日记.md] (${result.keyword})`);
+        document.getElementById("tb-keyword").value = "";
+        document.getElementById("tb-solution").value = "";
+        loadStats();
+      } catch (err) {
+        showToast("记录失败: " + err.message, true);
+      }
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      loadStats();
+      fetchModelStatus();
+      initReaderSelectionListener();
+    });
+
+    // ----- Paper Full-Text Reader (V1.4) -----
+    async function handlePasteTextFallback() {
+      const title = document.getElementById("paper-title").value.trim();
+      const abstract = document.getElementById("paper-abstract").value.trim();
+      if (!title) {
+        showToast("请先输入论文标题", true);
+        return;
+      }
+      const raw = prompt(
+        `【粘贴全文文本】\n\n` +
+        `论文: ${title}\n\n` +
+        `请粘贴从 PDF 阅读器复制的全文文本 (Ctrl+A → Ctrl+C, 至少 100 字):`,
+        ""
+      );
+      if (!raw || raw.trim().length < 100) {
+        showToast("粘贴内容太短, 至少 100 字", true);
+        return;
+      }
+      showToast("正在拆分章节...");
+      try {
+        const res = await fetch("/api/paper/split_text", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ raw_text: raw }),
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || "拆分失败");
+        if (!result.sections || result.sections.length === 0) {
+          throw new Error("未识别到任何章节, 请确认文本是否含章节标题");
+        }
+        _readerState.title = title;
+        _readerState.sections = result.sections;
+        _readerState.translations = {};
+        _readerState.activeSection = 0;
+        renderReader();
+        openReaderModal();
+        showToast(`✅ 已从粘贴文本识别 ${result.sections.length} 个章节`);
+      } catch (err) {
+        showToast("拆分失败: " + err.message, true);
+      }
+    }
+
+    function openReaderModal() {
+      document.getElementById("reader-modal").style.display = "flex";
+      document.body.style.overflow = "hidden";
+      fetchModelStatus();
+    }
+    function closeReaderModal() {
+      document.getElementById("reader-modal").style.display = "none";
+      document.body.style.overflow = "";
+      // Stop PDF.js rendering if active
+      if (_pdfState && _pdfState.rendering) {
+        try { _pdfState.rendering.cancel(); } catch (e) {}
+      }
+      // Hide Copilot elements
+      const bubble = document.getElementById("reader-selection-bubble");
+      if (bubble) bubble.style.display = "none";
+      const qaPanel = document.getElementById("reader-qa-panel");
+      if (qaPanel) qaPanel.style.display = "none";
+    }
+
+    // ---------------------------------------------------------------------------
+    // PDF dual-column reader
+    // ---------------------------------------------------------------------------
+    let _readerMode = "section"; // "section" | "pdf"
+    let _pdfZoom = 1.0; // user-controlled PDF zoom multiplier (PDF dual-column view)
+    let _pdfState = null; // { paperId, paperTitle, relativePath, pdfDoc, pages: [{num, canvas, text, translated}], rendering }
+
+    function switchReaderMode(mode) {
+      _readerMode = mode;
+      const sectionView = document.querySelector("#reader-modal > div > div:nth-child(2)");
+      const pdfView = document.getElementById("reader-pdf-view");
+      const btnSection = document.getElementById("reader-mode-section");
+      const btnPdf = document.getElementById("reader-mode-pdf");
+      const zoomBar = document.getElementById("pdf-zoom-bar");
+      if (mode === "pdf") {
+        sectionView.style.display = "none";
+        pdfView.style.display = "block";
+        btnSection.classList.remove("active");
+        btnPdf.classList.add("active");
+        // Hide translate-all button (only useful in section mode)
+        document.getElementById("translate-all-btn").style.display = "none";
+        if (zoomBar) zoomBar.style.display = "flex";
+        loadPdfDualColumn();
+      } else {
+        sectionView.style.display = "";
+        pdfView.style.display = "none";
+        btnSection.classList.add("active");
+        btnPdf.classList.remove("active");
+        document.getElementById("translate-all-btn").style.display = "";
+        if (zoomBar) zoomBar.style.display = "none";
+      }
+    }
+
+    /**
+     * PDF zoom controls (PDF dual-column view).
+     *   setReaderZoom(-1)   → zoom -10%
+     *   setReaderZoom(1)    → zoom +10%
+     *   setReaderZoom("fit")→ reset to 100%
+     * Re-runs loadPdfDualColumn() so each page canvas is re-rendered at new scale.
+     */
+    function setReaderZoom(deltaOrMode) {
+      if (!_pdfState || !_pdfState.pdfDoc) {
+        // First time user toggles zoom before PDF is ready — just update label
+        if (deltaOrMode === "fit") _pdfZoom = 1.0;
+        else _pdfZoom = Math.max(0.5, Math.min(2.5, (_pdfZoom || 1.0) + (deltaOrMode * 0.1)));
+        updateZoomLabel();
+        return;
+      }
+      if (deltaOrMode === "fit") {
+        _pdfZoom = 1.0;
+      } else {
+        _pdfZoom = Math.max(0.5, Math.min(2.5, _pdfZoom + deltaOrMode * 0.1));
+      }
+      _pdfZoom = Math.round(_pdfZoom * 100) / 100; // 2 decimals
+      updateZoomLabel();
+      // Bump generation so any in-flight render loop bails out
+      _pdfState.rendering.generation = (_pdfState.rendering.generation || 0) + 1;
+      const thisGen = _pdfState.rendering.generation;
+      _pdfState.rendering.cancelled = true;
+      // Only clear the PDF canvas side — translations don't depend on zoom,
+      // so we keep them (and re-use their LLM cache on subsequent fetches).
+      document.getElementById("pdf-pages-list").innerHTML = "";
+      // Schedule a new render loop after the old one observes its cancel flag
+      setTimeout(() => loadPdfDualColumn({ keepTranslations: true, generation: thisGen }), 80);
+    }
+    function updateZoomLabel() {
+      const el = document.getElementById("pdf-zoom-label");
+      if (el) el.textContent = Math.round((_pdfZoom || 1.0) * 100) + "%";
+    }
+
+    async function loadPdfDualColumn(opts = {}) {
+      const { keepTranslations = false, generation = null } = opts;
+      const title = _readerState.title || "";
+      const placeholder = document.getElementById("pdf-viewer-placeholder");
+      const listEl = document.getElementById("pdf-pages-list");
+      const transList = document.getElementById("pdf-translations-list");
+
+      // Try to find local PDF by cached path or title
+      let found = null;
+      if (_readerState.pdfPath) {
+        found = {
+          found: true,
+          relative_path: _readerState.pdfPath,
+          file_name: _readerState.pdfPath.split("/").pop().split("\\").pop(),
+          title: title,
+        };
+      } else {
+        try {
+          const r = await fetch(`/api/paper/find_pdf?title=${encodeURIComponent(title)}`);
+          found = await r.json();
+          if (found && found.found) {
+            _readerState.pdfPath = found.relative_path;
+          }
+        } catch (e) {
+          found = { found: false };
+        }
+      }
+
+      if (!found || !found.found) {
+        placeholder.style.display = "";
+        listEl.innerHTML = "";
+        transList.innerHTML = `<div style="padding:24px; color:var(--text-muted); text-align:center;">
+          <div style="font-size:36px;">🔍</div>
+          <div style="margin-top:12px; font-weight:500;">未在 vault 中找到匹配的本地 PDF。</div>
+          <div style="margin-top:6px; font-size:12px; color:var(--text-subtle);">
+            标题: ${escapeHtml(title)}<br>
+            您可点击下方按钮直接选择电脑上的 PDF 文件进行关联解析，或使用 📥 拉取全文 下载。
+          </div>
+          <div style="margin-top:16px;">
+            <button class="btn-pill-outline" onclick="document.getElementById('reader-pdf-upload-input').click()">
+              <span>📤 选择本地 PDF 关联解析</span>
+            </button>
+          </div>
+        </div>`;
+        return;
+      }
+
+      // Load PDF.js document
+      placeholder.style.display = "none";
+      listEl.innerHTML = `<div class="pdf-translation-loading">📥 正在加载 PDF (${escapeHtml(found.file_name)})…</div>`;
+      // Preserve existing translations when only zoom changed; the LLM cache
+      // is keyed by (paper_id, page), independent of zoom level.
+      if (!keepTranslations) {
+        transList.innerHTML = `<div class="pdf-translation-loading">📥 加载中…</div>`;
+      }
+
+      try {
+        if (typeof pdfjsLib === "undefined") {
+          throw new Error("PDF.js 未加载");
+        }
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+          "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+        const pdfUrl = `/api/paper/serve_pdf?relative_path=${encodeURIComponent(found.relative_path)}`;
+
+        // Reuse existing pdfDoc on zoom to avoid re-downloading / re-parsing
+        let pdfDoc;
+        if (keepTranslations && _pdfState && _pdfState.pdfDoc) {
+          pdfDoc = _pdfState.pdfDoc;
+        } else {
+          const loadingTask = pdfjsLib.getDocument({ url: pdfUrl });
+          pdfDoc = await loadingTask.promise;
+        }
+
+        // Reset cancelled flag for new render loop. Each loadPdfDualColumn
+        // claims a generation number; if a newer toggle supersedes us mid-
+        // render, the stale loop bails out via the generation guard below.
+        const myGen = (generation !== null)
+          ? generation
+          : ((_pdfState && _pdfState.rendering && _pdfState.rendering.generation) || 0) + 1;
+
+        _pdfState = {
+          paperId: found.relative_path.replace(/[^a-zA-Z0-9]/g, "_"),
+          paperTitle: found.title || title || "",
+          relativePath: found.relative_path,
+          pdfDoc,
+          pages: [],
+          rendering: { cancelled: false, generation: myGen },
+        };
+        // Mark cancelled flag when modal closes
+        const observer = setInterval(() => {
+          if (!document.getElementById("reader-modal") ||
+              getComputedStyle(document.getElementById("reader-modal")).display === "none") {
+            _pdfState.rendering.cancelled = true;
+            clearInterval(observer);
+          }
+        }, 1000);
+
+        // Render all pages
+        listEl.innerHTML = "";
+        for (let p = 1; p <= pdfDoc.numPages; p++) {
+          if (_pdfState.rendering.cancelled) break;
+          // Generation guard: bail if a newer zoom toggle superseded us
+          if (_pdfState.rendering.generation !== myGen) break;
+          const pageData = await renderPdfPage(p);
+          _pdfState.pages.push(pageData);
+        }
+        // Start smooth queue (page 1 translates immediately, pages 2..N translate paced at 3.2s)
+        // Skip if we're a stale generation — otherwise we'd queue unneeded translates.
+        if (_pdfState.rendering.generation === myGen) {
+          startPdfTranslationQueue();
+        }
+      } catch (err) {
+        listEl.innerHTML = `<div style="padding:18px; color:#B25336;">❌ PDF 加载失败: ${escapeHtml(String(err))}</div>`;
+        if (!keepTranslations) transList.innerHTML = "";
+      }
+    }
+
+    let _pdfQueueTimer = null;
+    let _pdfQueuePaused = false;
+
+    function togglePdfQueuePause() {
+      _pdfQueuePaused = !_pdfQueuePaused;
+      const btn = document.getElementById("pdf-queue-pause-btn");
+      if (btn) {
+        btn.textContent = _pdfQueuePaused ? "▶️ 继续排队" : "⏸️ 暂停排队";
+        btn.style.color = _pdfQueuePaused ? "var(--accent-terracotta)" : "var(--text-muted)";
+      }
+      if (!_pdfQueuePaused) {
+        showToast("已继续 PDF 队列翻译");
+        processNextInPdfQueue();
+      } else {
+        showToast("已暂停后续页面队列翻译");
+      }
+    }
+
+    async function startPdfTranslationQueue() {
+      _pdfQueuePaused = false;
+      const btn = document.getElementById("pdf-queue-pause-btn");
+      if (btn) {
+        btn.textContent = "⏸️ 暂停排队";
+        btn.style.color = "var(--text-muted)";
+      }
+      processNextInPdfQueue();
+    }
+
+    async function processNextInPdfQueue() {
+      if (!_pdfState || !_pdfState.pages || _pdfState.rendering.cancelled || _pdfQueuePaused) return;
+
+      const nextPage = _pdfState.pages.find(p => !p.translated && !p.translating);
+      if (!nextPage) return;
+
+      nextPage.translating = true;
+      await translatePdfPage(nextPage.num, nextPage.text, false);
+
+      if (!_pdfState || _pdfState.rendering.cancelled || _pdfQueuePaused) return;
+
+      _pdfQueueTimer = setTimeout(() => {
+        processNextInPdfQueue();
+      }, 3200);
+    }
+
+    async function renderPdfPage(pageNum) {
+      const listEl = document.getElementById("pdf-pages-list");
+      const page = await _pdfState.pdfDoc.getPage(pageNum);
+      const viewport0 = page.getViewport({ scale: 1.0 });
+      // Base width + user-controlled zoom multiplier (PDF dual-column)
+      const baseWidth = 520;
+      const targetWidth = Math.max(220, baseWidth * (_pdfZoom || 1.0));
+      const scale = targetWidth / viewport0.width;
+      const viewport = page.getViewport({ scale });
+
+      const wrapper = document.createElement("div");
+      wrapper.className = "pdf-page-block";
+      wrapper.id = `pdf-page-block-${pageNum}`;
+      const label = document.createElement("div");
+      label.className = "pdf-page-label";
+      label.textContent = `PAGE ${pageNum}`;
+      wrapper.appendChild(label);
+
+      // Wrapper for canvas + textLayer (allows direct text selection on PDF)
+      const canvasWrapper = document.createElement("div");
+      canvasWrapper.className = "pdf-page-canvas-wrapper";
+      canvasWrapper.style.width = `${Math.floor(viewport.width)}px`;
+      canvasWrapper.style.height = `${Math.floor(viewport.height)}px`;
+
+      const canvas = document.createElement("canvas");
+      canvas.className = "pdf-page-canvas";
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      canvasWrapper.appendChild(canvas);
+
+      const textLayerDiv = document.createElement("div");
+      textLayerDiv.className = "textLayer";
+      textLayerDiv.style.width = `${Math.floor(viewport.width)}px`;
+      textLayerDiv.style.height = `${Math.floor(viewport.height)}px`;
+      textLayerDiv.style.setProperty("--scale-factor", scale);
+      canvasWrapper.appendChild(textLayerDiv);
+
+      wrapper.appendChild(canvasWrapper);
+      listEl.appendChild(wrapper);
+
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      // Extract text via PDF.js (fast + no server roundtrip)
+      const tc = await page.getTextContent();
+      const items = tc.items.map(it => it.str).join(" ").trim();
+
+      // Render Text Layer for drag-selection on the PDF
+      if (typeof pdfjsLib !== "undefined" && pdfjsLib.renderTextLayer) {
+        try {
+          pdfjsLib.renderTextLayer({
+            textContentSource: tc,
+            textContent: tc,
+            container: textLayerDiv,
+            viewport: viewport,
+            textDivs: [],
+          });
+        } catch (tle) {
+          renderTextLayerFallback(tc, textLayerDiv, viewport);
+        }
+      } else {
+        renderTextLayerFallback(tc, textLayerDiv, viewport);
+      }
+
+      // Add placeholder translation block
+      const transList = document.getElementById("pdf-translations-list");
+      const transBlock = document.createElement("div");
+      transBlock.className = "pdf-translation-block";
+      transBlock.id = `pdf-trans-block-${pageNum}`;
+      transBlock.innerHTML = `
+        <div class="page-num" style="display:flex; justify-content:space-between; align-items:center;">
+          <span>第 ${pageNum} 页 / Page ${pageNum}</span>
+          <span id="pdf-page-tag-${pageNum}" style="font-size:10px; color:var(--text-subtle); font-family:var(--font-sans);">
+            ${pageNum === 1 ? "⏳ 即将翻译" : `🕒 排队中 (约 ${(pageNum - 1) * 3}s)`}
+          </span>
+        </div>
+        <div class="page-text pdf-translation-loading" id="pdf-page-text-${pageNum}">
+          ${pageNum === 1 ? "⏳ 正在翻译本页..." : `<span>🕒 等待排队翻译中 (受 20 RPM 保护)...</span> <button class="btn-pill-outline" style="font-size:10.5px; padding:2px 8px; margin-left:6px; vertical-align:middle;" onclick="translatePdfPage(${pageNum}, null, true)">优先翻译此页</button>`}
+        </div>
+      `;
+      transList.appendChild(transBlock);
+
+      return { num: pageNum, canvas, text: items, translated: false, translating: false };
+    }
+
+    function renderTextLayerFallback(tc, container, viewport) {
+      if (!container || !tc || !tc.items) return;
+      container.innerHTML = "";
+      for (const item of tc.items) {
+        if (!item.str || !item.str.trim()) continue;
+        const span = document.createElement("span");
+        span.textContent = item.str;
+        if (pdfjsLib.Util && pdfjsLib.Util.transform && item.transform) {
+          try {
+            const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+            span.style.left = `${tx[4]}px`;
+            span.style.top = `${tx[5] - (item.height * viewport.scale)}px`;
+          } catch (e) {}
+        }
+        span.style.fontSize = `${Math.max(8, item.height * viewport.scale)}px`;
+        container.appendChild(span);
+      }
+    }
+
+    async function translatePdfPage(pageNum, pageText = null, isPriority = false) {
+      const block = document.getElementById(`pdf-trans-block-${pageNum}`);
+      if (!block) return;
+      const textEl = document.getElementById(`pdf-page-text-${pageNum}`) || block.querySelector(".page-text");
+      const tagEl = document.getElementById(`pdf-page-tag-${pageNum}`);
+
+      let text = pageText;
+      if (!text && _pdfState && _pdfState.pages) {
+        const pObj = _pdfState.pages.find(p => p.num === pageNum);
+        if (pObj) text = pObj.text;
+      }
+
+      if (!text || text.length < 10) {
+        if (textEl) textEl.textContent = "(本页无文字内容)";
+        if (tagEl) tagEl.textContent = "无文字";
+        return;
+      }
+
+      if (tagEl) tagEl.textContent = isPriority ? "⚡ 优先翻译中..." : "⏳ 翻译中...";
+      if (textEl) textEl.innerHTML = `<span class="pdf-translation-loading">⏳ 正在调用 AI 翻译第 ${pageNum} 页...</span>`;
+
+      try {
+        const r = await fetch("/api/paper/translate_page", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            paper_id: _pdfState.paperId,
+            page: pageNum,
+            text: text,
+          }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        
+        textEl.className = "page-text";
+        textEl.innerHTML = formatMarkdownLite(data.translation);
+        if (typeof renderMathIn === "function") renderMathIn(textEl);
+        
+        const modelTag = data.model ? ` · ${data.model}` : "";
+        if (tagEl) tagEl.textContent = `✅ 已翻译${modelTag}`;
+
+        if (_pdfState && _pdfState.pages) {
+          const pObj = _pdfState.pages.find(p => p.num === pageNum);
+          if (pObj) {
+            pObj.translated = true;
+            pObj.translating = false;
+          }
+        }
+        fetchModelStatus();
+      } catch (err) {
+        if (tagEl) tagEl.textContent = "❌ 失败";
+        if (textEl) {
+          textEl.innerHTML = `<span style="color:#B25336;">❌ 翻译失败: ${escapeHtml(String(err.message || err))}</span>
+            <button class="btn-pill-outline" style="font-size:11px; padding:2px 8px; margin-left:8px;" onclick="translatePdfPage(${pageNum}, null, true)">🔄 重试本页</button>`;
+        }
+        if (_pdfState && _pdfState.pages) {
+          const pObj = _pdfState.pages.find(p => p.num === pageNum);
+          if (pObj) pObj.translating = false;
+        }
+      }
+    }
+
+
+    let _readerState = {
+      title: "",
+      sections: [],   // [{section, title, text, page_start, page_end}]
+      translations: {}, // {section_idx: {translation, model: "..."}}
+      activeSection: 0,
+      pdfPath: null,
+    };
+
+    async function handleFetchFullText() {
+      const idInput = document.getElementById("paper-id-input").value.trim();
+      const title = document.getElementById("paper-title").value.trim();
+      if (!idInput) {
+        showToast("请先输入 arXiv ID 或 DOI 或 PDF 链接", true);
+        return;
+      }
+      showToast("正在拉取全文并拆分章节...");
+      try {
+        const res = await fetch("/api/paper/fetch_full", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identifier: idInput }),
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || "拉取失败");
+        if (!result.sections || result.sections.length === 0) {
+          throw new Error("PDF 解析后未识别到任何章节, 请检查 PDF 是否可读");
+        }
+        _readerState.title = result.title || title || idInput;
+        _readerState.sections = result.sections;
+        _readerState.translations = {};
+        _readerState.activeSection = 0;
+        _readerState.pdfPath = result.pdf_path || null;
+        renderReader();
+        openReaderModal();
+        showToast(`✅ 已加载 ${result.sections.length} 个章节 (${result.total_pages} 页, ${result.char_count.toLocaleString()} 字)`);
+      } catch (err) {
+        showToast("拉取失败: " + err.message, true);
+      }
+    }
+
+    async function handleUploadLocalPdf(event) {
+      const input = event.target;
+      if (!input.files || input.files.length === 0) return;
+      const file = input.files[0];
+      if (!file.name.toLowerCase().endsWith(".pdf")) {
+        showToast("仅支持上传 PDF 文件 (.pdf)", true);
+        input.value = "";
+        return;
+      }
+
+      showToast(`正在上传并解析本地 PDF (${file.name})...`);
+      const category = document.getElementById("paper-category") ? document.getElementById("paper-category").value : "01_Device_TCAD_器件仿真";
+      const titleInput = document.getElementById("paper-title") ? document.getElementById("paper-title").value.trim() : "";
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      try {
+        let url = `/api/paper/upload_pdf?topic_category=${encodeURIComponent(category)}`;
+        if (titleInput) {
+          url += `&title=${encodeURIComponent(titleInput)}`;
+        }
+        const res = await fetch(url, {
+          method: "POST",
+          body: formData,
+        });
+        const result = await res.json();
+        if (!res.ok) {
+          let msg = result.detail;
+          if (Array.isArray(msg)) msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          else if (typeof msg !== 'string') msg = JSON.stringify(msg);
+          throw new Error(msg || `HTTP ${res.status}`);
+        }
+
+        // Fill metadata into form if blank
+        if (document.getElementById("paper-title") && !titleInput) {
+          document.getElementById("paper-title").value = result.title || file.name.replace(/\.pdf$/i, "");
+        }
+        const absSec = result.sections.find(s => s.section === "abstract");
+        if (absSec && document.getElementById("paper-abstract") && !document.getElementById("paper-abstract").value.trim()) {
+          document.getElementById("paper-abstract").value = absSec.text.slice(0, 800);
+        }
+
+        // Set reader state
+        _readerState.title = result.title || titleInput || file.name.replace(/\.pdf$/i, "");
+        _readerState.sections = result.sections;
+        _readerState.translations = {};
+        _readerState.activeSection = 0;
+        _readerState.pdfPath = result.pdf_path || null;
+
+        renderReader();
+        openReaderModal();
+
+        // Refresh PDF view if currently active
+        if (_readerMode === "pdf") {
+          document.getElementById("pdf-pages-list").innerHTML = "";
+          document.getElementById("pdf-translations-list").innerHTML = "";
+          loadPdfDualColumn();
+        }
+
+        showToast(`✅ 本地 PDF 已归档至 [${result.pdf_path}], 解析就绪: ${result.sections.length} 个章节 (${result.total_pages} 页, ${result.char_count.toLocaleString()} 字)`);
+        loadStats();
+      } catch (err) {
+        showToast("上传解析失败: " + err.message, true);
+      } finally {
+        input.value = "";
+      }
+    }
+
+    function renderReader() {
+      const s = _readerState;
+      document.getElementById("reader-title").textContent = s.title;
+      document.getElementById("reader-meta").textContent =
+        `${s.sections.length} 章节 · 共 ${s.sections.reduce((n, x) => n + x.char_count, 0).toLocaleString()} 字`;
+
+      // Section nav
+      const navHtml = s.sections.map((sec, i) => {
+        const isActive = i === s.activeSection;
+        const translated = s.translations[i];
+        const icon = sec.section === "preamble" ? "📄" :
+                     sec.section === "abstract" ? "📋" :
+                     sec.section === "introduction" ? "🔭" :
+                     sec.section === "methods" ? "🔬" :
+                     sec.section === "results" ? "📊" :
+                     sec.section === "discussion" ? "💭" :
+                     sec.section === "conclusion" ? "✅" :
+                     sec.section === "references" ? "📚" : "📑";
+        return `<div class="reader-nav-item ${isActive ? "active" : ""}" onclick="selectSection(${i})">
+          <span style="margin-right:6px;">${icon}</span>
+          <span>${sec.title}</span>
+          ${translated ? '<span style="margin-left:auto; color:var(--accent-olive); font-size:10px;">译</span>' : ""}
+        </div>`;
+      }).join("");
+      document.getElementById("reader-nav").innerHTML = navHtml;
+
+      renderSection(_readerState.activeSection);
+      // Cross-QA section picker — runs once per reader open via idempotent render
+      renderCrossQASectionPicker();
+    }
+
+    function selectSection(idx) {
+      _readerState.activeSection = idx;
+      renderReader();
+    }
+
+    function renderSection(idx) {
+      const sec = _readerState.sections[idx];
+      if (!sec) return;
+      document.getElementById("reader-original").innerHTML = `
+        <div class="reader-section-header">
+          <div class="reader-section-title">${sec.title}</div>
+          <div class="reader-section-meta">第 ${sec.page_start}-${sec.page_end} 页 · ${sec.char_count.toLocaleString()} 字 · ${sec.section}</div>
+        </div>
+        <div class="reader-section-body en-original">${formatMarkdownLite(sec.text)}</div>`;
+      const translated = _readerState.translations[idx];
+      const modelName = (_readerState.translationModels && _readerState.translationModels[idx]) || "";
+      const transEl = document.getElementById("reader-translation");
+      if (translated) {
+        transEl.innerHTML = `
+          <div class="reader-section-header">
+            <div class="reader-section-title">📝 中文翻译</div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <span class="reader-section-meta">${modelName ? `[${modelName}] · ` : ""}${translated.length} 字</span>
+              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copySectionTranslation(${idx})">📋 复制译文</button>
+              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="translateSection(${idx})">🔄 重新翻译</button>
+            </div>
+          </div>
+          <div class="reader-section-body cn-translation">${formatMarkdownLite(translated)}</div>`;
+        renderMathIn(transEl);
+      } else {
+        transEl.innerHTML = `
+          <div class="reader-section-header">
+            <div class="reader-section-title">📝 中文翻译</div>
+            <div class="reader-section-meta">点击下方按钮调用 AI 翻译</div>
+          </div>
+          <button class="btn-pill-outline" style="margin-top:16px;" onclick="translateSection(${idx})">
+            <span>✨ 一键翻译本节</span>
+          </button>`;
+      }
+    }
+
+    function copySectionTranslation(idx) {
+      const trans = _readerState.translations[idx];
+      if (!trans) return;
+      navigator.clipboard.writeText(trans).then(() => {
+        showToast("✅ 已复制本节译文到剪贴板");
+      }).catch(() => {
+        showToast("复制失败，请手动选取复制", true);
+      });
+    }
+
+
+    function escapeHtml(s) {
+      return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function formatMarkdownLite(s) {
+      // Markdown with KaTeX math: **bold**, `code`, $..$ inline, $$..$$ display
+      // Strategy: extract math first using SOH/SOH unicode markers that survive
+      // HTML escape, then process markdown, then replace markers with span/div
+      // containers that KaTeX will fill in.
+      if (s == null) return "";
+
+      // Use non-printable unicode chars as math delimiters (survive HTML escape)
+      const D_OPEN = "\u0001", D_CLOSE = "\u0002";
+      const I_OPEN = "\u0003", I_CLOSE = "\u0004";
+
+      // 1) Extract $$..$$ display math FIRST. Heuristic: if body is a single line
+      //    AND short (≤ 60 chars / no multi-line / no \begin..\end), LLM almost
+      //    always meant inline; downgrade to inline so layout stays compact and
+      //    these short formulas don't push the paragraph apart.
+      const INLINE_MAX_CHARS = 60;
+      let h = s.replace(/\$\$([\s\S]+?)\$\$/g, (m, body) => {
+        const trimmed = body.trim();
+        const isMultiLine = /\n/.test(trimmed);
+        const hasEnv = /\\(begin|end)\s*\{[^}]+\}/.test(trimmed);
+        const tooLong = trimmed.length > INLINE_MAX_CHARS;
+        if (!isMultiLine && !hasEnv && !tooLong) {
+          // downgrade short inline-shaped display → inline
+          return I_OPEN + body + I_CLOSE;
+        }
+        return D_OPEN + body + D_CLOSE;
+      });
+      // 2) Extract $..$ inline math (avoiding $$$ escaping)
+      h = h.replace(/(?<!\$)\$([^\$\n]+?)\$(?!\$)/g, (m, body) => I_OPEN + body + I_CLOSE);
+      // 3) HTML escape everything
+      h = escapeHtml(h);
+      // 4) Bold
+      h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      // 4b) Markdown headings (LLM translations often use # / ## on their own line)
+      h = h.replace(/^###\s+(.+)$/gm, '<h4 class="md-h4">$1</h4>');
+      h = h.replace(/^##\s+(.+)$/gm, '<h3 class="md-h3">$1</h3>');
+      h = h.replace(/^#\s+(.+)$/gm, '<h2 class="md-h2">$1</h2>');
+      // 5) Inline code (backticks survive escape, content is already escaped)
+      h = h.replace(/`([^`]+)`/g, '<code class="md-code-inline">$1</code>');
+      // 6) Restore display math markers as <div> placeholders
+      h = h.replace(new RegExp(D_OPEN + "([\\s\\S]+?)" + D_CLOSE, "g"),
+                    (_, body) => `<div class="math-display-block">${body}</div>`);
+      // 7) Restore inline math markers as <span> placeholders
+      h = h.replace(new RegExp(I_OPEN + "([^" + I_OPEN + I_CLOSE + "]+?)" + I_CLOSE, "g"),
+                    (_, body) => `<span class="math-placeholder math-inline">${body}</span>`);
+
+      // 8) Paragraphs — wrap each blank-line-separated block in <p>; CSS controls spacing.
+      //    Pre-existing heading tags (h2 / h3 / h4) are preserved by being matched first.
+      //    We split on blank lines, wrap each non-heading segment in <p>.
+      const segments = h.split(/\n{2,}/);
+      const wrapped = segments.map(seg => {
+        const trimmed = seg.trim();
+        if (!trimmed) return "";
+        if (/^<(h\d|math-display-block|math-placeholder|code|pre|ul|ol|blockquote)/.test(trimmed)) {
+          return trimmed; // already a block-level tag
+        }
+        return "<p>" + trimmed.replace(/\n/g, "<br>") + "</p>";
+      }).join("");
+      return wrapped;
+    }
+
+    /**
+     * Run KaTeX on all .math-display-block and .math-placeholder elements inside a container.
+     * KaTeX replaces each placeholder's textContent with rendered math.
+     * Errors render as red text.
+     */
+    function renderMathIn(container) {
+      if (!container) return;
+      // KaTeX loaded with `defer` — may not be ready on first call
+      if (typeof katex === "undefined") {
+        setTimeout(() => renderMathIn(container), 150);
+        return;
+      }
+      // Display math
+      container.querySelectorAll(".math-display-block").forEach(el => {
+        const tex = el.textContent || "";
+        try {
+          katex.render(tex, el, {
+            displayMode: true,
+            throwOnError: false,
+            errorColor: "#c43e3e",
+            strict: "ignore",
+            trust: false,
+          });
+        } catch (e) {
+          el.innerHTML = `<span style="color:#c43e3e; font-size:0.9em;">⚠ ${escapeHtml(String(e))}</span>`;
+        }
+      });
+      // Inline math
+      container.querySelectorAll(".math-placeholder.math-inline").forEach(el => {
+        const tex = el.textContent || "";
+        try {
+          katex.render(tex, el, {
+            displayMode: false,
+            throwOnError: false,
+            errorColor: "#c43e3e",
+            strict: "ignore",
+            trust: false,
+          });
+        } catch (e) {
+          el.innerHTML = `<span style="color:#c43e3e; font-size:0.9em;">⚠ ${escapeHtml(String(e))}</span>`;
+        }
+      });
+    }
+
+    // Convenience: apply formatMarkdownLite + renderMathIn in one go
+    function renderMarkdown(el, rawText) {
+      el.innerHTML = formatMarkdownLite(rawText);
+      renderMathIn(el);
+    }
+
+    async function translateSection(idx) {
+      const sec = _readerState.sections[idx];
+      const transEl = document.getElementById("reader-translation");
+      const estChars = (sec.text || "").length;
+      const estChunks = estChars > 8000 ? Math.ceil(estChars / 8000) : 1;
+      transEl.innerHTML = `<div style="padding:14px; color:var(--text-muted);">⏳ 翻译中${estChunks > 1 ? ` (大章节, 约拆 ${estChunks} 段)` : ""}...</div>`;
+      try {
+        const res = await fetch("/api/paper/translate_section", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            section_title: sec.title,
+            section_text: sec.text,
+            section_key: sec.section,
+          }),
+        });
+        const result = await res.json();
+        if (!res.ok) {
+          let msg = result.detail;
+          if (Array.isArray(msg)) {
+            msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          } else if (typeof msg !== 'string') {
+            msg = JSON.stringify(msg);
+          }
+          throw new Error(msg || `HTTP ${res.status}`);
+        }
+        _readerState.translations[idx] = result.translation;
+        _readerState.translationModels = _readerState.translationModels || {};
+        _readerState.translationModels[idx] = result.model;
+        renderSection(idx);
+        renderReader();
+        fetchModelStatus();
+
+        if (result.from_cache) {
+          showToast(`⚡ 缓存命中 · ${(result.chunk_count || 1)} 段 · 0s`);
+        } else if (result.was_segmented) {
+          showToast(`✅ 翻译完成 · 拆 ${result.chunk_count} 段`);
+        } else {
+          showToast(`✅ 翻译完成 (${result.model || "AI"})`);
+        }
+      } catch (err) {
+        transEl.innerHTML = `<div style="padding:18px; color:var(--accent-terracotta);">
+          <div style="font-weight:600; margin-bottom:6px;">❌ 翻译失败: ${escapeHtml(err.message)}</div>
+          <div style="font-size:12px; color:var(--text-subtle); margin-bottom:12px;">提示: 若主模型 429 额度耗尽，系统已自动降格至 Agnes 3.0 Flash，点击重试即可生效。</div>
+          <button class="btn-pill-outline" style="font-size:12px; padding:6px 14px;" onclick="translateSection(${idx})">🔄 重新翻译本节</button>
+        </div>`;
+      }
+    }
+
+    async function translateAllSections() {
+      const untranslated = _readerState.sections.filter((_, i) => !_readerState.translations[i]);
+      if (!untranslated.length) {
+        showToast("所有章节均已翻译完毕");
+        return;
+      }
+      if (!confirm(`将批量翻译剩余 ${untranslated.length} 个章节。为避免打满 20 RPM 限制，章节间将自动保持 3.2 秒间隔，确定继续?`)) {
+        return;
+      }
+      const btn = document.getElementById("translate-all-btn");
+      btn.disabled = true;
+      for (let i = 0; i < _readerState.sections.length; i++) {
+        if (_readerState.translations[i]) continue;
+        btn.innerHTML = `<span>⏳ 翻译中 (${i + 1}/${_readerState.sections.length} 节，20 RPM 保护)...</span>`;
+        await translateSection(i);
+        await new Promise(r => setTimeout(r, 3200));
+      }
+      btn.disabled = false;
+      btn.innerHTML = '<span>✨ 批量翻译全部章节</span>';
+      showToast("✅ 批量翻译完成");
+    }
+
+    async function exportBilingualNote() {
+      const s = _readerState;
+      if (!s.sections || !s.sections.length) {
+        showToast("当前无论文内容可导出", true);
+        return;
+      }
+      const topic = (document.getElementById("paper-category") && document.getElementById("paper-category").value) ||
+                    (document.getElementById("paper-topic") && document.getElementById("paper-topic").value) ||
+                    "01_Device_TCAD_器件仿真";
+      const authors = document.getElementById("paper-authors") ? document.getElementById("paper-authors").value : "";
+      const yearVal = document.getElementById("paper-year") ? parseInt(document.getElementById("paper-year").value, 10) : 2024;
+      showToast("正在导出双语精读笔记到 Obsidian 知识库 (02_双语精读笔记)...");
+      try {
+        const payload = {
+          title: s.title || "未命名论文",
+          topic_category: topic,
+          authors: authors,
+          year: isNaN(yearVal) ? 2024 : yearVal,
+          sections: s.sections.map((sec, idx) => ({
+            title: sec.title,
+            section: sec.section,
+            text: sec.text,
+            translation: s.translations[idx] || "",
+            page_start: sec.page_start,
+            page_end: sec.page_end,
+          })),
+          qa_records: _sessionQAList || []
+        };
+        const res = await fetch("/api/paper/export_bilingual", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "导出失败");
+        const qaCountNotice = (_sessionQAList && _sessionQAList.length) ? ` (已整合 ${_sessionQAList.length} 条划词答疑)` : "";
+        showToast(`✅ 双语笔记已导出到 Obsidian: [${data.folder || '02_双语精读笔记'}/${data.file_name}]${qaCountNotice}`);
+        loadStats();
+      } catch (err) {
+        showToast("导出失败: " + err.message, true);
+      }
+    }
+
+    // ----- Model Status & Probing -----
+    let _llmStatus = null;
+
+    async function fetchModelStatus() {
+      try {
+        const res = await fetch("/api/llm/status");
+        if (!res.ok) return;
+        _llmStatus = await res.json();
+        updateModelBadges();
+      } catch (e) {}
+    }
+
+    function updateModelBadges() {
+      if (!_llmStatus) return;
+      const headerDot = document.getElementById("header-model-dot");
+      const headerText = document.getElementById("header-model-text");
+      const readerDot = document.getElementById("reader-model-dot");
+      const readerText = document.getElementById("reader-model-text");
+      const readerProbeBtn = document.getElementById("reader-probe-btn");
+
+      if (!_llmStatus.configured) {
+        if (headerDot) headerDot.style.background = "#c43e3e";
+        if (headerText) headerText.textContent = "LLM 未配置";
+        if (readerDot) readerDot.style.background = "#c43e3e";
+        if (readerText) readerText.textContent = "LLM 未配置";
+        if (readerProbeBtn) readerProbeBtn.style.display = "none";
+        return;
+      }
+
+      const modelName = _llmStatus.active_model || "LLM";
+      if (_llmStatus.is_degraded) {
+        const badgeText = `🛡️ ${modelName} (降格·20 RPM)`;
+        if (headerDot) headerDot.style.background = "#d97706";
+        if (headerText) headerText.textContent = badgeText;
+        if (readerDot) readerDot.style.background = "#d97706";
+        if (readerText) readerText.textContent = badgeText;
+        if (readerProbeBtn) readerProbeBtn.style.display = "inline-block";
+      } else {
+        const badgeText = `🤖 ${modelName}`;
+        if (headerDot) headerDot.style.background = "var(--accent-olive)";
+        if (headerText) headerText.textContent = badgeText;
+        if (readerDot) readerDot.style.background = "var(--accent-olive)";
+        if (readerText) readerText.textContent = badgeText;
+        if (readerProbeBtn) readerProbeBtn.style.display = "none";
+      }
+    }
+
+    async function probeModelNow() {
+      showToast("正在探测 MiniMax 主模型额度状态...");
+      try {
+        const res = await fetch("/api/llm/probe", { method: "POST" });
+        const data = await res.json();
+        if (data.success) {
+          showToast(`🚀 ${data.message}`);
+        } else {
+          showToast(`⚠️ ${data.message}`, true);
+        }
+        await fetchModelStatus();
+      } catch (err) {
+        showToast("探测失败: " + err.message, true);
+      }
+    }
+
+    async function checkOrProbeModel() {
+      if (_llmStatus && _llmStatus.is_degraded) {
+        probeModelNow();
+      } else {
+        await fetchModelStatus();
+        showToast(`当前模型: ${_llmStatus?.active_model || "未配置"} (${_llmStatus?.is_degraded ? "降格保护中" : "主模型正常"})`);
+      }
+    }
+
+
+    async function askPaperQuestion() {
+      const question = document.getElementById("ask-paper-question").value.trim();
+      if (!question) {
+        showToast("请输入问题", true);
+        return;
+      }
+      const el = document.getElementById("ask-paper-result");
+      el.style.display = "block";
+      el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">⏳ AI 解读中 (最多 60 秒)...</div>`;
+      try {
+        const res = await fetch("/api/paper/explain", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: question,
+            sections: _readerState.sections.map(s => ({ section: s.section, title: s.title, text: s.text })),
+            paper_title: _readerState.title,
+          }),
+        });
+        const result = await res.json();
+        if (!res.ok) {
+          let msg = result.detail;
+          if (Array.isArray(msg)) {
+            msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          } else if (typeof msg !== 'string') {
+            msg = JSON.stringify(msg);
+          }
+          throw new Error(msg || `HTTP ${res.status}`);
+        }
+        el.innerHTML = `
+          <div class="reader-section-header">
+            <div class="reader-section-title">🤖 ${escapeHtml(question)}</div>
+          </div>
+          <div class="reader-section-body">${formatMarkdownLite(result.answer)}</div>`;
+        renderMathIn(el);
+      } catch (err) {
+        el.innerHTML = `<div style="padding:14px; color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    function presetQuestion(q) {
+      document.getElementById("ask-paper-question").value = q;
+      askPaperQuestion();
+    }
+
+    async function crossSectionQA() {
+      const question = document.getElementById("cross-qa-question").value.trim();
+      if (!question) {
+        showToast("请输入跨章节问题", true);
+        return;
+      }
+      if (_readerState.sections.length < 2) {
+        showToast("跨章节问答需要至少 2 个章节 (本论文章节不足)", true);
+        return;
+      }
+      // Collect selected sections (default: all non-references sections)
+      const checked = Array.from(document.querySelectorAll(".cross-qa-section-cb:checked"))
+        .map(cb => parseInt(cb.dataset.idx, 10));
+      const sections = (checked.length >= 2 ? checked : null);
+      const el = document.getElementById("cross-qa-result");
+      el.style.display = "block";
+      el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">⏳ 综合多章节分析中 (可能 60-120 秒)...</div>`;
+      try {
+        const res = await fetch("/api/paper/cross_qa", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: question,
+            sections: _readerState.sections.map(s => ({ section: s.section, title: s.title, text: s.text })),
+            selected_indices: sections,
+            paper_title: _readerState.title,
+          }),
+        });
+        const result = await res.json();
+        if (!res.ok) {
+          let msg = result.detail;
+          if (Array.isArray(msg)) {
+            msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          } else if (typeof msg !== 'string') {
+            msg = JSON.stringify(msg);
+          }
+          throw new Error(msg || `HTTP ${res.status}`);
+        }
+        const usedList = (result.sections_used || [])
+          .map(s => `<span class="cross-qa-tag">${escapeHtml(s.section)}</span>`).join("");
+        el.innerHTML = `
+          <div class="reader-section-header">
+            <div class="reader-section-title">🔗 跨章节综合 · ${escapeHtml(question)}</div>
+            <div class="reader-section-meta">综合 ${result.section_count} 个章节 · ${result.context_chars.toLocaleString()} 字 context${usedList ? ` · ${usedList}` : ""}</div>
+          </div>
+          <div class="reader-section-body">${formatMarkdownLite(result.answer)}</div>`;
+        renderMathIn(el);
+      } catch (err) {
+        el.innerHTML = `<div style="padding:14px; color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    function presetCrossQA(q) {
+      document.getElementById("cross-qa-question").value = q;
+      crossSectionQA();
+    }
+
+    function renderCrossQASectionPicker() {
+      const el = document.getElementById("cross-qa-sections");
+      if (!el) return;
+      const sections = _readerState.sections;
+      if (!sections || sections.length < 2) {
+        el.innerHTML = `<div style="color:var(--text-subtle); font-size:12px; padding:8px;">本论文章节数 < 2, 无法跨章节问答</div>`;
+        return;
+      }
+      el.innerHTML = sections.map((s, i) => {
+        const checked = s.section !== "references" && s.section !== "full_text";
+        return `<label style="display:flex; align-items:center; gap:6px; padding:4px 0; font-size:12px; color:var(--text-soft); cursor:pointer;">
+          <input type="checkbox" class="cross-qa-section-cb" data-idx="${i}" ${checked ? "checked" : ""} style="accent-color: var(--accent-olive);">
+          <span>${escapeHtml(s.section)}</span>
+          <span style="color:var(--text-subtle); margin-left:auto; font-size:10px;">${(s.text || "").length}字</span>
+        </label>`;
+      }).join("");
+    }
+
+    // ---------------------------------------------------------------------------
+    // AI Q&A Copilot / 划词答疑
+    // ---------------------------------------------------------------------------
+    let _readerSelState = {
+      text: "",
+      source: "general", // "pdf" | "translation" | "original" | "general"
+      pageNum: null,
+      sectionIdx: null,
+    };
+    let _lastAnswerText = "";
+    let _lastQAItem = null;
+    let _sessionQAList = [];
+    let _currentQAPreset = "通俗解释";
+
+    function initReaderSelectionListener() {
+      document.addEventListener("mouseup", (e) => {
+        // If selection happened inside textarea or input, ignore
+        if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
+
+        // Don't show bubble if clicking inside the QA panel controls
+        const qaPanel = document.getElementById("reader-qa-panel");
+        if (qaPanel && qaPanel.contains(e.target) && !e.target.closest("#qa-answer-container")) {
+          return;
+        }
+
+        const sel = window.getSelection();
+        const text = sel ? sel.toString().trim() : "";
+        const bubble = document.getElementById("reader-selection-bubble");
+        const floatingTag = document.getElementById("reader-floating-sel-tag");
+
+        // Verify selection is within reader modal
+        const readerModal = document.getElementById("reader-modal");
+        if (!readerModal || getComputedStyle(readerModal).display === "none") {
+          if (bubble) bubble.style.display = "none";
+          return;
+        }
+
+        if (text && text.length >= 2) {
+          let source = "general";
+          let pageNum = null;
+          let sectionIdx = null;
+
+          const pdfBlock = e.target.closest(".pdf-page-block");
+          if (pdfBlock) {
+            source = "pdf";
+            const m = pdfBlock.id.match(/\d+/);
+            if (m) pageNum = parseInt(m[0], 10);
+          } else if (e.target.closest("#pdf-translations-list") || e.target.closest(".pdf-translation-block")) {
+            source = "translation";
+            const transBlock = e.target.closest(".pdf-translation-block");
+            if (transBlock) {
+              const m = transBlock.id.match(/\d+/);
+              if (m) pageNum = parseInt(m[0], 10);
+            }
+          } else if (e.target.closest("#reader-original")) {
+            source = "original";
+            sectionIdx = _readerState.activeSection;
+          } else if (e.target.closest("#reader-translation")) {
+            source = "translation";
+            sectionIdx = _readerState.activeSection;
+          }
+
+          _readerSelState = { text, source, pageNum, sectionIdx };
+
+          if (floatingTag) {
+            floatingTag.style.display = "inline-block";
+            floatingTag.textContent = `${text.length}字`;
+          }
+
+          // Show floating bubble
+          if (bubble && sel.rangeCount > 0) {
+            try {
+              const range = sel.getRangeAt(0);
+              const rect = range.getBoundingClientRect();
+              if (rect.width > 0 || rect.height > 0) {
+                const x = Math.min(window.innerWidth - 180, Math.max(12, rect.left + (rect.width / 2) - 80));
+                const y = Math.max(12, rect.top - 42);
+                bubble.style.left = `${x}px`;
+                bubble.style.top = `${y}px`;
+                bubble.style.display = "flex";
+                const countEl = document.getElementById("reader-sel-bubble-count");
+                if (countEl) countEl.textContent = `(${text.length > 12 ? text.slice(0, 10) + '…' : text})`;
+              }
+            } catch (err) {}
+          }
+
+          // If QA panel is already visible, update the quote preview in real-time
+          if (qaPanel && qaPanel.style.display === "flex") {
+            updateQAQuotedSnippet();
+          }
+        } else {
+          // Fade out bubble if selection cleared
+          setTimeout(() => {
+            const currentSel = window.getSelection() ? window.getSelection().toString().trim() : "";
+            if (!currentSel && bubble) bubble.style.display = "none";
+          }, 150);
+        }
+      });
+    }
+
+    function toggleReaderQAPanel() {
+      const panel = document.getElementById("reader-qa-panel");
+      if (!panel) return;
+      if (panel.style.display === "flex") {
+        panel.style.display = "none";
+      } else {
+        openReaderQAPanel();
+      }
+    }
+
+    function minimizeReaderQAPanel() {
+      const panel = document.getElementById("reader-qa-panel");
+      if (panel) panel.classList.toggle("minimized");
+    }
+
+    function openReaderQAPanel(presetQ = null) {
+      const panel = document.getElementById("reader-qa-panel");
+      if (!panel) return;
+      panel.style.display = "flex";
+      panel.classList.remove("minimized");
+
+      // Hide bubble if showing
+      const bubble = document.getElementById("reader-selection-bubble");
+      if (bubble) bubble.style.display = "none";
+
+      updateQAQuotedSnippet();
+
+      const modelPill = document.getElementById("qa-panel-model-pill");
+      if (modelPill && _llmStatus) {
+        modelPill.textContent = _llmStatus.is_degraded ? "🛡️ 降格保护" : "🤖 主模型";
+        modelPill.style.color = _llmStatus.is_degraded ? "var(--accent-terracotta)" : "var(--accent-olive)";
+      }
+
+      if (presetQ) {
+        document.getElementById("qa-question-input").value = presetQ;
+        submitReaderQA();
+      } else {
+        document.getElementById("qa-question-input").focus();
+      }
+    }
+
+    function updateQAQuotedSnippet() {
+      const textEl = document.getElementById("qa-quoted-text");
+      const srcTag = document.getElementById("qa-quoted-source-tag");
+      const lenTag = document.getElementById("qa-quoted-len-tag");
+      const clearBtn = document.getElementById("qa-clear-quote-btn");
+
+      if (!_readerSelState.text) {
+        if (textEl) {
+          textEl.innerHTML = '<span style="color:var(--text-subtle);">(在左侧 PDF 或右侧译文中划选文字，将自动同步到此；也可直接提问)</span>';
+          textEl.style.fontStyle = "normal";
+        }
+        if (srcTag) {
+          srcTag.textContent = "无划选";
+          srcTag.style.background = "var(--bg-canvas-subtle)";
+          srcTag.style.color = "var(--text-muted)";
+        }
+        if (lenTag) lenTag.textContent = "";
+        if (clearBtn) clearBtn.style.display = "none";
+        return;
+      }
+
+      if (textEl) {
+        textEl.textContent = _readerSelState.text;
+        textEl.style.fontStyle = "italic";
+      }
+      if (srcTag) {
+        const srcLabel = _readerSelState.source === "pdf" ? "📄 来自 PDF" :
+                         _readerSelState.source === "translation" ? "📝 来自译文" :
+                         _readerSelState.source === "original" ? "📑 来自原文" : "📌 选中文本";
+        srcTag.textContent = srcLabel;
+        srcTag.style.background = "var(--accent-terracotta-subtle)";
+        srcTag.style.color = "var(--accent-terracotta)";
+      }
+      if (lenTag) lenTag.textContent = `· ${_readerSelState.text.length} 字`;
+      if (clearBtn) clearBtn.style.display = "inline-block";
+    }
+
+    function clearQAQuotedText() {
+      _readerSelState.text = "";
+      _readerSelState.source = "general";
+      _readerSelState.pageNum = null;
+      _readerSelState.sectionIdx = null;
+      const floatingTag = document.getElementById("reader-floating-sel-tag");
+      if (floatingTag) floatingTag.style.display = "none";
+      updateQAQuotedSnippet();
+    }
+
+    function triggerQAPreset(type) {
+      _currentQAPreset = type;
+      let q = "";
+      if (type === "通俗解释") {
+        q = "请用通俗易懂的中文深入解释这段内容的核心含义、学术背景与研究动机。";
+      } else if (type === "物理机制") {
+        q = "这段内容涉及什么半导体物理机制、能带/输运理论或器件模型？请结合公式与物理图景详细推导剖析。";
+      } else if (type === "工程启发") {
+        q = "这段内容在实际TCAD仿真建模、DTCO器件优化或实验复现中有何指导意义与启发？";
+      } else if (type === "术语速查") {
+        q = "请梳理这段内容中出现的关键专业术语、缩写与公式符号，给出全称与物理意义。";
+      }
+      document.getElementById("qa-question-input").value = q;
+      submitReaderQA();
+    }
+
+    function handleQAInputKeydown(e) {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        submitReaderQA();
+      }
+    }
+
+    async function submitReaderQA() {
+      const qInput = document.getElementById("qa-question-input");
+      const question = (qInput ? qInput.value.trim() : "");
+      if (!question) {
+        showToast("请输入您想问的问题", true);
+        return;
+      }
+
+      const welcome = document.getElementById("qa-welcome-placeholder");
+      const answerBody = document.getElementById("qa-answer-body");
+      const submitBtn = document.getElementById("qa-submit-btn");
+
+      if (welcome) welcome.style.display = "none";
+      if (answerBody) {
+        answerBody.style.display = "block";
+        answerBody.innerHTML = `
+          <div style="padding:16px 0; color:var(--text-muted); display:flex; align-items:center; gap:8px;">
+            <span class="pdf-translation-loading">⏳ AI 正在深度剖析所选内容与半导体物理机制...</span>
+          </div>
+        `;
+      }
+
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span>⏳ 解答中...</span>';
+      }
+
+      // Collect surrounding context
+      let surroundingContext = "";
+      if (_readerSelState.pageNum && _pdfState && _pdfState.pages) {
+        const pObj = _pdfState.pages.find(p => p.num === _readerSelState.pageNum);
+        if (pObj) surroundingContext = `[Page ${_readerSelState.pageNum}] ${pObj.text || ""}`;
+      } else if (_readerSelState.sectionIdx !== null && _readerState.sections) {
+        const sObj = _readerState.sections[_readerSelState.sectionIdx];
+        if (sObj) surroundingContext = `[Section ${sObj.title}] ${sObj.text || ""}`;
+      } else if (_readerState.sections && _readerState.sections[_readerState.activeSection]) {
+        const sObj = _readerState.sections[_readerState.activeSection];
+        surroundingContext = `[Section ${sObj.title}] ${sObj.text || ""}`;
+      }
+
+      try {
+        const payload = {
+          selected_text: _readerSelState.text || "(用户未划选特定片段，提问全篇整体背景)",
+          question: question,
+          paper_title: _readerState.title || "",
+          surrounding_context: surroundingContext,
+          source_type: _readerSelState.source || "general",
+        };
+
+        const res = await fetch("/api/paper/explain_selection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          let msg = data.detail;
+          if (Array.isArray(msg)) msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          else if (typeof msg !== 'string') msg = JSON.stringify(msg);
+          throw new Error(msg || `HTTP ${res.status}`);
+        }
+
+        _lastAnswerText = data.answer;
+        _lastQAItem = {
+          title: _readerState.title || "未命名论文",
+          question: question,
+          selection: _readerSelState.text || "",
+          answer: data.answer,
+          mode: _currentQAPreset || "explain",
+          topic_category: (document.getElementById("paper-category") && document.getElementById("paper-category").value) ||
+                          (document.getElementById("paper-topic") && document.getElementById("paper-topic").value) ||
+                          "01_Device_TCAD_器件仿真",
+          timestamp: new Date().toISOString()
+        };
+        _sessionQAList.push(_lastQAItem);
+
+        const modelBadge = data.model ? `<span style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">🤖 ${data.model}${data.is_degraded ? ' (降格)' : ''}</span>` : "";
+
+        answerBody.innerHTML = `
+          <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--card-border-subtle); display:flex; justify-content:space-between; align-items:center;">
+            <div style="font-weight:600; font-size:13px; color:var(--text-main);">❓ ${escapeHtml(question)}</div>
+            ${modelBadge}
+          </div>
+          <div class="reader-section-body" style="font-size:13px; line-height:1.65; color:var(--text-main); margin-bottom:14px;">
+            ${formatMarkdownLite(data.answer)}
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; justify-content:flex-end; padding-top:8px; border-top:1px solid var(--card-border-subtle); flex-wrap:wrap;">
+            <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px; color:#2E7D32; border-color:#81C784; background:#F1F8E9;" onclick="exportCurrentQAToObsidian()" title="将本条答疑保存到 Obsidian 04_AI划词答疑 文件夹">💾 导出本条答疑到 Obsidian</button>
+            <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copyLastQAAnswer()">📋 复制解答</button>
+            <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="saveQAToTroubleshoot('${escapeHtml(question.slice(0, 30))}')">➕ 存入避坑库</button>
+          </div>
+        `;
+
+        if (typeof renderMathIn === "function") renderMathIn(answerBody);
+        fetchModelStatus();
+      } catch (err) {
+        answerBody.innerHTML = `
+          <div style="padding:14px; color:var(--accent-terracotta);">
+            <div style="font-weight:600; margin-bottom:4px;">❌ 答疑失败</div>
+            <div style="font-size:12px;">${escapeHtml(err.message || String(err))}</div>
+            <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px; margin-top:8px;" onclick="submitReaderQA()">🔄 重试提问</button>
+          </div>
+        `;
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = '<span>🚀 发送提问</span>';
+        }
+      }
+    }
+
+    async function exportCurrentQAToObsidian() {
+      if (!_lastQAItem || !_lastQAItem.answer) {
+        showToast("暂无可导出的答疑内容", true);
+        return;
+      }
+      const topic = (document.getElementById("paper-category") && document.getElementById("paper-category").value) ||
+                    (document.getElementById("paper-topic") && document.getElementById("paper-topic").value) ||
+                    "01_Device_TCAD_器件仿真";
+      const yearVal = document.getElementById("paper-year") ? parseInt(document.getElementById("paper-year").value, 10) : 2024;
+      showToast("正在导出答疑卡片到 Obsidian (04_AI划词答疑)...");
+      try {
+        const payload = {
+          title: _lastQAItem.title || _readerState.title || "未命名论文",
+          question: _lastQAItem.question,
+          selection: _lastQAItem.selection,
+          answer: _lastQAItem.answer,
+          mode: _lastQAItem.mode || "explain",
+          topic_category: topic,
+          year: isNaN(yearVal) ? 2024 : yearVal,
+        };
+        const res = await fetch("/api/paper/export_qa", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "导出失败");
+        showToast(`✅ 答疑已归档至 Obsidian: [${data.folder}/${data.file_name}]`);
+        loadStats();
+      } catch (err) {
+        showToast("导出答疑失败: " + err.message, true);
+      }
+    }
+
+    function copyLastQAAnswer() {
+      if (!_lastAnswerText) return;
+      navigator.clipboard.writeText(_lastAnswerText).then(() => {
+        showToast("✅ 解答已复制到剪贴板");
+      }).catch(() => {
+        showToast("复制失败，请手动选择复制", true);
+      });
+    }
+
+    function saveQAToTroubleshoot(keyword) {
+      if (!_lastAnswerText) return;
+      const kwEl = document.getElementById("tb-keyword");
+      const solEl = document.getElementById("tb-solution");
+      if (kwEl) kwEl.value = keyword || "论文精读答疑";
+      if (solEl) solEl.value = _lastAnswerText;
+      showToast("已预填到右侧避坑知识库，关闭阅读器即可保存");
+    }
+  </script>
+
+  <!-- ===== Reader Modal (full screen overlay) ===== -->
+  <div id="reader-modal" style="display:none; position:fixed; inset:0; z-index:1000; background:var(--bg-canvas);">
+    <div style="height:100%; display:flex; flex-direction:column;">
+      <!-- Top bar -->
+      <div style="display:flex; align-items:center; justify-content:space-between; padding:14px 32px; border-bottom:1px solid var(--card-border); background:var(--bg-canvas);">
+        <div>
+          <div style="font-family:var(--font-serif); font-size:22px; font-weight:500; color:var(--text-main); line-height:1.2;" id="reader-title">论文分屏阅读</div>
+          <div style="font-size:11.5px; color:var(--text-subtle); margin-top:4px; letter-spacing:0.5px;" id="reader-meta">— · — 字</div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <!-- Model indicator badge in reader -->
+          <div id="reader-model-badge" class="pill-badge" style="font-size:11.5px; padding:5px 12px; cursor:pointer;" onclick="checkOrProbeModel()" title="点击检测大模型状态或探测升格">
+            <span class="dot" id="reader-model-dot"></span>
+            <span id="reader-model-text">AI 检测中</span>
+            <button id="reader-probe-btn" class="btn-zoom-toggle" style="display:none; font-size:10.5px; padding:2px 8px; margin-left:6px; background:var(--accent-terracotta); color:#fff; border-radius:6px;" onclick="event.stopPropagation(); probeModelNow();">⚡ 探测升格</button>
+          </div>
+          <!-- View mode toggle -->
+          <div style="display:flex; gap:0; padding:3px; background:var(--card-bg); border:1px solid var(--card-border); border-radius:18px; margin-right:6px;">
+            <button id="reader-mode-section" class="btn-mode-toggle active" onclick="switchReaderMode('section')">📑 章节视图</button>
+            <button id="reader-mode-pdf" class="btn-mode-toggle" onclick="switchReaderMode('pdf')">📄 PDF 双栏</button>
+          </div>
+          <!-- PDF zoom & queue controls (PDF mode only) -->
+          <div id="pdf-zoom-bar" style="display:none; gap:0; padding:3px; background:var(--card-bg); border:1px solid var(--card-border); border-radius:18px; margin-right:6px; align-items:center;">
+            <button class="btn-zoom-toggle" onclick="setReaderZoom(-1)" title="缩小 10%">−</button>
+            <span id="pdf-zoom-label" style="min-width:46px; text-align:center; font-family:var(--font-mono); font-size:12px; color:var(--text-main); padding:0 4px;">100%</span>
+            <button class="btn-zoom-toggle" onclick="setReaderZoom(1)" title="放大 10%">+</button>
+            <button class="btn-zoom-toggle" onclick="setReaderZoom('fit')" title="适配窗口">适配</button>
+            <span style="display:inline-block; width:1px; height:14px; background:var(--card-border); margin:0 4px;"></span>
+            <button class="btn-zoom-toggle" id="pdf-queue-pause-btn" onclick="togglePdfQueuePause()" title="暂停/继续自动队列翻译">⏸️ 暂停排队</button>
+          </div>
+          <!-- Export bilingual note button -->
+          <button class="btn-pill-outline" id="export-bilingual-btn" onclick="exportBilingualNote()" title="将当前双语精读内容导出到 Obsidian 库">
+            <span>💾 导出双语笔记</span>
+          </button>
+          <button class="btn-pill-outline" id="reader-qa-top-btn" onclick="toggleReaderQAPanel()" title="开启/关闭 划词答疑助手">
+            <span>🤖 划词答疑</span>
+          </button>
+          <button class="btn-pill-outline" id="translate-all-btn" onclick="translateAllSections()">
+            <span>✨ 批量翻译全部章节</span>
+          </button>
+          <button class="btn-pill" onclick="closeReaderModal()">
+            <span>关闭</span>
+            <span class="btn-pill-arrow">×</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Body: nav + split-screen -->
+      <div style="flex:1; display:grid; grid-template-columns: 220px 1fr 1fr; min-height:0;">
+        <!-- Section nav -->
+        <div id="reader-nav" style="border-right:1px solid var(--card-border); padding:14px 8px; overflow-y:auto; background:var(--card-bg-subtle);"></div>
+
+        <!-- Original (left) -->
+        <div style="overflow-y:auto; padding:28px 32px; border-right:1px solid var(--card-border);">
+          <div id="reader-original"></div>
+        </div>
+
+        <!-- Translation (right) -->
+        <div style="overflow-y:auto; padding:28px 32px; background:var(--bg-canvas-subtle);">
+          <div id="reader-translation"></div>
+          <!-- Ask LLM section -->
+          <div style="margin-top:36px; padding-top:24px; border-top:1px solid var(--card-border);">
+            <div class="hero-eyebrow">— AI INTERPRETATION</div>
+            <div style="font-family:var(--font-serif); font-size:20px; margin:8px 0 14px;">向 AI 提问本文</div>
+            <textarea id="ask-paper-question" class="field-textarea" style="min-height:80px;" placeholder="例如: 这篇论文的核心创新点是什么?"></textarea>
+            <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">
+              <button class="btn-pill-outline" style="font-size:11.5px; padding:6px 12px;" onclick="presetQuestion('这篇论文的核心创新点是什么?')">🎯 创新点</button>
+              <button class="btn-pill-outline" style="font-size:11.5px; padding:6px 12px;" onclick="presetQuestion('方法是如何实现的? 关键步骤/公式?')">🔬 方法</button>
+              <button class="btn-pill-outline" style="font-size:11.5px; padding:6px 12px;" onclick="presetQuestion('实验结果如何? 关键指标?')">📊 结果</button>
+              <button class="btn-pill-outline" style="font-size:11.5px; padding:6px 12px;" onclick="presetQuestion('这篇对我做 GAA-FET / CFET 研究有何启发?')">💡 启发</button>
+              <button class="btn-pill" style="font-size:11.5px; padding:6px 16px;" onclick="askPaperQuestion()">
+                <span>提问</span><span class="btn-pill-arrow">→</span>
+              </button>
+            </div>
+            <div id="ask-paper-result" style="margin-top:14px; display:none;"></div>
+          </div>
+
+          <!-- Cross-section Q&A (v1.2) -->
+          <div style="margin-top:32px; padding-top:24px; border-top:1px solid var(--card-border);">
+            <div class="hero-eyebrow">— CROSS-SECTION SYNTHESIS</div>
+            <div style="font-family:var(--font-serif); font-size:20px; margin:8px 0 6px;">跨章节综合问答</div>
+            <div style="font-size:12px; color:var(--text-subtle); margin-bottom:14px;">勾选要纳入的章节, AI 会综合多章节回答跨章节问题 (例如 "本文方法如何回应引言中提到的不足?")</div>
+            <div id="cross-qa-sections" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:6px 12px; padding:12px; background:var(--card-bg); border:1px solid var(--card-border); border-radius:8px; margin-bottom:14px;"></div>
+            <textarea id="cross-qa-question" class="field-textarea" style="min-height:70px;" placeholder="例如: [Methods] 中的改进是否回应了 [Introduction] 中提到的 SOTA 缺陷? [Results] 是否验证了 [Discussion] 的假设?"></textarea>
+            <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">
+              <button class="btn-pill-outline" style="font-size:11.5px; padding:6px 12px;" onclick="presetCrossQA('本文方法如何回应引言中提到的 SOTA 缺陷?')">🔗 方法 vs 引言</button>
+              <button class="btn-pill-outline" style="font-size:11.5px; padding:6px 12px;" onclick="presetCrossQA('实验结果是否验证了方法的预期? 哪些一致, 哪些矛盾?')">🔗 结果 vs 方法</button>
+              <button class="btn-pill-outline" style="font-size:11.5px; padding:6px 12px;" onclick="presetCrossQA('结论的局限性是否被讨论章节承认?')">🔗 结论 vs 讨论</button>
+              <button class="btn-pill" style="font-size:11.5px; padding:6px 16px;" onclick="crossSectionQA()">
+                <span>综合分析</span><span class="btn-pill-arrow">→</span>
+              </button>
+            </div>
+            <div id="cross-qa-result" style="margin-top:14px; display:none;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PDF dual-column view (hidden by default; toggled via top bar) -->
+      <div id="reader-pdf-view" style="display:none; flex:1; min-height:0;">
+        <div style="height:100%; display:grid; grid-template-columns: 1fr 1fr; min-height:0;">
+          <!-- Left: PDF.js viewer -->
+          <div id="pdf-viewer-container" style="overflow-y:auto; padding:18px 24px; border-right:1px solid var(--card-border); background:#F2EFE8;">
+            <div style="text-align:center; padding:48px 16px; color:var(--text-muted);" id="pdf-viewer-placeholder">
+              <div style="font-size:42px;">📄</div>
+              <div style="margin-top:14px; font-family:var(--font-serif); font-size:18px;">未在 vault 中找到本地 PDF</div>
+              <div style="margin-top:8px; font-size:13px; color:var(--text-subtle);">先通过 📥 拉取全文 下载论文 PDF，或直接选择电脑中的本地 PDF 文件进行解析。</div>
+              <div style="margin-top:18px;">
+                <input type="file" id="reader-pdf-upload-input" accept="application/pdf" style="display:none;" onchange="handleUploadLocalPdf(event)">
+                <button class="btn-pill-outline" onclick="document.getElementById('reader-pdf-upload-input').click()">
+                  <span>📤 选择本地 PDF 关联解析</span>
+                </button>
+              </div>
+            </div>
+            <div id="pdf-pages-list"></div>
+          </div>
+          <!-- Right: page-by-page translations -->
+          <div id="pdf-translations-container" style="overflow-y:auto; padding:18px 16px 64px 16px; background:var(--bg-canvas-subtle);">
+            <div id="pdf-translations-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Floating Selection Bubble -->
+      <div id="reader-selection-bubble" class="reader-selection-bubble" onclick="openReaderQAPanel()">
+        <span>💡</span>
+        <span style="font-weight:600;">问 AI 解答</span>
+        <span style="font-size:11px; opacity:0.8; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" id="reader-sel-bubble-count"></span>
+        <span style="color:var(--accent-sand); font-size:11px;">→</span>
+      </div>
+
+      <!-- Floating Copilot Launch Button -->
+      <button id="reader-qa-floating-btn" class="reader-floating-copilot-btn" onclick="toggleReaderQAPanel()" title="点击开启划词答疑助手">
+        <span>🤖 划词答疑</span>
+        <span id="reader-floating-sel-tag" style="display:none; font-size:10px; background:var(--accent-terracotta); color:#fff; padding:1px 6px; border-radius:10px; font-weight:600;"></span>
+      </button>
+
+      <!-- Floating Copilot Panel -->
+      <div id="reader-qa-panel" class="reader-qa-panel">
+        <!-- Panel Header -->
+        <div style="display:flex; align-items:center; justify-content:space-between; padding:12px 18px; border-bottom:1px solid var(--card-border); background:var(--bg-canvas); user-select:none;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:18px;">🤖</span>
+            <div>
+              <div style="font-family:var(--font-serif); font-size:15.5px; font-weight:600; color:var(--text-main); line-height:1.2;">划词答疑 · AI 学术助手</div>
+              <div style="font-size:10.5px; color:var(--text-subtle);">针对所选片段深度解答与推导</div>
+            </div>
+          </div>
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span id="qa-panel-model-pill" style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--card-bg-subtle); border:1px solid var(--card-border); color:var(--text-muted);">AI就绪</span>
+            <button class="btn-zoom-toggle" onclick="minimizeReaderQAPanel()" title="最小化/还原" style="padding:2px 8px; font-size:14px;">−</button>
+            <button class="btn-zoom-toggle" onclick="toggleReaderQAPanel()" title="关闭" style="padding:2px 8px; font-size:14px;">×</button>
+          </div>
+        </div>
+
+        <!-- Panel Body -->
+        <div class="qa-body" style="flex:1; display:flex; flex-direction:column; overflow:hidden; background:var(--card-bg);">
+          <!-- Quoted snippet card -->
+          <div id="qa-quoted-container" style="padding:10px 14px; border-bottom:1px solid var(--card-border); background:var(--card-bg-subtle); flex-shrink:0;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+              <div style="display:flex; align-items:center; gap:6px;">
+                <span style="font-size:11px; font-weight:600; color:var(--text-muted);">📌 引用内容</span>
+                <span id="qa-quoted-source-tag" style="font-size:10px; padding:1px 6px; border-radius:8px; background:var(--bg-canvas-subtle); color:var(--text-muted);">无划选</span>
+                <span id="qa-quoted-len-tag" style="font-size:10px; color:var(--text-subtle);"></span>
+              </div>
+              <button id="qa-clear-quote-btn" onclick="clearQAQuotedText()" style="display:none; background:transparent; border:0; font-size:11px; color:var(--accent-terracotta); cursor:pointer;" title="清除引用内容">× 清除引用</button>
+            </div>
+            <div id="qa-quoted-text" style="font-size:12px; color:var(--text-main); font-style:italic; max-height:64px; overflow-y:auto; line-height:1.45; word-break:break-word;">
+              (请在左侧 PDF 或右侧译文中用鼠标划选任意文字，将自动同步到此；也可直接提问)
+            </div>
+          </div>
+
+          <!-- Preset chips -->
+          <div style="padding:8px 14px; border-bottom:1px solid var(--card-border-subtle); display:flex; gap:6px; flex-wrap:wrap; background:#FAF9F6; flex-shrink:0;">
+            <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px;" onclick="triggerQAPreset('通俗解释')">🔍 通俗解释</button>
+            <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px;" onclick="triggerQAPreset('物理机制')">🔬 物理机制</button>
+            <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px;" onclick="triggerQAPreset('工程启发')">💡 工程启发</button>
+            <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px;" onclick="triggerQAPreset('术语速查')">🔤 术语速查</button>
+          </div>
+
+          <!-- Answer scroll area -->
+          <div id="qa-answer-container" style="flex:1; overflow-y:auto; padding:14px; min-height:140px; font-size:13px; line-height:1.6; color:var(--text-main);">
+            <div id="qa-welcome-placeholder" style="text-align:center; padding:32px 16px; color:var(--text-subtle);">
+              <div style="font-size:32px; margin-bottom:8px;">💡</div>
+              <div style="font-weight:500; font-size:14px; color:var(--text-muted);">划词或输入，随时答疑</div>
+              <div style="font-size:12px; margin-top:4px;">划选 PDF 原文或右侧中文译文，点击快捷预设或自由输入问题，AI 将为您深度剖析。</div>
+            </div>
+            <div id="qa-answer-body" style="display:none;"></div>
+          </div>
+
+          <!-- Question input bar -->
+          <div style="padding:10px 14px; border-top:1px solid var(--card-border); background:var(--bg-canvas); display:flex; flex-direction:column; gap:8px; flex-shrink:0;">
+            <div style="position:relative;">
+              <textarea id="qa-question-input" class="field-textarea" style="min-height:56px; max-height:100px; padding:8px 10px; font-size:12.5px; resize:none;" placeholder="输入您对所选内容的疑问 (Enter 发送, Shift+Enter 换行)..." onkeydown="handleQAInputKeydown(event)"></textarea>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-size:10.5px; color:var(--text-subtle);">Enter 提问 · Shift+Enter 换行</span>
+              <button id="qa-submit-btn" class="btn-pill" style="font-size:11.5px; padding:5px 14px;" onclick="submitReaderQA()">
+                <span>🚀 发送提问</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <style>
+    /* Reader modal styles */
+    .btn-mode-toggle {
+      background: transparent;
+      border: 0;
+      padding: 6px 14px;
+      border-radius: 14px;
+      font-size: 12px;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: var(--transition-smooth);
+      font-family: var(--font-sans);
+    }
+    .btn-mode-toggle.active {
+      background: var(--bg-canvas);
+      color: var(--text-main);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .btn-mode-toggle:hover:not(.active) {
+      color: var(--text-main);
+    }
+    /* PDF zoom button (compact pill bar) */
+    .btn-zoom-toggle {
+      background: transparent;
+      border: 0;
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 13px;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: var(--transition-smooth);
+      font-family: var(--font-sans);
+    }
+    .btn-zoom-toggle:hover {
+      background: var(--bg-canvas);
+      color: var(--text-main);
+    }
+    .btn-zoom-toggle:active { transform: scale(0.95); }
+    /* PDF dual-column page block */
+    .pdf-page-block {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      margin: 0 auto 24px auto;
+      max-width: 760px;
+      width: 100%;
+    }
+    .pdf-page-canvas-wrapper {
+      position: relative;
+      display: inline-block;
+      box-shadow: 0 2px 14px rgba(0,0,0,0.12);
+      background: #FFFFFF;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    .pdf-page-canvas {
+      display: block;
+      background: white;
+      max-width: 100%;
+      height: auto;
+    }
+    .textLayer {
+      position: absolute;
+      text-align: initial;
+      left: 0;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      overflow: hidden;
+      opacity: 1.0;
+      line-height: 1.0;
+      user-select: text;
+      -webkit-user-select: text;
+      pointer-events: auto;
+    }
+    .textLayer span, .textLayer br {
+      color: transparent !important;
+      position: absolute;
+      white-space: pre;
+      cursor: text;
+      transform-origin: 0% 0%;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    .textLayer ::selection, .textLayer span::selection {
+      background: rgba(178, 83, 54, 0.32) !important;
+      color: transparent !important;
+    }
+
+    /* Floating selection bubble */
+    .reader-selection-bubble {
+      position: fixed;
+      z-index: 1200;
+      display: none;
+      align-items: center;
+      gap: 6px;
+      background: #1C1A17;
+      color: #F7F5F0;
+      padding: 6px 14px;
+      border-radius: 22px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.30);
+      font-size: 12px;
+      font-family: var(--font-sans);
+      cursor: pointer;
+      transition: transform 0.15s ease, opacity 0.15s ease;
+      user-select: none;
+      animation: popInBubble 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .reader-selection-bubble:hover {
+      background: #2D2A26;
+      transform: translateY(-2px) scale(1.02);
+    }
+    @keyframes popInBubble {
+      from { opacity: 0; transform: translateY(6px) scale(0.95); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    /* Floating Copilot Launch Button */
+    .reader-floating-copilot-btn {
+      position: fixed;
+      right: 28px;
+      bottom: 24px;
+      z-index: 1055;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--text-main);
+      color: var(--text-light);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 24px;
+      padding: 9px 18px;
+      font-size: 12.5px;
+      font-weight: 500;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.22);
+      transition: var(--transition-smooth);
+      font-family: var(--font-sans);
+    }
+    .reader-floating-copilot-btn:hover {
+      background: #2E2A25;
+      transform: translateY(-2px);
+      box-shadow: 0 12px 28px rgba(0,0,0,0.28);
+    }
+
+    /* Floating Copilot Panel */
+    .reader-qa-panel {
+      position: fixed;
+      right: 24px;
+      bottom: 24px;
+      width: 450px;
+      max-width: calc(100vw - 32px);
+      max-height: 640px;
+      height: 580px;
+      z-index: 1060;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      box-shadow: 0 16px 48px rgba(28,26,23,0.22);
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+      animation: slideUpPanel 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      font-family: var(--font-sans);
+    }
+    @keyframes slideUpPanel {
+      from { opacity: 0; transform: translateY(20px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .reader-qa-panel.minimized {
+      height: 48px !important;
+    }
+    .reader-qa-panel.minimized .qa-body {
+      display: none !important;
+    }
+
+    .pdf-page-label {
+      font-size: 11px;
+      color: var(--text-subtle);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin: 8px 0 4px 0;
+    }
+    .pdf-translation-block {
+      padding: 20px 22px;
+      margin: 0 auto 22px auto;
+      max-width: 760px;
+      width: 100%;
+      background: var(--bg-canvas);
+      border: 1px solid var(--card-border);
+      border-left: 3px solid var(--accent-olive);
+      border-radius: 6px;
+      box-sizing: border-box;
+    }
+    @media (max-width: 760px) {
+      .pdf-translation-block { padding: 16px 14px; }
+    }
+    .pdf-translation-block .page-num {
+      font-size: 10.5px;
+      letter-spacing: 1.5px;
+      color: var(--accent-olive);
+      text-transform: uppercase;
+      font-weight: 600;
+      margin-bottom: 8px;
+      font-family: var(--font-mono);
+    }
+    .pdf-translation-block .page-text {
+      font-family: var(--font-cn);
+      font-size: 15px;
+      line-height: 1.95;
+      color: #1F1B17;
+      letter-spacing: 0.01em;
+    }
+    .pdf-translation-block .page-text p {
+      margin: 0 0 12px 0;
+      text-indent: 2em;
+    }
+    .pdf-translation-block .page-text p:last-child { margin-bottom: 0; }
+    /* Markdown headings inside translation block */
+    .pdf-translation-block .page-text h2,
+    .reader-section-body.cn-translation h2,
+    .reader-translation-cn h2 {
+      font-family: var(--font-cn);
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--accent-olive, #6a7a5a);
+      margin: 18px 0 10px 0;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--card-border);
+      text-indent: 0;
+    }
+    .pdf-translation-block .page-text h3,
+    .reader-section-body.cn-translation h3,
+    .reader-translation-cn h3 {
+      font-family: var(--font-cn);
+      font-size: 16.5px;
+      font-weight: 600;
+      color: var(--text-main);
+      margin: 14px 0 8px 0;
+      text-indent: 0;
+    }
+    .pdf-translation-block .page-text h4,
+    .reader-section-body.cn-translation h4,
+    .reader-translation-cn h4 {
+      font-family: var(--font-cn);
+      font-size: 15.5px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin: 12px 0 6px 0;
+      text-indent: 0;
+    }
+    .pdf-translation-loading {
+      padding: 14px;
+      color: var(--text-subtle);
+      font-size: 12.5px;
+      font-style: italic;
+    }
+    .reader-nav-item {
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: var(--text-muted);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      transition: var(--transition-smooth);
+      margin-bottom: 2px;
+    }
+    .reader-nav-item:hover {
+      background: var(--card-bg);
+      color: var(--text-main);
+    }
+    .reader-nav-item.active {
+      background: var(--accent-terracotta);
+      color: var(--text-light);
+      font-weight: 500;
+    }
+    .reader-nav-item.active span { color: inherit !important; }
+    .reader-section-header {
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 18px;
+    }
+    .reader-section-title {
+      font-family: var(--font-serif);
+      font-size: 26px;
+      font-weight: 500;
+      color: var(--text-main);
+      line-height: 1.25;
+      margin-bottom: 6px;
+    }
+    .reader-section-meta {
+      font-size: 11px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--text-subtle);
+    }
+    .reader-section-body {
+      font-family: var(--font-serif);
+      font-size: 16px;
+      line-height: 1.85;
+      color: var(--text-main);
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    /* Chinese translation panel: 黑体 + 更大段距 + 首行缩进 2 字 + 居中容器 */
+    .reader-section-body.cn-translation,
+    .reader-translation-cn {
+      font-family: var(--font-cn);
+      font-size: 15.5px;
+      line-height: 1.95;
+      letter-spacing: 0.01em;
+      color: #1F1B17;
+      max-width: 760px;
+      margin-left: auto;
+      margin-right: auto;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .reader-section-body.cn-translation p,
+    .reader-translation-cn p {
+      margin: 0 0 14px 0;
+      text-indent: 2em;
+    }
+    .reader-section-body.cn-translation p:last-child,
+    .reader-translation-cn p:last-child {
+      margin-bottom: 0;
+    }
+    /* English original: 衬线体 + 紧凑 */
+    .reader-section-body.en-original {
+      font-family: var(--font-serif);
+      font-size: 15px;
+      line-height: 1.75;
+      letter-spacing: 0;
+      color: var(--text-main);
+    }
+    .reader-section-body.en-original p {
+      margin: 0 0 12px 0;
+      text-indent: 1.5em;
+    }
+    .reader-section-body p { margin-top: 0; }
+    pre.reader-section-body {
+      font-family: var(--font-serif);
+      white-space: pre-wrap;
+    }
+
+    /* ===== KaTeX math rendering (matches Quiet Luxury aesthetic) ===== */
+    .math-display-block {
+      display: block;
+      text-align: center;
+      margin: 10px 0 6px 0;       /* tightened: was 18px/0 */
+      padding: 4px 0;             /* tightened: was 12px 8px with bg */
+      background: transparent;    /* tightened: was olive-tinted card */
+      border: 0;
+      border-radius: 0;
+      font-size: 1.04em;
+      overflow-x: auto;
+      overflow-y: hidden;
+    }
+    .math-display-block .katex-display {
+      margin: 0 !important;
+    }
+    .math-placeholder.math-inline {
+      display: inline-block;
+      padding: 0 2px;
+      color: var(--text-main);
+    }
+    .math-placeholder.math-inline .katex {
+      font-size: 1.02em;
+    }
+    /* Cross-section Q&A tags (section keys used in synthesized answer) */
+    .cross-qa-tag {
+      display: inline-block;
+      padding: 2px 8px;
+      margin-right: 4px;
+      background: rgba(106, 122, 90, 0.12);
+      color: var(--accent-olive, #6a7a5a);
+      border: 1px solid rgba(106, 122, 90, 0.25);
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.5px;
+      font-family: var(--font-mono, monospace);
+    }
+    /* Make KaTeX font match our serif */
+    .katex {
+      font-family: "Cormorant Garamond", "Latin Modern Math", KaTeX_Main, serif !important;
+      color: var(--text-main);
+    }
+    .katex .mord,
+    .katex .mrel,
+    .katex .mbin,
+    .katex .mopen,
+    .katex .mclose,
+    .katex .mpunct { color: var(--text-main); }
+    /* Inline code styling (for markdown `code`) */
+    .md-code-inline {
+      background: var(--card-bg-subtle);
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.92em;
+      color: var(--accent-terracotta, #b8633f);
+    }
+  </style>
+</body>
+</html>
