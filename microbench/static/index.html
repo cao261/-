@@ -1121,6 +1121,72 @@
         // Expose to window so inline onchange attribute on the QA toggle can find it.
         window.renderRecentFeed = renderRecentFeed;
 
+        // ---------------------------------------------------------------
+        // Cancellable LLM ask: tool that wraps fetch + AbortController,
+        // swaps the button label to "解答中... ✕ 取消", and exposes a
+        // window.cancelActiveAsk() so any cancel handler can fire it.
+        //   onSuccess(data) — request completed (200 OK)
+        //   onError(err)    — request failed (non-AbortError)
+        //   onAbort()       — user cancelled mid-flight (AbortError)
+        // ---------------------------------------------------------------
+        let _activeAsk = null; // {controller, btn, originalHTML}
+        function cancelActiveAsk() {
+          if (_activeAsk && _activeAsk.controller) {
+            try { _activeAsk.controller.abort(); } catch {}
+            showToast("已取消 AI 请求");
+          }
+        }
+        async function askLLMCancelable(btn, url, payload, options) {
+          options = options || {};
+          if (_activeAsk) {
+            showToast("已有 AI 请求进行中, 请先取消或等待完成", true);
+            return null;
+          }
+          if (!btn) return null;
+          const originalHTML = btn.innerHTML;
+          const controller = new AbortController();
+          _activeAsk = { controller, btn, originalHTML };
+          btn.innerHTML = `<span>⏳ 解答中...</span> <button type="button" data-cancel-ask style="margin-left:6px; padding:1px 8px; font-size:11px; background:var(--accent-terracotta); color:#fff; border:0; border-radius:6px; cursor:pointer;">✕ 取消</button>`;
+          // Make the cancel button fire window.cancelActiveAsk() reliably,
+          // since we just rewrote btn.innerHTML (so the inline onclick
+          // we'd attach via JS would otherwise rely on closure scope).
+          const cancelBtn = btn.querySelector("[data-cancel-ask]");
+          if (cancelBtn) cancelBtn.onclick = cancelActiveAsk;
+          try {
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+              signal: controller.signal,
+            });
+            const data = await res.json();
+            if (!res.ok) {
+              let msg = data.detail;
+              if (Array.isArray(msg)) {
+                msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+              } else if (typeof msg !== 'string') msg = JSON.stringify(msg);
+              throw new Error(msg || `HTTP ${res.status}`);
+            }
+            if (options.onSuccess) options.onSuccess(data);
+            return data;
+          } catch (err) {
+            if (err && err.name === "AbortError") {
+              if (options.onAbort) options.onAbort();
+              return null;
+            }
+            if (options.onError) options.onError(err);
+            return null;
+          } finally {
+            _activeAsk = null;
+            if (btn) {
+              btn.disabled = false;
+              btn.innerHTML = originalHTML;
+            }
+          }
+        }
+        window.cancelActiveAsk = cancelActiveAsk;
+        window.askLLMCancelable = askLLMCancelable;
+
         // Render recent feed
         window._feedCache = data.literature_list || [];
         // Restore vault name from localStorage so feed cards honor the setting
@@ -2242,38 +2308,30 @@
         showToast("请输入问题", true);
         return;
       }
+      const askBtn = document.querySelector('[onclick="askPaperQuestion()"]');
       const el = document.getElementById("ask-paper-result");
       el.style.display = "block";
       el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">⏳ AI 解读中 (最多 60 秒)...</div>`;
-      try {
-        const res = await fetch("/api/paper/explain", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            question: question,
-            sections: _readerState.sections.map(s => ({ section: s.section, title: s.title, text: s.text })),
-            paper_title: _readerState.title,
-          }),
-        });
-        const result = await res.json();
-        if (!res.ok) {
-          let msg = result.detail;
-          if (Array.isArray(msg)) {
-            msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
-          } else if (typeof msg !== 'string') {
-            msg = JSON.stringify(msg);
-          }
-          throw new Error(msg || `HTTP ${res.status}`);
+      await askLLMCancelable(askBtn, "/api/paper/explain", {
+        question: question,
+        sections: _readerState.sections.map(s => ({ section: s.section, title: s.title, text: s.text })),
+        paper_title: _readerState.title,
+      }, {
+        onSuccess: (result) => {
+          el.innerHTML = `
+            <div class="reader-section-header">
+              <div class="reader-section-title">🤖 ${escapeHtml(question)}</div>
+            </div>
+            <div class="reader-section-body">${formatMarkdownLite(result.answer)}</div>`;
+          renderMathIn(el);
+        },
+        onError: (err) => {
+          el.innerHTML = `<div style="padding:14px; color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
+        },
+        onAbort: () => {
+          el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">✕ 已取消本次解读</div>`;
         }
-        el.innerHTML = `
-          <div class="reader-section-header">
-            <div class="reader-section-title">🤖 ${escapeHtml(question)}</div>
-          </div>
-          <div class="reader-section-body">${formatMarkdownLite(result.answer)}</div>`;
-        renderMathIn(el);
-      } catch (err) {
-        el.innerHTML = `<div style="padding:14px; color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
-      }
+      });
     }
 
     function presetQuestion(q) {
@@ -2298,39 +2356,31 @@
       const el = document.getElementById("cross-qa-result");
       el.style.display = "block";
       el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">⏳ 综合多章节分析中 (可能 60-120 秒)...</div>`;
-      try {
-        const res = await fetch("/api/paper/cross_qa", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            question: question,
-            sections: _readerState.sections.map(s => ({ section: s.section, title: s.title, text: s.text })),
-            selected_indices: sections,
-            paper_title: _readerState.title,
-          }),
-        });
-        const result = await res.json();
-        if (!res.ok) {
-          let msg = result.detail;
-          if (Array.isArray(msg)) {
-            msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
-          } else if (typeof msg !== 'string') {
-            msg = JSON.stringify(msg);
-          }
-          throw new Error(msg || `HTTP ${res.status}`);
+      const askBtn = document.querySelector('[onclick="crossSectionQA()"]');
+      await askLLMCancelable(askBtn, "/api/paper/cross_qa", {
+        question: question,
+        sections: _readerState.sections.map(s => ({ section: s.section, title: s.title, text: s.text })),
+        selected_indices: sections,
+        paper_title: _readerState.title,
+      }, {
+        onSuccess: (result) => {
+          const usedList = (result.sections_used || [])
+            .map(s => `<span class="cross-qa-tag">${escapeHtml(s.section)}</span>`).join("");
+          el.innerHTML = `
+            <div class="reader-section-header">
+              <div class="reader-section-title">🔗 跨章节综合 · ${escapeHtml(question)}</div>
+              <div class="reader-section-meta">综合 ${result.section_count} 个章节 · ${result.context_chars.toLocaleString()} 字 context${usedList ? ` · ${usedList}` : ""}</div>
+            </div>
+            <div class="reader-section-body">${formatMarkdownLite(result.answer)}</div>`;
+          renderMathIn(el);
+        },
+        onError: (err) => {
+          el.innerHTML = `<div style="padding:14px; color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
+        },
+        onAbort: () => {
+          el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">✕ 已取消本次跨章节问答</div>`;
         }
-        const usedList = (result.sections_used || [])
-          .map(s => `<span class="cross-qa-tag">${escapeHtml(s.section)}</span>`).join("");
-        el.innerHTML = `
-          <div class="reader-section-header">
-            <div class="reader-section-title">🔗 跨章节综合 · ${escapeHtml(question)}</div>
-            <div class="reader-section-meta">综合 ${result.section_count} 个章节 · ${result.context_chars.toLocaleString()} 字 context${usedList ? ` · ${usedList}` : ""}</div>
-          </div>
-          <div class="reader-section-body">${formatMarkdownLite(result.answer)}</div>`;
-        renderMathIn(el);
-      } catch (err) {
-        el.innerHTML = `<div style="padding:14px; color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
-      }
+      });
     }
 
     function presetCrossQA(q) {
@@ -2589,11 +2639,6 @@
         `;
       }
 
-      if (submitBtn) {
-        submitBtn.disabled = true;
-        submitBtn.innerHTML = '<span>⏳ 解答中...</span>';
-      }
-
       // Collect surrounding context
       let surroundingContext = "";
       if (_readerSelState.pageNum && _pdfState && _pdfState.pages) {
@@ -2607,75 +2652,68 @@
         surroundingContext = `[Section ${sObj.title}] ${sObj.text || ""}`;
       }
 
-      try {
-        const payload = {
-          selected_text: _readerSelState.text || "(用户未划选特定片段，提问全篇整体背景)",
-          question: question,
-          paper_title: _readerState.title || "",
-          surrounding_context: surroundingContext,
-          source_type: _readerSelState.source || "general",
-        };
+      const payload = {
+        selected_text: _readerSelState.text || "(用户未划选特定片段,提问全篇整体背景)",
+        question: question,
+        paper_title: _readerState.title || "",
+        surrounding_context: surroundingContext,
+        source_type: _readerSelState.source || "general",
+      };
 
-        const res = await fetch("/api/paper/explain_selection", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          let msg = data.detail;
-          if (Array.isArray(msg)) msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
-          else if (typeof msg !== 'string') msg = JSON.stringify(msg);
-          throw new Error(msg || `HTTP ${res.status}`);
+      await askLLMCancelable(submitBtn, "/api/paper/explain_selection", payload, {
+        onSuccess: (data) => {
+          _lastAnswerText = data.answer;
+          _lastQAItem = {
+            title: _readerState.title || "未命名论文",
+            question: question,
+            selection: _readerSelState.text || "",
+            answer: data.answer,
+            mode: _currentQAPreset || "explain",
+            topic_category: (document.getElementById("paper-category") && document.getElementById("paper-category").value) ||
+                            (document.getElementById("paper-topic") && document.getElementById("paper-topic").value) ||
+                            "01_Device_TCAD_器件仿真",
+            timestamp: new Date().toISOString()
+          };
+          _sessionQAList.push(_lastQAItem);
+
+          const modelBadge = data.model ? `<span style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">🤖 ${data.model}${data.is_degraded ? ' (降格)' : ''}</span>` : "";
+
+          answerBody.innerHTML = `
+            <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--card-border-subtle); display:flex; justify-content:space-between; align-items:center;">
+              <div style="font-weight:600; font-size:13px; color:var(--text-main);">❓ ${escapeHtml(question)}</div>
+              ${modelBadge}
+            </div>
+            <div class="reader-section-body" style="font-size:13px; line-height:1.65; color:var(--text-main); margin-bottom:14px;">
+              ${formatMarkdownLite(data.answer)}
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; justify-content:flex-end; padding-top:8px; border-top:1px solid var(--card-border-subtle); flex-wrap:wrap;">
+              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px; color:#2E7D32; border-color:#81C784; background:#F1F8E9;" onclick="exportCurrentQAToObsidian()" title="将本条答疑保存到 Obsidian 04_AI划词答疑 文件夹">💾 导出本条答疑到 Obsidian</button>
+              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copyLastQAAnswer()">📋 复制解答</button>
+              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="saveQAToTroubleshoot('${escapeHtml(question.slice(0, 30))}')">➕ 存入避坑库</button>
+            </div>
+          `;
+
+          if (typeof renderMathIn === "function") renderMathIn(answerBody);
+          fetchModelStatus();
+        },
+        onError: (err) => {
+          answerBody.innerHTML = `
+            <div style="padding:14px; color:var(--accent-terracotta);">
+              <div style="font-weight:600; margin-bottom:4px;">❌ 答疑失败</div>
+              <div style="font-size:12px;">${escapeHtml(err.message || String(err))}</div>
+              <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px; margin-top:8px;" onclick="submitReaderQA()">🔄 重试提问</button>
+            </div>
+          `;
+        },
+        onAbort: () => {
+          answerBody.innerHTML = `
+            <div style="padding:14px; color:var(--text-muted);">
+              <div style="font-weight:600; margin-bottom:4px;">✕ 已取消本次解答</div>
+              <div style="font-size:12px;">输入下一个问题继续。</div>
+            </div>
+          `;
         }
-
-        _lastAnswerText = data.answer;
-        _lastQAItem = {
-          title: _readerState.title || "未命名论文",
-          question: question,
-          selection: _readerSelState.text || "",
-          answer: data.answer,
-          mode: _currentQAPreset || "explain",
-          topic_category: (document.getElementById("paper-category") && document.getElementById("paper-category").value) ||
-                          (document.getElementById("paper-topic") && document.getElementById("paper-topic").value) ||
-                          "01_Device_TCAD_器件仿真",
-          timestamp: new Date().toISOString()
-        };
-        _sessionQAList.push(_lastQAItem);
-
-        const modelBadge = data.model ? `<span style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">🤖 ${data.model}${data.is_degraded ? ' (降格)' : ''}</span>` : "";
-
-        answerBody.innerHTML = `
-          <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--card-border-subtle); display:flex; justify-content:space-between; align-items:center;">
-            <div style="font-weight:600; font-size:13px; color:var(--text-main);">❓ ${escapeHtml(question)}</div>
-            ${modelBadge}
-          </div>
-          <div class="reader-section-body" style="font-size:13px; line-height:1.65; color:var(--text-main); margin-bottom:14px;">
-            ${formatMarkdownLite(data.answer)}
-          </div>
-          <div style="display:flex; gap:8px; align-items:center; justify-content:flex-end; padding-top:8px; border-top:1px solid var(--card-border-subtle); flex-wrap:wrap;">
-            <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px; color:#2E7D32; border-color:#81C784; background:#F1F8E9;" onclick="exportCurrentQAToObsidian()" title="将本条答疑保存到 Obsidian 04_AI划词答疑 文件夹">💾 导出本条答疑到 Obsidian</button>
-            <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copyLastQAAnswer()">📋 复制解答</button>
-            <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="saveQAToTroubleshoot('${escapeHtml(question.slice(0, 30))}')">➕ 存入避坑库</button>
-          </div>
-        `;
-
-        if (typeof renderMathIn === "function") renderMathIn(answerBody);
-        fetchModelStatus();
-      } catch (err) {
-        answerBody.innerHTML = `
-          <div style="padding:14px; color:var(--accent-terracotta);">
-            <div style="font-weight:600; margin-bottom:4px;">❌ 答疑失败</div>
-            <div style="font-size:12px;">${escapeHtml(err.message || String(err))}</div>
-            <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px; margin-top:8px;" onclick="submitReaderQA()">🔄 重试提问</button>
-          </div>
-        `;
-      } finally {
-        if (submitBtn) {
-          submitBtn.disabled = false;
-          submitBtn.innerHTML = '<span>🚀 发送提问</span>';
-        }
-      }
+      });
     }
 
     async function exportCurrentQAToObsidian() {
