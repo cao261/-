@@ -319,15 +319,39 @@ def save_literature_card(data: dict) -> dict:
 
     # Resolve safe path under BASE_DIR in dedicated subfolder
     target_dir = _safe_path(BASE_DIR, "01_Literature", topic_category, "03_文献速览卡片")
-    target_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{year}_{safe_title}.md"
+    # Optional user-chosen subfolder (single component, no traversal).
+    # Empty string = default (03_文献速览卡片 directly).
+    subfolder_raw = (data.get("subfolder") or "").strip()
+    if subfolder_raw:
+        if "/" in subfolder_raw or "\\" in subfolder_raw or subfolder_raw in (".", ".."):
+            raise ValueError(
+                f"非法 subfolder: '{subfolder_raw}'. 必须是单层目录名,不能含 / 或 .."
+            )
+        safe_sub = sanitize_filename(subfolder_raw)
+        if not safe_sub:
+            raise ValueError(f"subfolder 清理后为空: '{subfolder_raw}'")
+        target_dir = _safe_path(target_dir, safe_sub)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Filename: honour user override, else default year + safe_title.
+    filename_override = (data.get("filename_override") or "").strip()
+    if filename_override:
+        # Strip .md if user added it; we re-attach the canonical extension.
+        if filename_override.lower().endswith(".md"):
+            filename_override = filename_override[:-3]
+        safe_base = sanitize_filename(filename_override)
+        if not safe_base:
+            raise ValueError(f"filename 清理后为空: '{filename_override}'")
+        filename = f"{safe_base}.md"
+    else:
+        filename = f"{year}_{safe_title}.md"
     file_path = _safe_path(target_dir, filename)
 
     file_path.write_text(rendered, encoding="utf-8")
     return {
         "status": "success",
         "file_name": filename,
-        "folder": f"01_Literature/{topic_category}/03_文献速览卡片",
+        "folder": str(file_path.parent.relative_to(BASE_DIR)).replace("\\", "/"),
         "relative_path": str(file_path.relative_to(BASE_DIR)).replace("\\", "/"),
         "pdf_name": pdf_name,
         "pdf_path": str((BASE_DIR / "01_Literature" / topic_category / "01_论文原文_PDF" / pdf_name).relative_to(BASE_DIR)).replace("\\", "/"),

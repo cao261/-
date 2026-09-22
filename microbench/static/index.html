@@ -758,6 +758,26 @@
             <input type="text" id="paper-tags" class="field-input" value="TCAD, GAA-Nanosheet, Sub-3nm">
           </div>
 
+          <!-- Save destination: choose subfolder + filename, see live path preview -->
+          <div class="field-group" style="background:var(--bg-canvas-subtle); padding:12px; border-radius:8px; border:1px dashed var(--card-border);">
+            <label class="field-label" style="color:var(--accent-olive);">📂 保存位置(可自定义子文件夹,留空用默认)</label>
+            <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+              <input list="paper-subfolder-list" type="text" id="paper-subfolder" class="field-input"
+                     style="flex:1;" oninput="globalThis.updatePaperSavePathPreview && updatePaperSavePathPreview()" onchange="updatePaperSavePathPreview()"
+                     placeholder="留空 = 默认 03_文献速览卡片/">
+              <datalist id="paper-subfolder-list"></datalist>
+              <button type="button" class="btn-pill-outline" style="font-size:11px; padding:3px 8px;" onclick="refreshPaperSubfolderList()" title="刷新该分类下已有子文件夹列表">🔄</button>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+              <input type="text" id="paper-filename" class="field-input"
+                     style="flex:1;" oninput="updatePaperSavePathPreview()" onchange="updatePaperSavePathPreview()"
+                     placeholder="留空 = 自动 {year}_{title}.md">
+            </div>
+            <div id="paper-save-path-preview" style="font-family:var(--font-mono); font-size:11px; color:var(--text-subtle); padding:6px 8px; background:var(--bg-canvas); border-radius:4px; word-break:break-all; min-height:18px;">
+              保存路径会在此实时显示 →
+            </div>
+          </div>
+
           <div class="field-group">
             <label class="field-label">论文摘要 (Abstract)</label>
             <textarea id="paper-abstract" class="field-textarea" placeholder="抓取后自动填充，或在此粘贴核心段落..."></textarea>
@@ -1237,20 +1257,29 @@
         showToast("论文标题不能为空", true);
         return;
       }
+      const subfolder = document.getElementById("paper-subfolder").value.trim();
+      const filenameOverride = document.getElementById("paper-filename").value.trim();
       const rawId = document.getElementById("paper-id-input").value.trim();
+      const topic = document.getElementById("paper-category").value;
+      const year = parseInt(document.getElementById("paper-year").value) || 2024;
       const payload = {
         title: title,
         authors: document.getElementById("paper-authors").value.trim(),
-        year: parseInt(document.getElementById("paper-year").value) || 2024,
+        year: year,
         venue: document.getElementById("paper-venue").value.trim(),
-        topic_category: document.getElementById("paper-category").value,
+        topic_category: topic,
         status: document.getElementById("paper-status").value,
         tags: document.getElementById("paper-tags").value.trim(),
         abstract: document.getElementById("paper-abstract").value.trim(),
         doi: rawId.startsWith("10.") ? rawId : "",
-        arxiv: rawId.includes("arxiv") || /^\d{4}\.\d{4,5}/.test(rawId) ? rawId : ""
+        arxiv: rawId.includes("arxiv") || /^\d{4}\.\d{4,5}/.test(rawId) ? rawId : "",
+        subfolder: subfolder,
+        filename_override: filenameOverride,
       };
 
+      const btn = document.querySelector('button[onclick="handleSavePaper()"]');
+      const original = btn ? btn.innerHTML : null;
+      if (btn) { btn.disabled = true; btn.innerHTML = '<span>⏳ 保存中...</span>'; }
       try {
         const res = await fetch("/api/paper/save", {
           method: "POST",
@@ -1259,12 +1288,87 @@
         });
         const result = await res.json();
         if (!res.ok) throw new Error(result.detail || "保存失败");
-        showToast(`✅ 文献卡片已归档至 Obsidian: [${result.folder || '01_Literature'}/${result.file_name}]`);
+        showToast(`✅ 文献卡片已归档: [${result.folder}/${result.file_name}]`, false, 5000);
+        // Refresh subfolder list so the new folder (if any) shows in datalist
+        refreshPaperSubfolderList();
         loadStats();
       } catch (err) {
         showToast("保存失败: " + err.message, true);
+      } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = original; }
       }
     }
+
+    /**
+     * Refresh the subfolder datalist for the currently selected topic_category.
+     * Cached lightly in memory so we don't refetch on every keystroke.
+     */
+    const _paperSubfolderCache = {}; // topic -> {ts, folders}
+    async function refreshPaperSubfolderList() {
+      const topic = document.getElementById("paper-category").value;
+      const cached = _paperSubfolderCache[topic];
+      const stale = !cached || (Date.now() - cached.ts > 30000); // 30s ttl
+      if (!stale) return _renderSubfolderOptions(cached.folders);
+      try {
+        const r = await fetch(`/api/paper/folders?topic_category=${encodeURIComponent(topic)}&kind=literature_cards`);
+        const data = await r.json();
+        const folders = (data && data.folders) || [];
+        _paperSubfolderCache[topic] = { ts: Date.now(), folders };
+        _renderSubfolderOptions(folders);
+      } catch (e) {
+        // best-effort; ignore (preview is a UX nicety, not a hard requirement)
+      }
+    }
+    function _renderSubfolderOptions(folders) {
+      const list = document.getElementById("paper-subfolder-list");
+      if (!list) return;
+      list.innerHTML = (folders || []).map(f => `<option value="${f.replace(/"/g, '&quot;')}"></option>`).join("");
+    }
+
+    /**
+     * Live preview of the file path the user is about to save into.
+     * Uses a lightweight client-side slug that mirrors the server's default filename.
+     */
+    function updatePaperSavePathPreview() {
+      const topic = document.getElementById("paper-category").value;
+      const sub = document.getElementById("paper-subfolder").value.trim();
+      const title = document.getElementById("paper-title").value.trim();
+      const year = parseInt(document.getElementById("paper-year").value) || 2024;
+      const fn = document.getElementById("paper-filename").value.trim();
+      const subPath = sub ? sub.replace(/[\/\\]/g, "_") : "";
+      const safeTitle = title
+        ? title.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim()
+        : "<title>";
+      const defaultBase = `${year}_${safeTitle.slice(0, 30)}`;
+      const finalBase = fn ? fn.replace(/\.md$/i, "") : defaultBase;
+      const parts = ["01_Literature", topic, "03_文献速览卡片"];
+      if (subPath) parts.push(subPath);
+      parts.push(`${finalBase}.md`);
+      const el = document.getElementById("paper-save-path-preview");
+      if (el) {
+        el.textContent = "📂 " + parts.join("/");
+        el.style.color = sub || fn ? "var(--text-main)" : "var(--text-subtle)";
+      }
+    }
+    window.refreshPaperSubfolderList = refreshPaperSubfolderList;
+    window.updatePaperSavePathPreview = updatePaperSavePathPreview;
+
+    // Re-render preview & refresh subfolder list when topic category changes.
+    // Use change event (datalist-driven select needs input + change).
+    document.addEventListener("DOMContentLoaded", () => {
+      const cat = document.getElementById("paper-category");
+      if (cat) {
+        cat.addEventListener("change", () => { refreshPaperSubfolderList(); updatePaperSavePathPreview(); });
+        cat.addEventListener("input", () => { refreshPaperSubfolderList(); updatePaperSavePathPreview(); });
+      }
+      const yr = document.getElementById("paper-year");
+      if (yr) yr.addEventListener("input", updatePaperSavePathPreview);
+      const tt = document.getElementById("paper-title");
+      if (tt) tt.addEventListener("input", updatePaperSavePathPreview);
+      // Initial render
+      refreshPaperSubfolderList();
+      updatePaperSavePathPreview();
+    });
 
     async function handleCreateRepro() {
       const name = document.getElementById("repro-name").value.trim();

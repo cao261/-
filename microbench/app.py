@@ -84,6 +84,14 @@ class SavePaperRequest(BaseModel):
     tags: Optional[str] = Field(default="TCAD", max_length=500)
     abstract: Optional[str] = Field(default="", max_length=10000)
     status: Optional[str] = Field(default="待精读", max_length=50)
+    # Optional user-chosen destination inside the topic folder. Empty = default behaviour.
+    # subfolder: a single relative path component (no / or ..), e.g. "周报01" or "GAAFET组会".
+    # filename_override: full filename WITHOUT .md extension, e.g. "2024_GAAFET_Benchmark".
+    # Empty string = server picks the default name.
+    subfolder: Optional[str] = Field(default="", max_length=80,
+                                     description="相对 topic_category 的子文件夹(可选,留空用默认)")
+    filename_override: Optional[str] = Field(default="", max_length=200,
+                                              description="自定义文件名(不带 .md 后缀,可选)")
 
 class CreateReproductionRequest(BaseModel):
     project_name: str = Field(..., min_length=1, max_length=80)
@@ -253,6 +261,40 @@ async def api_save_paper(req: SavePaperRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"保存文献卡片失败: {str(e)}")
+
+
+@app.get("/api/paper/folders")
+async def api_paper_folders(
+    topic_category: str = Query(..., min_length=1, max_length=100,
+                                description="分类, e.g. 01_Device_TCAD_器件仿真"),
+    kind: str = Query(default="literature_cards",
+                       description="literature_cards (03_文献速览卡片 子目录) / "
+                                   "literature_pdfs (01_论文原文_PDF 子目录) / "
+                                   "any (整个 topic_category 下所有子目录)"),
+):
+    """
+    List existing subfolders inside the chosen topic folder.
+    Used by the dashboard '保存位置' dropdown — no manual typing needed
+    when the folder already exists.
+    """
+    from .generator import ALLOWED_TOPIC_CATEGORIES, _safe_path
+    if topic_category not in ALLOWED_TOPIC_CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"非法 topic_category: '{topic_category}'")
+    try:
+        if kind == "literature_cards":
+            base = _safe_path(BASE_DIR, "01_Literature", topic_category, "03_文献速览卡片")
+        elif kind == "literature_pdfs":
+            base = _safe_path(BASE_DIR, "01_Literature", topic_category, "01_论文原文_PDF")
+        elif kind == "any":
+            base = _safe_path(BASE_DIR, "01_Literature", topic_category)
+        else:
+            raise HTTPException(status_code=400, detail=f"不支持的 kind: {kind}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not base.exists():
+        return {"topic_category": topic_category, "kind": kind, "folders": []}
+    folders = sorted([p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")])
+    return {"topic_category": topic_category, "kind": kind, "folders": folders}
 
 @app.post("/api/paper/export_bilingual")
 async def api_export_bilingual(req: ExportBilingualRequest):
