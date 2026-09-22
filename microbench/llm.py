@@ -21,6 +21,7 @@ import sys
 import json
 import re
 import time
+import asyncio
 from pathlib import Path
 from threading import Lock
 from typing import Optional
@@ -29,6 +30,11 @@ try:
     import requests
 except ImportError:
     requests = None  # type: ignore
+
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore
 
 # Auto-load .env from the workbench root (override=False so existing env vars take precedence)
 try:
@@ -530,6 +536,227 @@ def chat(
     raise LLMError("无可用的大模型配置")
 
 
+# ---------------------------------------------------------------------------
+# Async variants (Stage 1 of async llm refactor)
+#
+# Why a separate async path instead of converting chat() in place?
+#   - Sync chat() powers the high-throughput translation/summarization
+#     endpoints where cancellation is irrelevant (server-side batch work).
+#   - Async chat_async() powers the 3 reader-modal cancel-button endpoints
+#     where the user may abandon mid-flight; honoring cancellation saves
+#     API quota and reduces perceived latency on the cancel button.
+#
+# Behavior parity with sync chat():
+#   - Same failover (primary → Agnes on quota exhaustion)
+#   - Same retry semantics (transient 502/503/504, 429 backoff)
+#   - Same response shape (just strip thinking blocks at the end)
+#
+# New behaviors:
+#   - Uses httpx.AsyncClient (truly interruptible mid-HTTP-request, vs
+#     requests.post which blocks the worker thread)
+#   - Honors cancel_event (asyncio.Event): when set, skip retry storms
+#     and raise asyncio.CancelledError to short-circuit the endpoint
+# ---------------------------------------------------------------------------
+
+
+async def _invoke_model_async(
+    cfg: dict,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
+    json_mode: bool,
+    max_retries: int = 2,
+    cancel_event: Optional[asyncio.Event] = None,
+) -> tuple[bool, str, Optional[int]]:
+    """Async equivalent of _invoke_model().
+
+    Returns: (success: bool, content_or_error: str, status_code: Optional[int])
+
+    Raises asyncio.CancelledError when cancel_event is set (e.g. client
+    disconnected), skipping the rest of the retry loop so the endpoint can
+    bail out cleanly without burning more API quota.
+    """
+    if httpx is None:
+        return False, "httpx 包未安装, 请先 pip install httpx", None
+
+    is_agnes = cfg.get("is_fallback") or "agnes" in cfg.get("base_url", "").lower() or "agnes" in cfg.get("model", "").lower()
+
+    url = f"{cfg['base_url']}/chat/completions"
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+        "User-Agent": "MicroBench-Academic-Assistant/1.1",
+    }
+
+    # httpx equivalents of the requests exceptions we care about.
+    # SSLError surfaces as httpx.ConnectError (with SSL context wrapped),
+    # ChunkedEncodingError surfaces as httpx.RemoteProtocolError.
+    RETRYABLE_EXC = (
+        httpx.ConnectError,
+        httpx.TimeoutException,
+        httpx.RemoteProtocolError,
+        httpx.ReadError,
+        httpx.WriteError,
+    )
+
+    last_err = ""
+    last_status = None
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    for attempt in range(max_retries + 1):
+        # Check cancellation BEFORE attempting — saves quota on early cancel.
+        if _cancelled():
+            raise asyncio.CancelledError("client disconnected before retry")
+
+        if is_agnes:
+            # AgnesRateLimiter uses threading.Lock for cross-thread safety;
+            # acquire() is fast and non-blocking (it may sleep briefly to
+            # enforce min spacing — that sleep would normally be a thread
+            # sleep, but we run it from the async loop, so wrap with
+            # asyncio.to_thread to avoid blocking the event loop).
+            await asyncio.to_thread(agnes_limiter.acquire)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+            last_status = resp.status_code
+        except RETRYABLE_EXC as e:
+            last_err = str(e)
+            if _cancelled():
+                raise asyncio.CancelledError("client disconnected during retry") from e
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                await asyncio.sleep(wait)
+                continue
+            return False, f"网络连接失败 (重试 {max_retries} 次): {e}", last_status
+        except asyncio.CancelledError:
+            # Propagate cleanly without retrying
+            raise
+        except Exception as e:
+            # Non-retryable exception
+            return False, f"请求异常: {e}", last_status
+
+        if resp.status_code != 200:
+            try:
+                err_body = resp.json().get("error", {})
+                err = (
+                    err_body.get("message", "")
+                    or err_body.get("detail", "")
+                    or getattr(resp, "text", "")[:200]
+                )
+            except (ValueError, KeyError):
+                err = getattr(resp, "text", "")[:200]
+
+            last_err = err
+
+            # Agnes 429 rate limit backoff
+            if resp.status_code == 429 and is_agnes and attempt < max_retries:
+                if _cancelled():
+                    raise asyncio.CancelledError("client cancelled during 429 backoff")
+                wait = 3.5 * (attempt + 1)
+                await asyncio.sleep(wait)
+                continue
+
+            # Transient 502/503/504 retry
+            if resp.status_code in (502, 503, 504) and attempt < max_retries:
+                if _cancelled():
+                    raise asyncio.CancelledError("client cancelled during transient retry")
+                wait = 2 ** attempt
+                await asyncio.sleep(wait)
+                continue
+
+            return False, f"HTTP {resp.status_code}: {err}", resp.status_code
+
+        try:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            content = _strip_thinking_blocks(content)
+            return True, content, 200
+        except (KeyError, IndexError, ValueError) as e:
+            return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
+
+    return False, last_err, last_status
+
+
+async def chat_async(
+    messages: list[dict],
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    timeout: int = DEFAULT_TIMEOUT,
+    json_mode: bool = False,
+    max_retries: int = 2,
+    cancel_event: Optional[asyncio.Event] = None,
+) -> str:
+    """Async version of chat() with cancellation support.
+
+    Same failover + degradation logic as chat(), but uses httpx.AsyncClient
+    so in-flight HTTP requests can be interrupted by asyncio.CancelledError
+    (vs sync requests.post which would block until the server replies).
+
+    The cancel_event is checked before each retry; once set, raises
+    asyncio.CancelledError immediately so the endpoint can bail without
+    burning more API quota on a doomed request.
+    """
+    if httpx is None:
+        raise LLMError("httpx 包未安装, 请先 pip install httpx")
+
+    primary = model_manager.get_primary_config()
+    fallback = model_manager.get_fallback_config()
+
+    if not primary["configured"] and not fallback["configured"]:
+        raise LLMError(
+            "LLM 未配置: 请设置环境变量 LLM_API_KEY (主模型) 或 AGNES_API_KEY (备用模型). "
+            "可在工作台根目录编辑 .env 文件."
+        )
+
+    # Opportunistic auto-recovery probe (sync, fast — keep as-is)
+    if model_manager.is_degraded and primary["configured"] and model_manager.should_opportunistic_probe():
+        model_manager.probe_primary()
+
+    if not model_manager.is_degraded and primary["configured"]:
+        success, res, status_code = await _invoke_model_async(
+            primary, messages, max_tokens, temperature, timeout, json_mode,
+            max_retries=max_retries, cancel_event=cancel_event,
+        )
+        if success:
+            return res
+
+        if fallback["configured"] and model_manager.is_quota_exhausted_error(status_code or 0, res):
+            model_manager.mark_degraded(res)
+            fb_success, fb_res, _ = await _invoke_model_async(
+                fallback, messages, max_tokens, temperature, timeout, json_mode,
+                max_retries=max_retries, cancel_event=cancel_event,
+            )
+            if fb_success:
+                return fb_res
+            raise LLMError(f"降格模型 (Agnes) 调用失败: {fb_res} (原主模型报错: {res})")
+
+        raise LLMError(f"主模型 ({primary['model']}) 调用失败: {res}")
+
+    if fallback["configured"]:
+        success, res, _ = await _invoke_model_async(
+            fallback, messages, max_tokens, temperature, timeout, json_mode,
+            max_retries=max_retries, cancel_event=cancel_event,
+        )
+        if success:
+            return res
+        raise LLMError(f"备用模型 ({fallback['model']}) 调用失败: {res}")
+
+    raise LLMError("无可用的大模型配置")
+
+
 _THINKING_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
@@ -649,6 +876,8 @@ __all__ = [
     "get_llm_status",
     "probe_primary_model",
     "chat",
+    "chat_async",
+    "_invoke_model_async",
     "summarize_paper",
     "answer_with_context",
     "agnes_limiter",

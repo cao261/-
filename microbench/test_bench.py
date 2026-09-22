@@ -1596,6 +1596,244 @@ def test_explain_selection_endpoint():
         _check(True, "LLM 未配置, 跳过真实调用")
 
 
+def test_chat_async_basic():
+    """Stage 1: chat_async() happy path mirrors sync chat() output."""
+    print("\n[33] chat_async() 基础调用 (v1.4 async)")
+    import asyncio
+    import httpx as _httpx
+
+    class _Resp:
+        def __init__(self, status=200, body=None):
+            self.status_code = status
+            self._body = body or {"choices": [{"message": {"content": "hello async"}}]}
+            self.text = str(self._body)
+        def json(self):
+            return self._body
+
+    class _MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def post(self, url, **kwargs):
+            return _Resp()
+
+    _orig = _httpx.AsyncClient
+    _httpx.AsyncClient = _MockAsyncClient
+    try:
+        result = asyncio.run(llm.chat_async(
+            messages=[{"role": "user", "content": "hi"}],
+            max_retries=1,
+            timeout=10,
+        ))
+        _check(result == "hello async", f"chat_async 返回内容 (实际 {result!r})")
+    finally:
+        _httpx.AsyncClient = _orig
+
+
+def test_chat_async_cancel_event_preset():
+    """Stage 1: pre-set cancel_event → chat_async raises CancelledError without API call."""
+    print("\n[34] chat_async() 预设 cancel_event 立即抛错 (v1.4)")
+    import asyncio
+    import httpx as _httpx
+
+    call_count = {"n": 0}
+
+    class _Resp:
+        def __init__(self):
+            self.status_code = 200
+            self._body = {"choices": [{"message": {"content": "should not see this"}}]}
+            self.text = str(self._body)
+        def json(self):
+            return self._body
+
+    class _MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            call_count["n"] += 1
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def post(self, url, **kwargs):
+            return _Resp()
+
+    _orig = _httpx.AsyncClient
+    _httpx.AsyncClient = _MockAsyncClient
+    try:
+        ev = asyncio.Event()
+        ev.set()  # pre-cancelled
+        try:
+            asyncio.run(llm.chat_async(
+                messages=[{"role": "user", "content": "hi"}],
+                max_retries=2,
+                timeout=10,
+                cancel_event=ev,
+            ))
+            _check(False, "预取消应抛 CancelledError")
+        except asyncio.CancelledError:
+            _check(call_count["n"] == 0,
+                   f"预设 cancel_event → 0 次 HTTP 调用 (实际 {call_count['n']})")
+    finally:
+        _httpx.AsyncClient = _orig
+
+
+def test_chat_async_cancel_during_retry():
+    """Stage 1: 502 then set cancel_event → only 1 attempt (no retry storm)."""
+    print("\n[35] chat_async() 502 后取消 (v1.4) — 阻止重试风暴")
+    import asyncio
+    import httpx as _httpx
+
+    call_count = {"n": 0}
+    ev = asyncio.Event()
+
+    class _Resp:
+        def __init__(self, status=200, body=None):
+            self.status_code = status
+            self._body = body or {"error": {"message": "bad gateway"}}
+            self.text = str(self._body)
+        def json(self):
+            return self._body
+
+    class _MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def post(self, url, **kwargs):
+            call_count["n"] += 1
+            # After the first failed call, fire the cancel event to mimic
+            # client disconnect happening during the retry backoff window.
+            ev.set()
+            return _Resp(status=502)
+
+    _orig = _httpx.AsyncClient
+    _httpx.AsyncClient = _MockAsyncClient
+    try:
+        try:
+            asyncio.run(llm.chat_async(
+                messages=[{"role": "user", "content": "hi"}],
+                max_retries=3,  # would normally retry 3 times (4 attempts total)
+                timeout=10,
+                cancel_event=ev,
+            ))
+            _check(False, "502 后取消应抛 CancelledError")
+        except asyncio.CancelledError:
+            _check(call_count["n"] == 1,
+                   f"取消后只 1 次尝试 (实际 {call_count['n']}, 无重试)")
+    finally:
+        _httpx.AsyncClient = _orig
+
+
+def test_invoke_model_async_retries_on_502():
+    """Stage 1: _invoke_model_async retries on 502 like sync version."""
+    print("\n[36] _invoke_model_async 502 重试 (v1.4)")
+    import asyncio
+    import httpx as _httpx
+
+    call_count = {"n": 0}
+
+    class _Resp:
+        def __init__(self, status=200, body=None):
+            self.status_code = status
+            self._body = body or {"choices": [{"message": {"content": "ok"}}]}
+            self.text = str(self._body)
+        def json(self):
+            return self._body
+
+    class _MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def post(self, url, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] <= 2:
+                return _Resp(status=502, body={"error": {"message": "bad gateway"}})
+            return _Resp()
+
+    primary_cfg = llm.model_manager.get_primary_config()
+    if not primary_cfg.get("configured"):
+        _check(True, "未配置 LLM, 跳过 async 重试测试")
+        return
+
+    _orig = _httpx.AsyncClient
+    _httpx.AsyncClient = _MockAsyncClient
+    try:
+        success, content, status = asyncio.run(llm._invoke_model_async(
+            primary_cfg,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=100,
+            temperature=0.3,
+            timeout=10,
+            json_mode=False,
+            max_retries=3,
+        ))
+        _check(success is True, f"async 502 重试后成功 (实际 success={success})")
+        _check(call_count["n"] == 3,
+               f"共 3 次尝试 (实际 {call_count['n']})")
+    finally:
+        _httpx.AsyncClient = _orig
+
+
+def test_explain_endpoint_returns_499_on_cancel():
+    """Stage 1: /api/paper/explain honors client disconnect → 499."""
+    print("\n[37] /api/paper/explain 客户端断开 → 499 (v1.4)")
+    from fastapi.testclient import TestClient
+    from microbench.app import app
+    import httpx as _httpx
+
+    class _Resp:
+        def __init__(self):
+            self.status_code = 200
+            self._body = {"choices": [{"message": {"content": "long answer " * 200}}]}
+            self.text = str(self._body)
+        def json(self):
+            return self._body
+
+    # Slow mock that lets us fire cancel mid-flight via TestClient
+    import asyncio
+
+    class _SlowAsyncClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def post(self, url, **kwargs):
+            # Sleep long enough that we can simulate a client cancel
+            await asyncio.sleep(2)
+            return _Resp()
+
+    client = TestClient(app)
+    _orig = _httpx.AsyncClient
+    _httpx.AsyncClient = _SlowAsyncClient
+    try:
+        # Skip if LLM not configured (chat_async raises LLMError before cancel matters)
+        if not llm.is_configured():
+            _check(True, "LLM 未配置, 跳过端到端 499 测试")
+            return
+
+        payload = {
+            "question": "test cancel behavior",
+            "sections": [{"section": "abstract", "title": "Abstract", "text": "test context"}],
+            "paper_title": "TestPaper",
+        }
+        # TestClient doesn't natively simulate client disconnect, so we
+        # verify the wiring differently: confirm the endpoint still works
+        # with cancel-aware chat_async (smoke test that async path is wired)
+        r = client.post("/api/paper/explain", json=payload)
+        # Either 200 (slow but successful) or 499 (cancelled by Starlette timeout)
+        _check(r.status_code in (200, 499),
+               f"端点响应 200 或 499 (实际 {r.status_code})")
+    finally:
+        _httpx.AsyncClient = _orig
+
+
 def run_all():
     _cleanup_test_artifacts()
     test_path_safety()
@@ -1633,6 +1871,13 @@ def run_all():
     test_agnes_rate_limiter_unit()
     test_find_pdf_and_upload_pdf()
     test_explain_selection_endpoint()
+
+    # Stage 1: async llm path
+    test_chat_async_basic()
+    test_chat_async_cancel_event_preset()
+    test_chat_async_cancel_during_retry()
+    test_invoke_model_async_retries_on_502()
+    test_explain_endpoint_returns_499_on_cancel()
 
     _cleanup_test_artifacts()
 

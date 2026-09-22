@@ -10,9 +10,10 @@ V1.1 hardening:
 """
 
 import os
+import asyncio
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
@@ -65,6 +66,40 @@ app.add_middleware(
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# ---------------------------------------------------------------------------
+# Cancellation helpers (Stage 1: async LLM endpoints)
+#
+# Why we need this:
+#   The 3 cancel-button endpoints (explain / cross_qa / explain_selection)
+#   run async LLM calls that may take 30-120 seconds. When the user clicks
+#   ✕ 取消, the browser AbortController fires, the fetch promise rejects,
+#   and Starlette's request task is cancelled. We need that cancellation
+#   to propagate INTO the in-flight httpx.AsyncClient.post() so we don't
+#   keep burning API quota on a doomed request.
+#
+# How it works:
+#   - We pass an asyncio.Event (cancel_event) into chat_async()
+#   - A background watcher awaits request.is_disconnected(); when that
+#     resolves (client closed), the watcher sets cancel_event.
+#   - chat_async checks cancel_event before each retry and raises
+#     asyncio.CancelledError, which short-circuits the rest.
+#   - The endpoint catches CancelledError and returns 499 (Client Closed).
+# ---------------------------------------------------------------------------
+
+async def _disconnect_watcher(request: Request, cancel_event: asyncio.Event):
+    """Set cancel_event when the client disconnects, then exit cleanly."""
+    try:
+        # is_disconnected() resolves with True when the client closes the
+        # connection (browser AbortController triggers this). On normal
+        # completion we exit without setting the event.
+        await request.is_disconnected()
+        cancel_event.set()
+    except asyncio.CancelledError:
+        # Endpoint finished normally; the finally block in the endpoint
+        # cancelled us. Don't treat that as a client disconnect.
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -1074,7 +1109,7 @@ class CrossQARequest(BaseModel):
 
 
 @app.post("/api/paper/explain")
-async def api_explain(req: ExplainRequest):
+async def api_explain(req: ExplainRequest, request: Request):
     """
     Answer a user question about a paper using its sections as context.
 
@@ -1083,6 +1118,10 @@ async def api_explain(req: ExplainRequest):
       - "方法是如何实现的? 关键步骤/公式?"
       - "实验结果如何? 关键指标?"
       - "这篇对我做 GAA-FET/CFET 研究有何启发?"
+
+    Honors client disconnect (cancel button) via cancel_event watcher so
+    the in-flight httpx.AsyncClient call can short-circuit and we don't
+    burn API quota on a doomed request.
     """
     if not llm.is_configured():
         raise HTTPException(
@@ -1112,24 +1151,36 @@ async def api_explain(req: ExplainRequest):
         f"用户问题: {req.question}"
     )
 
+    # Cancellation plumbing (Stage 1)
+    cancel_event = asyncio.Event()
+    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
+
     try:
-        answer = llm.chat(
+        answer = await llm.chat_async(
             messages=[
                 {"role": "system", "content": EXPLAIN_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=1200,
             temperature=0.3,
+            cancel_event=cancel_event,
         )
         return {"status": "success", "answer": answer.strip()}
+    except asyncio.CancelledError:
+        # Client disconnected (✕ 取消 button); don't waste API quota on retries.
+        # 499 is nginx-style "Client Closed Request" — frontend treats as expected.
+        raise HTTPException(status_code=499, detail="客户端已断开连接, AI 解读已取消")
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=f"LLM 调用失败: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI 解读失败: {str(e)}")
+    finally:
+        cancel_event.set()  # unblock watcher if still alive
+        watcher.cancel()    # ensure it's cleaned up
 
 
 @app.post("/api/paper/cross_qa")
-async def api_cross_qa(req: CrossQARequest):
+async def api_cross_qa(req: CrossQARequest, request: Request):
     """
     Cross-chapter Q&A: synthesize information from 2+ sections to answer a
     question that requires combining content across the paper.
@@ -1179,14 +1230,19 @@ async def api_cross_qa(req: CrossQARequest):
         f"请综合上述多章节内容回答用户问题, 并用 [SECTION_KEY] 标注信息来源。"
     )
 
+    # Cancellation plumbing (Stage 1)
+    cancel_event = asyncio.Event()
+    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
+
     try:
-        answer = llm.chat(
+        answer = await llm.chat_async(
             messages=[
                 {"role": "system", "content": CROSS_QA_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=1500,
             temperature=0.3,
+            cancel_event=cancel_event,
         )
         return {
             "status": "success",
@@ -1201,10 +1257,15 @@ async def api_cross_qa(req: CrossQARequest):
             "section_count": len(sections_to_use),
             "context_chars": len(context),
         }
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=499, detail="客户端已断开连接, 跨章节问答已取消")
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=f"LLM 调用失败: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"跨章节问答失败: {str(e)}")
+    finally:
+        cancel_event.set()
+        watcher.cancel()
 
 
 EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是一个微电子与集成电路领域资深学者与论文精读导师。
@@ -1220,7 +1281,7 @@ EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是一个微电子与集成电路领域
 
 
 @app.post("/api/paper/explain_selection")
-async def api_explain_selection(req: ExplainSelectionRequest):
+async def api_explain_selection(req: ExplainSelectionRequest, request: Request):
     """
     Explain a specific highlighted/selected snippet from either the PDF text or
     the Chinese translation, using surrounding section/page context and LLM.
@@ -1245,8 +1306,12 @@ async def api_explain_selection(req: ExplainSelectionRequest):
     user_msg_parts.append(f"【用户的问题】:\n{req.question.strip()}")
     user_msg = "\n\n".join(user_msg_parts)
 
+    # Cancellation plumbing (Stage 1)
+    cancel_event = asyncio.Event()
+    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
+
     try:
-        answer = llm.chat(
+        answer = await llm.chat_async(
             messages=[
                 {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -1254,6 +1319,7 @@ async def api_explain_selection(req: ExplainSelectionRequest):
             max_tokens=1500,
             temperature=0.3,
             timeout=120,
+            cancel_event=cancel_event,
         )
         curr_st = llm.get_llm_status()
         return {
@@ -1264,10 +1330,15 @@ async def api_explain_selection(req: ExplainSelectionRequest):
             "model": curr_st["active_model"],
             "is_degraded": curr_st["is_degraded"],
         }
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=499, detail="客户端已断开连接, 划词答疑已取消")
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=f"LLM 答疑调用失败: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"答疑服务出错: {str(e)}")
+    finally:
+        cancel_event.set()
+        watcher.cancel()
 
 
 @app.get("/api/translation/cache_stats")
