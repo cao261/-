@@ -534,7 +534,18 @@ def save_bilingual_reading_card(data: dict) -> dict:
     sections = data.get("sections", [])
     qa_records = data.get("qa_records") or []
     safe_title = sanitize_filename(title)
-    filename = f"{year}_{safe_title[:35]}_双语精读.md"
+
+    # Filename override (single component, no .md suffix)
+    fn_override = (data.get("filename_override") or "").strip()
+    if fn_override:
+        if fn_override.lower().endswith(".md"):
+            fn_override = fn_override[:-3]
+        safe_base = sanitize_filename(fn_override)
+        if not safe_base:
+            raise ValueError(f"filename 清理后为空: '{fn_override}'")
+        filename = f"{safe_base}.md"
+    else:
+        filename = f"{year}_{safe_title[:35]}_双语精读.md"
 
     today = datetime.date.today().isoformat()
     lines = [
@@ -590,14 +601,25 @@ def save_bilingual_reading_card(data: dict) -> dict:
 
     content = "\n".join(lines)
     target_dir = _safe_path(BASE_DIR, "01_Literature", topic_category, "02_双语精读笔记")
-    target_dir.mkdir(parents=True, exist_ok=True)
+    # Optional user-chosen subfolder
+    subfolder_raw = (data.get("subfolder") or "").strip()
+    if subfolder_raw:
+        if "/" in subfolder_raw or "\\" in subfolder_raw or subfolder_raw in (".", ".."):
+            raise ValueError(
+                f"非法 subfolder: '{subfolder_raw}'. 必须是单层目录名,不能含 / 或 .."
+            )
+        safe_sub = sanitize_filename(subfolder_raw)
+        if not safe_sub:
+            raise ValueError(f"subfolder 清理后为空: '{subfolder_raw}'")
+        target_dir = _safe_path(target_dir, safe_sub)
+        target_dir.mkdir(parents=True, exist_ok=True)
     file_path = _safe_path(target_dir, filename)
     file_path.write_text(content, encoding="utf-8")
 
     return {
         "status": "success",
         "file_name": filename,
-        "folder": f"01_Literature/{topic_category}/02_双语精读笔记",
+        "folder": str(file_path.parent.relative_to(BASE_DIR)).replace("\\", "/"),
         "relative_path": str(file_path.relative_to(BASE_DIR)).replace("\\", "/"),
     }
 
@@ -628,7 +650,18 @@ def save_qa_card(data: dict) -> dict:
 
     safe_q = sanitize_filename(question)[:30].rstrip("_")
     safe_title = sanitize_filename(title)[:30].rstrip("_")
-    filename = f"QA_{now.strftime('%Y%m%d_%H%M%S')}_{safe_q or safe_title}.md"
+
+    # Filename override (single component, no .md suffix)
+    fn_override = (data.get("filename_override") or "").strip()
+    if fn_override:
+        if fn_override.lower().endswith(".md"):
+            fn_override = fn_override[:-3]
+        safe_base = sanitize_filename(fn_override)
+        if not safe_base:
+            raise ValueError(f"filename 清理后为空: '{fn_override}'")
+        filename = f"{safe_base}.md"
+    else:
+        filename = f"QA_{now.strftime('%Y%m%d_%H%M%S')}_{safe_q or safe_title}.md"
 
     # Format Markdown
     sel_block = ""
@@ -664,13 +697,24 @@ status: 已完成
 """
 
     target_dir = _safe_path(BASE_DIR, "01_Literature", topic_category, "04_AI划词答疑")
-    target_dir.mkdir(parents=True, exist_ok=True)
+    # Optional user-chosen subfolder
+    subfolder_raw = (data.get("subfolder") or "").strip()
+    if subfolder_raw:
+        if "/" in subfolder_raw or "\\" in subfolder_raw or subfolder_raw in (".", ".."):
+            raise ValueError(
+                f"非法 subfolder: '{subfolder_raw}'. 必须是单层目录名,不能含 / 或 .."
+            )
+        safe_sub = sanitize_filename(subfolder_raw)
+        if not safe_sub:
+            raise ValueError(f"subfolder 清理后为空: '{subfolder_raw}'")
+        target_dir = _safe_path(target_dir, safe_sub)
+        target_dir.mkdir(parents=True, exist_ok=True)
     file_path = _safe_path(target_dir, filename)
     file_path.write_text(content, encoding="utf-8")
 
     return {
         "status": "success",
         "file_name": filename,
-        "folder": f"01_Literature/{topic_category}/04_AI划词答疑",
+        "folder": str(file_path.parent.relative_to(BASE_DIR)).replace("\\", "/"),
         "relative_path": str(file_path.relative_to(BASE_DIR)).replace("\\", "/"),
     }

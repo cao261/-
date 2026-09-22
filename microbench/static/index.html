@@ -1207,6 +1207,122 @@
         window.cancelActiveAsk = cancelActiveAsk;
         window.askLLMCancelable = askLLMCancelable;
 
+        // ---------------------------------------------------------------
+        // Vault save modal: pick subfolder + filename before exporting
+        // bilingual notes or QA cards. Returns Promise<{subfolder, filename}|
+        // null (user cancelled).
+        //   opts.topic:    vault topic folder name (e.g. 01_Device_TCAD_器件仿真)
+        //   opts.kind:     folder kind for the dropdown (literature_cards default)
+        //   opts.defaultFilename: server-side default to show as placeholder
+        // ---------------------------------------------------------------
+        const _vaultSaveCache = {}; // kind -> {ts, folders}
+        async function _listSubfoldersForKind(kind) {
+          const cached = _vaultSaveCache[kind];
+          if (cached && Date.now() - cached.ts < 30000) return cached.folders;
+          try {
+            const r = await fetch(`/api/paper/folders?topic_category=${encodeURIComponent(_vaultSaveModal.topic)}&kind=${encodeURIComponent(kind)}`);
+            const data = await r.json();
+            const folders = (data && data.folders) || [];
+            _vaultSaveCache[kind] = { ts: Date.now(), folders };
+            return folders;
+          } catch (e) {
+            return [];
+          }
+        }
+        let _vaultSaveModal = { topic: "01_Device_TCAD_器件仿真" };
+        async function showVaultSaveModal(opts) {
+          const topic = opts.topic || "01_Device_TCAD_器件仿真";
+          const kind = opts.kind || "literature_cards";
+          const defaultFilename = opts.defaultFilename || "";
+          _vaultSaveModal.topic = topic;
+          const folders = await _listSubfoldersForKind(kind);
+
+          // Build / reuse modal DOM
+          let overlay = document.getElementById("vault-save-modal");
+          if (!overlay) {
+            overlay = document.createElement("div");
+            overlay.id = "vault-save-modal";
+            overlay.style.cssText = "position:fixed; inset:0; z-index:2000; background:rgba(0,0,0,0.42); display:flex; align-items:center; justify-content:center; z-index:2100;";
+            overlay.innerHTML = `
+              <div style="background:var(--bg-canvas); border-radius:12px; padding:22px 26px; width:min(560px, 92vw); box-shadow:0 18px 48px rgba(0,0,0,0.22); border:1px solid var(--card-border); font-family:var(--font-sans);">
+                <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
+                  <div style="font-family:var(--font-serif); font-size:18px; font-weight:500;">📂 保存到 vault</div>
+                  <button type="button" data-vault-cancel style="background:transparent; border:0; font-size:20px; color:var(--text-muted); cursor:pointer;">×</button>
+                </div>
+                <div style="margin-bottom:12px;">
+                  <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">子文件夹 (留空 = 上一层默认)</label>
+                  <div style="display:flex; gap:8px;">
+                    <input list="vault-save-subfolder-list" type="text" data-vault-subfolder
+                           style="flex:1; padding:6px 10px; font-size:13px; border:1px solid var(--card-border); border-radius:6px; background:var(--card-bg);"
+                           placeholder="例如:周报01_GAA组会">
+                    <datalist id="vault-save-subfolder-list"></datalist>
+                    <button type="button" data-vault-refresh style="padding:4px 10px; font-size:11px; border:1px solid var(--card-border); border-radius:6px; background:var(--card-bg); cursor:pointer;">🔄</button>
+                  </div>
+                </div>
+                <div style="margin-bottom:12px;">
+                  <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">文件名 (不带 .md 后缀)</label>
+                  <input type="text" data-vault-filename
+                         style="width:100%; padding:6px 10px; font-size:13px; border:1px solid var(--card-border); border-radius:6px; background:var(--card-bg);"
+                         placeholder="${escapeHtml(defaultFilename)}">
+                </div>
+                <div data-vault-path-preview
+                     style="font-family:var(--font-mono); font-size:11px; color:var(--text-subtle); padding:8px 10px; background:var(--bg-canvas-subtle); border-radius:6px; word-break:break-all; min-height:18px; margin-bottom:14px;">
+                  保存路径会在此实时显示 →
+                </div>
+                <div style="display:flex; gap:8px; justify-content:flex-end;">
+                  <button type="button" data-vault-cancel style="padding:6px 16px; font-size:12px; border:1px solid var(--card-border); border-radius:6px; background:transparent; cursor:pointer;">取消</button>
+                  <button type="button" data-vault-confirm style="padding:6px 16px; font-size:12px; border:0; border-radius:6px; background:var(--accent-olive); color:white; cursor:pointer;">💾 确认保存</button>
+                </div>
+              </div>`;
+            document.body.appendChild(overlay);
+          } else {
+            overlay.style.display = "flex";
+          }
+
+          // Populate inputs
+          const subInput = overlay.querySelector("[data-vault-subfolder]");
+          const fnInput = overlay.querySelector("[data-vault-filename]");
+          const list = overlay.querySelector("#vault-save-subfolder-list");
+          const preview = overlay.querySelector("[data-vault-path-preview]");
+          subInput.value = "";
+          fnInput.value = "";
+          list.innerHTML = folders.map(f => `<option value="${f.replace(/"/g, '&quot;')}"></option>`).join("");
+          fnInput.placeholder = defaultFilename;
+          updatePreview();
+          function updatePreview() {
+            const sub = subInput.value.trim();
+            const fn = fnInput.value.trim() || defaultFilename || "<自动>";
+            const safeSub = sub.replace(/[\/\\]/g, "_");
+            const safeFn = fn.replace(/[\\/:*?"<>|]/g, "_");
+            preview.textContent = `📂 01_Literature/${topic}/<canonical>/${safeSub ? safeSub + "/" : ""}${safeFn}.md`;
+            preview.style.color = (sub || fnInput.value.trim()) ? "var(--text-main)" : "var(--text-subtle)";
+          }
+          subInput.oninput = updatePreview;
+          fnInput.oninput = updatePreview;
+
+          // Wire buttons
+          const close = (result) => {
+            overlay.style.display = "none";
+            resolveFn(result);
+          };
+          let resolveFn;
+          const promise = new Promise(res => { resolveFn = res; });
+          overlay.querySelectorAll("[data-vault-cancel]").forEach(b => b.onclick = () => close(null));
+          overlay.querySelector("[data-vault-confirm]").onclick = () => {
+            close({ subfolder: subInput.value.trim(), filename: fnInput.value.trim() });
+          };
+          overlay.querySelector("[data-vault-refresh]").onclick = async () => {
+            delete _vaultSaveCache[kind];
+            const fresh = await _listSubfoldersForKind(kind);
+            list.innerHTML = fresh.map(f => `<option value="${f.replace(/"/g, '&quot;')}"></option>`).join("");
+            showToast(`已刷新 ${fresh.length} 个子文件夹`);
+          };
+          // Focus first input
+          setTimeout(() => subInput.focus(), 50);
+          return promise;
+        }
+        window.showVaultSaveModal = showVaultSaveModal;
+
         // Render recent feed
         window._feedCache = data.literature_list || [];
         // Restore vault name from localStorage so feed cards honor the setting
@@ -2301,7 +2417,15 @@
                     "01_Device_TCAD_器件仿真";
       const authors = document.getElementById("paper-authors") ? document.getElementById("paper-authors").value : "";
       const yearVal = document.getElementById("paper-year") ? parseInt(document.getElementById("paper-year").value, 10) : 2024;
-      showToast("正在导出双语精读笔记到 Obsidian 知识库 (02_双语精读笔记)...");
+      // Ask user where to save via the modal (default = 02_双语精读笔记/<year>_<title>_双语精读.md)
+      const defaultFn = `${yearVal || 2024}_${(s.title || "Untitled").replace(/[\\/:*?"<>|]/g, "_").slice(0, 35)}_双语精读`;
+      const dest = await showVaultSaveModal({
+        topic: topic,
+        kind: "literature_cards",
+        defaultFilename: defaultFn,
+      });
+      if (!dest) return; // user cancelled
+      showToast("正在导出双语精读笔记到 Obsidian...");
       try {
         const payload = {
           title: s.title || "未命名论文",
@@ -2316,7 +2440,9 @@
             page_start: sec.page_start,
             page_end: sec.page_end,
           })),
-          qa_records: _sessionQAList || []
+          qa_records: _sessionQAList || [],
+          subfolder: dest.subfolder || "",
+          filename_override: dest.filename || "",
         };
         const res = await fetch("/api/paper/export_bilingual", {
           method: "POST",
@@ -2326,7 +2452,7 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "导出失败");
         const qaCountNotice = (_sessionQAList && _sessionQAList.length) ? ` (已整合 ${_sessionQAList.length} 条划词答疑)` : "";
-        showToast(`✅ 双语笔记已导出到 Obsidian: [${data.folder || '02_双语精读笔记'}/${data.file_name}]${qaCountNotice}`);
+        showToast(`✅ 双语笔记已导出: [${data.folder}/${data.file_name}]${qaCountNotice}`, false, 5000);
         loadStats();
       } catch (err) {
         showToast("导出失败: " + err.message, true);
@@ -2829,7 +2955,16 @@
                     (document.getElementById("paper-topic") && document.getElementById("paper-topic").value) ||
                     "01_Device_TCAD_器件仿真";
       const yearVal = document.getElementById("paper-year") ? parseInt(document.getElementById("paper-year").value, 10) : 2024;
-      showToast("正在导出答疑卡片到 Obsidian (04_AI划词答疑)...");
+      // Ask user where to save via the modal (default = 04_AI划词答疑/QA_<ts>_<slug>.md)
+      const qSlug = (_lastQAItem.question || "QA").replace(/[\\/:*?"<>|]/g, "_").slice(0, 30);
+      const defaultFn = `QA_${yearVal || 2024}_${qSlug}`;
+      const dest = await showVaultSaveModal({
+        topic: topic,
+        kind: "literature_cards",
+        defaultFilename: defaultFn,
+      });
+      if (!dest) return;
+      showToast("正在导出答疑卡片到 Obsidian...");
       try {
         const payload = {
           title: _lastQAItem.title || _readerState.title || "未命名论文",
@@ -2839,6 +2974,8 @@
           mode: _lastQAItem.mode || "explain",
           topic_category: topic,
           year: isNaN(yearVal) ? 2024 : yearVal,
+          subfolder: dest.subfolder || "",
+          filename_override: dest.filename || "",
         };
         const res = await fetch("/api/paper/export_qa", {
           method: "POST",
@@ -2847,7 +2984,7 @@
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "导出失败");
-        showToast(`✅ 答疑已归档至 Obsidian: [${data.folder}/${data.file_name}]`);
+        showToast(`✅ 答疑已归档: [${data.folder}/${data.file_name}]`, false, 5000);
         loadStats();
       } catch (err) {
         showToast("导出答疑失败: " + err.message, true);

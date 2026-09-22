@@ -197,6 +197,10 @@ class ExportBilingualRequest(BaseModel):
     authors: Optional[str] = Field(default="", max_length=2000)
     year: Optional[int] = Field(default=2024, ge=1900, le=2100)
     qa_records: Optional[list] = Field(default=None, description="List of Q&A interaction records to bundle into note")
+    subfolder: Optional[str] = Field(default="", max_length=80,
+                                     description="相对 02_双语精读笔记 的子文件夹(可选)")
+    filename_override: Optional[str] = Field(default="", max_length=200,
+                                              description="自定义文件名(不带 .md)")
 
 class ExportQARequest(BaseModel):
     """Export a single Q&A record directly into 04_AI划词答疑 in Obsidian vault."""
@@ -208,6 +212,10 @@ class ExportQARequest(BaseModel):
     topic_category: Optional[str] = Field(default="01_Device_TCAD_器件仿真", max_length=100)
     year: Optional[int] = Field(default=2024, ge=1900, le=2100)
     source_pdf: Optional[str] = Field(default=None, max_length=300)
+    subfolder: Optional[str] = Field(default="", max_length=80,
+                                     description="相对 04_AI划词答疑 的子文件夹(可选)")
+    filename_override: Optional[str] = Field(default="", max_length=200,
+                                              description="自定义文件名(不带 .md)")
 
 
 # ---------------------------------------------------------------------------
