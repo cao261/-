@@ -72,15 +72,20 @@ def _render_template(tpl_path: Path, **vars) -> str:
     Read a markdown template file and render with Jinja2.
     Uses StrictUndefined so that any {{var}} typo or missing variable is caught
     at write-time rather than silently rendering as empty string.
+
+    autoescape=False is INTENTIONAL: the templates produce Obsidian-flavoured
+    Markdown / LaTeX which is rendered by Obsidian, not a browser. HTML
+    auto-escape would corrupt LaTeX subscripts like alpha_{b}. Output is
+    written to disk and consumed only by Obsidian — not served as HTML.
     """
     if not tpl_path.exists():
         # Caller is responsible for handling missing template; raise loudly.
         raise FileNotFoundError(f"模板不存在: {tpl_path}")
     src = tpl_path.read_text(encoding="utf-8")
-    env = jinja2.Environment(
+    env = jinja2.Environment(  # nosec B701
         loader=jinja2.BaseLoader(),
         undefined=jinja2.StrictUndefined,
-        autoescape=False,           # markdown / LaTeX, no HTML escaping
+        autoescape=False,           # nosec B701 — Markdown output (not HTML); see docstring
         keep_trailing_newline=True,
         trim_blocks=False,
         lstrip_blocks=False,
@@ -339,6 +344,15 @@ def save_literature_card(data: dict) -> dict:
         # Strip .md if user added it; we re-attach the canonical extension.
         if filename_override.lower().endswith(".md"):
             filename_override = filename_override[:-3]
+        # Reject any traversal hints BEFORE sanitization. sanitize_filename()
+        # only removes Windows-illegal characters and slashes; it doesn't
+        # detect "..", so "../../etc/passwd" becomes "..etcpasswd.md" —
+        # which is technically inside BASE_DIR (so not a real escape), but
+        # is clearly user error / attack intent and should be rejected.
+        if ".." in filename_override:
+            raise ValueError(
+                f"非法 filename_override: '{filename_override}' 含 '..', 请输入单层文件名"
+            )
         safe_base = sanitize_filename(filename_override)
         if not safe_base:
             raise ValueError(f"filename 清理后为空: '{filename_override}'")

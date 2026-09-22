@@ -5,8 +5,15 @@ Provides automated extraction of title, authors, year, abstract, BibTeX, and PDF
 
 import re
 import urllib.parse
-import xml.etree.ElementTree as ET
 import requests
+
+# Use defusedxml to safely parse untrusted XML from external APIs
+# (arXiv Atom feed). Standard xml.etree.ElementTree is vulnerable to
+# XXE / billion-laughs / quadratic blowup attacks on adversarial input.
+try:
+    from defusedxml.ElementTree import fromstring as _et_fromstring  # nosec B314 B405
+except ImportError:  # pragma: no cover - fallback if defusedxml missing
+    from xml.etree.ElementTree import fromstring as _et_fromstring  # nosec B314 B405
 
 HEADERS = {
     "User-Agent": "MicroBench-Academic-Assistant/1.0 (mailto:academic_workbench@xjtu.edu.cn)"
@@ -58,9 +65,8 @@ def fetch_arxiv_metadata(arxiv_id: str) -> dict:
                 f"Semantic Scholar 兜底失败: {s2_err}"
             ) from last_err
 
-    root = ET.fromstring(resp.text)
+    root = _et_fromstring(resp.text)  # nosec B314 - via defusedxml wrapper above
 
-    root = ET.fromstring(resp.text)
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     entry = root.find("atom:entry", ns)
     if entry is None:
