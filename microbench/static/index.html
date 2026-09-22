@@ -1208,6 +1208,33 @@
         window.askLLMCancelable = askLLMCancelable;
 
         // ---------------------------------------------------------------
+        // Shared modal dismissal: Esc key + click-outside (overlay backdrop).
+        // Returns a wrapped close fn that also cleans up its listeners.
+        // Use for any overlay-based modal: showKeywordPickerModal,
+        // showVaultSaveModal, and any future inline pickers.
+        // ---------------------------------------------------------------
+        function _wireModalDismissals(overlay, closeFn) {
+          const onKey = (e) => {
+            if (e.key === "Escape") {
+              e.stopPropagation();
+              closeFn(null);
+            }
+          };
+          const onClick = (e) => {
+            // Only the backdrop itself, not children (inner panel)
+            if (e.target === overlay) closeFn(null);
+          };
+          document.addEventListener("keydown", onKey);
+          overlay.addEventListener("click", onClick);
+          const wrapped = (r) => {
+            document.removeEventListener("keydown", onKey);
+            overlay.removeEventListener("click", onClick);
+            closeFn(r);
+          };
+          return wrapped;
+        }
+
+        // ---------------------------------------------------------------
         // Vault save modal: pick subfolder + filename before exporting
         // bilingual notes or QA cards. Returns Promise<{subfolder, filename}|
         // null (user cancelled).
@@ -1301,12 +1328,12 @@
           fnInput.oninput = updatePreview;
 
           // Wire buttons
-          const close = (result) => {
-            overlay.style.display = "none";
-            resolveFn(result);
-          };
           let resolveFn;
           const promise = new Promise(res => { resolveFn = res; });
+          const close = _wireModalDismissals(overlay, (result) => {
+            overlay.style.display = "none";
+            resolveFn(result);
+          });
           overlay.querySelectorAll("[data-vault-cancel]").forEach(b => b.onclick = () => close(null));
           overlay.querySelector("[data-vault-confirm]").onclick = () => {
             close({ subfolder: subInput.value.trim(), filename: fnInput.value.trim() });
@@ -3002,12 +3029,119 @@
 
     function saveQAToTroubleshoot(keyword) {
       if (!_lastAnswerText) return;
-      const kwEl = document.getElementById("tb-keyword");
-      const solEl = document.getElementById("tb-solution");
-      if (kwEl) kwEl.value = keyword || "论文精读答疑";
-      if (solEl) solEl.value = _lastAnswerText;
-      showToast("已预填到右侧避坑知识库，关闭阅读器即可保存");
+      showKeywordPickerModal({
+        defaultKeyword: keyword || (_lastQAItem && _lastQAItem.question ? _lastQAItem.question.slice(0, 30) : ""),
+        defaultSolution: _lastAnswerText,
+        defaultTool: "论文精读答疑",
+      }).then((result) => {
+        if (!result) return; // cancelled
+        // Direct one-click save to 03_Knowledge/踩坑与排错日记.md
+        fetch("/api/troubleshoot/add", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tool_name: result.tool,
+            category: result.category,
+            error_keyword: result.keyword,
+            raw_error: "",
+            root_cause: "",
+            solution: result.solution,
+          }),
+        }).then(r => r.json()).then(data => {
+          if (data && data.status === "success") {
+            showToast("✅ 已存入避坑知识库", false, 4000);
+            loadStats();
+          } else {
+            // Fallback to legacy pre-fill if backend rejects
+            const kwEl = document.getElementById("tb-keyword");
+            const solEl = document.getElementById("tb-solution");
+            if (kwEl) kwEl.value = result.keyword;
+            if (solEl) solEl.value = result.solution;
+            showToast("API 暂不可用, 已预填到右侧避坑表单(请手动保存): " + (data.detail || ""), true);
+          }
+        }).catch(() => {
+          // Network failure → fall back to pre-fill UX
+          const kwEl = document.getElementById("tb-keyword");
+          const solEl = document.getElementById("tb-solution");
+          if (kwEl) kwEl.value = result.keyword;
+          if (solEl) solEl.value = result.solution;
+          showToast("网络异常, 已预填到右侧避坑表单(请手动保存)", true);
+        });
+      });
     }
+
+    /**
+     * Light-weight inline modal for the '存入避坑库' button on QA cards.
+     * Lets the user pick category + adjust keyword in one click.
+     *   defaultKeyword / defaultSolution / defaultTool seed the form.
+     * Resolves to {tool, category, keyword, solution} or null on cancel.
+     */
+    async function showKeywordPickerModal(opts) {
+      opts = opts || {};
+      const categories = [
+        "TCAD仿真收敛",
+        "EDA环境与授权",
+        "Linux与服务器",
+        "Python与CUDA",
+      ];
+      let overlay = document.getElementById("keyword-picker-modal");
+      if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.id = "keyword-picker-modal";
+        overlay.style.cssText = "position:fixed; inset:0; z-index:2200; background:rgba(0,0,0,0.42); display:none; align-items:center; justify-content:center;";
+        overlay.innerHTML = `
+          <div style="background:var(--bg-canvas); border-radius:12px; padding:22px 26px; width:min(460px, 92vw); box-shadow:0 18px 48px rgba(0,0,0,0.22); border:1px solid var(--card-border); font-family:var(--font-sans);">
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
+              <div style="font-family:var(--font-serif); font-size:17px; font-weight:500;">📑 存入避坑知识库</div>
+              <button type="button" data-kp-cancel style="background:transparent; border:0; font-size:20px; color:var(--text-muted); cursor:pointer;">×</button>
+            </div>
+            <div style="margin-bottom:10px;">
+              <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">关键词 (一句话概括问题)</label>
+              <input type="text" data-kp-keyword style="width:100%; padding:6px 10px; font-size:13px; border:1px solid var(--card-border); border-radius:6px; background:var(--card-bg);" placeholder="例如: Sentaurus SDevice RHS NaN">
+            </div>
+            <div style="margin-bottom:10px;">
+              <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">分类</label>
+              <select data-kp-category style="width:100%; padding:6px 10px; font-size:13px; border:1px solid var(--card-border); border-radius:6px; background:var(--card-bg);"></select>
+            </div>
+            <div style="margin-bottom:14px;">
+              <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">工具 / 环境</label>
+              <input type="text" data-kp-tool style="width:100%; padding:6px 10px; font-size:13px; border:1px solid var(--card-border); border-radius:6px; background:var(--card-bg);" placeholder="例如: Sentaurus TCAD 2023">
+            </div>
+            <div style="display:flex; gap:8px; justify-content:flex-end;">
+              <button type="button" data-kp-cancel style="padding:6px 16px; font-size:12px; border:1px solid var(--card-border); border-radius:6px; background:transparent; cursor:pointer;">取消</button>
+              <button type="button" data-kp-confirm style="padding:6px 16px; font-size:12px; border:0; border-radius:6px; background:var(--accent-olive); color:white; cursor:pointer;">📑 一键存入</button>
+            </div>
+          </div>`;
+        document.body.appendChild(overlay);
+      }
+      overlay.style.display = "flex";
+
+      const kwInput = overlay.querySelector("[data-kp-keyword]");
+      const catSelect = overlay.querySelector("[data-kp-category]");
+      const toolInput = overlay.querySelector("[data-kp-tool]");
+      kwInput.value = opts.defaultKeyword || "";
+      catSelect.innerHTML = categories.map(c => `<option value="${c}">${c}</option>`).join("");
+      catSelect.value = "TCAD仿真收敛";
+      toolInput.value = opts.defaultTool || "";
+      setTimeout(() => kwInput.focus(), 50);
+
+      let resolveFn;
+      const promise = new Promise(res => { resolveFn = res; });
+      const close = _wireModalDismissals(overlay, (r) => { overlay.style.display = "none"; resolveFn(r); });
+      overlay.querySelectorAll("[data-kp-cancel]").forEach(b => b.onclick = () => close(null));
+      overlay.querySelector("[data-kp-confirm]").onclick = () => {
+        const kw = kwInput.value.trim();
+        if (!kw) { showToast("请填写关键词", true); return; }
+        close({
+          keyword: kw,
+          category: catSelect.value,
+          tool: toolInput.value.trim() || "TCAD/EDA",
+          solution: opts.defaultSolution || "",
+        });
+      };
+      return promise;
+    }
+    window.showKeywordPickerModal = showKeywordPickerModal;
   </script>
 
   <!-- ===== Reader Modal (full screen overlay) ===== -->
