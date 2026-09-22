@@ -24,7 +24,7 @@ import time
 import asyncio
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Optional, AsyncIterator
 
 try:
     import requests
@@ -757,6 +757,171 @@ async def chat_async(
     raise LLMError("无可用的大模型配置")
 
 
+# ---------------------------------------------------------------------------
+# Streaming variants (Stage 2 of async llm refactor)
+#
+# Why a separate stream path?
+#   - chat_async() returns the full response when complete — the user
+#     waits 30-120s with no feedback. chat_stream_async() yields chunks
+#     so the frontend can render text progressively ("typing" effect).
+#   - Streaming also lets us cancel mid-token: close the httpx stream
+#     immediately when cancel_event is set, instead of waiting for the
+#     full response to come back.
+#
+# What stays the same as chat_async():
+#   - Same failover (primary → Agnes on quota exhaustion)
+#   - Same cancel_event plumbing (skip mid-stream retries)
+#
+# What's different:
+#   - Uses httpx.AsyncClient.stream() instead of post()
+#   - No mid-stream retry (partial content can't be replayed; fail fast)
+#   - Returns AsyncIterator[str] (caller wraps in SSE or ReadableStream)
+#
+# Note on thinking blocks:
+#   - Reasoning models (MiniMax-M2.7) emit <think>...</think> blocks
+#     BEFORE the actual content. For Stage 2 we yield raw chunks without
+#     stripping — frontend applies display-side filtering or accepts raw
+#     reasoning. Stage 3 can add server-side stripping if needed.
+# ---------------------------------------------------------------------------
+
+
+async def _stream_model(
+    cfg: dict,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
+    cancel_event: Optional[asyncio.Event] = None,
+) -> AsyncIterator[str]:
+    """Yield content chunks from a single model via httpx streaming.
+
+    Yields the `content` field from each SSE `data: {...}` line.
+    Raises LLMError on non-200 status, asyncio.CancelledError on cancel.
+    Does NOT retry — callers wrap this in their own retry logic if needed.
+    """
+    if httpx is None:
+        raise LLMError("httpx 包未安装, 请先 pip install httpx")
+
+    url = f"{cfg['base_url']}/chat/completions"
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True,  # request SSE
+    }
+
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": "MicroBench-Academic-Assistant/1.2",
+    }
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    raise LLMError(
+                        f"HTTP {resp.status_code}: {body[:200].decode('utf-8', errors='replace')}"
+                    )
+
+                async for line in resp.aiter_lines():
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise asyncio.CancelledError("client disconnected mid-stream")
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        return
+                    try:
+                        obj = json.loads(data)
+                        delta = obj["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            yield delta
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        # Skip malformed lines (heartbeats, comments)
+                        continue
+        except asyncio.CancelledError:
+            raise
+        except httpx.ConnectError as e:
+            raise LLMError(f"网络连接失败: {e}")
+        except httpx.TimeoutException as e:
+            raise LLMError(f"请求超时: {e}")
+
+
+async def chat_stream_async(
+    messages: list[dict],
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    timeout: int = DEFAULT_TIMEOUT,
+    cancel_event: Optional[asyncio.Event] = None,
+) -> AsyncIterator[str]:
+    """Streaming version of chat() with cancellation support.
+
+    Async generator that yields content chunks as they arrive from the
+    upstream LLM. Same failover logic as chat_async():
+      1. If degraded, use Fallback (Agnes) directly
+      2. Otherwise try Primary first
+      3. If Primary hits quota exhaustion (429), switch to Agnes
+
+    Cancellation:
+      - cancel_event checked before each chunk (mid-stream close)
+      - Pre-stream check saves an HTTP call when cancel fires very early
+
+    Usage (in FastAPI endpoint):
+        async def event_gen():
+            try:
+                async for chunk in llm.chat_stream_async(messages, ..., cancel_event=cancel_event):
+                    yield f"data: {json.dumps({'text': chunk})}\\n\\n"
+                yield "data: [DONE]\\n\\n"
+            except asyncio.CancelledError:
+                yield "data: {\\"cancelled\\": true}\\n\\n"
+            except llm.LLMError as e:
+                yield f"data: {json.dumps({'error': str(e)})}\\n\\n"
+    """
+    primary = model_manager.get_primary_config()
+    fallback = model_manager.get_fallback_config()
+
+    if not primary["configured"] and not fallback["configured"]:
+        raise LLMError(
+            "LLM 未配置: 请设置环境变量 LLM_API_KEY 或 AGNES_API_KEY."
+        )
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise asyncio.CancelledError("client disconnected before stream start")
+
+    if not model_manager.is_degraded and primary["configured"]:
+        try:
+            async for chunk in _stream_model(
+                primary, messages, max_tokens, temperature, timeout, cancel_event,
+            ):
+                yield chunk
+            return
+        except asyncio.CancelledError:
+            raise
+        except LLMError as e:
+            err_msg = str(e)
+            if fallback["configured"] and (
+                "429" in err_msg or "quota" in err_msg.lower()
+            ):
+                model_manager.mark_degraded(err_msg)
+            else:
+                raise
+
+    if fallback["configured"]:
+        if fallback.get("is_fallback"):
+            await asyncio.to_thread(agnes_limiter.acquire)
+        async for chunk in _stream_model(
+            fallback, messages, max_tokens, temperature, timeout, cancel_event,
+        ):
+            yield chunk
+        return
+
+    raise LLMError("无可用的大模型配置")
+
+
 _THINKING_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
@@ -878,6 +1043,8 @@ __all__ = [
     "chat",
     "chat_async",
     "_invoke_model_async",
+    "chat_stream_async",
+    "_stream_model",
     "summarize_paper",
     "answer_with_context",
     "agnes_limiter",

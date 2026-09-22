@@ -10,12 +10,13 @@ V1.1 hardening:
 """
 
 import os
+import json
 import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -99,6 +100,33 @@ async def _disconnect_watcher(request: Request, cancel_event: asyncio.Event):
         # Endpoint finished normally; the finally block in the endpoint
         # cancelled us. Don't treat that as a client disconnect.
         pass
+
+
+async def _stream_llm_event_gen(chunk_iter):
+    """Wrap a chat_stream_async() iterator into SSE format.
+
+    Yields lines like:
+        data: {"text": "..."}\\n\\n     (per content chunk)
+        data: [DONE]\\n\\n              (on normal completion)
+        data: {"cancelled": true}\\n\\n (on asyncio.CancelledError)
+        data: {"error": "..."}\\n\\n    (on LLMError)
+
+    Always emits a final terminal event so the frontend can cleanly
+    close its ReadableStream without hanging on EOF.
+
+    Note: this generator runs inside the StreamingResponse body. When
+    the client disconnects, Starlette closes the response, which cancels
+    this generator — chat_stream_async() inside raises CancelledError
+    and the upstream httpx stream is closed.
+    """
+    try:
+        async for chunk in chunk_iter:
+            yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+    except asyncio.CancelledError:
+        yield 'data: {"cancelled": true}\n\n'
+    except llm.LLMError as e:
+        yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
 
 
 # ---------------------------------------------------------------------------
@@ -1339,6 +1367,177 @@ async def api_explain_selection(req: ExplainSelectionRequest, request: Request):
     finally:
         cancel_event.set()
         watcher.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Streaming variants (Stage 2: SSE for the cancel-button endpoints)
+#
+# Each stream endpoint mirrors its non-streaming counterpart but returns
+# a StreamingResponse with text/event-stream content type. The frontend
+# reads via fetch + ReadableStream and appends text chunks progressively.
+#
+# The non-streaming endpoints stay alive for backward compat (any
+# external callers can keep using them; internal UI now uses these).
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/paper/explain_stream")
+async def api_explain_stream(req: ExplainRequest, request: Request):
+    """Streaming variant of /api/paper/explain using SSE."""
+    if not llm.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="AI 解读需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
+        )
+
+    sections = req.sections[:20]
+    context_parts = []
+    total_chars = 0
+    for s in sections:
+        title = s.get("title", s.get("section", "?"))
+        text = (s.get("text") or "")[:6000]
+        chunk = f"[{s.get('section', '?')}] {title}\n{text}"
+        if total_chars + len(chunk) > 24000:
+            break
+        context_parts.append(chunk)
+        total_chars += len(chunk)
+    context = "\n\n---\n\n".join(context_parts)
+    paper_label = req.paper_title or "未命名论文"
+    user_msg = (
+        f"论文标题: {paper_label}\n\n"
+        f"--- 论文内容 (节选) ---\n{context}\n--- 论文内容结束 ---\n\n"
+        f"用户问题: {req.question}"
+    )
+
+    cancel_event = asyncio.Event()
+    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
+
+    async def event_gen():
+        try:
+            chunk_iter = llm.chat_stream_async(
+                messages=[
+                    {"role": "system", "content": EXPLAIN_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=1200,
+                temperature=0.3,
+                cancel_event=cancel_event,
+            )
+            async for chunk in _stream_llm_event_gen(chunk_iter):
+                yield chunk
+        finally:
+            cancel_event.set()
+            watcher.cancel()
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@app.post("/api/paper/cross_qa_stream")
+async def api_cross_qa_stream(req: CrossQARequest, request: Request):
+    """Streaming variant of /api/paper/cross_qa using SSE."""
+    if not llm.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="跨章节问答需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
+        )
+    if len(req.sections) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="跨章节问答至少需要 2 个章节。",
+        )
+
+    from .translation import build_cross_section_context
+
+    if req.selected_indices:
+        valid_indices = [i for i in req.selected_indices if 0 <= i < len(req.sections)]
+        sections_to_use = [req.sections[i] for i in valid_indices]
+        if len(sections_to_use) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="所选章节不足 2 个, 请至少勾选 2 个章节进行跨章节问答。",
+            )
+    else:
+        sections_to_use = req.sections
+
+    context = build_cross_section_context(
+        sections_to_use,
+        req.question,
+        per_section_budget=req.per_section_budget,
+    )
+    paper_label = req.paper_title or "未命名论文"
+    user_msg = (
+        f"论文标题: {paper_label}\n\n"
+        f"{context}\n\n"
+        f"请综合上述多章节内容回答用户问题, 并用 [SECTION_KEY] 标注信息来源。"
+    )
+
+    cancel_event = asyncio.Event()
+    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
+
+    async def event_gen():
+        try:
+            chunk_iter = llm.chat_stream_async(
+                messages=[
+                    {"role": "system", "content": CROSS_QA_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=1500,
+                temperature=0.3,
+                cancel_event=cancel_event,
+            )
+            async for chunk in _stream_llm_event_gen(chunk_iter):
+                yield chunk
+        finally:
+            cancel_event.set()
+            watcher.cancel()
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@app.post("/api/paper/explain_selection_stream")
+async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Request):
+    """Streaming variant of /api/paper/explain_selection using SSE."""
+    if not llm.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="AI 划词答疑需要 LLM 配置。请在 .env 中设置 LLM_API_KEY 或 AGNES_API_KEY。",
+        )
+
+    paper_label = req.paper_title or "未知论文"
+    source_desc = "PDF 英文原文" if req.source_type == "pdf" else ("中文译文" if req.source_type == "translation" else "论文选段")
+
+    user_msg_parts = [
+        f"论文标题: 《{paper_label}》",
+        f"【用户划选片段 ({source_desc})】:\n```text\n{req.selected_text.strip()}\n```",
+    ]
+    if req.surrounding_context:
+        ctx_snippet = req.surrounding_context.strip()[:10000]
+        user_msg_parts.append(f"【该片段所在的章节/页面上下文背景】:\n{ctx_snippet}")
+    user_msg_parts.append(f"【用户的问题】:\n{req.question.strip()}")
+    user_msg = "\n\n".join(user_msg_parts)
+
+    cancel_event = asyncio.Event()
+    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
+
+    async def event_gen():
+        try:
+            chunk_iter = llm.chat_stream_async(
+                messages=[
+                    {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=1500,
+                temperature=0.3,
+                timeout=120,
+                cancel_event=cancel_event,
+            )
+            async for chunk in _stream_llm_event_gen(chunk_iter):
+                yield chunk
+        finally:
+            cancel_event.set()
+            watcher.cancel()
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.get("/api/translation/cache_stats")

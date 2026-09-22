@@ -1834,6 +1834,206 @@ def test_explain_endpoint_returns_499_on_cancel():
         _httpx.AsyncClient = _orig
 
 
+def test_chat_stream_async_basic():
+    """Stage 2: chat_stream_async() yields chunks in order."""
+    print("\n[38] chat_stream_async() 流式输出 (v1.4 stream)")
+    import asyncio
+    import httpx as _httpx
+
+    sse_lines = [
+        'data: {"choices":[{"delta":{"content":"hello"}}]}',
+        'data: {"choices":[{"delta":{"content":" stream"}}]}',
+        'data: {"choices":[{"delta":{"content":" world"}}]}',
+        'data: [DONE]',
+    ]
+
+    class _MockStreamResp:
+        def __init__(self, *args, **kwargs):
+            self.status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def aiter_lines(self):
+            for line in sse_lines:
+                yield line
+        async def aread(self):
+            return b""
+
+    class _MockStreamClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        def stream(self, method, url, **kwargs):
+            return _MockStreamResp()
+
+    primary_cfg = llm.model_manager.get_primary_config()
+    if not primary_cfg.get("configured"):
+        _check(True, "未配置 LLM, 跳过 streaming 测试")
+        return
+
+    _orig = _httpx.AsyncClient
+    _httpx.AsyncClient = _MockStreamClient
+    try:
+        chunks = []
+        async def collect():
+            async for c in llm.chat_stream_async(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=100,
+                temperature=0.3,
+                timeout=10,
+            ):
+                chunks.append(c)
+        asyncio.run(collect())
+        _check(chunks == ["hello", " stream", " world"],
+               f"流式 chunks 顺序正确 (实际 {chunks})")
+        _check("".join(chunks) == "hello stream world",
+               f"拼接后 = 'hello stream world' (实际 {''.join(chunks)!r})")
+    finally:
+        _httpx.AsyncClient = _orig
+
+
+def test_chat_stream_async_cancel_mid_stream():
+    """Stage 2: cancel_event set mid-stream → CancelledError raised."""
+    print("\n[39] chat_stream_async() 流式中断 (v1.4 stream)")
+    import asyncio
+    import httpx as _httpx
+
+    cancel_external = {"ev": None}
+
+    sse_lines = [
+        'data: {"choices":[{"delta":{"content":"chunk1"}}]}',
+        'data: {"choices":[{"delta":{"content":"chunk2"}}]}',
+        'data: {"choices":[{"delta":{"content":"chunk3"}}]}',
+        'data: [DONE]',
+    ]
+
+    class _MockStreamResp:
+        def __init__(self, *args, **kwargs):
+            self.status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def aiter_lines(self):
+            n = 0
+            for line in sse_lines:
+                n += 1
+                if n == 2 and cancel_external["ev"] is not None:
+                    cancel_external["ev"].set()  # fire cancel after chunk1
+                yield line
+        async def aread(self):
+            return b""
+
+    class _MockStreamClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        def stream(self, method, url, **kwargs):
+            return _MockStreamResp()
+
+    primary_cfg = llm.model_manager.get_primary_config()
+    if not primary_cfg.get("configured"):
+        _check(True, "未配置 LLM, 跳过 cancel mid-stream 测试")
+        return
+
+    _orig = _httpx.AsyncClient
+    _httpx.AsyncClient = _MockStreamClient
+    try:
+        ev = asyncio.Event()
+        cancel_external["ev"] = ev
+        chunks = []
+        async def collect():
+            try:
+                async for c in llm.chat_stream_async(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=100,
+                    temperature=0.3,
+                    timeout=10,
+                    cancel_event=ev,
+                ):
+                    chunks.append(c)
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(collect())
+        # Should have received chunk1, then cancelled (not chunk2/chunk3)
+        _check(chunks == ["chunk1"],
+               f"取消后只收到 chunk1 (实际 {chunks})")
+    finally:
+        _httpx.AsyncClient = _orig
+
+
+def test_explain_stream_endpoint_returns_sse():
+    """Stage 2: /api/paper/explain_stream returns SSE chunks."""
+    print("\n[40] /api/paper/explain_stream SSE smoke (v1.4)")
+    from fastapi.testclient import TestClient
+    from microbench.app import app
+    import httpx as _httpx
+
+    sse_lines = [
+        'data: {"choices":[{"delta":{"content":"streamed"}}]}',
+        'data: {"choices":[{"delta":{"content":" answer"}}]}',
+        'data: [DONE]',
+    ]
+
+    class _MockStreamResp:
+        def __init__(self, *args, **kwargs):
+            self.status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def aiter_lines(self):
+            for line in sse_lines:
+                yield line
+        async def aread(self):
+            return b""
+
+    class _MockStreamClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        def stream(self, method, url, **kwargs):
+            return _MockStreamResp()
+
+    client = TestClient(app)
+    _orig = _httpx.AsyncClient
+    _httpx.AsyncClient = _MockStreamClient
+    try:
+        if not llm.is_configured():
+            _check(True, "LLM 未配置, 跳过 stream endpoint 测试")
+            return
+
+        payload = {
+            "question": "test stream",
+            "sections": [{"section": "abstract", "title": "Abstract", "text": "ctx"}],
+            "paper_title": "StreamTest",
+        }
+        with client.stream("POST", "/api/paper/explain_stream", json=payload) as r:
+            _check(r.status_code == 200,
+                   f"endpoint 返回 200 (实际 {r.status_code})")
+            _check(r.headers["content-type"].startswith("text/event-stream"),
+                   f"Content-Type 是 SSE (实际 {r.headers.get('content-type')})")
+            body = r.read().decode("utf-8")
+            _check('"text":"streamed"' in body,
+                   f"SSE body 含 'streamed' chunk (body 长度 {len(body)})")
+            _check('"text":" answer"' in body,
+                   f"SSE body 含 ' answer' chunk")
+            _check("data: [DONE]" in body,
+                   f"SSE body 末尾含 [DONE] 终止标记")
+    finally:
+        _httpx.AsyncClient = _orig
+
+
 def run_all():
     _cleanup_test_artifacts()
     test_path_safety()
