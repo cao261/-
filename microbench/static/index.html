@@ -1208,6 +1208,113 @@
         window.askLLMCancelable = askLLMCancelable;
 
         // ---------------------------------------------------------------
+        // Streaming variant of askLLMCancelable.
+        // Reads SSE chunks via fetch + ReadableStream so the caller can
+        // render text progressively ("typing" effect) instead of waiting
+        // for the full response.
+        //
+        //   onChunk(text, fullText) — each chunk arrived; fullText = accumulated
+        //   onSuccess(fullText)     — [DONE] received
+        //   onError(err)            — fetch failed / SSE error event
+        //   onAbort()               — user cancelled mid-flight
+        //
+        // Returns the accumulated full text on success, null on cancel/error.
+        // Shares the _activeAsk single-flight guard with askLLMCancelable
+        // (so a user can't kick off two LLM panels at once).
+        // ---------------------------------------------------------------
+        async function askLLMStream(btn, url, payload, options) {
+          options = options || {};
+          if (_activeAsk) {
+            showToast("已有 AI 请求进行中, 请先取消或等待完成", true);
+            return null;
+          }
+          if (!btn) return null;
+          const originalHTML = btn.innerHTML;
+          const controller = new AbortController();
+          _activeAsk = { controller, btn, originalHTML };
+          btn.innerHTML = `<span>⏳ 解答中...</span> <button type="button" data-cancel-ask style="margin-left:6px; padding:1px 8px; font-size:11px; background:var(--accent-terracotta); color:#fff; border:0; border-radius:6px; cursor:pointer;">✕ 取消</button>`;
+          const cancelBtn = btn.querySelector("[data-cancel-ask]");
+          if (cancelBtn) cancelBtn.onclick = cancelActiveAsk;
+
+          let accumulated = "";
+          let meta = null;
+          try {
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+              signal: controller.signal,
+            });
+            if (!res.ok) {
+              // Try to extract FastAPI error detail from JSON body
+              let detail = `HTTP ${res.status}`;
+              try {
+                const errBody = await res.json();
+                if (errBody && errBody.detail) detail = String(errBody.detail);
+              } catch {}
+              throw new Error(detail);
+            }
+            if (!res.body) throw new Error("响应无 body (SSE 不可用)");
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let buffer = "";
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              // SSE events separated by \n\n
+              const events = buffer.split("\n\n");
+              buffer = events.pop(); // keep last incomplete chunk in buffer
+              for (const evt of events) {
+                const line = evt.trim();
+                if (!line.startsWith("data: ")) continue;
+                const data = line.slice(6);
+                if (data === "[DONE]") {
+                  if (options.onSuccess) options.onSuccess(accumulated, meta);
+                  return accumulated;
+                }
+                let obj;
+                try { obj = JSON.parse(data); }
+                catch { continue; } // skip malformed
+                if (obj.cancelled) {
+                  if (options.onAbort) options.onAbort();
+                  return null;
+                }
+                if (obj.error) {
+                  throw new Error(String(obj.error));
+                }
+                if (obj.meta) {
+                  meta = obj.meta;
+                  if (options.onMeta) options.onMeta(meta);
+                }
+                if (obj.text) {
+                  accumulated += obj.text;
+                  if (options.onChunk) options.onChunk(obj.text, accumulated);
+                }
+              }
+            }
+            // Stream ended without [DONE] — treat as soft complete
+            if (options.onSuccess) options.onSuccess(accumulated, meta);
+            return accumulated;
+          } catch (err) {
+            if (err && err.name === "AbortError") {
+              if (options.onAbort) options.onAbort();
+              return null;
+            }
+            if (options.onError) options.onError(err);
+            return null;
+          } finally {
+            _activeAsk = null;
+            if (btn) {
+              btn.disabled = false;
+              btn.innerHTML = originalHTML;
+            }
+          }
+        }
+        window.askLLMStream = askLLMStream;
+
+        // ---------------------------------------------------------------
         // Shared modal dismissal: Esc key + click-outside (overlay backdrop).
         // Returns a wrapped close fn that also cleans up its listeners.
         // Use for any overlay-based modal: showKeywordPickerModal,
@@ -2568,25 +2675,34 @@
       const askBtn = document.querySelector('[onclick="askPaperQuestion()"]');
       const el = document.getElementById("ask-paper-result");
       el.style.display = "block";
-      el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">⏳ AI 解读中 (最多 60 秒)...</div>`;
-      await askLLMCancelable(askBtn, "/api/paper/explain", {
+      el.innerHTML = `
+        <div class="reader-section-header">
+          <div class="reader-section-title">🤖 ${escapeHtml(question)}</div>
+        </div>
+        <div class="reader-section-body" data-stream-target style="white-space:pre-wrap; min-height:1.4em;">⏳ AI 解读中...</div>`;
+      const streamTarget = el.querySelector("[data-stream-target]");
+      await askLLMStream(askBtn, "/api/paper/explain_stream", {
         question: question,
         sections: _readerState.sections.map(s => ({ section: s.section, title: s.title, text: s.text })),
         paper_title: _readerState.title,
       }, {
-        onSuccess: (result) => {
-          el.innerHTML = `
-            <div class="reader-section-header">
-              <div class="reader-section-title">🤖 ${escapeHtml(question)}</div>
-            </div>
-            <div class="reader-section-body">${formatMarkdownLite(result.answer)}</div>`;
+        onChunk: (chunk, full) => {
+          // Live typing effect: append raw text (no markdown formatting
+          // mid-stream — too expensive and janky)
+          streamTarget.textContent = full;
+          // Auto-scroll if container scrolls
+          streamTarget.parentElement.scrollTop = streamTarget.parentElement.scrollHeight;
+        },
+        onSuccess: (full) => {
+          // Format the final accumulated text once [DONE] arrives
+          streamTarget.innerHTML = formatMarkdownLite(full);
           renderMathIn(el);
         },
         onError: (err) => {
-          el.innerHTML = `<div style="padding:14px; color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
+          streamTarget.innerHTML = `<div style="color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
         },
         onAbort: () => {
-          el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">✕ 已取消本次解读</div>`;
+          streamTarget.innerHTML = `<div style="color:var(--text-muted);">✕ 已取消本次解读</div>`;
         }
       });
     }
@@ -2612,30 +2728,40 @@
       const sections = (checked.length >= 2 ? checked : null);
       const el = document.getElementById("cross-qa-result");
       el.style.display = "block";
-      el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">⏳ 综合多章节分析中 (可能 60-120 秒)...</div>`;
+      el.innerHTML = `
+        <div class="reader-section-header">
+          <div class="reader-section-title">🔗 跨章节综合 · ${escapeHtml(question)}</div>
+          <div class="reader-section-meta" data-cross-qa-meta style="color:var(--text-muted);">⏳ 综合多章节分析中...</div>
+        </div>
+        <div class="reader-section-body" data-stream-target style="white-space:pre-wrap; min-height:1.4em;"></div>`;
+      const streamTarget = el.querySelector("[data-stream-target]");
+      const metaTarget = el.querySelector("[data-cross-qa-meta]");
       const askBtn = document.querySelector('[onclick="crossSectionQA()"]');
-      await askLLMCancelable(askBtn, "/api/paper/cross_qa", {
+      await askLLMStream(askBtn, "/api/paper/cross_qa_stream", {
         question: question,
         sections: _readerState.sections.map(s => ({ section: s.section, title: s.title, text: s.text })),
         selected_indices: sections,
         paper_title: _readerState.title,
       }, {
-        onSuccess: (result) => {
-          const usedList = (result.sections_used || [])
-            .map(s => `<span class="cross-qa-tag">${escapeHtml(s.section)}</span>`).join("");
-          el.innerHTML = `
-            <div class="reader-section-header">
-              <div class="reader-section-title">🔗 跨章节综合 · ${escapeHtml(question)}</div>
-              <div class="reader-section-meta">综合 ${result.section_count} 个章节 · ${result.context_chars.toLocaleString()} 字 context${usedList ? ` · ${usedList}` : ""}</div>
-            </div>
-            <div class="reader-section-body">${formatMarkdownLite(result.answer)}</div>`;
+        onChunk: (chunk, full) => {
+          streamTarget.textContent = full;
+          streamTarget.parentElement.scrollTop = streamTarget.parentElement.scrollHeight;
+        },
+        onSuccess: (full) => {
+          // cross_qa_stream doesn't return sections_used (it's SSE-only);
+          // re-derive the meta line locally
+          const usedList = (sections || _readerState.sections.map((_, i) => i))
+            .map(i => `<span class="cross-qa-tag">${escapeHtml(_readerState.sections[i].section)}</span>`).join("");
+          const sectionCount = sections ? sections.length : _readerState.sections.length;
+          metaTarget.innerHTML = `综合 ${sectionCount} 个章节${usedList ? ` · ${usedList}` : ""}`;
+          streamTarget.innerHTML = formatMarkdownLite(full);
           renderMathIn(el);
         },
         onError: (err) => {
-          el.innerHTML = `<div style="padding:14px; color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
+          streamTarget.innerHTML = `<div style="color:var(--accent-terracotta);">❌ ${escapeHtml(err.message)}</div>`;
         },
         onAbort: () => {
-          el.innerHTML = `<div style="padding:14px; color:var(--text-muted);">✕ 已取消本次跨章节问答</div>`;
+          streamTarget.innerHTML = `<div style="color:var(--text-muted);">✕ 已取消本次跨章节问答</div>`;
         }
       });
     }
@@ -2889,10 +3015,15 @@
       if (welcome) welcome.style.display = "none";
       if (answerBody) {
         answerBody.style.display = "block";
+        // Streaming-friendly shell: question header + model badge placeholder
+        // + streaming answer body + action buttons row
         answerBody.innerHTML = `
-          <div style="padding:16px 0; color:var(--text-muted); display:flex; align-items:center; gap:8px;">
-            <span class="pdf-translation-loading">⏳ AI 正在深度剖析所选内容与半导体物理机制...</span>
+          <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--card-border-subtle); display:flex; justify-content:space-between; align-items:center;">
+            <div style="font-weight:600; font-size:13px; color:var(--text-main);">❓ ${escapeHtml(question)}</div>
+            <span data-qa-model-badge style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">⏳ 解答中...</span>
           </div>
+          <div data-stream-target style="font-size:13px; line-height:1.65; color:var(--text-main); margin-bottom:14px; white-space:pre-wrap; min-height:1.4em;">⏳ AI 正在深度剖析所选内容与半导体物理机制...</div>
+          <div data-qa-actions style="display:flex; gap:8px; align-items:center; justify-content:flex-end; padding-top:8px; border-top:1px solid var(--card-border-subtle); flex-wrap:wrap;"></div>
         `;
       }
 
@@ -2917,14 +3048,27 @@
         source_type: _readerSelState.source || "general",
       };
 
-      await askLLMCancelable(submitBtn, "/api/paper/explain_selection", payload, {
-        onSuccess: (data) => {
-          _lastAnswerText = data.answer;
+      await askLLMStream(submitBtn, "/api/paper/explain_selection_stream", payload, {
+        onMeta: (meta) => {
+          const badge = answerBody.querySelector("[data-qa-model-badge]");
+          if (badge && meta && meta.model) {
+            badge.innerHTML = `🤖 ${escapeHtml(meta.model)}${meta.is_degraded ? ' (降格)' : ''}`;
+          }
+        },
+        onChunk: (chunk, full) => {
+          const streamTarget = answerBody.querySelector("[data-stream-target]");
+          if (streamTarget) {
+            streamTarget.textContent = full;
+            streamTarget.parentElement.scrollTop = streamTarget.parentElement.scrollHeight;
+          }
+        },
+        onSuccess: (full, meta) => {
+          _lastAnswerText = full;
           _lastQAItem = {
             title: _readerState.title || "未命名论文",
             question: question,
             selection: _readerSelState.text || "",
-            answer: data.answer,
+            answer: full,
             mode: _currentQAPreset || "explain",
             topic_category: (document.getElementById("paper-category") && document.getElementById("paper-category").value) ||
                             (document.getElementById("paper-topic") && document.getElementById("paper-topic").value) ||
@@ -2933,42 +3077,45 @@
           };
           _sessionQAList.push(_lastQAItem);
 
-          const modelBadge = data.model ? `<span style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">🤖 ${data.model}${data.is_degraded ? ' (降格)' : ''}</span>` : "";
-
-          answerBody.innerHTML = `
-            <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--card-border-subtle); display:flex; justify-content:space-between; align-items:center;">
-              <div style="font-weight:600; font-size:13px; color:var(--text-main);">❓ ${escapeHtml(question)}</div>
-              ${modelBadge}
-            </div>
-            <div class="reader-section-body" style="font-size:13px; line-height:1.65; color:var(--text-main); margin-bottom:14px;">
-              ${formatMarkdownLite(data.answer)}
-            </div>
-            <div style="display:flex; gap:8px; align-items:center; justify-content:flex-end; padding-top:8px; border-top:1px solid var(--card-border-subtle); flex-wrap:wrap;">
+          const streamTarget = answerBody.querySelector("[data-stream-target]");
+          if (streamTarget) {
+            streamTarget.innerHTML = formatMarkdownLite(full);
+          }
+          // Render action buttons AFTER successful streaming
+          const actions = answerBody.querySelector("[data-qa-actions]");
+          if (actions) {
+            actions.innerHTML = `
               <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px; color:#2E7D32; border-color:#81C784; background:#F1F8E9;" onclick="exportCurrentQAToObsidian()" title="将本条答疑保存到 Obsidian 04_AI划词答疑 文件夹">💾 导出本条答疑到 Obsidian</button>
               <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copyLastQAAnswer()">📋 复制解答</button>
               <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="saveQAToTroubleshoot('${escapeHtml(question.slice(0, 30))}')">➕ 存入避坑库</button>
-            </div>
-          `;
+            `;
+          }
 
           if (typeof renderMathIn === "function") renderMathIn(answerBody);
           fetchModelStatus();
         },
         onError: (err) => {
-          answerBody.innerHTML = `
-            <div style="padding:14px; color:var(--accent-terracotta);">
-              <div style="font-weight:600; margin-bottom:4px;">❌ 答疑失败</div>
-              <div style="font-size:12px;">${escapeHtml(err.message || String(err))}</div>
-              <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px; margin-top:8px;" onclick="submitReaderQA()">🔄 重试提问</button>
-            </div>
-          `;
+          const streamTarget = answerBody.querySelector("[data-stream-target]");
+          if (streamTarget) {
+            streamTarget.innerHTML = `
+              <div style="padding:14px; color:var(--accent-terracotta);">
+                <div style="font-weight:600; margin-bottom:4px;">❌ 答疑失败</div>
+                <div style="font-size:12px;">${escapeHtml(err.message || String(err))}</div>
+                <button class="btn-pill-outline" style="font-size:11px; padding:3px 8px; margin-top:8px;" onclick="submitReaderQA()">🔄 重试提问</button>
+              </div>
+            `;
+          }
         },
         onAbort: () => {
-          answerBody.innerHTML = `
-            <div style="padding:14px; color:var(--text-muted);">
-              <div style="font-weight:600; margin-bottom:4px;">✕ 已取消本次解答</div>
-              <div style="font-size:12px;">输入下一个问题继续。</div>
-            </div>
-          `;
+          const streamTarget = answerBody.querySelector("[data-stream-target]");
+          if (streamTarget) {
+            streamTarget.innerHTML = `
+              <div style="padding:14px; color:var(--text-muted);">
+                <div style="font-weight:600; margin-bottom:4px;">✕ 已取消本次解答</div>
+                <div style="font-size:12px;">输入下一个问题继续。</div>
+              </div>
+            `;
+          }
         }
       });
     }

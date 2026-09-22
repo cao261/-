@@ -102,10 +102,11 @@ async def _disconnect_watcher(request: Request, cancel_event: asyncio.Event):
         pass
 
 
-async def _stream_llm_event_gen(chunk_iter):
+async def _stream_llm_event_gen(chunk_iter, meta=None):
     """Wrap a chat_stream_async() iterator into SSE format.
 
     Yields lines like:
+        data: {"meta": {...}}\\n\\n     (optional initial event with model info)
         data: {"text": "..."}\\n\\n     (per content chunk)
         data: [DONE]\\n\\n              (on normal completion)
         data: {"cancelled": true}\\n\\n (on asyncio.CancelledError)
@@ -120,11 +121,15 @@ async def _stream_llm_event_gen(chunk_iter):
     and the upstream httpx stream is closed.
     """
     try:
+        if meta:
+            yield f"data: {json.dumps({'meta': meta}, ensure_ascii=False)}\n\n"
         async for chunk in chunk_iter:
             yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
-        yield 'data: {"cancelled": true}\n\n'
+        # Client disconnected — Starlette already closed the response.
+        # Swallow without emitting (writing more would just buffer/throw).
+        return
     except llm.LLMError as e:
         yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
 
@@ -1383,7 +1388,16 @@ async def api_explain_selection(req: ExplainSelectionRequest, request: Request):
 
 @app.post("/api/paper/explain_stream")
 async def api_explain_stream(req: ExplainRequest, request: Request):
-    """Streaming variant of /api/paper/explain using SSE."""
+    """Streaming variant of /api/paper/explain using SSE.
+
+    Cancellation note: we deliberately do NOT use _disconnect_watcher +
+    cancel_event here. Starlette's StreamingResponse already cancels the
+    body generator when the client closes the connection (via the
+    listen_for_disconnect task_group), which propagates CancelledError
+    through chat_stream_async → httpx.AsyncClient.stream automatically.
+    Adding our own watcher interferes with Starlette's receive channel
+    and causes the stream to be cancelled prematurely on first call.
+    """
     if not llm.is_configured():
         raise HTTPException(
             status_code=503,
@@ -1409,9 +1423,6 @@ async def api_explain_stream(req: ExplainRequest, request: Request):
         f"用户问题: {req.question}"
     )
 
-    cancel_event = asyncio.Event()
-    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
-
     async def event_gen():
         try:
             chunk_iter = llm.chat_stream_async(
@@ -1421,20 +1432,26 @@ async def api_explain_stream(req: ExplainRequest, request: Request):
                 ],
                 max_tokens=1200,
                 temperature=0.3,
-                cancel_event=cancel_event,
             )
             async for chunk in _stream_llm_event_gen(chunk_iter):
                 yield chunk
-        finally:
-            cancel_event.set()
-            watcher.cancel()
+        except asyncio.CancelledError:
+            # Starlette already closed the response on client disconnect;
+            # swallow without emitting (the connection is gone).
+            return
+        except llm.LLMError as e:
+            yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.post("/api/paper/cross_qa_stream")
 async def api_cross_qa_stream(req: CrossQARequest, request: Request):
-    """Streaming variant of /api/paper/cross_qa using SSE."""
+    """Streaming variant of /api/paper/cross_qa using SSE.
+
+    See api_explain_stream for why we skip _disconnect_watcher here —
+    Starlette's StreamingResponse handles client disconnect natively.
+    """
     if not llm.is_configured():
         raise HTTPException(
             status_code=503,
@@ -1471,9 +1488,6 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
         f"请综合上述多章节内容回答用户问题, 并用 [SECTION_KEY] 标注信息来源。"
     )
 
-    cancel_event = asyncio.Event()
-    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
-
     async def event_gen():
         try:
             chunk_iter = llm.chat_stream_async(
@@ -1483,20 +1497,24 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
                 ],
                 max_tokens=1500,
                 temperature=0.3,
-                cancel_event=cancel_event,
             )
             async for chunk in _stream_llm_event_gen(chunk_iter):
                 yield chunk
-        finally:
-            cancel_event.set()
-            watcher.cancel()
+        except asyncio.CancelledError:
+            return
+        except llm.LLMError as e:
+            yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.post("/api/paper/explain_selection_stream")
 async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Request):
-    """Streaming variant of /api/paper/explain_selection using SSE."""
+    """Streaming variant of /api/paper/explain_selection using SSE.
+
+    See api_explain_stream for why we skip _disconnect_watcher here —
+    Starlette's StreamingResponse handles client disconnect natively.
+    """
     if not llm.is_configured():
         raise HTTPException(
             status_code=503,
@@ -1516,11 +1534,10 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
     user_msg_parts.append(f"【用户的问题】:\n{req.question.strip()}")
     user_msg = "\n\n".join(user_msg_parts)
 
-    cancel_event = asyncio.Event()
-    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
-
     async def event_gen():
         try:
+            st = llm.get_llm_status()
+            meta = {"model": st.get("active_model"), "is_degraded": st.get("is_degraded", False)}
             chunk_iter = llm.chat_stream_async(
                 messages=[
                     {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
@@ -1529,13 +1546,13 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
                 max_tokens=1500,
                 temperature=0.3,
                 timeout=120,
-                cancel_event=cancel_event,
             )
-            async for chunk in _stream_llm_event_gen(chunk_iter):
+            async for chunk in _stream_llm_event_gen(chunk_iter, meta=meta):
                 yield chunk
-        finally:
-            cancel_event.set()
-            watcher.cancel()
+        except asyncio.CancelledError:
+            return
+        except llm.LLMError as e:
+            yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
