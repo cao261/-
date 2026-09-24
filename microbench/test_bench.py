@@ -1516,15 +1516,33 @@ def test_export_qa_endpoint():
 def test_agnes_rate_limiter_unit():
     print("\n[30] AgnesRateLimiter 单元测试")
     import time
-    limiter = llm.AgnesRateLimiter(max_requests=2, window_seconds=2.0, min_interval=0.2)
+    limiter = llm.SlidingWindowRateLimiter(max_requests=2, window_seconds=2.0, min_interval=0.2)
     t0 = time.time()
     w1 = limiter.acquire()
     w2 = limiter.acquire()
     t1 = time.time()
     _check(t1 - t0 >= 0.18, f"两次调用间隔满足 min_interval 0.2s (实际 {t1 - t0:.2f}s)")
     stats = limiter.stats()
-    _check(stats["rpm_limit"] == 20, "stats rpm_limit == 20")
+    # 2026-09: Agnes free tier 降到 10 RPM,cap = max_requests + 2 (buffer for display)
+    _check(stats["rpm_limit"] == limiter.max_requests + 2,
+           f"stats rpm_limit = max_requests + 2 buffer (实际 {stats['rpm_limit']})")
     _check(stats["recent_requests_1m"] == 2, "stats recent_requests == 2")
+
+
+def test_primary_rate_limiter_unit():
+    print("\n[30b] PrimaryRateLimiter 单元测试 (MiniMax ~28 RPM)")
+    import time
+    limiter = llm.SlidingWindowRateLimiter(max_requests=3, window_seconds=2.0, min_interval=0.2)
+    t0 = time.time()
+    w1 = limiter.acquire()
+    w2 = limiter.acquire()
+    w3 = limiter.acquire()
+    t1 = time.time()
+    _check(t1 - t0 >= 0.38, f"三次调用间隔满足 min_interval 0.2s (实际 {t1 - t0:.2f}s)")
+    stats = limiter.stats()
+    _check(stats["rpm_limit"] == limiter.max_requests + 2,
+           f"stats rpm_limit = max_requests + 2 buffer (实际 {stats['rpm_limit']})")
+    _check(stats["recent_requests_1m"] == 3, "stats recent_requests == 3")
 
 
 def test_find_pdf_and_upload_pdf():
@@ -2069,6 +2087,7 @@ def run_all():
     test_export_bilingual_endpoint()
     test_export_qa_endpoint()
     test_agnes_rate_limiter_unit()
+    test_primary_rate_limiter_unit()
     test_find_pdf_and_upload_pdf()
     test_explain_selection_endpoint()
 
