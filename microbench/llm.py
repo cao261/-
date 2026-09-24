@@ -63,19 +63,28 @@ class LLMError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Agnes 20 RPM Rate Limiter
+# Sliding-window Rate Limiter (shared by both providers)
 # ---------------------------------------------------------------------------
+# One generic class replaces the previously copy-pasted AgnesRateLimiter
+# and PrimaryRateLimiter pairs. Each provider instantiates one with its
+# own (max_requests, min_interval) — see agnes_limiter / primary_limiter
+# below.
 
-class AgnesRateLimiter:
+class SlidingWindowRateLimiter:
     """
-    Thread-safe sliding-window rate limiter designed for Agnes 3.0 Flash.
+    Thread-safe sliding-window rate limiter shared across providers.
 
-    Agnes Free tier has a 20 RPM limit. We use:
-      - max_requests: 18 per 60s (safe buffer below 20 RPM)
-      - min_interval: 3.0s between consecutive requests
+    Two guards enforce together:
+      1. min_interval: minimum seconds between any two consecutive requests
+      2. max_requests within window_seconds (sliding-window RPM cap)
+
+    Defaults reflect the Agnes free-tier 10 RPM (we cap at 9/60s with
+    6s minimum spacing for safety). Primary (MiniMax) gets 28/60s + 2s
+    spacing — generous enough for batch translation without tripping
+    the 5-hour Token Plan quota.
     """
 
-    def __init__(self, max_requests: int = 18, window_seconds: float = 60.0, min_interval: float = 3.0):
+    def __init__(self, max_requests: int = 9, window_seconds: float = 60.0, min_interval: float = 6.0):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.min_interval = min_interval
@@ -109,10 +118,9 @@ class AgnesRateLimiter:
                     wait_time = window_wait
 
             if wait_time > 0:
-                # Sleep release then re-acquire time
+                # Sleep then re-acquire time
                 time.sleep(wait_time)
                 now = time.time()
-                # Re-clean after sleep
                 cutoff = now - self.window_seconds
                 self._timestamps = [t for t in self._timestamps if t > cutoff]
 
@@ -126,15 +134,18 @@ class AgnesRateLimiter:
             cutoff = now - self.window_seconds
             active = [t for t in self._timestamps if t > cutoff]
             return {
-                "rpm_limit": 20,
+                "rpm_limit": self.max_requests + 2,  # +2 buffer for display
                 "safe_rpm_cap": self.max_requests,
                 "recent_requests_1m": len(active),
                 "last_call_seconds_ago": round(now - self._last_call_time, 1) if self._last_call_time else None,
             }
 
 
-# Global rate limiter instance for Agnes
-agnes_limiter = AgnesRateLimiter()
+# Free-tier Agnes (10 RPM ceiling → 9 cap + 6s min spacing)
+agnes_limiter = SlidingWindowRateLimiter(max_requests=9, min_interval=6.0)
+
+# Primary (MiniMax M2.7) — 30 RPM observed ceiling → 28 cap + 2s min spacing
+primary_limiter = SlidingWindowRateLimiter(max_requests=28, min_interval=2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +327,10 @@ class DualModelManager:
                 "configured": fallback["configured"],
             },
             "next_probe_in_seconds": next_probe,
-            "rate_limit": agnes_limiter.stats(),
+            "rate_limit": {
+                "primary": primary_limiter.stats(),
+                "agnes": agnes_limiter.stats(),
+            },
         }
 
 
@@ -412,8 +426,11 @@ def _invoke_model(
 
     for attempt in range(max_retries + 1):
         if is_agnes:
-            # Respect Agnes 20 RPM rate limit & min spacing
+            # Respect Agnes 10 RPM rate limit & min spacing
             agnes_limiter.acquire()
+        else:
+            # Primary model (MiniMax) rate limit
+            primary_limiter.acquire()
 
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
@@ -621,7 +638,7 @@ async def _invoke_model_async(
             raise asyncio.CancelledError("client disconnected before retry")
 
         if is_agnes:
-            # AgnesRateLimiter uses threading.Lock for cross-thread safety;
+            # SlidingWindowRateLimiter uses threading.Lock for cross-thread safety;
             # acquire() is fast and non-blocking (it may sleep briefly to
             # enforce min spacing — that sleep would normally be a thread
             # sleep, but we run it from the async loop, so wrap with
