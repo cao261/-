@@ -9,13 +9,15 @@
   <!-- Google Fonts: Cormorant Garamond (Editorial Serif), Plus Jakarta Sans (Clean Modern Sans), JetBrains Mono (Code) -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <!-- KaTeX for math rendering -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
-  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
-  <!-- PDF.js for the dual-column reader (v1.2.2 — matches worker integrity) -->
-  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/web/pdf_viewer.css">
+  <!-- Async-load Google Fonts: was render-blocking ~25 KB on first paint. The
+       media="print" trick + onload swap means the CSS becomes non-blocking,
+       fonts render with the system stack first and swap in when ready. -->
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        media="print" onload="this.media='all'">
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"></noscript>
+  <!-- KaTeX & PDF.js CSS moved to lazy load — was 35 KB of render-blocking
+       dead weight on first paint since the corresponding JS is lazy too. -->
   
   <style>
     :root {
@@ -508,6 +510,73 @@
     }
     .archive-item-meta {
       font-size: 12px;
+    }
+    /* Feed item action buttons (📁 / 🌐 / 🗑️) */
+    .archive-item-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-shrink: 0;
+      margin-left: 10px;
+    }
+    .archive-item-actions button {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      border: 1px solid var(--card-border);
+      background: var(--card-bg);
+      cursor: pointer;
+      font-size: 13px;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      transition: var(--transition-smooth);
+      color: var(--text-subtle);
+    }
+    .archive-item-actions button:hover {
+      background: var(--card-bg-subtle);
+      border-color: var(--accent-terracotta);
+      color: var(--accent-terracotta);
+      transform: translateY(-1px);
+    }
+    .archive-item-actions button.danger:hover {
+      border-color: #B25336;
+      color: #B25336;
+    }
+    /* "Load more" button at the bottom of the feed */
+    .feed-loadmore {
+      display: block;
+      width: 100%;
+      margin-top: 12px;
+      padding: 8px 0;
+      font-size: 12px;
+      color: var(--accent-olive);
+      background: transparent;
+      border: 1px dashed var(--card-border);
+      border-radius: 6px;
+      cursor: pointer;
+      transition: var(--transition-smooth);
+    }
+    .feed-loadmore:hover {
+      background: var(--card-bg-subtle);
+      border-style: solid;
+      border-color: var(--accent-olive);
+    }
+    /* Snapshot history cards */
+    .snap-card {
+      padding: 14px 16px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      transition: var(--transition-smooth);
+    }
+    .snap-card:hover {
+      border-color: var(--accent-terracotta);
+      box-shadow: 0 4px 14px rgba(168, 81, 31, 0.08);
+      transform: translateY(-1px);
+    }
       color: var(--text-subtle);
       display: flex;
       gap: 12px;
@@ -615,6 +684,14 @@
       </span>
       <span class="pill-badge" style="font-family: var(--font-mono); font-size: 11px;">
         127.0.0.1:5000
+      </span>
+      <span class="pill-badge" id="snapshot-nav-btn" style="cursor:pointer;" onclick="showSnapshotModal()" title="查看/恢复已保存的论文翻译快照">
+        <span class="dot"></span>
+        <span id="snapshot-nav-text">📚 论文快照</span>
+      </span>
+      <span class="pill-badge" id="diag-nav-btn" style="cursor:pointer;" onclick="showDiagnoseModal()" title="查看最近翻译请求的状态/耗时/错误 · 替代 F12 devtools (本嵌入式 webview 默认禁用 F12)">
+        <span class="dot"></span>
+        <span id="diag-nav-text">🔧 诊断</span>
       </span>
     </div>
   </header>
@@ -996,7 +1073,7 @@
                 <span id="obsidian-status-dot" style="font-size:11px; color:var(--text-subtle);" title=""></span>
               </div>
               <label style="display:flex; gap:4px; align-items:center; font-size:10.5px; color:var(--text-muted); cursor:pointer;" title="是否在 Feed 中显示导出的 AI 划词答疑卡">
-                <input type="checkbox" id="feed-include-qa" style="accent-color:var(--accent-olive);" onchange="renderRecentFeed(window._feedCache)">
+                <input type="checkbox" id="feed-include-qa" style="accent-color:var(--accent-olive);" onchange="loadRecentFeed()">
                 <span>含 AI 答疑</span>
               </label>
               <div class="craft-box-tag">FEED</div>
@@ -1055,12 +1132,25 @@
           }
           return (localStorage.getItem("obsidian_vault_name") || "").trim();
         }
+        // Vault name validation: name must look like a real Obsidian vault —
+        // length ≥ 3, must contain at least one letter (not pure digits),
+        // no slashes / dots / colons (path-separator chars that would break
+        // the obsidian://open?vault=NAME&file=PATH URL). Without these rules
+        // the 🟢 status dot lit up for any non-empty string ("数字也变绿"
+        // was the user's complaint).
+        function isValidVaultName(name) {
+          if (!name) return false;
+          if (name.length < 3) return false;
+          if (/[\/\\\.:]/.test(name)) return false;
+          if (!/[A-Za-z\u4e00-\u9fff_-]/.test(name)) return false;
+          return true;
+        }
         function saveObsidianVaultName(v) {
           const trimmed = (v || "").trim();
           localStorage.setItem("obsidian_vault_name", trimmed);
           updateObsidianStatus();
           // Re-render feed so click handlers pick up the new vault name
-          renderRecentFeed(window._feedCache);
+          renderRecentFeed();
         }
         function updateObsidianStatus() {
           const dot = document.getElementById("obsidian-status-dot");
@@ -1068,10 +1158,14 @@
           if (!dot) return;
           if (!input) return;
           input.value = getObsidianVaultName();
-          dot.textContent = getObsidianVaultName() ? "🟢" : "⚪";
-          dot.title = getObsidianVaultName()
-            ? `点击将在 Obsidian 打开 (vault: ${getObsidianVaultName()})`
-            : "留空 = 浏览器新标签打开";
+          const v = getObsidianVaultName();
+          const valid = isValidVaultName(v);
+          dot.textContent = valid ? "🟢" : (v ? "🟡" : "⚪");
+          dot.title = valid
+            ? `点击将在 Obsidian 打开 (vault: ${v})`
+            : (v
+                ? `vault 名称不合法 (≥3 字符,需含字母/中文,不能含 / \\ : .) · 当前: "${v}"`
+                : "留空 = 浏览器新标签打开");
         }
         /**
          * Build an open URL for a vault-relative path.
@@ -1081,7 +1175,10 @@
          */
         function buildOpenUrl(relPath) {
           const vault = getObsidianVaultName();
-          if (vault) {
+          // Only build the obsidian:// URL when the vault name actually looks
+          // valid — otherwise fall through to the browser endpoint so a typo
+          // or pure-digit input doesn't open an empty / error page in Obsidian.
+          if (vault && isValidVaultName(vault)) {
             // obsidian://open?vault=NAME&file=PATH  — Obsidian picks it up
             // via registered URL scheme on Windows / macOS / Linux.
             return `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(relPath)}`;
@@ -1095,38 +1192,44 @@
         window.buildOpenUrl = buildOpenUrl;
 
         // Render recent feed (called from loadDashboardStats and toggle change)
-        window._feedCache = null; // last fetched literature_list
-        function renderRecentFeed(literatureList) {
+        // _feedState holds paginated feed data; we render slice(0, shownCount)
+        // and append a "加载更多" pill when more items remain in memory.
+        window._feedState = {
+          items: [],         // full literature list returned by /api/vault/literature
+          filteredTotal: 0,  // total after include_qa filter (server reports)
+          shownCount: 0,     // how many we've rendered so far
+          pageSize: 5,       // batch size for "加载更多"
+        };
+        function renderRecentFeed() {
           const feed = document.getElementById("recent-feed-container");
           const includeQA = document.getElementById("feed-include-qa")
             && document.getElementById("feed-include-qa").checked;
-          const items = (literatureList || []).filter(it => {
-            if (!includeQA) {
-              const rel = String(it.path || "").replace(/\\/g, "/");
-              if (/04_AI划词答疑/.test(rel)) return false;
-            }
-            return true;
-          }).slice(0, 5);
+          const state = window._feedState;
+          const items = state.items || [];
           if (items.length === 0) {
             feed.innerHTML = '<div style="font-size:13px; color:var(--text-subtle); padding: 12px 0;">'
               + (includeQA ? '暂无文献，请在左侧录入第一篇。' : '暂无非答疑文献。勾选「含 AI 答疑」可一并显示导出的答疑卡。')
               + '</div>';
             return;
           }
-          feed.innerHTML = items.map(item => {
+          // Render the leading slice [0, shownCount]
+          const visible = items.slice(0, state.shownCount || state.pageSize);
+          const rows = visible.map(item => {
             const relPath = String(item.path || "").replace(/\\/g, "/");
             const openUrl = relPath ? buildOpenUrl(relPath) : "";
             const isQA = /04_AI划词答疑/.test(relPath);
             const isBilingual = /双语精读/.test(item.title) || /双语精读/.test(relPath);
             const badge = isQA ? "AI 划词答疑" : isBilingual ? "双语精读" : "文献速览";
-            const isObsidian = !!getObsidianVaultName();
+            const isObsidian = isValidVaultName(getObsidianVaultName());
             const titleHint = isObsidian
               ? `点击在 Obsidian 打开 (vault: ${escapeHtml(getObsidianVaultName())})`
               : "点击在浏览器新标签打开 Markdown 源文件";
+            const safePath = escapeHtml(relPath);
+            const safeTitle = escapeHtml(item.title);
             return `
-            <div class="archive-item" style="cursor:pointer;" title="${titleHint}"
-                 onclick="${openUrl ? `window.open('${escapeHtml(openUrl)}', '_blank')` : 'void(0)'}">
-              <div>
+            <div class="archive-item">
+              <div style="cursor:pointer; flex:1; min-width: 0;" title="${titleHint}"
+                   onclick="${openUrl ? `window.open('${escapeJsString(openUrl)}', '_blank')` : 'void(0)'}">
                 <div class="archive-item-title">${escapeHtml(item.title)}</div>
                 <div class="archive-item-meta">
                   <span class="badge-terracotta">${escapeHtml(String(item.category).replace(/^\d+_/, ''))}</span>
@@ -1134,12 +1237,79 @@
                   <span>${escapeHtml(item.mtime)}</span>
                 </div>
               </div>
-              <span style="font-size:12px; color:var(--text-subtle);">${isObsidian ? '📓 Obsidian' : '🌐 Browser'}</span>
+              <div class="archive-item-actions">
+                <button onclick="event.stopPropagation(); feedReveal('${safePath}')" title="在文件管理器中显示该文件">📁</button>
+                <button onclick="event.stopPropagation(); feedOpen('${safePath}')" title="浏览器新标签打开源文件">🌐</button>
+                <button class="danger" onclick="event.stopPropagation(); feedDelete('${safePath}', '${safeTitle}')" title="软删除(到回收站)">🗑️</button>
+              </div>
             </div>
           `;}).join('');
+          // "加载更多" button if more items remain unrevealed
+          const remaining = items.length - visible.length;
+          const more = remaining > 0
+            ? `<button class="feed-loadmore" onclick="feedLoadMore()">加载更多 (剩余 ${remaining} 条 · 共 ${state.filteredTotal || items.length})</button>`
+            : (state.filteredTotal > visible.length
+                ? `<button class="feed-loadmore" onclick="loadRecentFeed(true)">还有 ${state.filteredTotal - visible.length} 条未加载,点击拉取下一页 →</button>`
+                : '');
+          feed.innerHTML = rows + more;
+        }
+        async function loadRecentFeed(append = false) {
+          const includeQA = document.getElementById("feed-include-qa")?.checked || false;
+          try {
+            const PAGE = 50; // pull a healthy slice once; client-side paginates
+            const r = await fetch(`/api/vault/literature?limit=${PAGE}&offset=0&include_qa=${includeQA}`);
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            const data = await r.json();
+            window._feedState.items = data.items || [];
+            window._feedState.filteredTotal = data.filtered_total || 0;
+            if (!append) window._feedState.shownCount = window._feedState.pageSize;
+            renderRecentFeed();
+          } catch (err) {
+            console.error("加载文献 feed 失败", err);
+            showToast("加载文献列表失败: " + err.message, true);
+          }
+        }
+        function feedLoadMore() {
+          const s = window._feedState;
+          s.shownCount = (s.shownCount || s.pageSize) + s.pageSize;
+          renderRecentFeed();
+        }
+        async function feedReveal(relPath) {
+          try {
+            const r = await fetch(`/api/vault/reveal?relative_path=${encodeURIComponent(relPath)}`, { method: "POST" });
+            const data = await r.json();
+            if (!r.ok) throw new Error(data.detail || "HTTP " + r.status);
+            showToast("📁 已唤起文件管理器", false, 2400);
+          } catch (err) {
+            showToast("打开文件管理器失败: " + err.message, true);
+          }
+        }
+        function feedOpen(relPath) {
+          // Force browser-open even when Obsidian vault is configured
+          window.open(`/api/vault/file?relative_path=${encodeURIComponent(relPath)}`, '_blank');
+        }
+        async function feedDelete(relPath, title) {
+          const ok = confirm(`确定删除文献笔记?\n\n${title}\n\n文件将进入回收站 (send2trash),可手动恢复。`);
+          if (!ok) return;
+          try {
+            const r = await fetch(`/api/vault/file?relative_path=${encodeURIComponent(relPath)}`, { method: "DELETE" });
+            const data = await r.json();
+            if (!r.ok) throw new Error(data.detail || "HTTP " + r.status);
+            showToast(`🗑️ 已删除: ${data.path}${data.deleted_to === 'permanent' ? ' (永久)' : ''}`, false, 3000);
+            // Refresh the feed and the dashboard stats card
+            await loadRecentFeed();
+            if (typeof loadStats === "function") loadStats();
+          } catch (err) {
+            showToast("删除失败: " + err.message, true);
+          }
         }
         // Expose to window so inline onchange attribute on the QA toggle can find it.
         window.renderRecentFeed = renderRecentFeed;
+        window.loadRecentFeed = loadRecentFeed;
+        window.feedLoadMore = feedLoadMore;
+        window.feedReveal = feedReveal;
+        window.feedOpen = feedOpen;
+        window.feedDelete = feedDelete;
 
         // ---------------------------------------------------------------
         // Cancellable LLM ask: tool that wraps fetch + AbortController,
@@ -1156,59 +1326,14 @@
             showToast("已取消 AI 请求");
           }
         }
-        async function askLLMCancelable(btn, url, payload, options) {
-          options = options || {};
-          if (_activeAsk) {
-            showToast("已有 AI 请求进行中, 请先取消或等待完成", true);
-            return null;
-          }
-          if (!btn) return null;
-          const originalHTML = btn.innerHTML;
-          const controller = new AbortController();
-          _activeAsk = { controller, btn, originalHTML };
-          btn.innerHTML = `<span>⏳ 解答中...</span> <button type="button" data-cancel-ask style="margin-left:6px; padding:1px 8px; font-size:11px; background:var(--accent-terracotta); color:#fff; border:0; border-radius:6px; cursor:pointer;">✕ 取消</button>`;
-          // Make the cancel button fire window.cancelActiveAsk() reliably,
-          // since we just rewrote btn.innerHTML (so the inline onclick
-          // we'd attach via JS would otherwise rely on closure scope).
-          const cancelBtn = btn.querySelector("[data-cancel-ask]");
-          if (cancelBtn) cancelBtn.onclick = cancelActiveAsk;
-          try {
-            const res = await fetch(url, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(payload),
-              signal: controller.signal,
-            });
-            const data = await res.json();
-            if (!res.ok) {
-              let msg = data.detail;
-              if (Array.isArray(msg)) {
-                msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
-              } else if (typeof msg !== 'string') msg = JSON.stringify(msg);
-              throw new Error(msg || `HTTP ${res.status}`);
-            }
-            if (options.onSuccess) options.onSuccess(data);
-            return data;
-          } catch (err) {
-            if (err && err.name === "AbortError") {
-              if (options.onAbort) options.onAbort();
-              return null;
-            }
-            if (options.onError) options.onError(err);
-            return null;
-          } finally {
-            _activeAsk = null;
-            if (btn) {
-              btn.disabled = false;
-              btn.innerHTML = originalHTML;
-            }
-          }
-        }
+        // DELETED 2026-09-24: askLLMCancelable (48 lines) + window.askLLMCancelable
+        // export — 100% dead code. askLLMStream (below) is the only path.
+        // cancelActiveAsk stays here because it's wired into askLLMStream's
+        // cancel button.
         window.cancelActiveAsk = cancelActiveAsk;
-        window.askLLMCancelable = askLLMCancelable;
 
         // ---------------------------------------------------------------
-        // Streaming variant of askLLMCancelable.
+        // Streaming variant of the cancellable ask.
         // Reads SSE chunks via fetch + ReadableStream so the caller can
         // render text progressively ("typing" effect) instead of waiting
         // for the full response.
@@ -1457,11 +1582,11 @@
         }
         window.showVaultSaveModal = showVaultSaveModal;
 
-        // Render recent feed
-        window._feedCache = data.literature_list || [];
-        // Restore vault name from localStorage so feed cards honor the setting
+        // Render recent feed — pull a fresh page from the dedicated endpoint
+        // so the new "加载更多" / 删除 / 📁 buttons work without re-walking disk.
+        // Restore vault name from localStorage so feed cards honor the setting.
         updateObsidianStatus();
-        renderRecentFeed(window._feedCache);
+        await loadRecentFeed();
       } catch (err) {
         console.error("加载统计数据失败", err);
       }
@@ -1697,10 +1822,189 @@
       }
     }
 
+    // ---------------------------------------------------------------
+    // 库懒加载: pdf.js / katex 只在用时才下载,启动更快
+    // ---------------------------------------------------------------
+    let _pdfJsPromise = null;
+    let _katexPromise = null;
+    function _appendLazyCss(href, crossorigin) {
+      // CSS is render-blocking once attached, but appendChild + cdn fetch
+      // can race ahead of the JS tag below — Chromium parallelizes.
+      const l = document.createElement("link");
+      l.rel = "stylesheet";
+      l.href = href;
+      if (crossorigin) l.crossOrigin = crossorigin;
+      document.head.appendChild(l);
+      return l;
+    }
+    function loadPdfJs() {
+      if (_pdfJsPromise) return _pdfJsPromise;
+      _pdfJsPromise = new Promise((resolve, reject) => {
+        // CSS first — only used in PDF mode, no impact on first paint.
+        _appendLazyCss("https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/web/pdf_viewer.css");
+        const s = document.createElement("script");
+        s.src = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js";
+        s.onload = () => {
+          try {
+            if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
+              window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+                "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+            }
+            resolve(window.pdfjsLib);
+          } catch (e) { reject(e); }
+        };
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+      return _pdfJsPromise;
+    }
+    function loadKatex() {
+      if (_katexPromise) return _katexPromise;
+      _katexPromise = new Promise((resolve, reject) => {
+        // CSS first — only used when first QA / translation renders math.
+        _appendLazyCss("https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css", "anonymous");
+        const s = document.createElement("script");
+        s.src = "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js";
+        s.crossOrigin = "anonymous";
+        s.onload = () => resolve(window.katex);
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+      return _katexPromise;
+    }
+    // 把全局别名指向懒加载版本,避免后续代码改写
+    window.loadPdfJs = loadPdfJs;
+    window.loadKatex = loadKatex;
+
+    // ---------------------------------------------------------------
+    // 状态持久化 (刷新浏览器不丢失)
+    // ---------------------------------------------------------------
+    const LS_STATE_KEY = "microbench_state_v1";
+
+    function _persistReaderState() {
+      try {
+        const params = new URLSearchParams();
+        if (_pdfState && _pdfState.relativePath) {
+          params.set("paper", _pdfState.relativePath);
+          params.set("mode", "pdf");
+          // currentPage tracking was never wired up — renderPdfPages always
+          // starts at p=1, so we hardcode that here for now. If a future
+          // scroll-to-page lands, restore the live tracker here.
+          params.set("page", "1");
+        } else if (_readerState && _readerState.pdfPath) {
+          params.set("paper", _readerState.pdfPath);
+          params.set("mode", _readerMode || "section");
+          params.set("section", String(_readerState.activeSection || 0));
+        } else {
+          history.replaceState(null, "", window.location.pathname + window.location.search);
+          return;
+        }
+        history.replaceState(null, "", "#" + params.toString());
+      } catch (e) {}
+    }
+
+    async function _restoreFromHash() {
+      try {
+        const raw = window.location.hash.replace(/^#/, "");
+        if (!raw) return;
+        const params = new URLSearchParams(raw);
+        const paper = params.get("paper");
+        const mode = params.get("mode") || "section";
+        const sectionIdx = parseInt(params.get("section") || "0", 10);
+        if (!paper) return;
+        // 等待 reader 元素渲染好
+        await new Promise(r => setTimeout(r, 350));
+        const idInput = document.getElementById("paper-id-input");
+        if (idInput) {
+          idInput.value = paper;
+          idInput.dispatchEvent(new Event("input"));
+        }
+        // 走 handleFetchFullText()(读 paper-id-input 的值)
+        if (typeof handleFetchFullText !== "function") {
+          showToast("Reader 入口函数未实现,请手动重开论文", true);
+          return;
+        }
+        await handleFetchFullText();
+        // 跳到指定 section 或 PDF mode
+        if (mode === "pdf") {
+          if (typeof switchReaderMode === "function") switchReaderMode("pdf");
+        } else if (sectionIdx > 0 && typeof selectSection === "function") {
+          // 等 sections 填充
+          setTimeout(() => selectSection(sectionIdx), 200);
+        }
+      } catch (e) {
+        console.error("[restoreFromHash]", e);
+      }
+    }
+
+    function _persistLocalState() {
+      try {
+        const state = {
+          sessionQAList: (_sessionQAList || []).slice(-50),
+          currentQAPreset: _currentQAPreset || "通俗解释",
+          lastAnswerText: _lastAnswerText || "",
+          readerMode: _readerMode || "section",
+          pdfZoom: _pdfZoom || 1.0,
+        };
+        localStorage.setItem(LS_STATE_KEY, JSON.stringify(state));
+      } catch (e) {}
+    }
+
+    function _restoreLocalState() {
+      try {
+        const raw = localStorage.getItem(LS_STATE_KEY);
+        if (!raw) return;
+        const s = JSON.parse(raw);
+        if (Array.isArray(s.sessionQAList)) _sessionQAList = s.sessionQAList;
+        if (typeof s.currentQAPreset === "string") _currentQAPreset = s.currentQAPreset;
+        if (typeof s.lastAnswerText === "string") _lastAnswerText = s.lastAnswerText;
+        if (s.readerMode === "section" || s.readerMode === "pdf") _readerMode = s.readerMode;
+        if (typeof s.pdfZoom === "number") _pdfZoom = s.pdfZoom;
+      } catch (e) {
+        console.error("[restoreLocalState]", e);
+      }
+    }
+
+    async function _restoreTranslationsFromCache() {
+      if (!_readerState || !Array.isArray(_readerState.sections) || !_readerState.sections.length) return;
+      try {
+        const keys = _readerState.sections.map(s => ({
+          section_key: s.section || s.id || "",
+          text: s.text || "",
+          model: "",
+        }));
+        const r = await fetch("/api/paper/translation_cache_batch_lookup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ keys }),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        const hits = data.hits || {};
+        let restored = 0;
+        _readerState.sections.forEach((sec, idx) => {
+          const k = sec.section || sec.id || "";
+          const hit = hits[k];
+          if (hit && hit.translation) {
+            _readerState.translations[idx] = hit;
+            restored += 1;
+          }
+        });
+        if (restored > 0) {
+          console.log(`[batch restore] 恢复 ${restored}/${_readerState.sections.length} 节翻译`);
+          if (typeof renderReader === "function") renderReader();
+        }
+      } catch (e) {
+        console.error("[restoreTranslationsFromCache]", e);
+      }
+    }
+
     window.addEventListener("DOMContentLoaded", () => {
       loadStats();
       fetchModelStatus();
       initReaderSelectionListener();
+      _restoreLocalState();
+      _restoreFromHash();
     });
 
     // ----- Paper Full-Text Reader (V1.4) -----
@@ -1739,6 +2043,8 @@
         _readerState.activeSection = 0;
         renderReader();
         openReaderModal();
+        _persistReaderState();
+        _restoreTranslationsFromCache();
         showToast(`✅ 已从粘贴文本识别 ${result.sections.length} 个章节`);
       } catch (err) {
         showToast("拆分失败: " + err.message, true);
@@ -1753,6 +2059,8 @@
     function closeReaderModal() {
       document.getElementById("reader-modal").style.display = "none";
       document.body.style.overflow = "";
+      // Clear URL hash so refresh doesn't auto-reopen
+      history.replaceState(null, "", window.location.pathname + window.location.search);
       // Stop PDF.js rendering if active
       if (_pdfState && _pdfState.rendering) {
         try { _pdfState.rendering.cancel(); } catch (e) {}
@@ -1773,6 +2081,8 @@
 
     function switchReaderMode(mode) {
       _readerMode = mode;
+      _persistLocalState();
+      _persistReaderState();
       const sectionView = document.querySelector("#reader-modal > div > div:nth-child(2)");
       const pdfView = document.getElementById("reader-pdf-view");
       const btnSection = document.getElementById("reader-mode-section");
@@ -1819,6 +2129,7 @@
       }
       _pdfZoom = Math.round(_pdfZoom * 100) / 100; // 2 decimals
       updateZoomLabel();
+      _persistLocalState();
       // Bump generation so any in-flight render loop bails out
       _pdfState.rendering.generation = (_pdfState.rendering.generation || 0) + 1;
       const thisGen = _pdfState.rendering.generation;
@@ -1835,7 +2146,7 @@
     }
 
     async function loadPdfDualColumn(opts = {}) {
-      const { keepTranslations = false, generation = null } = opts;
+      const { keepTranslations = false, generation = null, restoreSnapshot = null } = opts;
       const title = _readerState.title || "";
       const placeholder = document.getElementById("pdf-viewer-placeholder");
       const listEl = document.getElementById("pdf-pages-list");
@@ -1891,11 +2202,7 @@
       }
 
       try {
-        if (typeof pdfjsLib === "undefined") {
-          throw new Error("PDF.js 未加载");
-        }
-        pdfjsLib.GlobalWorkerOptions.workerSrc =
-          "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+        const pdfjsLib = await loadPdfJs();
         const pdfUrl = `/api/paper/serve_pdf?relative_path=${encodeURIComponent(found.relative_path)}`;
 
         // Reuse existing pdfDoc on zoom to avoid re-downloading / re-parsing
@@ -1914,8 +2221,18 @@
           ? generation
           : ((_pdfState && _pdfState.rendering && _pdfState.rendering.generation) || 0) + 1;
 
+        // Build a stable, short paperId. The naive `relative_path.replace(/[^a-zA-Z0-9]/g, "_")`
+        // keeps full path length (Chinese chars become underscores but not shorter), and Pydantic
+        // rejects paper_id > 100 chars. Use basename + 8-char djb2 hash of full path.
+        const _paperPath = found.relative_path;
+        const _paperBase = _paperPath.split("/").pop().replace(/\.pdf$/i, "").slice(0, 70) || "paper";
+        let _paperHash = 5381;
+        for (let _i = 0; _i < _paperPath.length; _i++) {
+          _paperHash = ((_paperHash << 5) + _paperHash + _paperPath.charCodeAt(_i)) | 0;
+        }
+        const paperId = `${_paperBase}_${(_paperHash >>> 0).toString(36)}`;
         _pdfState = {
-          paperId: found.relative_path.replace(/[^a-zA-Z0-9]/g, "_"),
+          paperId,
           paperTitle: found.title || title || "",
           relativePath: found.relative_path,
           pdfDoc,
@@ -1943,6 +2260,49 @@
         // Start smooth queue (page 1 translates immediately, pages 2..N translate paced at 3.2s)
         // Skip if we're a stale generation — otherwise we'd queue unneeded translates.
         if (_pdfState.rendering.generation === myGen) {
+          // Snapshot restore: rehydrate already-translated pages so the user
+          // doesn't pay LLM cost again. Pages whose hash doesn't match are
+          // left as translated=false so they re-queue normally.
+          if (restoreSnapshot) {
+            try {
+              await applySnapshotToState(_pdfState, restoreSnapshot);
+            } catch (e) {
+              console.error("snapshot 应用失败", e);
+            }
+          } else if (_pdfState.paperId) {
+            // Auto-load: even when the caller didn't pass a snapshot (the
+            // normal "open this paper" path), check whether a snapshot was
+            // saved by a previous session. The user expects: close MicroBench
+            // → reopen tomorrow → resume where they left off without paying
+            // LLM cost again. If the snapshot exists, we apply it transparently.
+            try {
+              const r = await fetch(
+                `/api/pdf/snapshot/load?paper_id=${encodeURIComponent(_pdfState.paperId)}`
+              );
+              if (r.ok) {
+                const snap = await r.json();
+                if (snap && snap.pages && snap.pages.length > 0) {
+                  const { matched, stale } = await applySnapshotToState(_pdfState, snap);
+                  if (matched > 0) {
+                    const staleNote = stale > 0
+                      ? ` · 其中 ${stale} 页原文微变(已标 ⚠️,可重译)`
+                      : "";
+                    showToast(
+                      `📚 已自动恢复 ${matched}/${_pdfState.pages.length} 页翻译快照 (免重翻)${staleNote}`,
+                      false,
+                      4600
+                    );
+                  }
+                }
+              } else if (r.status !== 404) {
+                // 404 = no snapshot, that's normal first visit. Anything
+                // else is a real error worth logging.
+                console.warn(`[snapshot auto-load] HTTP ${r.status}`);
+              }
+            } catch (e) {
+              console.error("snapshot auto-load failed", e);
+            }
+          }
           startPdfTranslationQueue();
         }
       } catch (err) {
@@ -1953,6 +2313,534 @@
 
     let _pdfQueueTimer = null;
     let _pdfQueuePaused = false;
+    // Chain ownership: while a translation chain is running for paperId X,
+    // we ignore startPdfTranslationQueue calls for a different paper. Without
+    // this guard, switching papers mid-chain would leave an old chain
+    // re-priming the new chain's page 1 — "翻译两遍".
+    let _pdfChainOwnerPaperId = null;
+
+    // -----------------------------------------------------------------------
+    // Snapshot helpers (PDF translation session persistence)
+    // -----------------------------------------------------------------------
+    // Lets the user skip re-translating pages after a restart, or hop
+    // between snapshots without re-paying LLM cost. Snapshots are saved
+    // manually via the "💾 保存当前" button in the PDF reader header,
+    // listed in the TopNav "📚 论文快照" button, and restored through
+    // the snapshot modal.
+    async function _sha256Hex16(str) {
+      // 16-char SHA-256 hex — collision risk for 1 PDF page is negligible
+      // (we don't use this for security). Avoids the cost of full 64-hex
+      // serializing on every page render.
+      if (!str) return "";
+      try {
+        const buf = new TextEncoder().encode(str);
+        const digest = await crypto.subtle.digest("SHA-256", buf);
+        const arr = Array.from(new Uint8Array(digest));
+        let hex = "";
+        for (let i = 0; i < 8; i++) {
+          hex += arr[i].toString(16).padStart(2, "0");
+        }
+        return hex;
+      } catch {
+        return "";
+      }
+    }
+
+    async function applySnapshotToState(pdfState, snapshot) {
+      // 1) Mtime check (PDF file on disk vs saved-at-time)
+      let curMtime = null;
+      try {
+        const r = await fetch(`/api/pdf/info?relative_path=${encodeURIComponent(pdfState.relativePath)}`);
+        if (r.ok) {
+          const info = await r.json();
+          curMtime = info.mtime;
+        }
+      } catch {}
+      if (curMtime != null && snapshot.paper_mtime &&
+          Math.abs(curMtime - snapshot.paper_mtime) > 1) {
+        showToast("⚠️ PDF 自上次保存后已改动 (mtime 不同),部分翻译可能错位,已自动标红", true, 5400);
+      }
+      // 2) Per-page hash check + DOM rehydrate
+      let matched = 0, stale = 0;
+      // Pre-cleanup: if a previous zoom toggle left duplicate trans-blocks
+      // behind, getElementById would return the wrong one (and miss page
+      // 1's id entirely). Strip duplicates by id before we start.
+      const seenIds = new Set();
+      const allBlocks = document.querySelectorAll("[id^='pdf-trans-block-'], [id^='pdf-page-text-'], [id^='pdf-page-tag-']");
+      allBlocks.forEach(el => {
+        if (seenIds.has(el.id)) el.parentNode && el.parentNode.removeChild(el);
+        else seenIds.add(el.id);
+      });
+      for (const pg of pdfState.pages) {
+        const snapPage = (snapshot.pages || []).find(s => s.page_num === pg.num);
+        if (!snapPage) continue;
+        const curHash = await _sha256Hex16(pg.text || "");
+        const hashOk = (curHash === snapPage.text_hash);
+        // Two-phase resolve for DOM elements: if getElementById misses (e.g.
+        // browser hasn't flushed the renderPdfPage appendChild yet), retry
+        // once after a tick. This is the fix for "page 1 stays stuck on
+        // ⏳ 翻译本页…" when PDF.js render loop runs but DOM isn't ready by
+        // the time applySnapshotToState fires.
+        let textEl = document.getElementById(`pdf-page-text-${pg.num}`);
+        let tagEl = document.getElementById(`pdf-page-tag-${pg.num}`);
+        if ((!textEl || !tagEl) && pdfState.rendering && pdfState.rendering.generation) {
+          await new Promise(r => setTimeout(r, 80));
+          textEl = document.getElementById(`pdf-page-text-${pg.num}`);
+          tagEl = document.getElementById(`pdf-page-tag-${pg.num}`);
+        }
+        // Last-resort: lazy-create the placeholder transBlock if the DOM
+        // still has no element for this page (e.g. race between renderPdfPage
+        // appendChild and applySnapshotToState fires, or prior zoom toggle
+        // nuked the block but kept the pageData around). This guarantees
+        // hydrate can always write a translation.
+        if ((!textEl || !tagEl)) {
+          const transList = document.getElementById("pdf-translations-list");
+          if (transList) {
+            const block = document.createElement("div");
+            block.className = "pdf-translation-block";
+            block.id = `pdf-trans-block-${pg.num}`;
+            block.innerHTML = `
+              <div class="page-num" style="display:flex; justify-content:space-between; align-items:center;">
+                <span>第 ${pg.num} 页 / Page ${pg.num}</span>
+                <span id="pdf-page-tag-${pg.num}" style="font-size:10px; color:var(--text-subtle); font-family:var(--font-sans);">⏳ 即将翻译</span>
+              </div>
+              <div class="page-text pdf-translation-loading" id="pdf-page-text-${pg.num}">⏳ 正在翻译本页...</div>
+            `;
+            transList.appendChild(block);
+            textEl = document.getElementById(`pdf-page-text-${pg.num}`);
+            tagEl = document.getElementById(`pdf-page-tag-${pg.num}`);
+            console.warn(`[snapshot p${pg.num}] DOM 缺失,已 lazy-create placeholder`);
+          }
+        }
+        let hydrated = false;
+        if (textEl && tagEl && snapPage.translation) {
+          try {
+            textEl.className = "page-text";
+            textEl.innerHTML = formatMarkdownLite(snapPage.translation);
+            if (typeof renderMathIn === "function") renderMathIn(textEl);
+            const modelTag = snapPage.model ? ` · ${snapPage.model}` : "";
+            const staleMark = hashOk ? "" : " ⚠️原文微变";
+            tagEl.textContent = `✅ 已恢复 (快照${modelTag})${staleMark}`;
+            if (!hashOk) {
+              tagEl.title = "原文 hash 与快照不一致(可能是 PDF.js 文本提取波动),翻译可能略有错位,可点「重译本页」";
+              pg.stale = true;
+              stale++;
+            }
+            hydrated = true;
+          } catch (e) {
+            console.error(`[snapshot hydrate p${pg.num}]`, e);
+          }
+        } else {
+          // Diagnostic: surface the reason hydration failed so we can debug
+          // from the user's perspective.
+          const why = !textEl && !tagEl ? "DOM 双双缺失"
+                    : !textEl ? "textEl 缺失"
+                    : !tagEl ? "tagEl 缺失"
+                    : "snapPage.translation 为空";
+          console.warn(`[snapshot p${pg.num}] hydrate 失败:${why}。已标 stale,queue 将自动翻译。`);
+        }
+        if (hydrated) {
+          pg.translated = true;
+          pg.translating = false;
+          pg.translation = snapPage.translation;
+          pg.translation_model = snapPage.model || "";
+          pg.translated_at = snapPage.translated_at || "";
+          matched++;
+        } else {
+          pg.stale = true;
+          stale++;
+          // pg.translated 保持 false,processNextInPdfQueue 会接走这一页
+        }
+      }
+      console.log(`[snapshot] ${matched} hydrated, ${stale} stale/fallback out of ${(snapshot.pages || []).length}`);
+      // Safety net: kick the queue once more 200ms after hydrate. If hydrate
+      // marked translated=true on all pages, this is a no-op (find returns
+      // undefined). If any page is still translated=false, it gets picked up.
+      setTimeout(() => {
+        if (typeof processNextInPdfQueue === "function") {
+          processNextInPdfQueue();
+        }
+      }, 200);
+      // Surface the hydrate outcome to the user so they can tell whether
+      // page 1 was actually restored from snapshot or routed to auto-retranslate.
+      if (typeof showToast === "function") {
+        const debounceMs = 600; // small delay so it doesn't collide with the load toast
+        setTimeout(() => {
+          if (matched > 0) {
+            showToast(
+              stale > 0
+                ? `📚 快照恢复 ${matched} 页 · ${stale} 页需要重新翻译(LLM 启动中)`
+                : `📚 快照恢复 ${matched} 页 (全部)`,
+              false, 4600
+            );
+          }
+        }, debounceMs);
+      }
+      return { matched, stale };
+    }
+
+    // Debounced snapshot auto-save: triggered from the success branch of
+    // translatePdfPage(). After a 5s idle window we POST to /api/pdf/snapshot/save
+    // so the user's progress lands on disk even if they close MicroBench
+    // without clicking "💾 保存当前". Keeps the public API surface unchanged.
+    let _autoSnapshotTimer = null;
+    function _scheduleAutoSnapshot() {
+      if (_autoSnapshotTimer) clearTimeout(_autoSnapshotTimer);
+      _autoSnapshotTimer = setTimeout(() => {
+        _autoSnapshotTimer = null;
+        // Skip when nothing is translated yet (savePdfSnapshot would toast
+        // an empty state warning every time, which is annoying).
+        if (!_pdfState || !_pdfState.pages) return;
+        const translatable = _pdfState.pages.filter(p => p.translated && p.translation);
+        if (translatable.length === 0) return;
+        savePdfSnapshot({ silent: true });
+      }, 5000);
+    }
+
+    async function savePdfSnapshot(opts = {}) {
+      const silent = !!(opts && opts.silent);
+      if (!_pdfState || !_pdfState.paperId) {
+        if (!silent) showToast("请先打开一篇 PDF 再保存快照", true);
+        return null;
+      }
+      const translatable = _pdfState.pages.filter(p => p.translated && p.translation);
+      if (translatable.length === 0) {
+        if (!silent) showToast("当前论文还没有翻译完成的页面,先翻几页再保存", true, 3800);
+        return null;
+      }
+      const btn = document.getElementById("pdf-snapshot-save-btn");
+      const origText = btn ? btn.innerText : null;
+      if (btn && !silent) { btn.disabled = true; btn.innerText = "⏳ 计算 hash..."; }
+      // Compute per-page text_hash in parallel — sha256 of small strings
+      // is microseconds, but a 30-page paper would still feel slow if serial.
+      const pagesPayload = await Promise.all(translatable.map(async (pg) => ({
+        page_num: pg.num,
+        text_hash: await _sha256Hex16(pg.text || ""),
+        translation: pg.translation,
+        model: pg.translation_model || "",
+        translated_at: pg.translated_at || new Date().toISOString(),
+      })));
+      // Pull current mtime so load-time check has something to compare
+      let paperMtime = 0;
+      try {
+        const r = await fetch(`/api/pdf/info?relative_path=${encodeURIComponent(_pdfState.relativePath)}`);
+        if (r.ok) {
+          const info = await r.json();
+          paperMtime = info.mtime || 0;
+        }
+      } catch {}
+      if (btn && !silent) btn.innerText = "💾 保存中...";
+      try {
+        const r = await fetch("/api/pdf/snapshot/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            paper_id: _pdfState.paperId,
+            paper_title: _pdfState.paperTitle,
+            relative_path: _pdfState.relativePath,
+            paper_mtime: paperMtime,
+            pages: pagesPayload,
+          }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        if (!silent) {
+          showToast(
+            `💾 已保存 ${pagesPayload.length}/${_pdfState.pages.length} 页快照 (${(data.bytes / 1024).toFixed(1)} KB · ${data.saved_at.slice(11, 19)})`,
+            false, 4600
+          );
+        }
+        // (Removed 2026-09-24: was calling _refreshSnapshotBadge — empty stub.)
+        return data;
+      } catch (err) {
+        if (!silent) showToast("保存快照失败: " + err.message, true);
+        return null;
+      } finally {
+        if (btn && !silent) { btn.disabled = false; btn.innerText = origText; }
+      }
+    }
+
+    async function listSnapshots() {
+      try {
+        const r = await fetch("/api/pdf/snapshot/list");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        return data.snapshots || [];
+      } catch (err) {
+        console.error("list snapshots failed", err);
+        return [];
+      }
+    }
+
+    async function deleteSnapshot(paperId) {
+      if (!confirm(`删除该论文的翻译快照?\n\n${paperId}\n\n(下次打开需要重新翻译)`)) return;
+      try {
+        const r = await fetch(`/api/pdf/snapshot/delete?paper_id=${encodeURIComponent(paperId)}`, { method: "DELETE" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        showToast("🗑️ 快照已删除", false, 2400);
+        await refreshSnapshotModal();
+      } catch (err) {
+        showToast("删除失败: " + err.message, true);
+      }
+    }
+
+    async function openFromSnapshot(snap) {
+      // 1) wire _readerState so handleFetchFullText path works, but we
+      //    don't want to spam LLM calls — just bypass that and inject the
+      //    snapshot directly.
+      _readerState.pdfPath = snap.relative_path;
+      _readerState.title = snap.paper_title || _readerState.title || "";
+      // 2) Close any open modal first
+      if (document.getElementById("snapshot-modal")) closeSnapshotModal();
+      // 3) Open reader + load with restoreSnapshot
+      openReaderModal();
+      switchReaderMode("pdf");
+      try {
+        await loadPdfDualColumn({ restoreSnapshot: snap });
+        showToast(
+          `📚 已恢复 ${snap.paper_title} · ${snap.pages.length} 页快照已重水化`,
+          false, 3600
+        );
+      } catch (err) {
+        showToast("打开快照失败: " + err.message, true);
+      }
+    }
+
+    async function showSnapshotModal() {
+      let modal = document.getElementById("snapshot-modal");
+      if (!modal) {
+        modal = document.createElement("div");
+        modal.id = "snapshot-modal";
+        modal.style.cssText = "position:fixed; inset:0; z-index:2000; background:rgba(0,0,0,0.42); display:flex; align-items:center; justify-content:center;";
+        modal.innerHTML = `
+          <div class="snap-modal-panel" style="background:var(--bg-canvas); border-radius:14px; padding:24px 28px; width:min(640px, 94vw); max-height:80vh; overflow-y:auto; box-shadow:0 18px 48px rgba(0,0,0,0.22); border:1px solid var(--card-border); font-family:var(--font-sans);">
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
+              <div>
+                <div style="font-family:var(--font-serif); font-size:20px; font-weight:500;">📚 论文翻译快照</div>
+                <div style="font-size:12px; color:var(--text-subtle); margin-top:4px;">
+                  切换到任何一篇已保存的论文,自动恢复已翻译页面,免重翻。
+                </div>
+              </div>
+              <button type="button" onclick="closeSnapshotModal()" style="background:transparent; border:0; font-size:22px; color:var(--text-muted); cursor:pointer;" title="关闭">×</button>
+            </div>
+            <div id="snapshot-list" style="display:flex; flex-direction:column; gap:10px;">
+              <div style="color:var(--text-subtle); padding:30px 0; text-align:center;">
+                <div style="font-size:24px;">⏳</div>
+                <div style="margin-top:8px; font-size:13px;">加载快照列表...</div>
+              </div>
+            </div>
+          </div>
+        `;
+        document.body.appendChild(modal);
+      } else {
+        modal.style.display = "flex";
+      }
+      // ESC to close
+      const onEsc = (e) => { if (e.key === "Escape") closeSnapshotModal(); };
+      document.addEventListener("keydown", onEsc, { once: true });
+      await refreshSnapshotModal();
+    }
+
+    async function refreshSnapshotModal() {
+      const listEl = document.getElementById("snapshot-list");
+      if (!listEl) return;
+      const snapshots = await listSnapshots();
+      if (snapshots.length === 0) {
+        listEl.innerHTML = `
+          <div style="text-align:center; padding:36px 16px; color:var(--text-subtle);">
+            <div style="font-size:36px; margin-bottom:12px;">📭</div>
+            <div style="font-size:14px; color:var(--text-muted);">还没有任何快照</div>
+            <div style="font-size:12px; margin-top:6px; line-height:1.6;">
+              在 PDF reader 顶栏点击 <strong>「💾 保存当前」</strong> 后,这里会出现保存记录。
+            </div>
+          </div>
+        `;
+        return;
+      }
+      listEl.innerHTML = snapshots.map((s) => {
+        const safe = (s) => escapeHtml(String(s));
+        const staleHint = s.paper_mtime
+          ? `mtime=${new Date(s.paper_mtime * 1000).toLocaleString()}`
+          : "";
+        const pathHint = s.relative_path ? ` · ${safe(s.relative_path.split("/").slice(-2).join("/"))}` : "";
+        const pct = s.total_pages > 0 ? Math.round((s.translated_pages / s.total_pages) * 100) : 0;
+        return `
+        <div class="snap-card" data-paper-id="${safe(s.paper_id)}">
+          <div style="display:flex; align-items:flex-start; gap:14px;">
+            <div style="font-size:32px; line-height:1;">📄</div>
+            <div style="flex:1; min-width:0;">
+              <div style="font-family:var(--font-serif); font-size:15px; font-weight:500; color:var(--text-main); margin-bottom:4px; word-break:break-word;">
+                ${safe(s.paper_title || s.paper_id)}
+              </div>
+              <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; font-size:11px; color:var(--text-subtle); margin-bottom:6px;">
+                <span style="background:var(--card-bg-subtle); padding:2px 8px; border-radius:10px;">
+                  ✓ ${s.translated_pages}/${s.total_pages} 页 (${pct}%)
+                </span>
+                <span title="${safe(staleHint)}">💾 ${safe((s.saved_at || "").slice(0, 16).replace("T", " "))}</span>
+              </div>
+              <div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono); word-break:break-all;">
+                ${safe(s.paper_id)}${safe(pathHint)}
+              </div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:6px; flex-shrink:0;">
+              <button class="btn-pill" style="font-size:12px;" onclick="openSnapshotById('${safe(s.paper_id)}')">📖 打开</button>
+              <button class="btn-pill-outline" style="font-size:11px;" onclick="deleteSnapshot('${safe(s.paper_id)}')">🗑️ 删除</button>
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+    }
+
+    async function openSnapshotById(paperId) {
+      try {
+        const r = await fetch(`/api/pdf/snapshot/load?paper_id=${encodeURIComponent(paperId)}`);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const snap = await r.json();
+        await openFromSnapshot(snap);
+      } catch (err) {
+        showToast("加载快照失败: " + err.message, true);
+      }
+    }
+
+    function closeSnapshotModal() {
+      const m = document.getElementById("snapshot-modal");
+      if (m) m.style.display = "none";
+    }
+
+    // Expose to window for inline onclick attribute on the TopNav button
+    window.savePdfSnapshot = savePdfSnapshot;
+    window.listSnapshots = listSnapshots;
+    window.deleteSnapshot = deleteSnapshot;
+    window.openSnapshotById = openSnapshotById;
+    window.showSnapshotModal = showSnapshotModal;
+    window.closeSnapshotModal = closeSnapshotModal;
+    window.openFromSnapshot = openFromSnapshot;
+    window.refreshSnapshotModal = refreshSnapshotModal;
+
+    // -----------------------------------------------------------------------
+    // Translation diagnostic ring buffer + in-app panel
+    // -----------------------------------------------------------------------
+    // Replaces the need for F12 devtools. The webview in desktop.py does
+    // NOT expose F12, so the user has no way to inspect pending/failed
+    // network requests. This buffer records the last 50 translate_page
+    // requests with status / duration / model / error; the "🔧 诊断" pill
+    // opens a modal listing them.
+    const _DIAG_CAP = 50;
+    const _diagLog = [];          // newest first
+    function _recordDiag(entry) {
+      try {
+        _diagLog.unshift(entry);
+        if (_diagLog.length > _DIAG_CAP) _diagLog.length = _DIAG_CAP;
+        // Keep the floating badge counter in sync if mounted
+        const badge = document.getElementById("diag-fab");
+        if (badge) {
+          const last = _diagLog[0];
+          const errCount = _diagLog.filter(e => e.error || !e.ok).length;
+          badge.dataset.errCount = String(errCount);
+          badge.dataset.lastOk = last && !last.error && last.ok ? "1" : "0";
+        }
+      } catch {}
+    }
+    function _clearDiagLog() {
+      _diagLog.length = 0;
+      showDiagnoseModal();
+    }
+    function _diagSummary() {
+      const total = _diagLog.length;
+      const errs = _diagLog.filter(e => e.error || !e.ok).length;
+      const oks = total - errs;
+      const durations = _diagLog.map(e => e.duration_ms || 0).filter(x => x > 0);
+      const avg = durations.length ? Math.round(durations.reduce((a,b) => a+b, 0) / durations.length) : 0;
+      const max = durations.length ? Math.max(...durations) : 0;
+      const slow = durations.filter(x => x > 30000).length;
+      return { total, errs, oks, avg, max, slow };
+    }
+    function showDiagnoseModal() {
+      let modal = document.getElementById("diag-modal");
+      if (!modal) {
+        modal = document.createElement("div");
+        modal.id = "diag-modal";
+        modal.style.cssText = "position:fixed; inset:0; z-index:2000; background:rgba(0,0,0,0.42); display:flex; align-items:center; justify-content:center;";
+        modal.innerHTML = `
+          <div style="background:var(--bg-canvas); border-radius:14px; padding:22px 26px; width:min(820px, 94vw); max-height:84vh; overflow-y:auto; box-shadow:0 18px 48px rgba(0,0,0,0.22); border:1px solid var(--card-border); font-family:var(--font-sans);">
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
+              <div>
+                <div style="font-family:var(--font-serif); font-size:20px; font-weight:500;">🔧 翻译诊断面板</div>
+                <div style="font-size:12px; color:var(--text-subtle); margin-top:4px;">
+                  最近 <span id="diag-cap">50</span> 条 translate_page 请求记录。超时(>90s)、错误、模型、耗时一览。
+                </div>
+              </div>
+              <div style="display:flex; gap:6px;">
+                <button class="btn-pill-outline" style="font-size:11px; padding:4px 12px;" onclick="_clearDiagLog()">🧹 清空</button>
+                <button type="button" onclick="closeDiagnoseModal()" style="background:transparent; border:0; font-size:22px; color:var(--text-muted); cursor:pointer;" title="关闭">×</button>
+              </div>
+            </div>
+            <div id="diag-summary-bar" style="display:flex; flex-wrap:wrap; gap:12px; padding:10px 12px; background:var(--card-bg-subtle); border-radius:8px; margin-bottom:12px; font-size:12px;"></div>
+            <div id="diag-table" style="font-family:var(--font-mono); font-size:11.5px;"></div>
+          </div>
+        `;
+        document.body.appendChild(modal);
+        const onEsc = (e) => { if (e.key === "Escape") closeDiagnoseModal(); };
+        document.addEventListener("keydown", onEsc, { once: true });
+      } else {
+        modal.style.display = "flex";
+      }
+      _renderDiagnoseTable();
+    }
+    function _renderDiagnoseTable() {
+      const summaryEl = document.getElementById("diag-summary-bar");
+      const tableEl = document.getElementById("diag-table");
+      if (!summaryEl || !tableEl) return;
+      const s = _diagSummary();
+      summaryEl.innerHTML = `
+        <span>📊 共 <strong>${s.total}</strong> 条</span>
+        <span style="color:#5a8a3e;">✓ ${s.oks}</span>
+        <span style="color:#B25336;">✗ ${s.errs}</span>
+        <span>⏱ 平均 <strong>${(s.avg/1000).toFixed(1)}s</strong> · 最长 ${(s.max/1000).toFixed(1)}s</span>
+        <span style="color:${s.slow > 0 ? "#B25336" : "var(--text-muted)"};">🐢 慢响应(>30s): ${s.slow}</span>
+      `;
+      if (_diagLog.length === 0) {
+        tableEl.innerHTML = `
+          <div style="text-align:center; padding:36px 16px; color:var(--text-subtle);">
+            <div style="font-size:32px; margin-bottom:12px;">📭</div>
+            <div style="font-size:14px;">还没有翻译请求记录</div>
+            <div style="font-size:12px; margin-top:6px;">打开一篇 PDF 后这里的 ring buffer 会被填充。</div>
+          </div>
+        `;
+        return;
+      }
+      tableEl.innerHTML = `
+        <div style="display:grid; grid-template-columns: 60px 50px 90px 70px 110px 60px 1fr; gap:6px 12px; padding:8px 10px; background:var(--card-bg); border-radius:6px; font-weight:500; color:var(--text-muted); text-transform:uppercase; font-size:10.5px;">
+          <div>Page</div><div>Status</div><div>Duration</div><div>Model</div><div>Chars in/out</div><div>Time</div><div>Error</div>
+        </div>
+        ${_diagLog.map(e => {
+          const ok = e.ok && !e.error;
+          const color = ok ? "#5a8a3e" : "#B25336";
+          const icon = ok ? "✓" : "✗";
+          const dur = (e.duration_ms / 1000).toFixed(1) + "s";
+          const durColor = e.duration_ms > 30000 ? "#B25336" : (e.duration_ms > 90000 ? "#7a1a1a" : "var(--text-main)");
+          const time = (e.ts || "").slice(11, 19);
+          return `
+            <div style="display:grid; grid-template-columns: 60px 50px 90px 70px 110px 60px 1fr; gap:6px 12px; padding:8px 10px; border-bottom:1px solid var(--card-border-subtle); align-items:center;">
+              <div style="color:${color}; font-weight:500;">${icon} p${e.page}</div>
+              <div style="color:${color};">${e.status || '—'}</div>
+              <div style="color:${durColor};">${dur}</div>
+              <div>${escapeHtml(e.model || '—')}</div>
+              <div>${e.chars_in}→${e.chars_out}</div>
+              <div style="color:var(--text-subtle);">${time}</div>
+              <div style="color:${color}; word-break:break-word; font-family:var(--font-mono); font-size:10.5px;">${escapeHtml(e.error || '')}</div>
+            </div>`;
+        }).join('')}
+      `;
+    }
+    function closeDiagnoseModal() {
+      const m = document.getElementById("diag-modal");
+      if (m) m.style.display = "none";
+    }
+    window.showDiagnoseModal = showDiagnoseModal;
+    window.closeDiagnoseModal = closeDiagnoseModal;
+    window._diagLog = _diagLog;
+    window._recordDiag = _recordDiag;
 
     function togglePdfQueuePause() {
       _pdfQueuePaused = !_pdfQueuePaused;
@@ -1970,6 +2858,12 @@
     }
 
     async function startPdfTranslationQueue() {
+      // Always claim ownership of the current paperId. The previous
+      // paper's chain (if any) parked in setTimeout 3200ms will stop
+      // itself on its next tick because its `_pdfState.rendering.cancelled`
+      // is true AND its old paperId no longer matches the owner. We do
+      // NOT need to early-return here — claim regardless.
+      _pdfChainOwnerPaperId = _pdfState.paperId;
       _pdfQueuePaused = false;
       const btn = document.getElementById("pdf-queue-pause-btn");
       if (btn) {
@@ -1981,14 +2875,23 @@
 
     async function processNextInPdfQueue() {
       if (!_pdfState || !_pdfState.pages || _pdfState.rendering.cancelled || _pdfQueuePaused) return;
+      // Bail if a newer paper started its own chain while we were waiting
+      if (_pdfChainOwnerPaperId !== _pdfState.paperId) return;
 
       const nextPage = _pdfState.pages.find(p => !p.translated && !p.translating);
       if (!nextPage) return;
 
-      nextPage.translating = true;
+      // Ownership of `translating` flag lives in translatePdfPage (it sets
+      // it on entry and clears it on success/error). Setting it here too
+      // would race the dedupe check inside translatePdfPage and cause the
+      // inner call to return immediately, freezing page 1 forever with
+      // its initial "⏳ 正在翻译本页…" HTML never replaced.
       await translatePdfPage(nextPage.num, nextPage.text, false);
 
       if (!_pdfState || _pdfState.rendering.cancelled || _pdfQueuePaused) return;
+      // After awaiting, the user may have switched papers. Verify ownership
+      // before scheduling the next tick.
+      if (_pdfChainOwnerPaperId !== _pdfState.paperId) return;
 
       _pdfQueueTimer = setTimeout(() => {
         processNextInPdfQueue();
@@ -2021,8 +2924,13 @@
 
       const canvas = document.createElement("canvas");
       canvas.className = "pdf-page-canvas";
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
+      // HiDPI: 用 devicePixelRatio 让 canvas 物理像素 = CSS 像素 * DPR
+      // 没这一步时 125% / 200% 缩放下文字会糊
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(viewport.width * dpr);
+      canvas.height = Math.floor(viewport.height * dpr);
+      canvas.style.width = `${Math.floor(viewport.width)}px`;
+      canvas.style.height = `${Math.floor(viewport.height)}px`;
       canvasWrapper.appendChild(canvas);
 
       const textLayerDiv = document.createElement("div");
@@ -2036,6 +2944,9 @@
       listEl.appendChild(wrapper);
 
       const ctx = canvas.getContext("2d");
+      // 把 canvasContext 用 DPR 缩放,渲染时 PDF.js 输出按 CSS 像素,
+      // 但写入物理像素 buffer,放大时仍然清晰
+      ctx.scale(dpr, dpr);
       await page.render({ canvasContext: ctx, viewport }).promise;
 
       // Extract text via PDF.js (fast + no server roundtrip)
@@ -2068,11 +2979,11 @@
         <div class="page-num" style="display:flex; justify-content:space-between; align-items:center;">
           <span>第 ${pageNum} 页 / Page ${pageNum}</span>
           <span id="pdf-page-tag-${pageNum}" style="font-size:10px; color:var(--text-subtle); font-family:var(--font-sans);">
-            ${pageNum === 1 ? "⏳ 即将翻译" : `🕒 排队中 (约 ${(pageNum - 1) * 3}s)`}
+            ${pageNum === 1 ? "⏳ 即将翻译" : `🕒 排队中 (约 ${(pageNum - 1) * _getCurrentRpmInfo().interval}s)`}
           </span>
         </div>
         <div class="page-text pdf-translation-loading" id="pdf-page-text-${pageNum}">
-          ${pageNum === 1 ? "⏳ 正在翻译本页..." : `<span>🕒 等待排队翻译中 (受 20 RPM 保护)...</span> <button class="btn-pill-outline" style="font-size:10.5px; padding:2px 8px; margin-left:6px; vertical-align:middle;" onclick="translatePdfPage(${pageNum}, null, true)">优先翻译此页</button>`}
+          ${pageNum === 1 ? "⏳ 正在翻译本页..." : `<span>🕒 等待排队翻译中 (受 ${_getCurrentRpmInfo().rpm} RPM 保护, 间隔 ${_getCurrentRpmInfo().interval}s)...</span> <button class="btn-pill-outline" style="font-size:10.5px; padding:2px 8px; margin-left:6px; vertical-align:middle;" onclick="translatePdfPage(${pageNum}, null, true)">优先翻译此页</button>`}
         </div>
       `;
       transList.appendChild(transBlock);
@@ -2099,6 +3010,24 @@
       }
     }
 
+    // ---------------------------------------------------------------
+    // 当前 RPM 保护信息 (按当前 provider 动态返回)
+    // ---------------------------------------------------------------
+    function _getCurrentRpmInfo() {
+      const isAgnes = !_llmStatus || _llmStatus.is_degraded;
+      if (!_llmStatus || !_llmStatus.rate_limit) {
+        return isAgnes ? { rpm: 11, interval: 6, label: "Agnes (降格·10 RPM)" }
+                       : { rpm: 30, interval: 2, label: "Primary (~28 RPM)" };
+      }
+      const lim = isAgnes ? _llmStatus.rate_limit.agnes : _llmStatus.rate_limit.primary;
+      return {
+        rpm: lim?.rpm_limit ?? (isAgnes ? 11 : 30),
+        interval: isAgnes ? 6 : 2,
+        label: isAgnes ? `Agnes (降格·${lim?.rpm_limit ?? 11} RPM)`
+                       : `Primary (~${lim?.rpm_limit ?? 30} RPM)`,
+      };
+    }
+
     async function translatePdfPage(pageNum, pageText = null, isPriority = false) {
       const block = document.getElementById(`pdf-trans-block-${pageNum}`);
       if (!block) return;
@@ -2111,14 +3040,46 @@
         if (pObj) text = pObj.text;
       }
 
+      // De-dupe: skip if this page is already being translated by another
+      // invocation (auto-queue + manual priority click could otherwise
+      // race the same fetch). pObj.translating is left set; let the
+      // in-flight caller finish first.
+      if (_pdfState && _pdfState.pages) {
+        const pObj = _pdfState.pages.find(p => p.num === pageNum);
+        if (pObj) {
+          if (pObj.translating) return;
+          pObj.translating = true;
+        }
+      }
+
       if (!text || text.length < 10) {
         if (textEl) textEl.textContent = "(本页无文字内容)";
         if (tagEl) tagEl.textContent = "无文字";
+        // Mark the slot as done so the queue doesn't keep picking it up
+        if (_pdfState && _pdfState.pages) {
+          const pObj = _pdfState.pages.find(p => p.num === pageNum);
+          if (pObj) {
+            pObj.translated = true;
+            pObj.translating = false;
+          }
+        }
         return;
       }
 
       if (tagEl) tagEl.textContent = isPriority ? "⚡ 优先翻译中..." : "⏳ 翻译中...";
       if (textEl) textEl.innerHTML = `<span class="pdf-translation-loading">⏳ 正在调用 AI 翻译第 ${pageNum} 页...</span>`;
+
+      // AbortController + 90s hard timeout. The thinking-model LLM (M2.7)
+      // routinely takes 50-120s — 90s is a soft ceiling that lets realistic
+      // responses through but caps true hangs (LLM down, network blackhole).
+      // Without this, a stalled request leaves "⏳ 翻译中..." in the UI
+      // forever and the user has no clue if it's still working or dead.
+      const ac = new AbortController();
+      const acTimer = setTimeout(() => {
+        ac.abort();
+        if (tagEl) tagEl.textContent = "⏳ 超时(>90s)";
+      }, 90000);
+      const t0 = performance.now();
 
       try {
         const r = await fetch("/api/paper/translate_page", {
@@ -2129,14 +3090,38 @@
             page: pageNum,
             text: text,
           }),
+          signal: ac.signal,
         });
+        clearTimeout(acTimer);
         const data = await r.json();
-        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
-        
+        const t1 = performance.now();
+        _recordDiag({
+          ts: new Date().toISOString(),
+          page: pageNum,
+          url: "/api/paper/translate_page",
+          status: r.status,
+          ok: r.ok,
+          duration_ms: Math.round(t1 - t0),
+          model: data?.model || "",
+          chars_in: text.length,
+          chars_out: (data?.translation || "").length,
+          error: null,
+        });
+        if (!r.ok) {
+          // FastAPI Pydantic 校验错误返 detail: [{loc, msg, type}], 转 string
+          let detail = data.detail;
+          if (Array.isArray(detail)) {
+            detail = detail.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          } else if (typeof detail !== 'string') {
+            detail = JSON.stringify(detail);
+          }
+          throw new Error(detail || `HTTP ${r.status}`);
+        }
+
         textEl.className = "page-text";
         textEl.innerHTML = formatMarkdownLite(data.translation);
         if (typeof renderMathIn === "function") renderMathIn(textEl);
-        
+
         const modelTag = data.model ? ` · ${data.model}` : "";
         if (tagEl) tagEl.textContent = `✅ 已翻译${modelTag}`;
 
@@ -2145,21 +3130,76 @@
           if (pObj) {
             pObj.translated = true;
             pObj.translating = false;
+            // Cache translation text + model on the pageData so:
+            //   1. "💾 保存当前" can POST them to /api/pdf/snapshot/save
+            //   2. Future restore-from-snapshot can rehydrate without LLM
+            pObj.translation = data.translation;
+            pObj.translation_model = data.model || "";
+            pObj.translated_at = new Date().toISOString();
           }
         }
+        // Auto-persist: schedule a debounced snapshot save so closing the
+        // app 5 seconds from now still keeps the user's progress. The
+        // manual "💾 保存当前" button still works the same way.
+        _scheduleAutoSnapshot();
         fetchModelStatus();
       } catch (err) {
-        if (tagEl) tagEl.textContent = "❌ 失败";
+        clearTimeout(acTimer);
+        const t1 = performance.now();
+        const isAbort = err && (err.name === "AbortError" || /aborted/i.test(err.message || ""));
+        const detail = isAbort ? "请求超时 (>90s) — LLM 久未响应,请查看诊断面板判断"
+                                : (err?.message || JSON.stringify(err) || "未知错误");
+        _recordDiag({
+          ts: new Date().toISOString(),
+          page: pageNum,
+          url: "/api/paper/translate_page",
+          status: 0,
+          ok: false,
+          duration_ms: Math.round(t1 - t0),
+          model: "",
+          chars_in: text.length,
+          chars_out: 0,
+          error: isAbort ? "AbortError: timeout 90s" : detail,
+        });
+        console.error(`[translatePdfPage#${pageNum}]`, err);
+        if (tagEl) tagEl.textContent = isAbort ? "⏳ 超时" : "❌ 失败";
         if (textEl) {
-          textEl.innerHTML = `<span style="color:#B25336;">❌ 翻译失败: ${escapeHtml(String(err.message || err))}</span>
-            <button class="btn-pill-outline" style="font-size:11px; padding:2px 8px; margin-left:8px;" onclick="translatePdfPage(${pageNum}, null, true)">🔄 重试本页</button>`;
+          textEl.innerHTML = `<span style="color:#B25336;">❌ 翻译失败: ${escapeHtml(detail)}</span>
+            <button class="btn-pill-outline" style="font-size:11px; padding:2px 8px; margin-left:8px;"
+                    onclick="window.resetAndRetryPdfPage(${pageNum})">🔄 重试本页</button>`;
         }
         if (_pdfState && _pdfState.pages) {
           const pObj = _pdfState.pages.find(p => p.num === pageNum);
-          if (pObj) pObj.translating = false;
+          if (pObj) {
+            // Critical: mark translated=true so the auto-queue's `find`
+            // doesn't keep picking up this failed page every 3.2s. Without
+            // this, a transient LLM error caused the same page to be
+            // re-fetched over and over ("翻译两遍"). Manual resetAndRetryPdfPage
+            // resets the flag before re-issuing the request.
+            pObj.translated = true;
+            pObj.translating = false;
+            pObj.failed = true;
+          }
         }
       }
     }
+
+    // Manual retry helper for a single failed page: clears the
+    // translated/failed flags so the auto-queue (or this caller's
+    // priority path) will pick it up again, but only one fresh attempt
+    // is issued per click — no infinite-loop retry.
+    function resetAndRetryPdfPage(pageNum) {
+      if (_pdfState && _pdfState.pages) {
+        const pObj = _pdfState.pages.find(p => p.num === pageNum);
+        if (pObj) {
+          pObj.translated = false;
+          pObj.failed = false;
+          pObj.translating = false;
+        }
+      }
+      translatePdfPage(pageNum, null, true);
+    }
+    window.resetAndRetryPdfPage = resetAndRetryPdfPage;
 
 
     let _readerState = {
@@ -2195,6 +3235,8 @@
         _readerState.activeSection = 0;
         _readerState.pdfPath = result.pdf_path || null;
         renderReader();
+        _persistReaderState();
+        _restoreTranslationsFromCache();
         openReaderModal();
         showToast(`✅ 已加载 ${result.sections.length} 个章节 (${result.total_pages} 页, ${result.char_count.toLocaleString()} 字)`);
       } catch (err) {
@@ -2254,6 +3296,8 @@
 
         renderReader();
         openReaderModal();
+        _persistReaderState();
+        _restoreTranslationsFromCache();
 
         // Refresh PDF view if currently active
         if (_readerMode === "pdf") {
@@ -2305,6 +3349,7 @@
     function selectSection(idx) {
       _readerState.activeSection = idx;
       renderReader();
+      _persistReaderState();
     }
 
     function renderSection(idx) {
@@ -2355,8 +3400,53 @@
 
 
     function escapeHtml(s) {
-      return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      // Single quotes NOT escaped: previous version left `'` intact, which
+      // broke inline JS attribute handlers like `onclick="window.open('${url}')"`
+      // because a vault name containing `'` would terminate the string early
+      // and let an attacker inject arbitrary JS. Defense: escape both quotes.
+      return (s == null ? "" : String(s))
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
+    // Escape for inside a single-quoted JS string literal (used in inline
+    // onclick handlers like `window.open('${escapeJsString(url)}', '_blank')`).
+    // Backslashes must be escaped first so the resulting string can be safely
+    // embedded in `'..'` without quote-escape ambiguity.
+    function escapeJsString(s) {
+      return (s == null ? "" : String(s))
+        .replace(/\\/g, "\\\\")
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, "\\n")
+        .replace(/\r/g, "\\r");
+    }
+
+    // Inverse of (some of) formatMarkdownLite+renderMathIn: turn the
+    // placeholder nodes back into raw `$..$` / `$$..$$` source. Used by
+    // the bilingual-note exporter so the saved .md file contains
+    // markdown structure (paragraphs, headings, lists, bold, code) but
+    // leaves math as naked LaTeX — no <span class="katex"> AST nodes.
+    // LaTeX inside the placeholder body was html-escaped by
+    // formatMarkdownLite; reverse only the chars that can legitimately
+    // appear inside math (`<`, `>`, `&`, `"`).
+    function _unrenderMathPlaceholders(html) {
+      if (!html) return "";
+      const un = (s) => String(s)
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&amp;/g, "&");
+      let out = String(html)
+        .replace(/<div class="math-display-block">([\s\S]*?)<\/div>/g,
+                 (_, b) => "$$" + un(b) + "$$")
+        .replace(/<span class="math-placeholder math-inline">([\s\S]*?)<\/span>/g,
+                 (_, b) => "$" + un(b) + "$");
+      return out;
+    }
+    // Expose for tests / other exporters
+    window._unrenderMathPlaceholders = _unrenderMathPlaceholders;
 
     function formatMarkdownLite(s) {
       // Markdown with KaTeX math: **bold**, `code`, $..$ inline, $$..$$ display
@@ -2424,12 +3514,12 @@
      * KaTeX replaces each placeholder's textContent with rendered math.
      * Errors render as red text.
      */
-    function renderMathIn(container) {
+    async function renderMathIn(container) {
       if (!container) return;
-      // KaTeX loaded with `defer` — may not be ready on first call
+      // KaTeX lazy-loaded on first need
       if (typeof katex === "undefined") {
-        setTimeout(() => renderMathIn(container), 150);
-        return;
+        try { await loadKatex(); }
+        catch (e) { setTimeout(() => renderMathIn(container), 150); return; }
       }
       // Display math
       container.querySelectorAll(".math-display-block").forEach(el => {
@@ -2461,12 +3551,6 @@
           el.innerHTML = `<span style="color:#c43e3e; font-size:0.9em;">⚠ ${escapeHtml(String(e))}</span>`;
         }
       });
-    }
-
-    // Convenience: apply formatMarkdownLite + renderMathIn in one go
-    function renderMarkdown(el, rawText) {
-      el.innerHTML = formatMarkdownLite(rawText);
-      renderMathIn(el);
     }
 
     async function translateSection(idx) {
@@ -2524,59 +3608,173 @@
         showToast("所有章节均已翻译完毕");
         return;
       }
-      if (!confirm(`将批量翻译剩余 ${untranslated.length} 个章节。为避免打满 20 RPM 限制，章节间将自动保持 3.2 秒间隔，确定继续?`)) {
+      const rpmInfo0 = _getCurrentRpmInfo();
+      if (!confirm(`将批量翻译剩余 ${untranslated.length} 个章节。为避免打满 ${rpmInfo0.rpm} RPM 限制，章节间将自动保持 ${(rpmInfo0.interval + 0.2).toFixed(1)} 秒间隔，确定继续?`)) {
         return;
       }
       const btn = document.getElementById("translate-all-btn");
       btn.disabled = true;
       for (let i = 0; i < _readerState.sections.length; i++) {
         if (_readerState.translations[i]) continue;
-        btn.innerHTML = `<span>⏳ 翻译中 (${i + 1}/${_readerState.sections.length} 节，20 RPM 保护)...</span>`;
+        btn.innerHTML = `<span>⏳ 翻译中 (${i + 1}/${_readerState.sections.length} 节，${rpmInfo0.rpm} RPM 保护)...</span>`;
         await translateSection(i);
-        await new Promise(r => setTimeout(r, 3200));
+        await new Promise(r => setTimeout(r, rpmInfo0.interval * 1000 + 200));
       }
       btn.disabled = false;
       btn.innerHTML = '<span>✨ 批量翻译全部章节</span>';
       showToast("✅ 批量翻译完成");
     }
 
-    async function exportBilingualNote() {
+    async function exportBilingualNote(mode = "bilingual") {
       const s = _readerState;
-      if (!s.sections || !s.sections.length) {
+      // Two possible data sources: section-view reader (s.sections[idx] +
+      // s.translations[idx]) OR PDF dual-column view (_pdfState.pages[i] with
+      // embedded .translation). The latter never touches _readerState.sections
+      // — loadPdfDualColumn writes to its own _pdfState — so the buttons used
+      // to silently no-op when the user was in PDF mode. Normalize to a
+      // single {sections, translations, title} shape that downstream code can
+      // consume without branching.
+      let sections, translations, title;
+      if (s.sections && s.sections.length) {
+        sections = s.sections;
+        translations = s.translations || {};
+        title = s.title;
+      } else if (_pdfState && _pdfState.pages && _pdfState.pages.length) {
+        // Synthesize sections from per-page data. Each page becomes one
+        // section (with page title + page-range hints) so the exported .md
+        // is still useful as a reading note even in PDF dual-column mode.
+        sections = _pdfState.pages.map((p) => ({
+          title: `第 ${p.num} 页 / Page ${p.num}`,
+          section: String(p.num),
+          text: p.text || "",
+          page_start: p.num,
+          page_end: p.num,
+        }));
+        translations = {};
+        for (const p of _pdfState.pages) {
+          if (p.translated && p.translation) {
+            translations[p.num] = p.translation;
+          }
+        }
+        title = _pdfState.paperTitle || s.title || "Untitled";
+      } else {
         showToast("当前无论文内容可导出", true);
         return;
       }
+      // Translation coverage guard: bilingual notes are only useful when
+      // sections actually have their AI translation. Without this check the
+      // user gets a file that is just the English original wrapped in
+      // collapsible <details> blocks — defeating the whole point of an
+      // "双语精读笔记" export. Pre-flight the count so they can react.
+      const totalSecs = sections.length;
+      // sections are indexed either by sequential idx (section-view) OR by
+      // page num (PDF-view synthetic) — we need a lookup helper that handles
+      // both. translations object is `{idx: text}` in section view but
+      // `{pageNum: text}` in PDF-view synthesis.
+      const isTranslated = (idx, sec) => {
+        if (translations[idx]) return true;
+        if (sec && sec.page_start && translations[sec.page_start]) return true;
+        return false;
+      };
+      const translatedSecs = sections.reduce(
+        (n, sec, idx) => n + (isTranslated(idx, sec) ? 1 : 0), 0
+      );
+      if (mode !== "en-only" && translatedSecs === 0) {
+        showToast(
+          `⚠️ 这 ${totalSecs} 章都还没翻译,中文模式没东西可写。先点「一键翻译本节」翻完再导出。`,
+          true,
+          5400
+        );
+        return;
+      }
+      const missingList = sections
+        .map((sec, idx) => (!isTranslated(idx, sec)) ? (sec.title || `第 ${idx+1} 节`) : null)
+        .filter(Boolean);
       const topic = (document.getElementById("paper-category") && document.getElementById("paper-category").value) ||
                     (document.getElementById("paper-topic") && document.getElementById("paper-topic").value) ||
                     "01_Device_TCAD_器件仿真";
       const authors = document.getElementById("paper-authors") ? document.getElementById("paper-authors").value : "";
       const yearVal = document.getElementById("paper-year") ? parseInt(document.getElementById("paper-year").value, 10) : 2024;
-      // Ask user where to save via the modal (default = 02_双语精读笔记/<year>_<title>_双语精读.md)
-      const defaultFn = `${yearVal || 2024}_${(s.title || "Untitled").replace(/[\\/:*?"<>|]/g, "_").slice(0, 35)}_双语精读`;
+      // Adjust filename suffix to make the variant obvious in the file list
+      const variantSuffix = mode === "cn-only" ? "中文精译" : mode === "en-only" ? "English" : "双语精读";
+      const defaultFn = `${yearVal || 2024}_${(title || "Untitled").replace(/[\\/:*?"<>|]/g, "_").slice(0, 35)}_${variantSuffix}`;
+      const warning = (mode !== "en-only" && missingList.length > 0)
+        ? `⚠️ 还有 ${missingList.length}/${totalSecs} 章未翻译 (${missingList.slice(0, 3).join("、")}${missingList.length > 3 ? " 等" : ""}),这些章节将只含英文原文(空中文)。`
+        : "";
+      // Surface the warning as a non-blocking toast so the user still
+      // gets the heads-up but we don't make them click through a confirm
+      // dialog they might dismiss by reflex (which used to silently abort
+      // the export — "点了仅中文但保存不了").
+      if (warning) showToast(warning, true, 5400);
       const dest = await showVaultSaveModal({
         topic: topic,
         kind: "literature_cards",
         defaultFilename: defaultFn,
       });
       if (!dest) return; // user cancelled
-      showToast("正在导出双语精读笔记到 Obsidian...");
+      // When the user doesn't type a custom one, the modal returns
+      // dest.filename === "" — in that case fall back to the variant-aware
+      // defaultFn so the on-disk filename reflects the chosen mode (e.g.
+      // "_中文精译" suffix instead of always "_双语精读").
+      const finalFilename = (dest.filename || "").trim() || defaultFn;
+      showToast("正在生成排版 HTML 并导出...", false, 2400);
+      // Build the embedded HTML for each section: apply formatMarkdownLite
+      // for markdown structure (paragraphs, headings, bold, lists, code),
+      // then convert math placeholders BACK to raw `$..$` / `$$..$$` source
+      // — the user prefers the saved .md to NOT embed <span class="katex">
+      // AST nodes. Users who DO install an Obsidian math plugin (e.g.
+      // obsidian-latex) will still see properly rendered formulas; without
+      // a plugin the literal source is shown.
+      let renderedSections = 0;
+      const sectionsPayload = [];
+      for (let idx = 0; idx < sections.length; idx++) {
+        const sec = sections[idx];
+        const transStr = (translations[idx] || (sec.page_start && translations[sec.page_start]) || "").toString();
+        let translationHtml = "";
+        let origHtml = "";
+        if (transStr) {
+          const tmp = document.createElement("div");
+          tmp.innerHTML = formatMarkdownLite(transStr);
+          translationHtml = _unrenderMathPlaceholders(tmp.innerHTML);
+        }
+        if (sec.text) {
+          const tmp2 = document.createElement("div");
+          tmp2.innerHTML = formatMarkdownLite(sec.text);
+          origHtml = _unrenderMathPlaceholders(tmp2.innerHTML);
+        }
+        // Apply mode: drop the field the user didn't ask for. Server still
+        // sees the keys as "" and skips the corresponding block in the
+        // generator's `if trans_html` / `if orig_html` guards.
+        const payloadObj = {
+          title: sec.title,
+          section: sec.section,
+          text: sec.text,
+          orig_html: origHtml,
+          translation: transStr,
+          translation_html: translationHtml,
+          page_start: sec.page_start,
+          page_end: sec.page_end,
+        };
+        if (mode === "cn-only") {
+          payloadObj.text = "";
+          payloadObj.orig_html = "";
+        } else if (mode === "en-only") {
+          payloadObj.translation = "";
+          payloadObj.translation_html = "";
+        }
+        sectionsPayload.push(payloadObj);
+        renderedSections++;
+      }
       try {
         const payload = {
-          title: s.title || "未命名论文",
+          title: title || "未命名论文",
           topic_category: topic,
           authors: authors,
           year: isNaN(yearVal) ? 2024 : yearVal,
-          sections: s.sections.map((sec, idx) => ({
-            title: sec.title,
-            section: sec.section,
-            text: sec.text,
-            translation: s.translations[idx] || "",
-            page_start: sec.page_start,
-            page_end: sec.page_end,
-          })),
+          sections: sectionsPayload,
           qa_records: _sessionQAList || [],
           subfolder: dest.subfolder || "",
-          filename_override: dest.filename || "",
+          filename_override: finalFilename,
         };
         const res = await fetch("/api/paper/export_bilingual", {
           method: "POST",
@@ -2586,7 +3784,10 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "导出失败");
         const qaCountNotice = (_sessionQAList && _sessionQAList.length) ? ` (已整合 ${_sessionQAList.length} 条划词答疑)` : "";
-        showToast(`✅ 双语笔记已导出: [${data.folder}/${data.file_name}]${qaCountNotice}`, false, 5000);
+        showToast(
+          `✅ 双语笔记已导出 (${renderedSections} 章节已 KaTeX 排版): [${data.folder}/${data.file_name}]${qaCountNotice}`,
+          false, 5400
+        );
         loadStats();
       } catch (err) {
         showToast("导出失败: " + err.message, true);
@@ -2623,8 +3824,9 @@
       }
 
       const modelName = _llmStatus.active_model || "LLM";
+      const rpmInfo = _getCurrentRpmInfo();
       if (_llmStatus.is_degraded) {
-        const badgeText = `🛡️ ${modelName} (降格·20 RPM)`;
+        const badgeText = `🛡️ ${modelName} (降格·${rpmInfo.rpm} RPM)`;
         if (headerDot) headerDot.style.background = "#d97706";
         if (headerText) headerText.textContent = badgeText;
         if (readerDot) readerDot.style.background = "#d97706";
@@ -2977,8 +4179,323 @@
       updateQAQuotedSnippet();
     }
 
+    // ---------------------------------------------------------------
+    // Question-scope router (two-stage):
+    //
+    //   Stage 1 (this function): a small LLM call reads the selection
+    //   + question and decides how much context to attach. Returns
+    //   {mode, budget, reason, source}. On any failure we silently fall
+    //   back to the keyword heuristic so the main QA flow is never
+    //   blocked. Caller (submitReaderQA) passes the result to stage 2.
+    //
+    //   Stage 2 (the existing /explain_selection_stream endpoint) gets
+    //   the curated surroundingContext built from the routed scope.
+    //
+    // Budget we pay for this: ~150-250 input tokens + 80-200 output
+    // tokens at the router, max ~12s latency. Saves the much larger
+    // cost of always-attaching-a-whole-chapter for trivial lookups,
+    // AND catches open-ended questions like "这种方法在我自己的工艺
+    // 节点上能用吗" that no keyword heuristic could route correctly.
+    //
+    // preset is passed as a hint (not an override) so the LLM can
+    // still up-route when the question demands more context than the
+    // preset suggests. The user can still force the mode by hitting
+    // the preset button again — and the toast lets them see why we
+    // chose what we chose.
+    // ---------------------------------------------------------------
+    async function _routeQuestionScope(question, preset, selectedText) {
+      // Fast path: explicit "术语速查" preset → always term (user
+      // explicitly asked for term-level). Skip the LLM round-trip.
+      if (preset === "术语速查") {
+        return {
+          mode: "term", budget: 800, label: "紧邻上下文 (~800 字)",
+          source: "preset", reason: "preset=术语速查(强制)",
+        };
+      }
+
+      // Otherwise: ask the LLM. With a 12s timeout so the user isn't
+      // left waiting if the model is sluggish.
+      try {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 12000);
+        let r;
+        try {
+          r = await fetch("/api/paper/classify_qa_scope", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              selected_text: (selectedText || "(未划选)").slice(0, 2000),
+              question: (question || "").slice(0, 1000),
+              preset: preset || "",
+            }),
+            signal: ac.signal,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        if (!data || !["term", "mid", "wide", "full"].includes(data.mode)) {
+          throw new Error("router 返回 mode 非法");
+        }
+        const label = ({
+          term: "紧邻上下文",
+          mid:  "章节上下文",
+          wide: "摘要+当前章节+结论",
+          full: "全文摘要",
+        })[data.mode] + ` (~${(data.budget || 8000).toLocaleString()} 字)`;
+        return {
+          mode: data.mode, budget: data.budget || 8000, label,
+          source: "ai", reason: data.reason || "(无)",
+        };
+      } catch (err) {
+        // Router unavailable (network, timeout, LLM down, bad JSON) —
+        // fall back to keyword heuristic. We log so the diagnostic
+        // panel shows what happened, but we never block the user.
+        console.warn("[qa-scope router] fallback to keyword:", err && err.message);
+        const kw = _keywordClassify(question) || {
+          mode: "mid", budget: 8000, label: "章节上下文 (~8K 字)",
+        };
+        return { ...kw, source: "keyword", reason: "LLM 路由失败,关键词兜底" };
+      }
+    }
+
+    // Pure-keyword fallback (used when the LLM router is unavailable).
+    // Returns null when no specific keyword matches — caller falls back
+    // to mid (default).
+    function _keywordClassify(question) {
+      const q = (question || "").trim();
+      const ql = q.toLowerCase();
+      if (/(术语|缩写|全称|符号|定义|意思|含义|代表什么|是什么|缩写名|英文|缩写词)/.test(q)) {
+        return { mode: "term", budget: 600, label: "紧邻上下文 (~600 字)" };
+      }
+      if (/(创新点?|主要贡献|贡献所在|创新性|创新之处|创新贡献|novel|contribution|有什么创新|相比.*?优势|相比.*?改进)/.test(ql + q)) {
+        return { mode: "wide", budget: 20000, label: "摘要+当前章节+结论" };
+      }
+      if (/(整篇|全文|整体|主旨|总结一下|概括|主要思想|核心观点|大纲|structure|overview|summarize|summary)/.test(ql + q)) {
+        return { mode: "full", budget: 60000, label: "全文摘要 (~60K 字)" };
+      }
+      if (/(实现方法|怎么实现|如何实现|实验方法|流程|对比.*?性能|评测|仿真|复现|具体怎么做|用了什么方法|算法)/.test(q)) {
+        return { mode: "wide", budget: 14000, label: "摘要+当前章节+结论" };
+      }
+      return null; // signal "no specific hit"
+    }
+
+    // Locate the user's selection inside the source's full text so we can
+    // take a tight window around it (term mode) instead of handing over the
+    // whole page. Returns "" if we can't find a unique anchor — caller
+    // falls back to head-truncation in that case.
+    function _sliceAroundSelection(fullText, selection, budget) {
+      if (!fullText) return "";
+      if (!selection || selection.length < 4) return fullText.slice(0, budget);
+      const idx = fullText.indexOf(selection);
+      if (idx < 0) {
+        // Selection text may have been normalized (whitespace, smart quotes).
+        // Try a fuzzy prefix match: take the first 24 chars of selection.
+        const anchor = selection.slice(0, 24);
+        const aidx = fullText.indexOf(anchor);
+        if (aidx < 0) return fullText.slice(0, budget);
+        const half = Math.floor(budget / 2);
+        const start = Math.max(0, aidx - half);
+        const end = Math.min(fullText.length, aidx + budget - half);
+        return fullText.slice(start, end);
+      }
+      const half = Math.floor(budget / 2);
+      const start = Math.max(0, idx - half);
+      const end = Math.min(fullText.length, idx + selection.length + half);
+      return fullText.slice(start, end);
+    }
+
+    // ---------------------------------------------------------------
+    // Refinement loop: when the user is unsatisfied with the answer,
+    // they can ⬆️ promote scope (see more paper), ⬇️ demote it (focus
+    // tighter), or ✏️ write free-form feedback that gets threaded into
+    // both the router prompt (so the LLM re-decides scope) AND the
+    // answer prompt (so the LLM knows what to fix).
+    //
+    // We don't re-run submitReaderQA — that would tear down the panel
+    // and lose scroll position. Instead we update the existing
+    // stream-target in place and stream the new answer right on top.
+    // ---------------------------------------------------------------
+    const _SCOPE_LADDER = [
+      { mode: "term", budget: 800,  label: "紧邻上下文 (~800 字)" },
+      { mode: "mid",  budget: 8000, label: "章节上下文 (~8K 字)" },
+      { mode: "wide", budget: 20000, label: "摘要+当前章节+结论 (~20K 字)" },
+      { mode: "full", budget: 60000, label: "全文摘要 (~60K 字)" },
+    ];
+
+    async function _refineQA(answerBody, direction, feedbackText) {
+      const question = answerBody.dataset.question || "";
+      const priorAnswer = answerBody.dataset.priorAnswer || "";
+      const priorMode = answerBody.dataset.priorScopeMode || "mid";
+
+      // 1. Resolve the new scope.
+      let newScope;
+      if (direction === "up" || direction === "down") {
+        const idx = Math.max(0, _SCOPE_LADDER.findIndex(s => s.mode === priorMode));
+        const nextIdx = direction === "up"
+          ? Math.min(idx + 1, _SCOPE_LADDER.length - 1)
+          : Math.max(idx - 1, 0);
+        newScope = _SCOPE_LADDER[nextIdx];
+      } else if (direction === "feedback") {
+        // Let the LLM re-decide scope with the user's free-form feedback
+        // appended as a hint. We deliberately route the *augmented*
+        // question through stage 1 so the model can re-evaluate.
+        const augmented = `${question}\n\n[用户反馈,用于本次重新决策上下文范围] ${feedbackText}`;
+        newScope = await _routeQuestionScope(
+          augmented, _currentQAPreset, _readerSelState.text || ""
+        );
+      } else {
+        return; // unknown direction
+      }
+
+      // 2. Build context for the new scope.
+      const surroundingContext = _buildScopeContext(newScope);
+
+      // 3. Replace the prior answer with a streaming placeholder so the
+      //    user can see "AI 正在重新回答…" right where the old answer was.
+      const streamTarget = answerBody.querySelector("[data-stream-target]");
+      const scopeBadge = answerBody.querySelector("[data-qa-scope-badge]");
+      const modelBadge = answerBody.querySelector("[data-qa-model-badge]");
+      if (streamTarget) {
+        streamTarget.textContent = "⏳ AI 重新回答中...";
+        streamTarget.parentElement.scrollTop = streamTarget.parentElement.scrollHeight;
+      }
+      if (scopeBadge) {
+        const actualChars = (surroundingContext || "").length;
+        scopeBadge.textContent = `🔁 重新回答 · ${newScope.label} · 实际 ${actualChars.toLocaleString()} 字`;
+      }
+      if (modelBadge) modelBadge.textContent = "⏳ 解答中...";
+
+      // 4. Re-issue the streaming call. payload carries the prior answer
+      //    + feedback so the LLM can avoid repeating the same content
+      //    and steer toward what the user actually wants.
+      const submitBtn = document.getElementById("qa-submit-btn");
+      await askLLMStream(submitBtn, "/api/paper/explain_selection_stream", {
+        selected_text: _readerSelState.text || "(用户未划选特定片段,提问全篇整体背景)",
+        question: question,
+        paper_title: _readerState.title || "",
+        surrounding_context: surroundingContext,
+        source_type: _readerSelState.source || "general",
+        feedback: feedbackText || "",
+        prior_answer: priorAnswer || "",
+        force_scope: newScope.mode,
+      }, {
+        onMeta: (meta) => {
+          if (modelBadge && meta && meta.model) {
+            modelBadge.innerHTML = `🤖 ${escapeHtml(meta.model)}${meta.is_degraded ? ' (降格)' : ''}`;
+          }
+        },
+        onChunk: (chunk, full) => {
+          if (streamTarget) {
+            streamTarget.textContent = full;
+            streamTarget.parentElement.scrollTop = streamTarget.parentElement.scrollHeight;
+          }
+        },
+        onSuccess: (full, meta) => {
+          if (streamTarget) {
+            streamTarget.innerHTML = formatMarkdownLite(full);
+            if (typeof renderMathIn === "function") renderMathIn(streamTarget);
+          }
+          // Update state so the next refinement starts from this answer.
+          answerBody.dataset.priorAnswer = full;
+          answerBody.dataset.priorScope = newScope.label;
+          answerBody.dataset.priorScopeMode = newScope.mode;
+          if (typeof renderMathIn === "function") renderMathIn(answerBody);
+        },
+        onError: (err) => {
+          if (streamTarget) {
+            streamTarget.innerHTML = `<span style="color:var(--accent-terracotta);">❌ 重新回答失败: ${escapeHtml(err.message || String(err))}</span>`;
+          }
+        },
+      });
+    }
+
+    // Build context for the chosen scope. Resolves the "current page" or
+    // "current section" first, then layers in wider material for wide/full.
+    function _buildScopeContext(scope) {
+      // 1. Identify the anchor: PDF page object OR section object.
+      let anchorText = "";
+      let anchorLabel = "";
+      if (_readerSelState.pageNum && _pdfState && _pdfState.pages) {
+        const pObj = _pdfState.pages.find(p => p.num === _readerSelState.pageNum);
+        if (pObj) { anchorText = pObj.text || ""; anchorLabel = `[Page ${_readerSelState.pageNum}]`; }
+      }
+      if (!anchorText && _readerSelState.sectionIdx !== null && _readerState.sections) {
+        const sObj = _readerState.sections[_readerSelState.sectionIdx];
+        if (sObj) { anchorText = sObj.text || ""; anchorLabel = `[Section ${sObj.title || ""}]`; }
+      }
+      if (!anchorText && _readerState.sections && _readerState.sections[_readerState.activeSection]) {
+        const sObj = _readerState.sections[_readerState.activeSection];
+        anchorText = sObj.text || ""; anchorLabel = `[Section ${sObj.title || ""}]`;
+      }
+      const selText = _readerSelState.text || "";
+
+      // 2. Build per-scope output.
+      if (scope.mode === "term") {
+        // Tight window around the selection (≈ budget chars). Don't
+        // include the section header here — definitions are usually
+        // resolved by the surrounding sentence, not the heading.
+        const tight = _sliceAroundSelection(anchorText, selText, scope.budget);
+        return tight
+          ? `${anchorLabel}\n${tight}`
+          : `(未在 ${anchorLabel} 文本中找到用户划选片段,改用段落头部)\n${anchorText.slice(0, scope.budget)}`;
+      }
+
+      if (scope.mode === "mid") {
+        // Current page/section, head-truncated to budget.
+        const body = anchorText ? anchorText.slice(0, scope.budget) : "";
+        return body ? `${anchorLabel}\n${body}` : "";
+      }
+
+      // wide / full: only meaningful in section-view (we need _readerState.sections).
+      // PDF dual-column mode degrades gracefully: take the current page +
+      // its 2 neighbors, head-truncated to scope.budget.
+      if (!_readerState.sections || !_readerState.sections.length) {
+        // PDF mode fallback — extend across nearby pages.
+        if (scope.mode === "wide" || scope.mode === "full") {
+          const allText = (_pdfState?.pages || [])
+            .map(p => `[Page ${p.num}]\n${p.text || ""}`).join("\n\n");
+          const sliced = _sliceAroundSelection(allText, selText, scope.budget)
+            || allText.slice(0, scope.budget);
+          return `⚠️ PDF 双栏视图无完整章节索引,已拼接相邻页面:\n${sliced}`;
+        }
+      }
+
+      if (scope.mode === "wide") {
+        // abstract / intro (first section) + active / selected section + conclusion (last).
+        const sections = _readerState.sections;
+        const chunks = [];
+        const per = Math.max(2000, Math.floor(scope.budget / 3));
+        if (sections[0] && (sections[0].text || "").length > 200) {
+          chunks.push(`[Section ${sections[0].title || "1"} (摘要/引言)]\n${(sections[0].text || "").slice(0, per)}`);
+        }
+        const activeIdx = _readerSelState.sectionIdx !== null
+          ? _readerSelState.sectionIdx
+          : _readerState.activeSection;
+        if (activeIdx != null && sections[activeIdx] && activeIdx !== 0) {
+          chunks.push(`[当前选中: ${sections[activeIdx].title || `Section ${activeIdx+1}`}]\n${(sections[activeIdx].text || "").slice(0, per)}`);
+        }
+        if (sections.length > 1) {
+          const last = sections[sections.length - 1];
+          if (last !== sections[0] && (last.text || "").length > 200) {
+            chunks.push(`[末节: ${last.title || sections.length}] (结论)\n${(last.text || "").slice(0, per)}`);
+          }
+        }
+        return chunks.join("\n\n---\n\n");
+      }
+
+      // mode === "full"
+      const sections = _readerState.sections;
+      const per = Math.max(1500, Math.floor(scope.budget / Math.min(sections.length, 8)));
+      return sections.slice(0, 8).map((sec, i) =>
+        `[${sec.title || `Section ${i+1}`}]\n${(sec.text || "").slice(0, per)}`
+      ).join("\n\n---\n\n");
+    }
+
     function triggerQAPreset(type) {
       _currentQAPreset = type;
+      _persistLocalState();
       let q = "";
       if (type === "通俗解释") {
         q = "请用通俗易懂的中文深入解释这段内容的核心含义、学术背景与研究动机。";
@@ -3015,29 +4532,47 @@
       if (welcome) welcome.style.display = "none";
       if (answerBody) {
         answerBody.style.display = "block";
-        // Streaming-friendly shell: question header + model badge placeholder
-        // + streaming answer body + action buttons row
+        // Streaming-friendly shell: question header + scope badge + model
+        // badge placeholder + streaming answer body + action buttons row.
+        // The scope badge shows the user what context budget we used; they
+        // can override by picking a different preset (or rewrite the
+        // question to add keywords like "创新点" / "术语" / "整体").
         answerBody.innerHTML = `
-          <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--card-border-subtle); display:flex; justify-content:space-between; align-items:center;">
-            <div style="font-weight:600; font-size:13px; color:var(--text-main);">❓ ${escapeHtml(question)}</div>
-            <span data-qa-model-badge style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">⏳ 解答中...</span>
+          <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--card-border-subtle); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+            <div style="font-weight:600; font-size:13px; color:var(--text-main); flex:1; min-width:0;">❓ ${escapeHtml(question)}</div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <span data-qa-scope-badge style="font-size:10.5px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">⏳ 上下文测算中</span>
+              <span data-qa-model-badge style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">⏳ 解答中...</span>
+            </div>
           </div>
           <div data-stream-target style="font-size:13px; line-height:1.65; color:var(--text-main); margin-bottom:14px; white-space:pre-wrap; min-height:1.4em;">⏳ AI 正在深度剖析所选内容与半导体物理机制...</div>
           <div data-qa-actions style="display:flex; gap:8px; align-items:center; justify-content:flex-end; padding-top:8px; border-top:1px solid var(--card-border-subtle); flex-wrap:wrap;"></div>
         `;
       }
 
-      // Collect surrounding context
-      let surroundingContext = "";
-      if (_readerSelState.pageNum && _pdfState && _pdfState.pages) {
-        const pObj = _pdfState.pages.find(p => p.num === _readerSelState.pageNum);
-        if (pObj) surroundingContext = `[Page ${_readerSelState.pageNum}] ${pObj.text || ""}`;
-      } else if (_readerSelState.sectionIdx !== null && _readerState.sections) {
-        const sObj = _readerState.sections[_readerSelState.sectionIdx];
-        if (sObj) surroundingContext = `[Section ${sObj.title}] ${sObj.text || ""}`;
-      } else if (_readerState.sections && _readerState.sections[_readerState.activeSection]) {
-        const sObj = _readerState.sections[_readerState.activeSection];
-        surroundingContext = `[Section ${sObj.title}] ${sObj.text || ""}`;
+      // Adaptive scope: stage 1 lets the LLM itself judge how much context
+      // is needed. The user explicitly asked for this — keyword heuristics
+      // can't catch open-ended questions like "这个方法在我自己的工艺节点
+      // 上能用吗" (looks like mid but actually needs wide). A small router
+      // call (~200 tokens, ~3-8s) reads the selection + question and
+      // returns {mode, budget, reason}; if it fails (network, timeout, LLM
+      // down) we silently fall back to the keyword heuristic so the main
+      // QA flow is never blocked.
+      const scope = await _routeQuestionScope(question, _currentQAPreset, _readerSelState.text || "");
+      const surroundingContext = _buildScopeContext(scope);
+      // Surface the chosen scope to the user so the trade-off is visible.
+      // They can always click a different preset to override the heuristic.
+      const scopeBadge = answerBody && answerBody.querySelector("[data-qa-scope-badge]");
+      if (scopeBadge) {
+        const actualChars = (surroundingContext || "").length;
+        const sourceTag = scope.source === "ai"
+          ? "🧭 AI 路由"
+          : (scope.source === "preset" ? "⚙️ preset" : "🔑 关键词 fallback");
+        scopeBadge.textContent = `${sourceTag} · ${scope.label} · 实际 ${actualChars.toLocaleString()} 字`;
+        scopeBadge.title =
+          `mode=${scope.mode} · 上限 ${scope.budget.toLocaleString()}\n` +
+          `依据: ${scope.reason || "(无)"}\n` +
+          `换 preset 可强制覆盖路由结果`;
       }
 
       const payload = {
@@ -3076,19 +4611,75 @@
             timestamp: new Date().toISOString()
           };
           _sessionQAList.push(_lastQAItem);
+          _persistLocalState();
 
           const streamTarget = answerBody.querySelector("[data-stream-target]");
           if (streamTarget) {
             streamTarget.innerHTML = formatMarkdownLite(full);
           }
-          // Render action buttons AFTER successful streaming
+          // Stash the full prior answer + question on the answerBody so the
+          // "refine" buttons (⬆️ / ⬇️ / ✏️ 反馈) can re-issue with feedback
+          // threading. Without this the refine loop would have no memory of
+          // what the user just saw.
+          answerBody.dataset.question = question;
+          answerBody.dataset.priorAnswer = full;
+          answerBody.dataset.priorModel = (meta && meta.model) || "";
+          answerBody.dataset.priorScope = scope.label;
+          answerBody.dataset.priorScopeMode = scope.mode;
+
+          // Render action buttons AFTER successful streaming. Order matters:
+          //   1. Refinement (close to the answer it refines)
+          //   2. Save / export (further action)
           const actions = answerBody.querySelector("[data-qa-actions]");
           if (actions) {
             actions.innerHTML = `
-              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px; color:#2E7D32; border-color:#81C784; background:#F1F8E9;" onclick="exportCurrentQAToObsidian()" title="将本条答疑保存到 Obsidian 04_AI划词答疑 文件夹">💾 导出本条答疑到 Obsidian</button>
-              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copyLastQAAnswer()">📋 复制解答</button>
-              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="saveQAToTroubleshoot('${escapeHtml(question.slice(0, 30))}')">➕ 存入避坑库</button>
+              <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; width:100%;">
+                <span style="font-size:10.5px; color:var(--text-subtle); margin-right:2px;">回答不满意?</span>
+                <button class="btn-pill-outline" style="font-size:10.5px; padding:2px 8px;" data-refine="up" title="下一轮把上下文范围升一档 (mid→wide→full),让 AI 看到更多论文内容">⬆️ 多看点上下文</button>
+                <button class="btn-pill-outline" style="font-size:10.5px; padding:2px 8px;" data-refine="down" title="下一轮把上下文范围降一档 (full→wide→mid→term),让 AI 聚焦更紧">⬇️ 少看上下文</button>
+                <button class="btn-pill-outline" style="font-size:10.5px; padding:2px 8px;" data-refine="feedback" title="自己写一段反馈(答得太浅/偏题/要更技术细节...),把这条说明作为下一轮的 hint">✏️ 带反馈重答</button>
+                <span style="flex:1;"></span>
+                <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px; color:#2E7D32; border-color:#81C784; background:#F1F8E9;" onclick="exportCurrentQAToObsidian()" title="将本条答疑保存到 Obsidian 04_AI划词答疑 文件夹">💾 导出本条答疑到 Obsidian</button>
+                <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copyLastQAAnswer()">📋 复制解答</button>
+                <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="saveQAToTroubleshoot('${escapeHtml(question.slice(0, 30))}')">➕ 存入避坑库</button>
+              </div>
+              <div data-refine-feedback hidden style="margin-top:8px; padding:10px; background:var(--bg-canvas-subtle); border-radius:6px; border:1px solid var(--card-border-subtle);">
+                <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">告诉 AI 你对刚才的回答哪里不满意,例如 "答得太笼统,要具体公式"、"忽略了我问的 X 角度"、"引用一下 §3 的实验结果" 等:</div>
+                <textarea data-refine-feedback-input style="width:100%; min-height:60px; padding:6px 10px; font-size:12px; border:1px solid var(--card-border); border-radius:6px; background:var(--bg-canvas); resize:vertical;" placeholder="例如: 解释得太空泛,要列出公式推导和数据支撑"></textarea>
+                <div style="display:flex; gap:6px; margin-top:6px; justify-content:flex-end;">
+                  <button class="btn-pill-outline" style="font-size:11px; padding:2px 10px;" data-refine-feedback-cancel>取消</button>
+                  <button class="btn-pill-outline" style="font-size:11px; padding:2px 10px; color:var(--accent-olive); border-color:var(--accent-olive);" data-refine-feedback-confirm>🚀 提交反馈并重答</button>
+                </div>
+              </div>
             `;
+            // Wire refinement handlers (inline so we keep closure over answerBody)
+            const refineUp = actions.querySelector('[data-refine="up"]');
+            const refineDown = actions.querySelector('[data-refine="down"]');
+            const refineFb = actions.querySelector('[data-refine="feedback"]');
+            const fbPanel = actions.querySelector("[data-refine-feedback]");
+            const fbInput = actions.querySelector("[data-refine-feedback-input]");
+            const fbCancel = actions.querySelector("[data-refine-feedback-cancel]");
+            const fbConfirm = actions.querySelector("[data-refine-feedback-confirm]");
+            if (refineUp) refineUp.onclick = () => _refineQA(answerBody, "up");
+            if (refineDown) refineDown.onclick = () => _refineQA(answerBody, "down");
+            if (refineFb) refineFb.onclick = () => {
+              if (fbPanel) {
+                fbPanel.hidden = false;
+                if (fbInput) fbInput.focus();
+              }
+            };
+            if (fbCancel) fbCancel.onclick = () => {
+              if (fbPanel) fbPanel.hidden = true;
+              if (fbInput) fbInput.value = "";
+            };
+            if (fbConfirm) fbConfirm.onclick = () => {
+              const fbText = (fbInput && fbInput.value || "").trim();
+              if (!fbText) {
+                showToast("请先输入反馈内容", true);
+                return;
+              }
+              _refineQA(answerBody, "feedback", fbText);
+            };
           }
 
           if (typeof renderMathIn === "function") renderMathIn(answerBody);
@@ -3320,10 +4911,17 @@
             <button class="btn-zoom-toggle" onclick="setReaderZoom('fit')" title="适配窗口">适配</button>
             <span style="display:inline-block; width:1px; height:14px; background:var(--card-border); margin:0 4px;"></span>
             <button class="btn-zoom-toggle" id="pdf-queue-pause-btn" onclick="togglePdfQueuePause()" title="暂停/继续自动队列翻译">⏸️ 暂停排队</button>
+            <button class="btn-zoom-toggle" id="pdf-snapshot-save-btn" onclick="savePdfSnapshot()" title="保存当前 PDF 论文的已翻译页面 · 下次进来直接恢复(免重翻)">💾 保存当前</button>
           </div>
-          <!-- Export bilingual note button -->
-          <button class="btn-pill-outline" id="export-bilingual-btn" onclick="exportBilingualNote()" title="将当前双语精读内容导出到 Obsidian 库">
-            <span>💾 导出双语笔记</span>
+          <!-- Export bilingual note button (with bilingual / cn-only / en-only variants) -->
+          <button class="btn-pill-outline" id="export-bilingual-btn" onclick="exportBilingualNote('bilingual')" title="导出双语精读笔记到 Obsidian 库: 中文译文 + 英文原文 (英文默认折叠)">
+            <span>💾 双语笔记</span>
+          </button>
+          <button class="btn-pill-outline" id="export-cn-btn" onclick="exportBilingualNote('cn-only')" title="只导出中文译文 · 不含英文原文 · 文件更小可读性更高" style="margin-left:6px;">
+            <span>🇨🇳 仅中文</span>
+          </button>
+          <button class="btn-pill-outline" id="export-en-btn" onclick="exportBilingualNote('en-only')" title="只导出英文原文 · 适用于跳过翻译步骤归档" style="margin-left:6px;">
+            <span>🇬🇧 仅英文</span>
           </button>
           <button class="btn-pill-outline" id="reader-qa-top-btn" onclick="toggleReaderQAPanel()" title="开启/关闭 划词答疑助手">
             <span>🤖 划词答疑</span>

@@ -11,6 +11,7 @@ V1.1 hardening:
 
 import os
 import json
+import re
 import asyncio
 from pathlib import Path
 
@@ -38,6 +39,13 @@ from .generator import (
     generate_weekly_report,
     search_vault,
     ALLOWED_TOPIC_CATEGORIES,
+    sanitize_filename,
+    _safe_path,             # exported once; used by all vault-file endpoints
+)
+from .translation import (
+    chunk_section_text,
+    get_cache,
+    build_cross_section_context,
 )
 from . import llm
 from .plot_compare import (
@@ -67,39 +75,6 @@ app.add_middleware(
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-
-# ---------------------------------------------------------------------------
-# Cancellation helpers (Stage 1: async LLM endpoints)
-#
-# Why we need this:
-#   The 3 cancel-button endpoints (explain / cross_qa / explain_selection)
-#   run async LLM calls that may take 30-120 seconds. When the user clicks
-#   ✕ 取消, the browser AbortController fires, the fetch promise rejects,
-#   and Starlette's request task is cancelled. We need that cancellation
-#   to propagate INTO the in-flight httpx.AsyncClient.post() so we don't
-#   keep burning API quota on a doomed request.
-#
-# How it works:
-#   - We pass an asyncio.Event (cancel_event) into chat_async()
-#   - A background watcher awaits request.is_disconnected(); when that
-#     resolves (client closed), the watcher sets cancel_event.
-#   - chat_async checks cancel_event before each retry and raises
-#     asyncio.CancelledError, which short-circuits the rest.
-#   - The endpoint catches CancelledError and returns 499 (Client Closed).
-# ---------------------------------------------------------------------------
-
-async def _disconnect_watcher(request: Request, cancel_event: asyncio.Event):
-    """Set cancel_event when the client disconnects, then exit cleanly."""
-    try:
-        # is_disconnected() resolves with True when the client closes the
-        # connection (browser AbortController triggers this). On normal
-        # completion we exit without setting the event.
-        await request.is_disconnected()
-        cancel_event.set()
-    except asyncio.CancelledError:
-        # Endpoint finished normally; the finally block in the endpoint
-        # cancelled us. Don't treat that as a client disconnect.
-        pass
 
 
 async def _stream_llm_event_gen(chunk_iter, meta=None):
@@ -232,6 +207,15 @@ class ExplainSelectionRequest(BaseModel):
                                                 description="上下文背景 (如所在章节或页面文本)")
     source_type: Optional[str] = Field(default="pdf", max_length=50,
                                        description="pdf / translation / original")
+    feedback: Optional[str] = Field(default="", max_length=2000,
+                                    description="用户对上一轮回答的反馈(为空=首次提问)。"
+                                                "后端会把这段内容塞进 user_msg,让 LLM 知道用户为什么"
+                                                "不满意、这次要怎么调整。")
+    prior_answer: Optional[str] = Field(default="", max_length=8000,
+                                        description="上一轮的回答全文(供 LLM 知道之前答了什么)")
+    force_scope: Optional[str] = Field(default="", max_length=20,
+                                        description="强制 scope (term|mid|wide|full)。"
+                                                    "为空=按 router 决定。" )
 
 
 class TranslatePageRequest(BaseModel):
@@ -239,10 +223,22 @@ class TranslatePageRequest(BaseModel):
     `paper_id` is a stable identifier (e.g. arXiv ID or DOI) — used to
     key the page-level translation cache so re-opening a paper is instant.
     """
-    paper_id: str = Field(..., min_length=3, max_length=100)
+    paper_id: str = Field(..., min_length=3, max_length=200)
     page: int = Field(..., ge=1, le=200, description="1-based page number")
     text: str = Field(..., min_length=10, max_length=15000,
                       description="Full page text (single chunk from pdfplumber)")
+
+
+class TranslationCacheBatchItem(BaseModel):
+    section_key: str = Field(default="", max_length=80)
+    text: str = Field(default="", max_length=60000)
+    model: str = Field(default="", max_length=80,
+                       description="preferred model; empty = active model")
+
+
+class TranslationCacheBatchRequest(BaseModel):
+    keys: list[TranslationCacheBatchItem] = Field(..., min_length=1, max_length=200,
+                       description="list of {section_key, text, model}")
 
 
 class PasteTextRequest(BaseModel):
@@ -310,6 +306,50 @@ async def api_stats():
         return get_vault_stats()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"读取 vault 统计失败: {str(e)}")
+
+
+@app.get("/api/vault/literature")
+async def api_vault_literature(
+    limit: int = Query(default=20, ge=1, le=200, description="每页条目数"),
+    offset: int = Query(default=0, ge=0, description="跳过前面 N 条"),
+    include_qa: bool = Query(default=False, description="是否包含 04_AI划词答疑/ 子目录"),
+):
+    """
+    Paginated literature feed for the dashboard's "最新文献 & 进度流" panel.
+
+    Returns:
+      - items:        当前页条目
+      - total:        总条目数 (全部 literature, 不分 include_qa)
+      - filtered_total: 经过 include_qa 过滤后的条目总数
+      - has_more:     offset + items.length < filtered_total
+
+    Frontend replaces the old /api/stats feed with this endpoint so the
+    "加载更多" button can stream additional pages without re-walking the disk.
+    """
+    try:
+        # Reuse get_vault_stats to keep the directory scan in one place,
+        # then apply our own pagination on top.
+        stats = get_vault_stats()
+        all_items = stats.get("literature_list", [])
+        if include_qa:
+            filtered = all_items
+        else:
+            # Same rule the old frontend used: hide QA cards unless asked.
+            filtered = [
+                it for it in all_items
+                if "04_AI划词答疑" not in str(it.get("path", "")).replace("\\", "/")
+            ]
+        page = filtered[offset:offset + limit]
+        return {
+            "items": page,
+            "total": len(all_items),
+            "filtered_total": len(filtered),
+            "offset": offset,
+            "limit": limit,
+            "has_more": (offset + len(page)) < len(filtered),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取文献列表失败: {str(e)}")
 
 @app.post("/api/paper/fetch")
 async def api_fetch_paper(req: FetchPaperRequest):
@@ -425,7 +465,7 @@ async def api_download_pdf(
         )
 
     is_arxiv = "arxiv" in identifier.lower() or bool(
-        __import__("re").search(r"^\d{4}\.\d{4,5}", identifier.strip())
+        re.search(r"^\d{4}\.\d{4,5}", identifier.strip())
     )
     if not is_arxiv:
         # For DOI, return landing URL instead of trying direct PDF
@@ -481,7 +521,6 @@ async def api_serve_pdf(
     Used by the PDF.js dual-column reader to load the original PDF
     without exposing the filesystem.
     """
-    from .generator import _safe_path
     try:
         # Defensive: _safe_path rejects '..' and absolute paths
         pdf_path = _safe_path(BASE_DIR, relative_path)
@@ -510,7 +549,6 @@ async def api_vault_file(
     in a new browser tab. Only .md / .txt files inside BASE_DIR are
     served; PDFs and other binaries must use /api/paper/serve_pdf.
     """
-    from .generator import _safe_path
     try:
         file_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
@@ -533,6 +571,127 @@ async def api_vault_file(
     )
 
 
+@app.delete("/api/vault/file")
+async def api_vault_delete_file(
+    relative_path: str = Query(..., min_length=3, max_length=500,
+                               description="相对 BASE_DIR 的 .md / .txt 路径"),
+):
+    """
+    Soft-delete a single text file from the vault (sent to OS Recycle Bin via
+    send2trash). The file can be restored manually from the Recycle Bin if
+    the delete was accidental.
+
+    Used by the dashboard feed's per-row 🗑️ button. Path validation mirrors
+    GET /api/vault/file: only _safe_path-resolved paths under BASE_DIR with
+    .md/.txt/.markdown suffix are deletable. PDFs and other binaries are
+    deliberately rejected — those should be managed through the Obsidian
+    app or file manager.
+    """
+    try:
+        file_path = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
+    suffix = file_path.suffix.lower()
+    if suffix not in (".md", ".markdown", ".txt"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持删除的文件类型: {suffix} (仅支持 .md/.txt/.markdown)",
+        )
+    # Refuse to delete the vault-level shared knowledge files so a stray
+    # "feed delete" can never wipe knowledge the rest of the app depends on.
+    rel_str = str(file_path.relative_to(BASE_DIR)).replace("\\", "/").strip("/")
+    protected_prefixes = (
+        "_Templates/",
+        "03_Knowledge/",
+        "00_Dashboard/",
+        "04_Weekly_Reports/",
+    )
+    if any(rel_str.startswith(p) for p in protected_prefixes):
+        raise HTTPException(
+            status_code=403,
+            detail=f"该目录受保护,请在 Obsidian 或文件管理器中手动删除: {rel_str}",
+        )
+    try:
+        try:
+            from send2trash import send2trash
+            send2trash(str(file_path))
+            deleted_to = "recycle_bin"
+        except ImportError:
+            # send2trash not installed → fall back to permanent delete with
+            # a best-effort confirmation. Logged so users can wire up
+            # `pip install send2trash` for the safer path.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "send2trash not installed; performing permanent delete. "
+                "Install with `pip install send2trash` for Recycle Bin support."
+            )
+            file_path.unlink()
+            deleted_to = "permanent"
+        return {"status": "success", "path": rel_str, "deleted_to": deleted_to}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除失败: {e}")
+
+
+@app.post("/api/vault/reveal")
+async def api_vault_reveal(
+    relative_path: str = Query(..., min_length=3, max_length=500,
+                               description="相对 BASE_DIR 的路径"),
+):
+    """
+    Reveal a file in the OS file manager:
+      - Windows: `explorer /select,"<abs>"` (highlights the file)
+      - macOS:   `open -R "<abs>"`
+      - Linux:   best-effort `xdg-open` on the parent folder
+
+    Returns the command that was executed (best-effort, may differ by OS).
+    """
+    import sys, subprocess
+    try:
+        file_path = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
+
+    abs_path = str(file_path)
+    cmd = None
+    try:
+        if sys.platform.startswith("win"):
+            # CRITICAL: /select, takes ONE comma-separated argument. If the
+            # file path itself contains a comma (e.g. "paper, draft.pdf"),
+            # naive `["explorer", f"/select,{abs_path}"]` would feed explorer
+            # a truncated path (split at the first non-arg comma). Use
+            # CreateProcess directly via the = form, OR shell=True with a
+            # properly escaped command line. The latter is simpler and works
+            # for paths with spaces, commas, ampersands, parentheses.
+            #
+            # Wrap path in double quotes and escape any embedded quotes
+            # (rare on Windows but cheap to handle). Backslashes are left
+            # alone — cmd.exe doesn't interpret them in a quoted path.
+            escaped = abs_path.replace('"', '\\"')
+            cmd_str = f'explorer "/select,{escaped}"'
+            subprocess.Popen(cmd_str, shell=True)
+        elif sys.platform == "darwin":
+            cmd = ["open", "-R", abs_path]
+            subprocess.Popen(cmd)
+        else:
+            # Linux: most file managers don't have a "reveal" verb; just open
+            # the parent folder via xdg-open and let the user navigate.
+            parent = str(file_path.parent)
+            cmd = ["xdg-open", parent]
+            subprocess.Popen(cmd)
+    except FileNotFoundError as e:
+        # If explorer/open is not on PATH for some reason, surface the error
+        # rather than silently failing.
+        raise HTTPException(status_code=500, detail=f"系统工具缺失: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"打开失败: {e}")
+
+    return {"status": "success", "command": cmd, "abs_path": abs_path}
+
+
 @app.get("/api/paper/find_pdf")
 async def api_find_pdf(
     title: str = Query(..., min_length=1, max_length=300,
@@ -551,8 +710,6 @@ async def api_find_pdf(
     base = BASE_DIR / "01_Literature"
     if not base.exists():
         return {"found": False}
-
-    import re
 
     def _norm(s: str) -> str:
         return re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", s).lower()
@@ -1042,7 +1199,6 @@ async def api_translate_section(req: TranslateRequest):
             detail="翻译需要 LLM 配置。请在 .env 中设置 LLM_API_KEY 或 AGNES_API_KEY + LLM_BASE_URL。",
         )
 
-    from .translation import chunk_section_text, get_cache
     cache = get_cache()
     curr_st = llm.get_llm_status()
     model = curr_st.get("active_model") or "default"
@@ -1141,164 +1297,11 @@ class CrossQARequest(BaseModel):
     per_section_budget: Optional[int] = Field(default=6000, ge=1000, le=12000)
 
 
-@app.post("/api/paper/explain")
-async def api_explain(req: ExplainRequest, request: Request):
-    """
-    Answer a user question about a paper using its sections as context.
-
-    Pre-built question examples (前端可一键触发):
-      - "这篇论文的核心创新点是什么?"
-      - "方法是如何实现的? 关键步骤/公式?"
-      - "实验结果如何? 关键指标?"
-      - "这篇对我做 GAA-FET/CFET 研究有何启发?"
-
-    Honors client disconnect (cancel button) via cancel_event watcher so
-    the in-flight httpx.AsyncClient call can short-circuit and we don't
-    burn API quota on a doomed request.
-    """
-    if not llm.is_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="AI 解读需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
-        )
-
-    # Build context from sections — prefer Abstract + Introduction for context window
-    sections = req.sections[:20]
-    context_parts = []
-    total_chars = 0
-    for s in sections:
-        title = s.get("title", s.get("section", "?"))
-        text = (s.get("text") or "")[:6000]  # cap per-section
-        chunk = f"[{s.get('section', '?')}] {title}\n{text}"
-        if total_chars + len(chunk) > 24000:  # ~6k tokens
-            break
-        context_parts.append(chunk)
-        total_chars += len(chunk)
-
-    context = "\n\n---\n\n".join(context_parts)
-    paper_label = req.paper_title or "未命名论文"
-
-    user_msg = (
-        f"论文标题: {paper_label}\n\n"
-        f"--- 论文内容 (节选) ---\n{context}\n--- 论文内容结束 ---\n\n"
-        f"用户问题: {req.question}"
-    )
-
-    # Cancellation plumbing (Stage 1)
-    cancel_event = asyncio.Event()
-    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
-
-    try:
-        answer = await llm.chat_async(
-            messages=[
-                {"role": "system", "content": EXPLAIN_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=1200,
-            temperature=0.3,
-            cancel_event=cancel_event,
-        )
-        return {"status": "success", "answer": answer.strip()}
-    except asyncio.CancelledError:
-        # Client disconnected (✕ 取消 button); don't waste API quota on retries.
-        # 499 is nginx-style "Client Closed Request" — frontend treats as expected.
-        raise HTTPException(status_code=499, detail="客户端已断开连接, AI 解读已取消")
-    except llm.LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM 调用失败: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI 解读失败: {str(e)}")
-    finally:
-        cancel_event.set()  # unblock watcher if still alive
-        watcher.cancel()    # ensure it's cleaned up
-
-
-@app.post("/api/paper/cross_qa")
-async def api_cross_qa(req: CrossQARequest, request: Request):
-    """
-    Cross-chapter Q&A: synthesize information from 2+ sections to answer a
-    question that requires combining content across the paper.
-
-    Use cases:
-      - "本文方法在 [Introduction] 提到的不足上如何改进?"
-      - "[Results] 中观察到的现象与 [Discussion] 的解释是否一致?"
-      - "对比本文 [Methods] 与之前 [Introduction] 提到的 SOTA 方法"
-
-    The endpoint respects `selected_indices` so users can pick which sections
-    feed into the context window — useful when papers have many sections.
-    """
-    if not llm.is_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="跨章节问答需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
-        )
-    if len(req.sections) < 2:
-        raise HTTPException(
-            status_code=400,
-            detail="跨章节问答至少需要 2 个章节。",
-        )
-
-    from .translation import build_cross_section_context
-
-    # If user selected specific indices, filter sections; else use all
-    if req.selected_indices:
-        valid_indices = [i for i in req.selected_indices if 0 <= i < len(req.sections)]
-        sections_to_use = [req.sections[i] for i in valid_indices]
-        if len(sections_to_use) < 2:
-            raise HTTPException(
-                status_code=400,
-                detail="所选章节不足 2 个, 请至少勾选 2 个章节进行跨章节问答。",
-            )
-    else:
-        sections_to_use = req.sections
-
-    context = build_cross_section_context(
-        sections_to_use,
-        req.question,
-        per_section_budget=req.per_section_budget,
-    )
-    paper_label = req.paper_title or "未命名论文"
-    user_msg = (
-        f"论文标题: {paper_label}\n\n"
-        f"{context}\n\n"
-        f"请综合上述多章节内容回答用户问题, 并用 [SECTION_KEY] 标注信息来源。"
-    )
-
-    # Cancellation plumbing (Stage 1)
-    cancel_event = asyncio.Event()
-    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
-
-    try:
-        answer = await llm.chat_async(
-            messages=[
-                {"role": "system", "content": CROSS_QA_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=1500,
-            temperature=0.3,
-            cancel_event=cancel_event,
-        )
-        return {
-            "status": "success",
-            "answer": answer.strip(),
-            "sections_used": [
-                {
-                    "section": s.get("section", "?"),
-                    "title": s.get("title", "?"),
-                }
-                for s in sections_to_use
-            ],
-            "section_count": len(sections_to_use),
-            "context_chars": len(context),
-        }
-    except asyncio.CancelledError:
-        raise HTTPException(status_code=499, detail="客户端已断开连接, 跨章节问答已取消")
-    except llm.LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM 调用失败: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"跨章节问答失败: {str(e)}")
-    finally:
-        cancel_event.set()
-        watcher.cancel()
+# NOTE: /api/paper/explain and /api/paper/cross_qa non-streaming endpoints
+# were removed on 2026-09-24 (audit: 100% dead code — frontend only uses
+# the /explain_stream and /cross_qa_stream variants). The Pydantic models
+# ExplainRequest and CrossQARequest are kept because the stream endpoints
+# reference them.
 
 
 EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是一个微电子与集成电路领域资深学者与论文精读导师。
@@ -1313,76 +1316,149 @@ EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是一个微电子与集成电路领域
 """
 
 
-@app.post("/api/paper/explain_selection")
-async def api_explain_selection(req: ExplainSelectionRequest, request: Request):
+# ---------------------------------------------------------------------------
+# QA scope router — two-stage LLM call
+# ---------------------------------------------------------------------------
+# Stage 1 of the selection-QA flow: a small "router" LLM call that reads the
+# user's selection + question and decides how much surrounding context to
+# attach before the main answer call. Returns one of:
+#   - "term" : ~600 chars around the selection (lookups: abbreviations, single
+#              symbol definitions, narrow factual questions)
+#   - "mid"  : current page/section (single-paragraph explain, mechanism,
+#              engineering insight)
+#   - "wide" : abstract + active section + conclusion (innovation / method /
+#              cross-section reasoning)
+#   - "full" : multi-section slice up to 60K chars (whole-paper overview /
+#              cross-chapter comparison)
+# Why two stages instead of keywords: keyword heuristics (e.g. "创新点" →
+# wide) miss open-ended questions like "这种方法在我自己的工艺节点上能用吗"
+# which need a full chapter or more. An LLM router costs ~200 tokens and
+# 3-8 seconds — far cheaper than attaching a full chapter to a one-line
+# abbreviation question and diluting the model's attention.
+# ---------------------------------------------------------------------------
+
+QA_SCOPE_ROUTER_PROMPT = r"""你是论文问答的"上下文路由器"。
+基于用户划选的片段 + 用户的提问,判断回答这个问题最少需要多少上下文。
+
+可选 mode:
+- "term" : 紧邻上下文 ~600-800 字。仅术语查全称、单符号/缩写定义、单值查表。
+- "mid"  : 当前章节 4-8K 字。解释单段、物理机制、工程启发、局部推导。
+- "wide" : 摘要 + 当前章节 + 结论 12-20K 字。创新点、方法实现、章节间对比、综述式问题。
+- "full" : 全文摘要 60K 字。整篇主旨、跨章节贡献对比、"整体讲了什么"。
+
+只看 (selected_text + question) 这两个输入做判断 — 不要编造论文内容。
+若问题开放、不能确定 → 选更大一档 (mid 提到 wide,wide 提到 full)。
+
+严格只返回 JSON,不要任何额外文字:
+{"mode": "<term|mid|wide|full>", "reason": "<一句话依据>", "budget": <整数字符数>}
+"""
+
+
+class ClassifyQAScopeRequest(BaseModel):
+    selected_text: str = Field(..., min_length=1, max_length=15000)
+    question: str = Field(..., min_length=1, max_length=1000)
+    preset: Optional[str] = Field(default="", max_length=50,
+                                   description="当前用户在 UI 上选的 preset (可作 hint,非强制)")
+
+
+@app.post("/api/paper/classify_qa_scope")
+async def api_classify_qa_scope(req: ClassifyQAScopeRequest):
     """
-    Explain a specific highlighted/selected snippet from either the PDF text or
-    the Chinese translation, using surrounding section/page context and LLM.
+    Two-stage QA flow's stage 1: route a selection-QA request to the right
+    context scope (term / mid / wide / full). Uses a small LLM call with
+    json_mode so the answer is parseable; falls back to keyword heuristic
+    on any parse error or LLM failure so the main QA flow never blocks.
     """
     if not llm.is_configured():
+        # No LLM available — caller falls back to its keyword heuristic.
         raise HTTPException(
             status_code=503,
-            detail="AI 划词答疑需要 LLM 配置。请在 .env 中设置 LLM_API_KEY 或 AGNES_API_KEY。",
+            detail="LLM 未配置,前端将用关键词启发式 fallback",
         )
 
-    paper_label = req.paper_title or "未知论文"
-    source_desc = "PDF 英文原文" if req.source_type == "pdf" else ("中文译文" if req.source_type == "translation" else "论文选段")
-
-    user_msg_parts = [
-        f"论文标题: 《{paper_label}》",
-        f"【用户划选片段 ({source_desc})】:\n```text\n{req.selected_text.strip()}\n```",
-    ]
-    if req.surrounding_context:
-        ctx_snippet = req.surrounding_context.strip()[:10000]
-        user_msg_parts.append(f"【该片段所在的章节/页面上下文背景】:\n{ctx_snippet}")
-
-    user_msg_parts.append(f"【用户的问题】:\n{req.question.strip()}")
-    user_msg = "\n\n".join(user_msg_parts)
-
-    # Cancellation plumbing (Stage 1)
-    cancel_event = asyncio.Event()
-    watcher = asyncio.create_task(_disconnect_watcher(request, cancel_event))
+    preset_hint = (req.preset or "").strip()
+    user_msg = (
+        f"【用户划选片段】:\n```text\n{req.selected_text.strip()[:2000]}\n```\n\n"
+        f"【用户提问】:\n{req.question.strip()}\n\n"
+        + (f"【UI preset 提示 (非强制)】: {preset_hint}\n" if preset_hint else "")
+        + "\n请按 system prompt 中的 4 档选择最合适的 mode,只返回 JSON。"
+    )
 
     try:
-        answer = await llm.chat_async(
+        raw = llm.chat(
             messages=[
-                {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
+                {"role": "system", "content": QA_SCOPE_ROUTER_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=1500,
-            temperature=0.3,
-            timeout=120,
-            cancel_event=cancel_event,
+            # Thinking-mode LLMs (MiniMax-M2.7) emit a <think> block before
+            # the actual JSON; budget must cover both. Empirically ~600
+            # output tokens is enough for the think + JSON payload.
+            max_tokens=800,
+            temperature=0.1,
+            json_mode=True,
+            timeout=25,
         )
-        curr_st = llm.get_llm_status()
-        return {
-            "status": "success",
-            "answer": answer.strip(),
-            "selected_text": req.selected_text,
-            "question": req.question,
-            "model": curr_st["active_model"],
-            "is_degraded": curr_st["is_degraded"],
-        }
-    except asyncio.CancelledError:
-        raise HTTPException(status_code=499, detail="客户端已断开连接, 划词答疑已取消")
-    except llm.LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM 答疑调用失败: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"答疑服务出错: {str(e)}")
-    finally:
-        cancel_event.set()
-        watcher.cancel()
+        # Stage 1 failure is non-fatal — caller will fall back to keywords.
+        raise HTTPException(status_code=502, detail=f"router LLM 调用失败: {e}")
+
+    # Strip any leading <think>...</think> block (M2.7 always emits one
+    # even when response_format=json_object is set). Without this the
+    # JSON parser hits `<think>` first and errors out.
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").strip()
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].strip()
+    # Strip thinking block if present
+    cleaned = re.sub(r"<think>[\s\S]*?</think>\s*", "", cleaned).strip()
+    # Some models still emit a stray prefix before the JSON object —
+    # find the first '{' and last '}' and parse the slice between them.
+    if not cleaned.startswith("{"):
+        first = cleaned.find("{")
+        last = cleaned.rfind("}")
+        if first >= 0 and last > first:
+            cleaned = cleaned[first:last + 1]
+    try:
+        data = json.loads(cleaned)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"router 返回非 JSON: {cleaned[:200]} (parse err: {e})",
+        )
+
+    mode = str(data.get("mode", "")).strip().lower()
+    if mode not in ("term", "mid", "wide", "full"):
+        raise HTTPException(status_code=502, detail=f"router mode 非法: {mode}")
+
+    try:
+        budget = int(data.get("budget", 0))
+    except Exception:
+        budget = 0
+    # Clamp into reasonable bounds so a runaway router can't blow up the
+    # downstream prompt budget.
+    budget = max(300, min(budget, 80000))
+
+    return {
+        "mode": mode,
+        "reason": str(data.get("reason", "")).strip()[:200],
+        "budget": budget,
+        "preset": preset_hint,
+    }
+
+
+
 
 
 # ---------------------------------------------------------------------------
 # Streaming variants (Stage 2: SSE for the cancel-button endpoints)
 #
-# Each stream endpoint mirrors its non-streaming counterpart but returns
-# a StreamingResponse with text/event-stream content type. The frontend
-# reads via fetch + ReadableStream and appends text chunks progressively.
+# Each stream endpoint returns a StreamingResponse with text/event-stream
+# content type. The frontend reads via fetch + ReadableStream and appends
+# text chunks progressively, with ✕ 取消 button wired to AbortController.
 #
-# The non-streaming endpoints stay alive for backward compat (any
-# external callers can keep using them; internal UI now uses these).
+# Non-streaming counterparts were removed on 2026-09-24 (100% dead code —
+# frontend only calls the /..._stream variants).
 # ---------------------------------------------------------------------------
 
 
@@ -1390,8 +1466,7 @@ async def api_explain_selection(req: ExplainSelectionRequest, request: Request):
 async def api_explain_stream(req: ExplainRequest, request: Request):
     """Streaming variant of /api/paper/explain using SSE.
 
-    Cancellation note: we deliberately do NOT use _disconnect_watcher +
-    cancel_event here. Starlette's StreamingResponse already cancels the
+    Cancellation note: Starlette's StreamingResponse already cancels the
     body generator when the client closes the connection (via the
     listen_for_disconnect task_group), which propagates CancelledError
     through chat_stream_async → httpx.AsyncClient.stream automatically.
@@ -1449,8 +1524,8 @@ async def api_explain_stream(req: ExplainRequest, request: Request):
 async def api_cross_qa_stream(req: CrossQARequest, request: Request):
     """Streaming variant of /api/paper/cross_qa using SSE.
 
-    See api_explain_stream for why we skip _disconnect_watcher here —
-    Starlette's StreamingResponse handles client disconnect natively.
+    Starlette's StreamingResponse handles client disconnect natively via
+    the receive channel — no extra watcher needed (see api_explain_stream).
     """
     if not llm.is_configured():
         raise HTTPException(
@@ -1462,8 +1537,6 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
             status_code=400,
             detail="跨章节问答至少需要 2 个章节。",
         )
-
-    from .translation import build_cross_section_context
 
     if req.selected_indices:
         valid_indices = [i for i in req.selected_indices if 0 <= i < len(req.sections)]
@@ -1512,8 +1585,8 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
 async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Request):
     """Streaming variant of /api/paper/explain_selection using SSE.
 
-    See api_explain_stream for why we skip _disconnect_watcher here —
-    Starlette's StreamingResponse handles client disconnect natively.
+    Starlette's StreamingResponse handles client disconnect natively via
+    the receive channel — no extra watcher needed (see api_explain_stream).
     """
     if not llm.is_configured():
         raise HTTPException(
@@ -1531,6 +1604,17 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
     if req.surrounding_context:
         ctx_snippet = req.surrounding_context.strip()[:10000]
         user_msg_parts.append(f"【该片段所在的章节/页面上下文背景】:\n{ctx_snippet}")
+    # Feedback loop: when the user re-asks because they didn't like the
+    # previous answer, thread the prior answer + their feedback through so
+    # the LLM can correct course (more depth, narrower focus, different
+    # angle, etc.) instead of producing a parallel answer that ignores the
+    # user's dissatisfaction.
+    if req.feedback and req.feedback.strip():
+        fb = req.feedback.strip()[:1500]
+        user_msg_parts.append(f"【上一轮回答未能满足,用户反馈】:\n{fb}")
+        if req.prior_answer and req.prior_answer.strip():
+            prev = req.prior_answer.strip()[:6000]
+            user_msg_parts.append(f"【上一轮你给出的回答 (供参考,这次请避免重复)】:\n{prev}")
     user_msg_parts.append(f"【用户的问题】:\n{req.question.strip()}")
     user_msg = "\n\n".join(user_msg_parts)
 
@@ -1560,7 +1644,6 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
 @app.get("/api/translation/cache_stats")
 async def api_translation_cache_stats():
     """Return translation cache stats (size/hits/misses) — useful for debug."""
-    from .translation import get_cache
     return get_cache().stats()
 
 
@@ -1578,7 +1661,6 @@ async def api_translate_page(req: TranslatePageRequest):
             detail="按页翻译需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
         )
 
-    from .translation import chunk_section_text, get_cache
     cache = get_cache()
     cfg = llm._config()
     model = cfg["model"]
@@ -1636,6 +1718,32 @@ async def api_translate_page(req: TranslatePageRequest):
     }
     cache.put(cache_section_key, req.text, model, result)
     return result
+
+
+@app.post("/api/paper/translation_cache_batch_lookup")
+async def api_translation_cache_batch_lookup(req: TranslationCacheBatchRequest):
+    """
+    Batch lookup: returns `{section_key: result}` for cache hits only (misses are skipped).
+    Used by the frontend to restore translation state after a page refresh — without
+    this, every section shows "未翻译" until the user re-clicks. Hits come back
+    instantly from the in-memory LRU cache (no LLM call).
+    """
+    cache = get_cache()
+    hits: dict = {}
+    misses = 0
+    for item in req.keys:
+        cached = cache.get(item.section_key, item.text, item.model)
+        if cached:
+            cached["from_cache"] = True
+            hits[item.section_key] = cached
+        else:
+            misses += 1
+    return {
+        "hits": hits,
+        "misses": misses,
+        "total": len(req.keys),
+        "cache_stats": cache.stats(),
+    }
 
 
 @app.post("/api/paper/split_text")
@@ -1738,3 +1846,217 @@ async def api_paste_analyze(req: PasteTextRequest):
         except llm.LLMError as e:
             response["ai_error"] = f"LLM 调用失败: {str(e)}"
     return response
+
+
+# ---------------------------------------------------------------------------
+# PDF translation session snapshots
+# ---------------------------------------------------------------------------
+# Persists, per paper, the pages that have been translated so the user can
+# pick up where they left off after restarting MicroBench, or hop between
+# papers in the snapshot history without re-paying LLM cost. Files live in
+# `logs/_pdf_snapshots/<paperId>.json` — kept inside the project's own
+# `logs/` (gitignored) so they don't leak into the public Obsidian vault.
+# Hard per-snapshot limit: 5 MB on save to prevent runaway fills.
+
+import datetime as _dt
+
+SNAPSHOT_DIR_NAME = "_pdf_snapshots"
+SNAPSHOT_MAX_BYTES = 5 * 1024 * 1024
+SNAPSHOT_SCHEMA_VERSION = 1
+
+
+class _SnapshotPageItem(BaseModel):
+    page_num: int = Field(..., ge=1, le=2000)
+    text_hash: str = Field(..., min_length=4, max_length=64,
+                           description="SHA-256 hex of the original page text")
+    text: str = Field(default="", max_length=30000,
+                      description="Optional — original page text for offline restore")
+    translation: str = Field(..., min_length=1, max_length=30000)
+    model: Optional[str] = Field(default="", max_length=64)
+    translated_at: Optional[str] = Field(default="", max_length=40)
+
+
+class SnapshotSaveRequest(BaseModel):
+    paper_id: str = Field(..., min_length=3, max_length=128,
+                          description="Stable paper identifier (matches renderPdfPages' paperId)")
+    paper_title: str = Field(..., min_length=1, max_length=500)
+    relative_path: str = Field(..., min_length=3, max_length=500)
+    paper_mtime: float = Field(..., ge=0,
+                               description="stat().st_mtime of the source PDF at save time")
+    paper_text_signature: str = Field(default="", max_length=64,
+                                      description="Optional — fingerprint across all pages")
+    pages: list = Field(..., description="List of translated pages")
+
+
+def _snapshot_dir() -> Path:
+    p = BASE_DIR / "logs" / SNAPSHOT_DIR_NAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _snapshot_path(paper_id: str) -> Path:
+    # paper_id is computed in JS as `${_paperBase}_${hash}` and is already
+    # filename-safe (alphanumeric + underscore). Defensive-normalize anyway.
+    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "snapshot"
+    return _snapshot_dir() / f"{safe}.json"
+
+
+def _safe_read_json(path: Path) -> Optional[dict]:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+@app.get("/api/pdf/snapshot/list")
+async def api_pdf_snapshot_list():
+    """List all saved PDF translation snapshots, newest first."""
+    base = _snapshot_dir()
+    out = []
+    for fp in base.glob("*.json"):
+        data = _safe_read_json(fp)
+        if not data:
+            continue
+        pages = data.get("pages") or []
+        out.append({
+            "paper_id": data.get("paper_id") or fp.stem,
+            "paper_title": data.get("paper_title", ""),
+            "relative_path": data.get("relative_path", ""),
+            "saved_at": data.get("saved_at", ""),
+            "paper_mtime": data.get("paper_mtime", 0),
+            "total_pages": len(pages),
+            "translated_pages": sum(1 for p in pages if p.get("translation")),
+            "schema_version": data.get("schema_version", 0),
+        })
+    out.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
+    return {"snapshots": out}
+
+
+@app.get("/api/pdf/snapshot/load")
+async def api_pdf_snapshot_load(
+    paper_id: str = Query(..., min_length=3, max_length=128),
+):
+    """
+    Load a snapshot for restore. Returns the raw saved JSON. Strict
+    consistency checks (mtime, per-page hash) are performed CLIENT-SIDE
+    because the server doesn't re-parse the PDF — the JS layer already
+    has pdf.js loaded and can re-extract page text in the same way it
+    did on the original read.
+    """
+    data = _safe_read_json(_snapshot_path(paper_id))
+    if not data:
+        raise HTTPException(status_code=404, detail=f"快照不存在: {paper_id}")
+    return data
+
+
+@app.post("/api/pdf/snapshot/save")
+async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
+    """
+    Save (or overwrite) a snapshot. Body must fit within 5MB serialized.
+
+    Validates:
+      - paper_id filename-safe
+      - unique pages (no duplicate page_num)
+      - total size <= 5MB
+
+    Writes atomically via a .tmp + os.replace to avoid leaving half-files
+    if MicroBench is killed mid-write.
+    """
+    safe_id = "".join(c for c in req.paper_id if c.isalnum() or c in "_-")[:128]
+    if len(safe_id) < 3:
+        raise HTTPException(status_code=400, detail="paper_id 非法")
+
+    # Validate page list
+    seen = set()
+    for p in req.pages:
+        try:
+            pn = int(p.get("page_num"))
+            tx = p.get("translation", "")
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"page 字段缺失或类型错误: {p}")
+        if not tx:
+            raise HTTPException(status_code=400, detail=f"page {pn} translation 为空")
+        if pn in seen:
+            raise HTTPException(status_code=400, detail=f"page {pn} 重复")
+        seen.add(pn)
+
+    payload = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "paper_id": safe_id,
+        "paper_title": req.paper_title,
+        "relative_path": req.relative_path,
+        "paper_mtime": req.paper_mtime,
+        "paper_text_signature": req.paper_text_signature,
+        "pages": req.pages,
+        "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    if len(serialized.encode("utf-8")) > SNAPSHOT_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"快照过大(>{SNAPSHOT_MAX_BYTES // 1024 // 1024}MB),请减少保存页数",
+        )
+
+    target = _snapshot_path(safe_id)
+    tmp = target.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(serialized, encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception as e:
+        # Best-effort cleanup of orphan .tmp
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"写盘失败: {e}")
+
+    return {
+        "status": "success",
+        "paper_id": safe_id,
+        "saved_at": payload["saved_at"],
+        "saved_pages": len(req.pages),
+        "bytes": len(serialized.encode("utf-8")),
+        "path": str(target.relative_to(BASE_DIR)).replace("\\", "/"),
+    }
+
+
+@app.delete("/api/pdf/snapshot/delete")
+async def api_pdf_snapshot_delete(
+    paper_id: str = Query(..., min_length=3, max_length=128),
+):
+    """Delete one snapshot file. Idempotent (returns success even if missing)."""
+    target = _snapshot_path(paper_id)
+    if target.exists():
+        target.unlink()
+    return {"status": "success", "paper_id": paper_id}
+
+
+@app.get("/api/pdf/info")
+async def api_pdf_info(
+    relative_path: str = Query(..., min_length=3, max_length=500),
+):
+    """
+    Quick file-level metadata for a vault PDF: size + mtime.
+
+    Used by the snapshot loader to compare current mtime against the
+    mtime recorded at save time, so the user gets warned if the PDF was
+    overwritten/replaced between sessions.
+    """
+    try:
+        fp = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+    if not fp.exists() or not fp.is_file():
+        raise HTTPException(status_code=404, detail="PDF 不存在")
+    if fp.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="不是 PDF 文件")
+    st = fp.stat()
+    return {
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+        "mtime_iso": _dt.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+        "relative_path": str(fp.relative_to(BASE_DIR)).replace("\\", "/"),
+    }

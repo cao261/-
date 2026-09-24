@@ -11,6 +11,7 @@ V1.1 hardening:
 import datetime
 import os
 import re
+import time
 from pathlib import Path
 
 import jinja2
@@ -213,8 +214,37 @@ def _build_snippet(body: str, patterns: list, max_chars: int = 400) -> str:
 # Vault stats
 # ---------------------------------------------------------------------------
 
+# 30s in-memory cache for get_vault_stats. The dashboard's loadStats() fires
+# on every page mount, and walking 01_Literature/**/*.md every time is the
+# single biggest cold-start cost in the recent-feed path. A 30s TTL means:
+#   - Dashboard load: cache miss → real scan (acceptable, ~100ms)
+#   - Within 30s of any other load: cache hit → ~0ms
+#   - After save_*: writes invalidate the cache (see save_* functions below).
+_VAULT_STATS_CACHE: dict | None = None
+_VAULT_STATS_TS: float = 0.0
+_VAULT_STATS_TTL = 30.0  # seconds
+
+
+def _invalidate_vault_stats_cache() -> None:
+    """Drop the cached vault-stats dict (called by all save_* functions)."""
+    global _VAULT_STATS_CACHE, _VAULT_STATS_TS
+    _VAULT_STATS_CACHE = None
+    _VAULT_STATS_TS = 0.0
+
+
 def get_vault_stats() -> dict:
-    """Analyze current literature and reproduction status across the vault."""
+    """Analyze current literature and reproduction status across the vault.
+
+    Result is cached in-process for 30s. Writes to the vault invalidate the
+    cache so the next read sees fresh numbers.
+    """
+    # Cache hit: return the same dict object we scanned last time. We don't
+    # need to deep-copy because callers treat the result as read-only.
+    global _VAULT_STATS_CACHE, _VAULT_STATS_TS
+    now = time.monotonic()
+    if _VAULT_STATS_CACHE is not None and (now - _VAULT_STATS_TS) < _VAULT_STATS_TTL:
+        return _VAULT_STATS_CACHE
+
     lit_dir = BASE_DIR / "01_Literature"
     repro_dir = BASE_DIR / "02_Reproduction"
     trouble_file = BASE_DIR / "03_Knowledge" / "踩坑与排错日记.md"
@@ -251,7 +281,7 @@ def get_vault_stats() -> dict:
 
     weekly_count = len(list(weekly_dir.glob("*.md"))) if weekly_dir.exists() else 0
 
-    return {
+    result = {
         "literature_total": len(lit_files),
         "literature_list": sorted(lit_files, key=lambda x: x["mtime"], reverse=True)[:10],
         "reproduction_total": len(repro_projects),
@@ -259,6 +289,9 @@ def get_vault_stats() -> dict:
         "troubleshoot_count": trouble_count,
         "weekly_count": weekly_count,
     }
+    _VAULT_STATS_CACHE = result
+    _VAULT_STATS_TS = time.monotonic()
+    return result
 
 # ---------------------------------------------------------------------------
 # Literature card
@@ -362,6 +395,7 @@ def save_literature_card(data: dict) -> dict:
     file_path = _safe_path(target_dir, filename)
 
     file_path.write_text(rendered, encoding="utf-8")
+    _invalidate_vault_stats_cache()
     return {
         "status": "success",
         "file_name": filename,
@@ -427,6 +461,7 @@ def create_reproduction_workspace(data: dict) -> dict:
 
     readme_path = _safe_path(proj_dir, "README.md")
     readme_path.write_text(rendered, encoding="utf-8")
+    _invalidate_vault_stats_cache()
 
     return {
         "status": "success",
@@ -480,7 +515,7 @@ def record_troubleshoot(data: dict) -> dict:
         trouble_file.write_text(existing + entry, encoding="utf-8")
     else:
         trouble_file.write_text(f"# 踩坑与排错日记\n{entry}", encoding="utf-8")
-
+    _invalidate_vault_stats_cache()
     return {"status": "success", "keyword": error_keyword}
 
 # ---------------------------------------------------------------------------
@@ -525,6 +560,7 @@ def generate_weekly_report() -> dict:
     filename = f"Weekly_{today.strftime('%Y%m%d')}_{week_id}.md"
     file_path = _safe_path(weekly_dir, filename)
     file_path.write_text(rendered, encoding="utf-8")
+    _invalidate_vault_stats_cache()
 
     return {
         "status": "success",
@@ -587,14 +623,32 @@ def save_bilingual_reading_card(data: dict) -> dict:
 
     for sec in sections:
         sec_title = sec.get("title", "未命名章节")
+        trans_html = (sec.get("translation_html") or "").strip()
         trans = (sec.get("translation") or "").strip()
+        orig_html = (sec.get("orig_html") or "").strip()
         orig = (sec.get("text") or "").strip()
         lines.append(f"### {sec_title}\n")
-        if trans:
+        # Translation: prefer pre-rendered HTML (already KaTeX-processed) over
+        # raw markdown. The HTML embeds inline <span class="katex"> + <svg>
+        # blocks for every formula, so Obsidian / Typora / GitHub preview all
+        # show fully-typeset math without any community plugin.
+        if trans_html:
+            lines.append("> [!NOTE] 中文精译 (已 KaTeX 排版)\n")
+            lines.append('<div class="bilingual-trans-cn">\n')
+            lines.append(trans_html)
+            lines.append("\n</div>\n")
+        elif trans:
+            # Fallback when client didn't pre-render (older client / partial load)
             trans_block = "\n".join(f"> {line}" if line.strip() else ">" for line in trans.splitlines())
-            lines.append(f"> [!NOTE] 中文精译\n{trans_block}\n")
-        if orig:
-            lines.append(f"<details>\n<summary><b>展开对应英文原文 (第 {sec.get('page_start', 1)}-{sec.get('page_end', 1)} 页)</b></summary>\n\n{orig}\n\n</details>\n")
+            lines.append(f"> [!NOTE] 中文精译 (LaTeX 源码 — 需 Obsidian 公式插件)\n{trans_block}\n")
+        # English original: same dual-mode treatment. Useful when the source
+        # PDF contains LaTeX (common in microelectronics / physics papers).
+        if orig_html:
+            page_hint = f"(第 {sec.get('page_start', 1)}-{sec.get('page_end', 1)} 页 · KaTeX 已排版)"
+            lines.append(f"<details>\n<summary><b>展开对应英文原文 {page_hint}</b></summary>\n\n<div class=\"bilingual-trans-en\">\n\n{orig_html}\n\n</div>\n\n</details>\n")
+        elif orig:
+            page_hint = f"(第 {sec.get('page_start', 1)}-{sec.get('page_end', 1)} 页)"
+            lines.append(f"<details>\n<summary><b>展开对应英文原文 {page_hint}</b></summary>\n\n{orig}\n\n</details>\n")
         lines.append("---\n")
 
     if qa_records:
@@ -629,6 +683,7 @@ def save_bilingual_reading_card(data: dict) -> dict:
         target_dir.mkdir(parents=True, exist_ok=True)
     file_path = _safe_path(target_dir, filename)
     file_path.write_text(content, encoding="utf-8")
+    _invalidate_vault_stats_cache()
 
     return {
         "status": "success",
@@ -725,6 +780,7 @@ status: 已完成
         target_dir.mkdir(parents=True, exist_ok=True)
     file_path = _safe_path(target_dir, filename)
     file_path.write_text(content, encoding="utf-8")
+    _invalidate_vault_stats_cache()
 
     return {
         "status": "success",
