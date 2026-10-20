@@ -71,6 +71,16 @@ PASS_COUNT = 0
 FAIL_COUNT = 0
 FAILED_TESTS = []
 
+# This file is a STANDALONE script, not a pytest module. Without this
+# marker pytest collects every `test_*` function in it and runs them
+# individually — which means the suite's vault-writing and network-calling
+# helpers get executed *outside* the `run_all()` flow, so nothing cleans
+# up afterwards and the user's real notes get littered with test cards.
+# It also made the pre-commit hook slow and network-dependent.
+# The pytest-style suite lives in tests/; this one is run explicitly with
+#     python -m microbench.test_bench
+__test__ = False
+
 
 def _check(cond: bool, label: str):
     global PASS_COUNT, FAIL_COUNT
