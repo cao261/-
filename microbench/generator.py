@@ -337,11 +337,18 @@ def get_vault_stats() -> dict:
         content = trouble_file.read_text(encoding="utf-8")
         # The counter used to match a LEGACY heading format ("### 坑 01：…")
         # that the writer no longer produces — it writes "### 坑记录：[…]
-        # (date)". On the real vault this reported 4 instead of 76, so the
-        # dashboard's "避坑沉淀" counter was wrong by an order of
-        # magnitude. Match both formats.
+        # (date)". On the real vault this reported 4 instead of 10.
+        #
+        # The whitespace classes MUST be horizontal-only ([ \t]) and not
+        # \s: \s matches newlines, so `^###\s+坑(?:\s*\d+|\s*记录)` happily
+        # spanned several lines and counted the same heading many times
+        # over — it reported 76 for a file that holds 10 entries.
         trouble_count = len(
-            re.findall(r"^###\s+坑(?:\s*\d+|\s*记录)\s*[：:]", content, re.MULTILINE)
+            re.findall(
+                r"^###[ \t]+坑(?:[ \t]*\d+|[ \t]*记录)[：:]",
+                content,
+                re.MULTILINE,
+            )
         )
 
     weekly_count = len(list(weekly_dir.glob("*.md"))) if weekly_dir.exists() else 0

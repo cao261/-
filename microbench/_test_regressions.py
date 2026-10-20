@@ -182,18 +182,39 @@ print("\n[6] Test-suite hygiene: the cleanup must not delete real vault notes")
 # explicit manifest of files the suite created, never on a name substring.
 from . import test_bench as _tb
 
+
+def _safe_read(path):
+    """Read a file's text, or '' if it cannot be read."""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+# The invariant is NOT "no file has a matching name" — it is "a file is an
+# artifact if and only if its CONTENT carries the marker". Pick a matching
+# name whose content does NOT carry the marker and assert it is not
+# treated as an artifact. (The vault legitimately contains a real note
+# whose title mentions MoS2.)
 _real = BASE_DIR / "01_Literature"
 _matching = [
     f for f in _real.rglob("*.md")
     if any(p in f.name for p in ("SmokeTest", "MoS2", "BilingualTest", "QA_"))
 ]
+_unmarked = [f for f in _matching if not _tb.TEST_ARTIFACT_MARKER in _safe_read(f)]
 check(
-    len(_matching) == 0 or not _tb._is_test_artifact(_matching[0]),
-    "substring-matching vault notes are NOT treated as test artifacts",
+    not _unmarked or not _tb._is_test_artifact(_unmarked[0]),
+    "同名但内容无标记的真实笔记不会被当成测试残留",
 )
 check(
     hasattr(_tb, "_is_test_artifact"),
     "test_bench exposes _is_test_artifact() for manifest-based cleanup",
+)
+# And the converse: a file that DOES carry the marker is recognised.
+_marked = [f for f in _matching if _tb.TEST_ARTIFACT_MARKER in _safe_read(f)]
+check(
+    not _marked or all(_tb._is_test_artifact(f) for f in _marked),
+    "带标记的文件都会被识别为测试残留",
 )
 
 # ---------------------------------------------------------------------------

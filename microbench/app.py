@@ -14,6 +14,7 @@ import json
 import re
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -58,10 +59,27 @@ from .plot_compare import (
 )
 from .paper_text import fetch_full_text, split_into_sections, extract_text_from_pdf
 
+
+@asynccontextmanager
+async def _lifespan(app: "FastAPI"):
+    """Release the pooled httpx clients when the server stops.
+
+    Uses the modern `lifespan` hook — `app.on_event("shutdown")` is
+    deprecated and emitted a DeprecationWarning on every startup.
+    """
+    yield
+    try:
+        from .llm import close_async_clients
+        close_async_clients()
+    except Exception:
+        pass
+
+
 app = FastAPI(
     title="MicroBench - 微电子与半导体科研工作台",
     version="1.4.0",
     description="本地学术工作台 API: 文献抓取/全文/PDF/BibTeX/翻译/AI解读/复现工程/踩坑/周报/RAG",
+    lifespan=_lifespan,
 )
 
 # CORS — only allow localhost (UI is same-origin via FastAPI's static file serving).
@@ -177,16 +195,6 @@ async def csrf_origin_guard(request: Request, call_next):
     return await call_next(request)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-
-
-@app.on_event("shutdown")
-async def _shutdown_pooled_clients():
-    """Release the pooled httpx clients when the server stops."""
-    try:
-        from .llm import close_async_clients
-        close_async_clients()
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
