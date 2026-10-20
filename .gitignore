@@ -24,12 +24,16 @@ Thumbs.db
 # LLM API keys (NEVER commit)
 .env
 
-# Local debug / smoke test artifacts
-_test_*.py
-_debug_*.py
-_smoke_*.py
-_v*_smoke*.py
-_liu_*.py
+# Local debug / smoke test artifacts (repository ROOT only — the same
+# pattern inside microbench/ would hide microbench/_test_regressions.py,
+# which is a real regression suite and belongs in version control)
+_/_test_*.py
+/_test_webview.py
+_/_debug_*.py
+_/_smoke_*.py
+_/_v*_smoke*.py
+_/_liu_*.py
+/_clean_*.py
 
 # Vault contents (user actual notes/literature) — keep on disk only
 00_Dashboard/
@@ -41,9 +45,20 @@ _Templates/
 .obsidian/
 
 # Generated audit/scratch artifacts (not source)
-_*.py
-_*.txt
-_audit_*.md
+_/_*.txt
+/_audit_*.md
+/_*.log
 
 # Audit report produced by security-audit skill (kept locally, never in repo)
 AUDIT_REPORT.md
+
+# Runtime artifacts. app.py's snapshot code claims logs/
+
+# Backup copies of the launcher (kept on disk, never in the repo)
+start_workbench.bat.bak is gitignored so
+# translated paper text never leaks into the public Obsidian vault — it was
+# not actually ignored, so a `git add -A` would have committed them.
+logs/
+
+# Backup copies of the launcher (kept on disk, never in the repo)
+start_workbench.bat.bak

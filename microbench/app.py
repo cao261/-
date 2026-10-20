@@ -13,7 +13,9 @@ import os
 import json
 import re
 import asyncio
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,6 +65,10 @@ app = FastAPI(
 )
 
 # CORS — only allow localhost (UI is same-origin via FastAPI's static file serving).
+# NOTE: allow_methods MUST include DELETE, otherwise the browser refuses the
+# preflight for DELETE /api/vault/file and DELETE /api/pdf/snapshot/delete
+# whenever the page is loaded from a slightly different origin (e.g. the
+# desktop webview on a custom --port).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -70,11 +76,140 @@ app.add_middleware(
         "http://localhost:5000",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# CSRF / cross-origin request guard
+# ---------------------------------------------------------------------------
+# CORS only decides whether the *browser* may hand the response back to the
+# requesting page. It does NOT stop a cross-site <form> from *delivering* a
+# request to 127.0.0.1:5000 — "simple" POSTs (text/plain, or form-encoded)
+# are sent without a preflight, so the side effect happens even though the
+# attacker cannot read the answer.
+#
+# MicroBench's mutating endpoints have real side effects on the user's machine
+# and wallet: writing notes into the vault, spawning explorer windows, and
+# spending the user's LLM tokens. A hostile web page the user happens to have
+# open can drive all of that via a hidden form post.
+#
+# Guard: every state-changing request must originate from the loopback
+# interface, on the very port this server is listening on. We accept
+#   - no Origin and no Referer at all  -> non-browser client (curl/Postman/IDE)
+#   - Origin/Referer whose host is 127.0.0.1 / localhost / [::1] AND whose
+#     port matches the port the request arrived on
+# Everything else is rejected with 403 before it reaches a handler.
+# ---------------------------------------------------------------------------
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _origin_is_local(origin: str, allowed_ports: set) -> bool:
+    """True if `origin` is the loopback interface on a port we serve."""
+    if not origin or origin == "null":
+        # "null" is what a sandboxed iframe / file:// page sends. It is NOT
+        # our own page, so treat it as hostile.
+        return False
+    try:
+        parsed = urlparse(origin)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in _LOOPBACK_HOSTS:
+        return False
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    # The UI is always served from the same origin as the API, so the port
+    # must match one we are actually listening on. A different loopback
+    # port is a different app.
+    return port in allowed_ports
+
+
+@app.middleware("http")
+async def csrf_origin_guard(request: Request, call_next):
+    """Reject cross-origin state-changing requests (see block comment above)."""
+    if request.method.upper() not in _SAFE_METHODS:
+        # The ports this server answers on: the socket it is bound to, and
+        # the port in the Host header (which is what the browser actually
+        # used to reach us). The Host header cannot be forged by a
+        # cross-site page — the page controls the *target* URL, not the
+        # Host of the request it triggers.
+        allowed_ports = set()
+        server = request.scope.get("server") or ()
+        if len(server) > 1 and server[1]:
+            allowed_ports.add(int(server[1]))
+        host_header = request.headers.get("host") or ""
+        try:
+            if ":" in host_header:
+                allowed_ports.add(int(host_header.rsplit(":", 1)[1]))
+            elif host_header:
+                allowed_ports.add(80)
+        except ValueError:
+            pass
+        if not allowed_ports:
+            allowed_ports = {5000}
+
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        if origin:
+            if not _origin_is_local(origin, allowed_ports):
+                return HTMLResponse(
+                    f"<h1>403</h1><p>拒绝跨站请求 (Origin: {origin})。</p>",
+                    status_code=403,
+                )
+        elif referer:
+            ref_origin = f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"
+            if not _origin_is_local(ref_origin, allowed_ports):
+                return HTMLResponse(
+                    f"<h1>403</h1><p>拒绝跨站请求 (Referer: {referer})。</p>",
+                    status_code=403,
+                )
+        # No Origin AND no Referer -> not a browser form post. Allow.
+    return await call_next(request)
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@app.on_event("shutdown")
+async def _shutdown_pooled_clients():
+    """Release the pooled httpx clients when the server stops."""
+    try:
+        from .llm import close_async_clients
+        close_async_clients()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Readable validation errors
+# ---------------------------------------------------------------------------
+# FastAPI's default 422 body is a list of dicts:
+#   {"detail":[{"loc":["body","pages",0,"page_num"],"msg":"...","type":"..."}]}
+# The frontend does `new Error(result.detail || "…")`, so a list gets
+# stringified to "[object Object]" and the user sees a useless toast.
+# Flatten it into a single human-readable line instead.
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(x) for x in err.get("loc", []) if x != "body")
+        msg = err.get("msg", "参数无效")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    detail = "请求参数无效 — " + "; ".join(parts) if parts else "请求参数无效"
+    return JSONResponse(status_code=422, content={"detail": detail})
 
 
 async def _stream_llm_event_gen(chunk_iter, meta=None):
@@ -214,8 +349,12 @@ class ExplainSelectionRequest(BaseModel):
     prior_answer: Optional[str] = Field(default="", max_length=8000,
                                         description="上一轮的回答全文(供 LLM 知道之前答了什么)")
     force_scope: Optional[str] = Field(default="", max_length=20,
-                                        description="强制 scope (term|mid|wide|full)。"
-                                                    "为空=按 router 决定。" )
+                                        description="上下文预算档位 (term|mid|wide|full)。"
+                                                    "客户端按所选 scope 构造 surrounding_context 并随请求下发; "
+                                                    "服务端据此对上下文做**上限截断**"
+                                                    "(term=2K / mid=8K / wide=20K / full=50K 字符), "
+                                                    "防止客户端或路由器的预算失控。"
+                                                    "留空则按 mid 的上限处理。")
 
 
 class TranslatePageRequest(BaseModel):
@@ -301,9 +440,24 @@ async def serve_index():
     return response
 
 @app.get("/api/stats")
-async def api_stats():
+def api_stats():
+    """Vault counters for the dashboard.
+
+    Deliberately counters-only. get_vault_stats() now returns the FULL
+    (untruncated) literature list so that /api/vault/literature can
+    paginate on top of it; shipping that list here as well meant the
+    dashboard re-serialised every note on every page mount (~6 KB for 23
+    notes, and growing linearly). The feed uses /api/vault/literature, so
+    the list was dead weight here.
+    """
     try:
-        return get_vault_stats()
+        stats = get_vault_stats()
+        return {
+            "literature_total": stats.get("literature_total", 0),
+            "reproduction_total": stats.get("reproduction_total", 0),
+            "troubleshoot_count": stats.get("troubleshoot_count", 0),
+            "weekly_count": stats.get("weekly_count", 0),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"读取 vault 统计失败: {str(e)}")
 
@@ -352,7 +506,15 @@ async def api_vault_literature(
         raise HTTPException(status_code=500, detail=f"读取文献列表失败: {str(e)}")
 
 @app.post("/api/paper/fetch")
-async def api_fetch_paper(req: FetchPaperRequest):
+def api_fetch_paper(req: FetchPaperRequest):
+    """Fetch paper metadata (arXiv / DOI / Crossref).
+
+    Sync `def` on purpose — smart_fetch_paper() performs several
+    blocking HTTP calls (arXiv, then Semantic Scholar, then Crossref),
+    each with a 15-20s timeout. As an `async def` it pinned the event
+    loop for the whole chain, freezing every other request (including
+    the dashboard's live counters and the SSE readers).
+    """
     try:
         data = smart_fetch_paper(req.identifier)
         # Also try to resolve landing URL for DOI papers (for manual download link)
@@ -659,20 +821,21 @@ async def api_vault_reveal(
     cmd = None
     try:
         if sys.platform.startswith("win"):
-            # CRITICAL: /select, takes ONE comma-separated argument. If the
-            # file path itself contains a comma (e.g. "paper, draft.pdf"),
-            # naive `["explorer", f"/select,{abs_path}"]` would feed explorer
-            # a truncated path (split at the first non-arg comma). Use
-            # CreateProcess directly via the = form, OR shell=True with a
-            # properly escaped command line. The latter is simpler and works
-            # for paths with spaces, commas, ampersands, parentheses.
+            # Explorer's /select switch takes ONE argument: everything after
+            # the first comma is the path, so a path containing commas is
+            # fine as long as it stays a single argv element.
             #
-            # Wrap path in double quotes and escape any embedded quotes
-            # (rare on Windows but cheap to handle). Backslashes are left
-            # alone — cmd.exe doesn't interpret them in a quoted path.
-            escaped = abs_path.replace('"', '\\"')
-            cmd_str = f'explorer "/select,{escaped}"'
-            subprocess.Popen(cmd_str, shell=True)
+            # This used to be `shell=True` with an f-string. Two problems:
+            #   1. cmd.exe is inserted into the chain, and it expands %VAR%
+            #      even inside double quotes — a file literally named
+            #      "100%PATH%.md" would be opened as a different path.
+            #   2. the old backslash-escaping of '"' was meaningless: Windows
+            #      filenames cannot contain '"' at all, and cmd does not use
+            #      backslash escaping anyway.
+            # shell=False keeps the path as a single argv element, so no
+            # shell metacharacter of any kind is interpreted.
+            cmd = ["explorer", f"/select,{abs_path}"]
+            subprocess.Popen(cmd)
         elif sys.platform == "darwin":
             cmd = ["open", "-R", abs_path]
             subprocess.Popen(cmd)
@@ -776,12 +939,25 @@ async def api_upload_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="仅支持上传 PDF 文件 (.pdf)")
 
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) > 40 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="PDF 文件不能超过 40MB")
+    # Read in chunks with a running cap. `await file.read()` with no size
+    # argument buffers the *entire* body in memory before the limit is
+    # checked, so a 2GB upload could exhaust RAM (and the 40MB check only
+    # fired after the fact). Streaming keeps the peak at limit + 1 chunk.
+    MAX_UPLOAD_BYTES = 40 * 1024 * 1024
+    buf = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="PDF 文件不能超过 40MB")
+    pdf_bytes = bytes(buf)
 
     try:
-        pages = extract_text_from_pdf(pdf_bytes)
+        # pdfplumber parsing is CPU-bound and can take seconds on a large
+        # paper — keep it off the event loop.
+        pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF 文本提取失败: {str(e)}")
 
@@ -846,12 +1022,15 @@ async def api_upload_pdf(
 
 
 @app.get("/api/paper/bibtex")
-async def api_export_bibtex(
+def api_export_bibtex(
     arxiv: Optional[str] = Query(default=None, max_length=50),
     doi: Optional[str] = Query(default=None, max_length=200),
     bib_key: Optional[str] = Query(default=None, max_length=80),
 ):
-    """Generate a BibTeX entry from arXiv ID or DOI."""
+    """Generate a BibTeX entry from arXiv ID or DOI.
+
+    Sync `def` on purpose — the metadata fetch is blocking network I/O.
+    """
     if not arxiv and not doi:
         raise HTTPException(status_code=400, detail="必须提供 arxiv 或 doi 之一")
     try:
@@ -919,20 +1098,28 @@ async def api_llm_status():
     }
 
 @app.post("/api/llm/probe")
-async def api_llm_probe():
-    """Manually probe MiniMax to test if quota has reset and trigger auto-upgrade."""
+def api_llm_probe():
+    """Manually probe MiniMax to test if quota has reset and trigger auto-upgrade.
+
+    Deliberately a sync `def` (not `async def`): probe_primary_model() is a
+    blocking `requests.post(timeout=15)`. FastAPI runs sync endpoints in the
+    anyio worker-thread pool, so a probe no longer freezes the event loop
+    (and with it every SSE stream and the dashboard's live counters).
+    """
     res = llm.probe_primary_model()
     return res
 
 
 @app.post("/api/paper/summarize")
-async def api_summarize_paper(req: SummarizeRequest):
+def api_summarize_paper(req: SummarizeRequest):
     """
     Generate a Chinese TL;DR + 3-5 key points + 1 research takeaway
     from paper metadata via LLM.
 
     If LLM is not configured, returns 200 with a fallback skeleton + an
     inline error message in the result (so the UI can still render gracefully).
+
+    Sync `def` on purpose — llm.summarize_paper() is a blocking HTTP call.
     """
     if not llm.is_configured():
         raise HTTPException(
@@ -948,7 +1135,7 @@ async def api_summarize_paper(req: SummarizeRequest):
         raise HTTPException(status_code=500, detail=f"生成摘要失败: {str(e)}")
 
 @app.post("/api/ask")
-async def api_ask_question(req: AskRequest):
+def api_ask_question(req: AskRequest):
     """
     RAG-style Q&A over the local vault.
 
@@ -959,6 +1146,9 @@ async def api_ask_question(req: AskRequest):
 
     Resilience: even if LLM call fails, the matched chunks are returned so
     the user can still browse what their vault contains on the topic.
+
+    Sync `def` on purpose — both search_vault() (full vault scan) and
+    llm.answer_with_context() (blocking HTTP) are synchronous.
     """
     chunks = search_vault(req.question, top_k=req.top_k or 5)
     if not chunks:
@@ -1028,11 +1218,25 @@ async def api_plot_extract(
     Returns pixel-space (x, y) points plus metadata.
     Frontend then calibrates to real coords via /api/plot/calibrate.
     """
-    image_bytes = await image.read()
-    if len(image_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="图片不能超过 10MB")
+    # Stream the upload with a running cap instead of buffering it whole
+    # and checking afterwards.
+    MAX_IMAGE_BYTES = 10 * 1024 * 1024
+    buf = bytearray()
+    while True:
+        chunk = await image.read(1024 * 1024)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="图片不能超过 10MB")
+    image_bytes = bytes(buf)
+
     try:
-        result = extract_curve_from_image(
+        # The digitiser walks every pixel (it used to be a pure-Python
+        # double loop taking seconds on a 4K screenshot) — keep it off the
+        # event loop.
+        result = await asyncio.to_thread(
+            extract_curve_from_image,
             image_bytes, sat_thresh=sat_thresh, val_thresh=val_thresh
         )
         return {"status": "success", **result}
@@ -1093,7 +1297,7 @@ async def api_plot_compare(req: CompareRequest):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/paper/fetch_full")
-async def api_fetch_full_text(req: FetchFullRequest):
+def api_fetch_full_text(req: FetchFullRequest):
     """
     Fetch the full text of a paper given an arXiv ID, DOI, or URL.
     Extracts PDF, splits into canonical sections (Abstract / Introduction /
@@ -1108,6 +1312,10 @@ async def api_fetch_full_text(req: FetchFullRequest):
     Caveats: IEEE / Elsevier / Wiley DOIs are usually paywalled —
     we'll return 400 with a clear message asking the user to either
     paste the PDF URL, use an arXiv preprint, or paste the text directly.
+
+    Sync `def` on purpose — fetch_full_text() does network I/O *and* PDF
+    parsing (tens of seconds on a large paper). As `async def` it pinned the
+    event loop and froze every other request for the duration.
     """
     try:
         result = fetch_full_text(req.identifier)
@@ -1224,22 +1432,34 @@ async def api_translate_section(req: TranslateRequest):
                 user_msg = (
                     f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}"
                 )
-            translated_parts.append(
-                llm.chat(
-                    messages=[
-                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    # Shorter cap: smaller chunks need shorter responses, and
-                    # faster responses are less likely to be killed mid-stream
-                    # by upstream proxies / load balancers.
-                    max_tokens=1500,
-                    temperature=0.2,
-                    # Generous timeout — MiniMax-M2.7 thinking mode can take 60s
-                    # per chunk; multi-chunk translations need headroom.
-                    timeout=120,
-                ).strip()
+            # llm.chat() is a *synchronous* requests-based call with a 120s
+            # timeout. Calling it straight from this async def pins the event
+            # loop for the whole round trip, so every other endpoint (stats,
+            # feed, model probe) stalls while one section translates — and this
+            # loop can do it once per chunk. Hand it to a worker thread.
+            #
+            # NOTE: the `.strip()` must apply to the RESULT, not to the
+            # coroutine object returned by asyncio.to_thread. Writing
+            # `await asyncio.to_thread(...).strip()` binds .strip() to the
+            # coroutine and raises
+            #   "'coroutine' object has no attribute 'strip'"
+            # — which broke both translation endpoints completely.
+            translated = await asyncio.to_thread(
+                llm.chat,
+                messages=[
+                    {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                # Shorter cap: smaller chunks need shorter responses, and
+                # faster responses are less likely to be killed mid-stream
+                # by upstream proxies / load balancers.
+                max_tokens=1500,
+                temperature=0.2,
+                # Generous timeout — MiniMax-M2.7 thinking mode can take 60s
+                # per chunk; multi-chunk translations need headroom.
+                timeout=120,
             )
+            translated_parts.append((translated or "").strip())
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=f"LLM 翻译失败: {str(e)}")
     except Exception as e:
@@ -1385,7 +1605,10 @@ async def api_classify_qa_scope(req: ClassifyQAScopeRequest):
     )
 
     try:
-        raw = llm.chat(
+        # Synchronous LLM call from an async endpoint — offload to a thread so
+        # the router's 25s budget never blocks the whole server.
+        raw = await asyncio.to_thread(
+            llm.chat,
             messages=[
                 {"role": "system", "content": QA_SCOPE_ROUTER_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -1602,8 +1825,25 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
         f"【用户划选片段 ({source_desc})】:\n```text\n{req.selected_text.strip()}\n```",
     ]
     if req.surrounding_context:
-        ctx_snippet = req.surrounding_context.strip()[:10000]
-        user_msg_parts.append(f"【该片段所在的章节/页面上下文背景】:\n{ctx_snippet}")
+        # Scope budget, mirroring the router's advertised tiers
+        # (term ~600-800 / mid 4-8K / wide 12-20K / full up to 60K).
+        #
+        # The server used to hard-truncate the context to 10 000 chars
+        # regardless of scope. That silently defeated the whole two-stage
+        # design: the LLM router would allocate an 80K budget for "full"
+        # scope and the server would throw away 70 000 characters of it
+        # before the model ever saw them. The client is still the one that
+        # *builds* the context (the server has no paper text), but the
+        # server now enforces the ceiling, so a buggy or hostile client
+        # cannot smuggle a full-paper dump into a "term" question.
+        scope_caps = {"term": 2000, "mid": 8000, "wide": 20000, "full": 50000}
+        cap = scope_caps.get((req.force_scope or "").strip().lower(), 8000)
+        ctx_snippet = req.surrounding_context.strip()[:cap]
+        truncated = len(req.surrounding_context.strip()) > cap
+        user_msg_parts.append(
+            f"【该片段所在的章节/页面上下文背景】:\n{ctx_snippet}"
+            + ("\n(上下文过长, 已按所选 scope 截断)" if truncated else "")
+        )
     # Feedback loop: when the user re-asks because they didn't like the
     # previous answer, thread the prior answer + their feedback through so
     # the LLM can correct course (more depth, narrower focus, different
@@ -1688,17 +1928,19 @@ async def api_translate_page(req: TranslatePageRequest):
                 )
             else:
                 user_msg = f"翻译以下学术论文第 {req.page} 页:\n\n{chunk}"
-            translated_parts.append(
-                llm.chat(
-                    messages=[
-                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    max_tokens=1500,
-                    temperature=0.2,
-                    timeout=90,
-                ).strip()
+            translated = await asyncio.to_thread(
+                llm.chat,
+                messages=[
+                    {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=1500,
+                temperature=0.2,
+                timeout=90,
             )
+            # `.strip()` must apply to the awaited result, not to the
+            # coroutine (see the same note in api_translate_section).
+            translated_parts.append((translated or "").strip())
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=f"按页翻译失败: {e}")
     except Exception as e:
@@ -1830,7 +2072,9 @@ async def api_paste_analyze(req: PasteTextRequest):
             return response
         try:
             # Build ExplainRequest context
-            answer = llm.chat(
+            # Sync LLM call from an async endpoint — offload to a worker thread.
+            answer = await asyncio.to_thread(
+                llm.chat,
                 messages=[
                     {"role": "system", "content": EXPLAIN_SYSTEM_PROMPT},
                     {"role": "user", "content": (
@@ -1885,7 +2129,13 @@ class SnapshotSaveRequest(BaseModel):
                                description="stat().st_mtime of the source PDF at save time")
     paper_text_signature: str = Field(default="", max_length=64,
                                       description="Optional — fingerprint across all pages")
-    pages: list = Field(..., description="List of translated pages")
+    # Typed + bounded. This used to be a bare `list`, which meant a client
+    # could POST an unbounded number of arbitrary objects: the server parsed
+    # the whole thing into memory and only *then* checked the 5MB limit, so
+    # the "5MB cap" never actually capped peak memory. `_SnapshotPageItem`
+    # was defined for exactly this purpose but never referenced.
+    pages: list[_SnapshotPageItem] = Field(..., max_length=2000,
+                                            description="List of translated pages")
 
 
 def _snapshot_dir() -> Path:
@@ -1971,16 +2221,12 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
     # Validate page list
     seen = set()
     for p in req.pages:
-        try:
-            pn = int(p.get("page_num"))
-            tx = p.get("translation", "")
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"page 字段缺失或类型错误: {p}")
-        if not tx:
-            raise HTTPException(status_code=400, detail=f"page {pn} translation 为空")
+        pn = p.page_num
         if pn in seen:
             raise HTTPException(status_code=400, detail=f"page {pn} 重复")
         seen.add(pn)
+
+    pages_out = [p.model_dump() for p in req.pages]
 
     payload = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
@@ -1989,7 +2235,7 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
         "relative_path": req.relative_path,
         "paper_mtime": req.paper_mtime,
         "paper_text_signature": req.paper_text_signature,
-        "pages": req.pages,
+        "pages": pages_out,
         "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
     }
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)

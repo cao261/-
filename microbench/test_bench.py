@@ -83,45 +83,83 @@ def _check(cond: bool, label: str):
         print(f"  ❌ {label}")
 
 
+# ===========================================================================
+# Test-artifact identification
+# ===========================================================================
+# Every file this suite creates carries a unique marker string in its
+# frontmatter (the marker rides along in the card title, which the
+# literature / bilingual / QA templates all render into the file).
+#
+# The previous cleanup keyed off *filename substrings* — "SmokeTest",
+# "MoS2", "BilingualTest", "QA_". That is a loaded gun in this vault: the
+# user's research area is 2D materials (MoS2 / HZO / 2D-FET), so the day
+# they save a real note titled "MoS2-based HZO 2D-FET …" the suite would
+# silently unlink their literature. Cleanup now asks "does this file
+# contain the marker?" instead of "does its name look like a test?".
+TEST_ARTIFACT_MARKER = "MBTESTARTIFACT"
+
+
+def _is_test_artifact(path) -> bool:
+    """True iff `path` is a markdown file this test suite created.
+
+    Decided by content, never by filename. A file that cannot be read is
+    NOT considered an artifact (fail-safe: never delete what we can't
+    positively identify).
+    """
+    try:
+        p = Path(path)
+        if not p.is_file() or p.suffix.lower() not in (".md", ".markdown"):
+            return False
+        head = p.read_text(encoding="utf-8", errors="replace")[:8192]
+    except OSError:
+        return False
+    return TEST_ARTIFACT_MARKER in head
+
+
 def _cleanup_test_artifacts():
     """
     Remove any files created by previous test runs so the suite is idempotent.
-    Tests are matched by filename pattern rather than timestamp to be safe.
+
+    Identification is by *content marker*, not by filename — see
+    TEST_ARTIFACT_MARKER above for why a substring match on the filename is
+    unsafe in this vault.
     """
     import shutil
-    patterns = [
-        ("SmokeTest", "md"),        # save_literature_card smoke titles
-        ("MoS2", "md"),             # special-chars title
-        ("BilingualTest", "md"),    # export_bilingual test
-        ("QA_", "md"),              # export_qa test
-    ]
-    for lit_cat in (BASE_DIR / "01_Literature").iterdir():
-        if not lit_cat.is_dir():
-            continue
-        for f in lit_cat.rglob("*.md"):
-            for pat, ext in patterns:
-                if pat in f.name and f.name.endswith(f".{ext}"):
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
+    removed = 0
+    lit_root = BASE_DIR / "01_Literature"
+    if lit_root.exists():
+        for f in lit_root.rglob("*.md"):
+            if _is_test_artifact(f):
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
     # Cleanup test reproduction project
     test_proj = BASE_DIR / "02_Reproduction" / "repro_test_gaa_v11"
     if test_proj.exists():
         shutil.rmtree(test_proj, ignore_errors=True)
-    # Cleanup troubleshoot test entries (recognizable by exact tool_name + keyword)
+    # Cleanup troubleshoot test entries (recognizable by exact tool_name + keyword).
+    # The date used to be pinned to 2026-09-20, which meant that from the
+    # next day on the entry was never removed again and every test run
+    # appended a fresh copy to the user's shared knowledge file. Match any
+    # date instead.
     trouble_file = BASE_DIR / "03_Knowledge" / "踩坑与排错日记.md"
     if trouble_file.exists():
         text = trouble_file.read_text(encoding="utf-8")
-        # Strip blocks whose keyword matches a test pattern
+        # Strip blocks whose keyword matches a test pattern.
+        # The fences are 3 or 4 backticks: record_troubleshoot now uses a
+        # 4-backtick fence so that a `raw_error` containing ``` cannot
+        # terminate the block early.
         import re
         cleaned = re.sub(
-            r"\n---\n\n### 坑记录：\[TCAD仿真收敛\] (?:Test convergence issue V1\.1|smoke_test_convergence) \(2026-09-20\)\n- \*\*工具/环境\*\*：[^\n]+\n- \*\*错误现场\*\*：\n```text\n[^\n]+\n```\n- \*\*根本原因\*\*：\n[^\n]+\n- \*\*解决方案\*\*：\n```bash\n[^\n]+\n```\n",
+            r"\n---\n\n### 坑记录：\[TCAD仿真收敛\] (?:Test convergence issue V1\.1|smoke_test_convergence) \(\d{4}-\d{2}-\d{2}\)\n- \*\*工具/环境\*\*：[^\n]+\n- \*\*错误现场\*\*：\n`{3,4}text\n[^\n]+\n`{3,4}\n- \*\*根本原因\*\*：\n[^\n]+\n- \*\*解决方案\*\*：\n`{3,4}bash\n[^\n]+\n`{3,4}\n",
             "",
             text,
         )
         if cleaned != text:
             trouble_file.write_text(cleaned, encoding="utf-8")
+    return removed
 
 
 # ===========================================================================
@@ -203,7 +241,10 @@ def test_special_chars():
     print("\n[3] Special characters in titles")
 
     # Chinese + curly braces + spaces + slashes (slashes get sanitized)
-    weird_title = "新型 {MoS2}/HZO 异质结 2D-FET — 物理建模"
+    # The trailing marker is what makes this file identifiable as a test
+    # artifact by CONTENT (see TEST_ARTIFACT_MARKER) instead of by a
+    # filename pattern that would also match a real MoS2 note.
+    weird_title = "新型 {MoS2}/HZO 异质结 2D-FET — 物理建模 " + TEST_ARTIFACT_MARKER
     sanitized = sanitize_filename(weird_title)
     # Forbidden Windows chars removed; spaces → underscore; curly braces ARE legal
     forbidden = set('\\/*?:"<>|')
@@ -454,6 +495,12 @@ def test_troubleshoot():
 # ===========================================================================
 def test_weekly_report():
     print("\n[8] Weekly report")
+    # Snapshot the weekly-report folder so we can remove exactly the file
+    # this test creates. generate_weekly_report() names the file after
+    # today's date, so running the suite on a new day used to leave a
+    # brand-new report behind in the user's vault, every single time.
+    weekly_dir = BASE_DIR / "04_Weekly_Reports"
+    before = {p.name for p in weekly_dir.iterdir()} if weekly_dir.exists() else set()
     res = generate_weekly_report()
     _check(res["status"] == "success", "周报生成成功")
     weekly_file = BASE_DIR / res["path"]
@@ -461,6 +508,14 @@ def test_weekly_report():
     import re
     leftover = re.findall(r"\{\{[a-zA-Z_]+\}\}", content)
     _check(len(leftover) == 0, "周报无残留占位符")
+    # Remove whatever this test just created (only files that were not there
+    # before the call).
+    try:
+        for p in weekly_dir.iterdir():
+            if p.name not in before:
+                p.unlink()
+    except OSError:
+        pass
 
 
 # ===========================================================================
@@ -1121,36 +1176,40 @@ def test_cross_qa_endpoint():
             saved[k] = os.environ[k]
             del os.environ[k]
     try:
-        r = client.post("/api/paper/cross_qa", json={
+        r = client.post("/api/paper/cross_qa_stream", json={
             "question": "X 在 Y 中如何应用?", "sections": sections,
         })
-        _check(r.status_code == 503, f"无 LLM 配置 cross_qa 返回 503 (实际 {r.status_code})")
+        _check(r.status_code == 503, f"无 LLM 配置 cross_qa_stream 返回 503 (实际 {r.status_code})")
     finally:
         for k, v in saved.items():
             os.environ[k] = v
 
     # < 2 sections → 422 (Pydantic min_length validation) OR 400
     if llm.is_configured():
-        r = client.post("/api/paper/cross_qa", json={
+        r = client.post("/api/paper/cross_qa_stream", json={
             "question": "test", "sections": sections[:1],
         })
         _check(r.status_code in (400, 422), f"< 2 章节返回 400/422 (实际 {r.status_code})")
 
-        # Real call with 3 sections + selected_indices subset
-        r = client.post("/api/paper/cross_qa", json={
+        # Real call with 3 sections + selected_indices subset.
+        # NOTE: the non-streaming /api/paper/cross_qa endpoint was removed
+        # on 2026-09-24 (commit 8be4eac) in favour of the SSE variant, so
+        # the assertions below now read the SSE frames instead of a JSON
+        # body. The old test kept hitting a 404 and failing ever since.
+        with client.stream("POST", "/api/paper/cross_qa_stream", json={
             "question": "本文方法如何回应引言中提到的 SOTA 缺陷?",
             "sections": sections,
             "selected_indices": [0, 2],  # only intro + results
             "paper_title": "GMI Inductor Sensor (test)",
-        })
-        _check(r.status_code == 200, f"cross_qa 正常路径返回 200 (实际 {r.status_code})")
-        data = r.json()
-        _check(data.get("status") == "success", "响应 status=success")
-        _check("answer" in data and len(data["answer"]) > 10, "返回 answer 字段且非空")
-        _check(data.get("section_count") == 2, f"section_count=2 (实际 {data.get('section_count')})")
-        _check(len(data.get("sections_used", [])) == 2, "sections_used 含 2 个")
-        _check(any("introduction" == s["section"] for s in data["sections_used"]),
-               "selected_indices=[0,2] 正确选用 intro+results")
+        }) as resp:
+            _check(resp.status_code == 200,
+                   f"cross_qa_stream 正常路径返回 200 (实际 {resp.status_code})")
+            _check(resp.headers["content-type"].startswith("text/event-stream"),
+                   f"Content-Type 是 SSE (实际 {resp.headers.get('content-type')})")
+            body = resp.read().decode("utf-8")
+        _check("data: " in body, "SSE body 含 data: 帧")
+        _check("data: [DONE]" in body, "SSE body 末尾含 [DONE] 终止标记")
+        _check('"error"' not in body, f"SSE 未报错: {body[:200]}")
     else:
         _check(False, "LLM 未配置, 跳过跨章节问答真实调用")
 
@@ -1410,7 +1469,7 @@ def test_export_bilingual_endpoint():
     client = TestClient(mb_app.app)
 
     payload = {
-        "title": "BilingualTest_GAA_Analysis",
+        "title": "BilingualTest_GAA_Analysis_MBTESTARTIFACT",
         "authors": "Zhang et al.",
         "year": 2025,
         "topic_category": "01_Device_TCAD_器件仿真",
@@ -1451,7 +1510,7 @@ def test_export_bilingual_endpoint():
 
     # Test export with qa_records bundled
     payload_qa = {
-        "title": "BilingualTest_With_QA_Records",
+        "title": "BilingualTest_With_QA_Records_MBTESTARTIFACT",
         "authors": "Zhang et al.",
         "year": 2025,
         "topic_category": "01_Device_TCAD_器件仿真",
@@ -1491,7 +1550,7 @@ def test_export_qa_endpoint():
     client = TestClient(mb_app.app)
 
     payload = {
-        "title": "SmokeTest_QA_Paper",
+        "title": "SmokeTest_QA_Paper_MBTESTARTIFACT",
         "question": "什么是量子限制效应与迁移率退化？",
         "selection": "Quantum confinement effects severely reduce carrier mobility in nanosheets thinner than 5nm.",
         "answer": "当纳米片厚度小于 5nm 时，声子散射加剧且能带结构改变，导致载流子有效质量增大与迁移率急剧下降。",
@@ -1582,13 +1641,16 @@ def test_find_pdf_and_upload_pdf():
 
 
 def test_explain_selection_endpoint():
-    print("\n[32] /api/paper/explain_selection 划词答疑接口测试")
+    print("\n[32] /api/paper/explain_selection_stream 划词答疑接口测试")
     from fastapi.testclient import TestClient
     from microbench.app import app
     client = TestClient(app)
 
     # 1. Validation error when selected_text too short
-    r_bad = client.post("/api/paper/explain_selection", json={
+    # NOTE: the non-streaming /api/paper/explain_selection endpoint was
+    # removed on 2026-09-24 (commit 8be4eac); the SSE variant is the
+    # live one. The old test kept hitting a 404 and failing ever since.
+    r_bad = client.post("/api/paper/explain_selection_stream", json={
         "selected_text": "x",
         "question": "test",
     })
@@ -1603,13 +1665,15 @@ def test_explain_selection_endpoint():
             "surrounding_context": "Abstract: With the continued scaling of advanced technology nodes...",
             "source_type": "pdf",
         }
-        r = client.post("/api/paper/explain_selection", json=payload)
-        _check(r.status_code == 200, f"explain_selection 返回 200 (实际 {r.status_code})")
-        data = r.json()
-        _check(data.get("status") == "success", "返回 status=success")
-        _check("answer" in data and len(data["answer"]) > 10, "返回非空 answer")
-        _check("model" in data, f"返回 model 标识: {data.get('model')}")
-        _check("is_degraded" in data, "返回 is_degraded 状态")
+        with client.stream("POST", "/api/paper/explain_selection_stream", json=payload) as r:
+            _check(r.status_code == 200, f"explain_selection_stream 返回 200 (实际 {r.status_code})")
+            _check(r.headers["content-type"].startswith("text/event-stream"),
+                   f"Content-Type 是 SSE (实际 {r.headers.get('content-type')})")
+            body = r.read().decode("utf-8")
+        _check("data: " in body, "SSE body 含 data: 帧")
+        _check("data: [DONE]" in body, "SSE body 末尾含 [DONE] 终止标记")
+        _check('"meta"' in body, "SSE body 含 meta 事件 (模型标识)")
+        _check('"error"' not in body, f"SSE 未报错: {body[:200]}")
     else:
         _check(True, "LLM 未配置, 跳过真实调用")
 
@@ -1629,6 +1693,7 @@ def test_chat_async_basic():
             return self._body
 
     class _MockAsyncClient:
+        is_closed = False
         def __init__(self, *args, **kwargs):
             pass
         async def __aenter__(self):
@@ -1715,6 +1780,7 @@ def test_chat_async_cancel_during_retry():
             return self._body
 
     class _MockAsyncClient:
+        is_closed = False
         def __init__(self, *args, **kwargs):
             pass
         async def __aenter__(self):
@@ -1763,6 +1829,7 @@ def test_invoke_model_async_retries_on_502():
             return self._body
 
     class _MockAsyncClient:
+        is_closed = False
         def __init__(self, *args, **kwargs):
             pass
         async def __aenter__(self):
@@ -1799,41 +1866,59 @@ def test_invoke_model_async_retries_on_502():
         _httpx.AsyncClient = _orig
 
 
-def test_explain_endpoint_returns_499_on_cancel():
-    """Stage 1: /api/paper/explain honors client disconnect → 499."""
-    print("\n[37] /api/paper/explain 客户端断开 → 499 (v1.4)")
+def test_explain_stream_endpoint_handles_slow_upstream():
+    """The old '/api/paper/explain returns 499 on client disconnect' test
+    targeted the non-streaming endpoint, which was removed on 2026-09-24
+    (commit 8be4eac). The live endpoint is the SSE variant, whose
+    cancellation is handled by Starlette's own disconnect handling (verified
+    separately in the 2026-09-27 audit: the upstream generator is finalised
+    ~0.01s after the client stops reading).
+
+    What is worth keeping is the slow-upstream path: a stream that takes
+    seconds to produce its first frame must still return a well-formed SSE
+    body with a terminal [DONE] event, and must not blow up.
+    """
+    print("\n[37] /api/paper/explain_stream 慢上游 → 正常 SSE 流 (v1.4)")
     from fastapi.testclient import TestClient
     from microbench.app import app
     import httpx as _httpx
-
-    class _Resp:
-        def __init__(self):
-            self.status_code = 200
-            self._body = {"choices": [{"message": {"content": "long answer " * 200}}]}
-            self.text = str(self._body)
-        def json(self):
-            return self._body
-
-    # Slow mock that lets us fire cancel mid-flight via TestClient
     import asyncio
 
-    class _SlowAsyncClient:
+    class _SlowStreamResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_lines(self):
+            await asyncio.sleep(1.5)
+            yield 'data: {"choices":[{"delta":{"content":"chunk-1"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"chunk-2"}}]}'
+            yield "data: [DONE]"
+
+        async def aread(self):
+            return b""
+
+    class _SlowStreamCtx:
         async def __aenter__(self):
-            return self
+            return _SlowStreamResponse()
+
         async def __aexit__(self, *args):
             return False
-        async def post(self, url, **kwargs):
-            # Sleep long enough that we can simulate a client cancel
-            await asyncio.sleep(2)
-            return _Resp()
+
+    class _SlowAsyncClient:
+        is_closed = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def stream(self, *args, **kwargs):
+            return _SlowStreamCtx()
 
     client = TestClient(app)
     _orig = _httpx.AsyncClient
     _httpx.AsyncClient = _SlowAsyncClient
     try:
-        # Skip if LLM not configured (chat_async raises LLMError before cancel matters)
         if not llm.is_configured():
-            _check(True, "LLM 未配置, 跳过端到端 499 测试")
+            _check(True, "LLM 未配置, 跳过慢上游端到端测试")
             return
 
         payload = {
@@ -1841,13 +1926,15 @@ def test_explain_endpoint_returns_499_on_cancel():
             "sections": [{"section": "abstract", "title": "Abstract", "text": "test context"}],
             "paper_title": "TestPaper",
         }
-        # TestClient doesn't natively simulate client disconnect, so we
-        # verify the wiring differently: confirm the endpoint still works
-        # with cancel-aware chat_async (smoke test that async path is wired)
-        r = client.post("/api/paper/explain", json=payload)
-        # Either 200 (slow but successful) or 499 (cancelled by Starlette timeout)
-        _check(r.status_code in (200, 499),
-               f"端点响应 200 或 499 (实际 {r.status_code})")
+        with client.stream("POST", "/api/paper/explain_stream", json=payload) as r:
+            _check(r.status_code == 200,
+                   f"端点响应 200 (实际 {r.status_code})")
+            _check(r.headers["content-type"].startswith("text/event-stream"),
+                   f"Content-Type 是 SSE (实际 {r.headers.get('content-type')})")
+            body = r.read().decode("utf-8")
+        _check("data: " in body, "SSE body 含 data: 帧")
+        _check("data: [DONE]" in body, "SSE body 末尾含 [DONE] 终止标记")
+        _check('"error"' not in body, f"SSE 未报错: {body[:200]}")
     finally:
         _httpx.AsyncClient = _orig
 
@@ -2096,7 +2183,7 @@ def run_all():
     test_chat_async_cancel_event_preset()
     test_chat_async_cancel_during_retry()
     test_invoke_model_async_retries_on_502()
-    test_explain_endpoint_returns_499_on_cancel()
+    test_explain_stream_endpoint_handles_slow_upstream()
 
     _cleanup_test_artifacts()
 
@@ -2112,5 +2199,20 @@ def run_all():
         print("\n🎉 全部测试通过!")
 
 
+def run_all_with_cleanup():
+    """Run the suite and leave the vault exactly as it was found.
+
+    The suite writes into the real vault (that is the only way to test
+    the card writers), so it must clean up AFTER itself too — the
+    pre-run cleanup only removed the debris of the *previous* run, which
+    meant every execution left one test card and one troubleshooting entry
+    behind in the user's knowledge base.
+    """
+    try:
+        run_all()
+    finally:
+        _cleanup_test_artifacts()
+
+
 if __name__ == "__main__":
-    run_all()
+    run_all_with_cleanup()

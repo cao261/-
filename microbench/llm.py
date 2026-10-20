@@ -22,6 +22,7 @@ import json
 import re
 import time
 import asyncio
+import weakref
 from pathlib import Path
 from threading import Lock
 from typing import Optional, AsyncIterator
@@ -57,9 +58,37 @@ DEFAULT_MAX_TOKENS = 800
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_TIMEOUT = 60
 
+# Hard cap on the number of upstream API calls ONE user request may make,
+# counted across the probe, the primary provider's retries and the
+# fallback provider's retries.
+#
+# Worst case before this cap: 7 upstream calls and ~12.5 minutes of wall
+# clock for a single browser request (probe 15s + 3 primary attempts at
+# 120s each with 1s/2s backoffs + 3 fallback attempts at 120s each with
+# 3.5s/7s backoffs). A 3-chunk section translation calls chat() three
+# times, so it could fire 21 upstream calls inside one minute — enough to
+# trip the very per-minute cap the rate limiter exists to protect.
+MAX_UPSTREAM_CALLS_PER_REQUEST = 6
+
+
+def _is_empty_content_error(msg: str) -> bool:
+    """True when the failure was "the model returned no visible text"."""
+    if not msg:
+        return False
+    return "返回空内容" in msg or "仅返回思考过程" in msg
+
 
 class LLMError(Exception):
-    """Raised when LLM call fails for any reason. Wraps upstream errors cleanly."""
+    """Raised when LLM call fails for any reason. Wraps upstream errors cleanly.
+
+    `status_code` carries the upstream HTTP status when one is known, so
+    callers can tell a quota exhaustion (429) from other failures without
+    re-parsing the human-readable message.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +118,38 @@ class SlidingWindowRateLimiter:
         self.window_seconds = window_seconds
         self.min_interval = min_interval
         self._lock = Lock()
+        # Planned slot times — may be in the future. Used for the window
+        # cap and the min-interval spacing, so a pending reservation
+        # correctly counts against the budget.
         self._timestamps: list[float] = []
+        # Actual call times — only appended once the slot has really been
+        # used. Used for the "recent requests" statistic, which must not
+        # count a reservation that has not fired yet.
+        self._actual_times: list[float] = []
         self._last_call_time: float = 0.0
+        # The *planned* time of the most recent reservation. It can be in
+        # the future (that is the whole point of reserving a slot), so it
+        # must not be used to compute "seconds since the last call" — that
+        # would report a negative number.
+        self._last_planned_time: float = 0.0
 
     def acquire(self) -> float:
         """
         Block until safe to make a request under the RPM cap and min interval.
         Returns the number of seconds waited (if any).
+
+        The sleep happens OUTSIDE the lock. The previous implementation held
+        the lock across `time.sleep()`, so a queued request froze every other
+        caller of the limiter — including `stats()`, which the
+        /api/llm/status endpoint and both translation endpoints call. A
+        single queued translation could therefore stall the status readout
+        for the whole min-interval window.
+
+        Correctness of the min-interval spacing is preserved by *reserving*
+        the slot under the lock: the planned call time is recorded and
+        `_last_call_time` is advanced before the lock is released, so a
+        second thread arriving during the sleep still sees the reservation
+        and waits its own turn.
         """
         with self._lock:
             now = time.time()
@@ -118,26 +172,41 @@ class SlidingWindowRateLimiter:
                     wait_time = window_wait
 
             if wait_time > 0:
-                # Sleep then re-acquire time
-                time.sleep(wait_time)
-                now = time.time()
-                cutoff = now - self.window_seconds
-                self._timestamps = [t for t in self._timestamps if t > cutoff]
+                # Reserve the slot atomically, then sleep without the lock.
+                planned = now + wait_time
+                self._timestamps.append(planned)
+                self._last_planned_time = planned
+            else:
+                self._timestamps.append(now)
+                self._last_planned_time = now
 
-            self._timestamps.append(now)
-            self._last_call_time = now
-            return wait_time
+        if wait_time > 0:
+            time.sleep(wait_time)
+        # Record the moment the call actually happened (after the sleep).
+        with self._lock:
+            fired = time.time()
+            self._last_call_time = fired
+            self._actual_times.append(fired)
+            cutoff = fired - self.window_seconds
+            self._actual_times = [t for t in self._actual_times if t > cutoff]
+        return wait_time
 
     def stats(self) -> dict:
         with self._lock:
             now = time.time()
             cutoff = now - self.window_seconds
-            active = [t for t in self._timestamps if t > cutoff]
+            # Only count slots that have actually fired. A reservation for
+            # a future time is not a request that has happened yet.
+            active = [t for t in self._actual_times if t > cutoff]
             return {
                 "rpm_limit": self.max_requests + 2,  # +2 buffer for display
                 "safe_rpm_cap": self.max_requests,
                 "recent_requests_1m": len(active),
                 "last_call_seconds_ago": round(now - self._last_call_time, 1) if self._last_call_time else None,
+                "next_slot_in_seconds": (
+                    round(max(0.0, self._last_planned_time - now), 1)
+                    if self._last_planned_time else None
+                ),
             }
 
 
@@ -146,6 +215,50 @@ agnes_limiter = SlidingWindowRateLimiter(max_requests=9, min_interval=6.0)
 
 # Primary (MiniMax M2.7) — 30 RPM observed ceiling → 28 cap + 2s min spacing
 primary_limiter = SlidingWindowRateLimiter(max_requests=28, min_interval=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction for anything that reaches the browser
+# ---------------------------------------------------------------------------
+
+# (pattern, group index whose *content* is replaced by "***"; None = replace
+#  the whole match). Keeping the prefix (e.g. "Bearer ") makes the message
+# readable while still removing the credential.
+_SECRET_PATTERNS = (
+    (re.compile(r"sk-[A-Za-z0-9_\-]{4,}"), None),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]{8,}"), 1),
+    (re.compile(r"((?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+", re.IGNORECASE), 1),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip credential-shaped substrings from text that will be displayed."""
+    if not text:
+        return text
+    out = text
+    for pat, keep_group in _SECRET_PATTERNS:
+        if keep_group is None:
+            out = pat.sub("***", out)
+        else:
+            out = pat.sub(lambda m, g=keep_group: m.group(g) + "***", out)
+    return out
+
+
+def _safe_base_url(url: str) -> str:
+    """Return a URL with any embedded userinfo (user:password@) removed."""
+    if not url:
+        return url
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(url)
+        if not parts.hostname:
+            return url
+        netloc = parts.hostname
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        return url
 
 
 # ---------------------------------------------------------------------------
@@ -233,21 +346,74 @@ class DualModelManager:
             return (now - self.last_primary_probe) >= self.probe_interval_seconds
 
     def is_quota_exhausted_error(self, status_code: int, err_text: str) -> bool:
-        """Detect if an error signifies MiniMax 5-hour quota exhaustion or Token Plan limit."""
+        """Detect if an error signifies MiniMax 5-hour quota exhaustion or Token Plan limit.
+
+        This distinction matters a lot, because it decides whether the app
+        permanently demotes to the weaker fallback model (Agnes 3.0 Flash,
+        20 RPM). The old keyword list included the bare words "limit" and
+        "exceeded", so an ordinary per-minute RPM cap — e.g.
+        "429 rate limit exceeded (per-minute RPM cap)" — was classified as
+        "the 5-hour token plan is spent". The app then demoted to Agnes,
+        and 15 minutes later the probe succeeded and promoted MiniMax back,
+        so the user saw the same question answered well one minute and badly
+        the next, while burning quota on both models.
+
+        Quota exhaustion now requires an *unambiguously quota-shaped* signal.
+        A pure rate-limit message (RPM / QPS / "Too Many Requests") is NOT
+        quota exhaustion and must not trigger a demotion.
+        """
         if status_code != 429:
             return False
-        text_lower = err_text.lower()
-        keywords = [
-            "token plan", "2056", "quota", "额度", "套餐", "limit",
-            "exceeded", "充值", "上限", "insufficient"
-        ]
-        return any(k in text_lower or k in err_text for k in keywords)
+        text = (err_text or "").lower()
+
+        quota_signals = (
+            "token plan",      # MiniMax: "Token Plan limit exceeded"
+            "2056",            # MiniMax quota error code
+            "quota",
+            "额度",
+            "套餐",
+            "充值",
+            "余额",
+            "欠费",
+            "insufficient",
+            "balance",
+            "billing",
+            "exhausted",       # "resource exhausted" / "quota exhausted"
+        )
+        if not any(sig in text for sig in quota_signals):
+            return False
+
+        # A message that is *only* about rate limiting is not a quota
+        # problem, even if it happens to contain a quota-ish word.
+        rate_only_signals = (
+            "rate limit",
+            "too many requests",
+            "requests per minute",
+            "per-minute",
+            "rpm",
+            "qps",
+            "每秒",
+            "每分钟",
+        )
+        has_rate_signal = any(sig in text for sig in rate_only_signals)
+        if has_rate_signal:
+            # "rate limit" + a genuine quota word (e.g. "quota exceeded")
+            # is still a quota problem; "rate limit exceeded" alone is not.
+            quota_only = [s for s in quota_signals if s in text]
+            if all(s in ("quota", "exhausted") for s in quota_only):
+                # "quota exceeded" from a rate limiter — still ambiguous,
+                # so treat the rate-limit reading as the safe one.
+                return False
+        return True
 
     def probe_primary(self) -> dict:
         """
         Explicitly probe primary model with a minimal request to test if quota has reset.
         If successful, auto-upgrades back to primary.
         """
+        if requests is None:
+            return {"success": False, "message": "requests 包未安装, 无法探针"}
+
         primary = self.get_primary_config()
         if not primary["configured"]:
             return {"success": False, "message": "主模型未配置 API Key"}
@@ -266,6 +432,10 @@ class DualModelManager:
         }
 
         try:
+            # The probe is a real upstream call — it must go through the
+            # primary limiter, otherwise the probe itself can be the call
+            # that trips the per-minute cap the limiter protects against.
+            primary_limiter.acquire()
             resp = requests.post(url, json=payload, headers=headers, timeout=15)
             if resp.status_code == 200:
                 self.mark_recovered()
@@ -275,7 +445,11 @@ class DualModelManager:
                     "message": f"主模型 ({primary['model']}) 探测成功，已自动升格为首选模型！",
                 }
             else:
-                err = resp.text[:200]
+                # Only the status code is surfaced. The raw body can carry
+                # provider internals (and, for a misconfigured gateway,
+                # an echoed Authorization header), and this string is
+                # returned to the browser by /api/llm/probe.
+                err = f"HTTP {resp.status_code}"
                 with self._lock:
                     self.last_primary_probe = time.time()
                 return {
@@ -314,16 +488,19 @@ class DualModelManager:
             "active_model": active_model,
             "active_provider": active_provider,
             "is_degraded": self.is_degraded,
-            "degraded_reason": self.degraded_reason,
+            "degraded_reason": _redact_secrets(self.degraded_reason),
             "degraded_at": self.degraded_at,
             "primary": {
                 "model": primary["model"],
-                "base_url": primary["base_url"],
+                # Redacted: a self-hosted gateway is commonly configured as
+                # https://user:sk-secret@host/v1, and /api/llm/status hands
+                # this string straight to the browser.
+                "base_url": _safe_base_url(primary["base_url"]),
                 "configured": primary["configured"],
             },
             "fallback": {
                 "model": fallback["model"],
-                "base_url": fallback["base_url"],
+                "base_url": _safe_base_url(fallback["base_url"]),
                 "configured": fallback["configured"],
             },
             "next_probe_in_seconds": next_probe,
@@ -391,10 +568,16 @@ def _invoke_model(
     timeout: int,
     json_mode: bool,
     max_retries: int = 2,
+    budget: Optional[list[int]] = None,
 ) -> tuple[bool, str, Optional[int]]:
     """
     Execute request against a specific model configuration.
     Returns: (success: bool, content_or_error: str, status_code: Optional[int])
+
+    `budget` is a one-element list shared by every provider call of ONE user
+    request. Each upstream attempt decrements it; when it hits zero the
+    call gives up instead of continuing to retry. This bounds the worst
+    case for a single browser request (see MAX_UPSTREAM_CALLS_PER_REQUEST).
     """
     is_agnes = cfg.get("is_fallback") or "agnes" in cfg.get("base_url", "").lower() or "agnes" in cfg.get("model", "").lower()
 
@@ -425,6 +608,16 @@ def _invoke_model(
     last_status = None
 
     for attempt in range(max_retries + 1):
+        # Global per-request budget: stop instead of burning more quota
+        # (and more of the user's wall clock) once the cap is reached.
+        if budget is not None:
+            if budget[0] <= 0:
+                return False, (
+                    f"重试预算耗尽 (单次请求上游调用上限 "
+                    f"{MAX_UPSTREAM_CALLS_PER_REQUEST})"
+                ), last_status
+            budget[0] -= 1
+
         if is_agnes:
             # Respect Agnes 10 RPM rate limit & min spacing
             agnes_limiter.acquire()
@@ -470,14 +663,30 @@ def _invoke_model(
                 time.sleep(wait)
                 continue
 
-            return False, f"HTTP {resp.status_code}: {err}", resp.status_code
+            return False, f"HTTP {resp.status_code}: {_redact_secrets(err)}", resp.status_code
 
         try:
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"].get("content")
+            if not isinstance(content, str) or not content.strip():
+                # Two ways to land here:
+                #  a) the provider returned content: null — we used to
+                #     return that as a *successful* call, and the caller
+                #     then crashed with a TypeError (HTTP 500) or, worse,
+                #     answered the user with `null`;
+                #  b) a reasoning model burned its whole token budget on
+                #     a <think> block and produced no visible text. This
+                #     is the common case with MiniMax-M2.7: at
+                #     max_tokens=200 the answer is often empty.
+                # Treat both as a failed attempt so the caller can retry
+                # with a bigger budget instead of showing a blank answer.
+                return False, f"LLM 返回空内容 (max_tokens={max_tokens}): {resp.text[:160]}", 200
             content = _strip_thinking_blocks(content)
+            if not content.strip():
+                # All of the answer was inside a <think> block.
+                return False, f"LLM 仅返回思考过程, 无正文 (max_tokens={max_tokens})", 200
             return True, content, 200
-        except (KeyError, IndexError, ValueError) as e:
+        except (KeyError, IndexError, ValueError, AttributeError) as e:
             return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
 
     return False, last_err, last_status
@@ -518,20 +727,48 @@ def chat(
             # Successfully upgraded!
             pass
 
+    # Shared budget for the WHOLE user request — every upstream call this
+    # request makes (probe + primary attempts + fallback attempts) draws
+    # from it. Without a global cap the worst case was 7 upstream calls
+    # and ~12.5 minutes of wall clock for a single browser request:
+    #   probe(1) + primary×3 (3×120s + 1s + 2s) + fallback×3 (3×120s + 3.5s + 7s)
+    # A 3-chunk section translation calls chat() three times, so it could
+    # fire 21 upstream calls in one minute — which is itself enough to trip
+    # the per-minute cap the limiter is supposed to protect against.
+    budget = [MAX_UPSTREAM_CALLS_PER_REQUEST]
+
     # If NOT degraded and Primary is configured, try Primary first
     if not model_manager.is_degraded and primary["configured"]:
         success, res, status_code = _invoke_model(
-            primary, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries
+            primary, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries,
+            budget=budget,
         )
         if success:
             return res
+
+        # Reasoning-model budget guard: MiniMax-M2.7 emits a <think> block
+        # before the answer. When max_tokens is too small the whole budget
+        # is consumed by the reasoning and the visible answer comes back
+        # empty. Measured: max_tokens=200 → empty, 800 → fine, and the
+        # exact threshold moves with the question's difficulty. Retry once
+        # with a doubled budget instead of showing the user a blank box.
+        if _is_empty_content_error(res) and budget[0] > 0:
+            bigger = min(max_tokens * 2, 4096)
+            retry_success, retry_res, _ = _invoke_model(
+                primary, messages, bigger, temperature, timeout, json_mode,
+                max_retries=0, budget=budget,
+            )
+            if retry_success:
+                return retry_res
+            res = f"{res} (重试 {bigger} tokens 仍为空)"
 
         # Check if Primary failed due to 429 quota exhaustion (e.g. MiniMax 5-hour limit)
         if fallback["configured"] and model_manager.is_quota_exhausted_error(status_code or 0, res):
             model_manager.mark_degraded(res)
             # Seamlessly fail over to fallback!
             fb_success, fb_res, _ = _invoke_model(
-                fallback, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries
+                fallback, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries,
+                budget=budget,
             )
             if fb_success:
                 return fb_res
@@ -543,7 +780,8 @@ def chat(
     # Degraded or Primary not configured: use Fallback (Agnes)
     if fallback["configured"]:
         success, res, _ = _invoke_model(
-            fallback, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries
+            fallback, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries,
+            budget=budget,
         )
         if success:
             return res
@@ -574,6 +812,85 @@ def chat(
 #   - Honors cancel_event (asyncio.Event): when set, skip retry storms
 #     and raise asyncio.CancelledError to short-circuit the endpoint
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Shared async HTTP client
+# ---------------------------------------------------------------------------
+# A fresh `httpx.AsyncClient` per call means a fresh TLS handshake per
+# request and no keep-alive reuse. For a reading session that fires a
+# dozen AI calls, that is a few hundred milliseconds of pure handshake
+# overhead. One pooled client per event loop fixes it.
+#
+# httpx.AsyncClient is bound to the event loop it was created in, so the
+# cache is keyed by the running loop. A client from a dead loop (e.g. one
+# created inside a pytest-asyncio test) is simply dropped — httpx closes
+# its pool when the object is garbage collected.
+_async_client_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_async_client_lock = Lock()
+
+
+def _get_async_client(default_timeout: int = DEFAULT_TIMEOUT):
+    """Return a pooled httpx.AsyncClient for the current event loop.
+
+    The cache is a WeakKeyDictionary keyed by the loop object itself, so a
+    loop that is closed (e.g. one created by `asyncio.run()` in a test)
+    drops out of the cache and both the loop and its client become
+    collectable. An earlier version keyed by `id(loop)` while also
+    holding a *strong* reference to the loop, which meant every
+    `asyncio.run()` leaked a closed ProactorEventLoop (and its IOCP
+    handle) plus an unclosed client with its connection pool — forever.
+    """
+    if httpx is None:
+        raise LLMError("httpx 包未安装, 请先 pip install httpx")
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        # No running loop — caller is misusing the async API.
+        raise LLMError("必须在事件循环内调用")
+    with _async_client_lock:
+        entry = _async_client_cache.get(loop)
+        # `getattr` rather than a direct attribute access: a client object
+        # supplied by a test double (or any future wrapper) may not expose
+        # `is_closed`, and an AttributeError here would abort the request
+        # instead of simply creating a fresh client.
+        if entry is not None and not getattr(entry, "is_closed", False):
+            return entry
+        client = httpx.AsyncClient(
+            timeout=default_timeout,
+            limits=httpx.Limits(
+                max_connections=16,
+                max_keepalive_connections=8,
+                keepalive_expiry=30.0,
+            ),
+        )
+        # NOTE: the value must NOT hold a reference to the key (the loop).
+        # A WeakKeyDictionary whose value strongly references its own key
+        # keeps the key alive forever, so the entry would never be dropped
+        # and the loop + client would leak.
+        _async_client_cache[loop] = client
+        return client
+
+
+def close_async_clients() -> None:
+    """Close every pooled client. Call from the app's shutdown hook."""
+    with _async_client_lock:
+        _async_client_cache.clear()
+
+
+async def _acquire_limiter_async(is_agnes: bool):
+    """Await the right provider's rate limiter without blocking the loop.
+
+    Both providers must be limited on the async path. The primary limiter
+    used to be applied only on the synchronous path, so the three SSE
+    endpoints could fire at MiniMax with no RPM protection at all — which
+    is exactly how a per-minute cap gets hit, which used to be
+    misclassified as "quota exhausted" and triggered a demotion.
+    """
+    limiter = agnes_limiter if is_agnes else primary_limiter
+    await asyncio.to_thread(limiter.acquire)
 
 
 async def _invoke_model_async(
@@ -637,17 +954,16 @@ async def _invoke_model_async(
         if _cancelled():
             raise asyncio.CancelledError("client disconnected before retry")
 
-        if is_agnes:
-            # SlidingWindowRateLimiter uses threading.Lock for cross-thread safety;
-            # acquire() is fast and non-blocking (it may sleep briefly to
-            # enforce min spacing — that sleep would normally be a thread
-            # sleep, but we run it from the async loop, so wrap with
-            # asyncio.to_thread to avoid blocking the event loop).
-            await asyncio.to_thread(agnes_limiter.acquire)
+        # Both providers are rate-limited on the async path. The primary
+        # limiter used to be missing here, which is how the per-minute cap
+        # got hit by the SSE endpoints.
+        await _acquire_limiter_async(is_agnes)
 
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+            client = _get_async_client(timeout)
+            resp = await client.post(
+                url, json=payload, headers=headers, timeout=timeout
+            )
             last_status = resp.status_code
         except RETRYABLE_EXC as e:
             last_err = str(e)
@@ -694,14 +1010,30 @@ async def _invoke_model_async(
                 await asyncio.sleep(wait)
                 continue
 
-            return False, f"HTTP {resp.status_code}: {err}", resp.status_code
+            return False, f"HTTP {resp.status_code}: {_redact_secrets(err)}", resp.status_code
 
         try:
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"].get("content")
+            if not isinstance(content, str) or not content.strip():
+                # Two ways to land here:
+                #  a) the provider returned content: null — we used to
+                #     return that as a *successful* call, and the caller
+                #     then crashed with a TypeError (HTTP 500) or, worse,
+                #     answered the user with `null`;
+                #  b) a reasoning model burned its whole token budget on
+                #     a <think> block and produced no visible text. This
+                #     is the common case with MiniMax-M2.7: at
+                #     max_tokens=200 the answer is often empty.
+                # Treat both as a failed attempt so the caller can retry
+                # with a bigger budget instead of showing a blank answer.
+                return False, f"LLM 返回空内容 (max_tokens={max_tokens}): {resp.text[:160]}", 200
             content = _strip_thinking_blocks(content)
+            if not content.strip():
+                # All of the answer was inside a <think> block.
+                return False, f"LLM 仅返回思考过程, 无正文 (max_tokens={max_tokens})", 200
             return True, content, 200
-        except (KeyError, IndexError, ValueError) as e:
+        except (KeyError, IndexError, ValueError, AttributeError) as e:
             return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
 
     return False, last_err, last_status
@@ -738,9 +1070,14 @@ async def chat_async(
             "可在工作台根目录编辑 .env 文件."
         )
 
-    # Opportunistic auto-recovery probe (sync, fast — keep as-is)
+    # Opportunistic auto-recovery probe (async — the probe is a blocking
+    # requests.post with a 15s timeout; running it inline on the event
+    # loop froze the whole server, including every SSE stream).
     if model_manager.is_degraded and primary["configured"] and model_manager.should_opportunistic_probe():
-        model_manager.probe_primary()
+        try:
+            await asyncio.to_thread(model_manager.probe_primary)
+        except Exception:
+            pass
 
     if not model_manager.is_degraded and primary["configured"]:
         success, res, status_code = await _invoke_model_async(
@@ -835,37 +1172,106 @@ async def _stream_model(
         "User-Agent": "MicroBench-Academic-Assistant/1.2",
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            async with client.stream("POST", url, json=payload, headers=headers) as resp:
-                if resp.status_code != 200:
-                    body = await resp.aread()
-                    raise LLMError(
-                        f"HTTP {resp.status_code}: {body[:200].decode('utf-8', errors='replace')}"
-                    )
+    # Rate-limit whichever provider we are about to hit. This lives here
+    # rather than at the call sites so that no streaming path can bypass
+    # it — the primary (MiniMax) limiter used to be missing entirely from
+    # the async/stream code, which is how the per-minute cap got hit.
+    is_agnes = (
+        cfg.get("is_fallback")
+        or "agnes" in cfg.get("base_url", "").lower()
+        or "agnes" in cfg.get("model", "").lower()
+    )
+    await _acquire_limiter_async(is_agnes)
 
-                async for line in resp.aiter_lines():
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise asyncio.CancelledError("client disconnected mid-stream")
-                    if not line or not line.startswith("data: "):
+    # Use the shared pooled client (per event loop) instead of building a
+    # new AsyncClient per stream: a fresh client means a fresh TLS
+    # handshake and no keep-alive reuse, on the one path that fires most
+    # requests. The client is NOT closed here — it is shared.
+    client = _get_async_client(timeout)
+    # Buffer for <think> stripping. The reasoning block can be split across
+    # several SSE chunks, so it cannot be filtered chunk-by-chunk — the
+    # text has to be accumulated until the block closes. The old code
+    # streamed the raw reasoning straight to the browser (the module
+    # comment claimed the frontend filtered it, but the frontend has no
+    # <think> handling at all), so every answer opened with the model's
+    # internal monologue.
+    think_buf = ""
+    in_think = False
+    try:
+        async with client.stream("POST", url, json=payload, headers=headers) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                err = LLMError(
+                    f"HTTP {resp.status_code}: {body[:200].decode('utf-8', errors='replace')}"
+                )
+                # Carry the status code so callers can distinguish a
+                # quota exhaustion (429) from a rate-limit (also 429 but
+                # with a different body) without re-parsing the message.
+                err.status_code = resp.status_code
+                raise err
+
+            async for line in resp.aiter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise asyncio.CancelledError("client disconnected mid-stream")
+                if not line or not line.startswith("data: "):
+                    continue
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    # Flush any tail that arrived after the last </think>.
+                    if not in_think and think_buf:
+                        yield think_buf
+                    return
+                try:
+                    obj = json.loads(data)
+                    delta = obj["choices"][0]["delta"].get("content", "") or ""
+                    if not delta:
                         continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        return
-                    try:
-                        obj = json.loads(data)
-                        delta = obj["choices"][0]["delta"].get("content", "")
-                        if delta:
-                            yield delta
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        # Skip malformed lines (heartbeats, comments)
+                    if in_think:
+                        think_buf += delta
+                        if "</think>" in think_buf:
+                            in_think = False
+                            think_buf = think_buf.split("</think>", 1)[1]
+                            if think_buf:
+                                yield think_buf
+                                think_buf = ""
                         continue
-        except asyncio.CancelledError:
-            raise
-        except httpx.ConnectError as e:
-            raise LLMError(f"网络连接失败: {e}")
-        except httpx.TimeoutException as e:
-            raise LLMError(f"请求超时: {e}")
+                    if "<think>" in delta:
+                        before, _, rest = delta.partition("<think>")
+                        if before:
+                            yield before
+                        in_think = True
+                        think_buf = rest
+                        if "</think>" in think_buf:
+                            in_think = False
+                            think_buf = think_buf.split("</think>", 1)[1]
+                            if think_buf:
+                                yield think_buf
+                                think_buf = ""
+                        continue
+                    yield delta
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    # Skip malformed lines (heartbeats, comments)
+                    continue
+    except asyncio.CancelledError:
+        raise
+    except httpx.ConnectError as e:
+        raise LLMError(f"网络连接失败: {e}")
+    except httpx.TimeoutException as e:
+        raise LLMError(f"请求超时: {e}")
+    except httpx.HTTPError as e:
+        # Every other httpx transport/protocol failure (ReadError,
+        # RemoteProtocolError, WriteError, CloseError, ProxyError …)
+        # is a subclass of httpx.HTTPError but NOT of ConnectError or
+        # TimeoutException, so it used to escape as a raw httpx
+        # exception. The SSE wrapper only catches llm.LLMError, so the
+        # stream aborted with no terminal event — and the frontend
+        # treats a stream that ends without [DONE] as a *successful*
+        # answer. The user therefore saw a half-written answer
+        # rendered as a complete, confident one. Wrapping it as an
+        # LLMError makes the frontend show the error instead.
+        raise LLMError(f"上游连接中断: {type(e).__name__}: {e}")
+    except Exception as e:
+        raise LLMError(f"流式响应异常: {type(e).__name__}: {e}")
 
 
 async def chat_stream_async(
@@ -909,27 +1315,60 @@ async def chat_stream_async(
     if cancel_event is not None and cancel_event.is_set():
         raise asyncio.CancelledError("client disconnected before stream start")
 
+    # Opportunistic auto-recovery probe. Without this, the three SSE
+    # reader panels could never leave the degraded (Agnes) state on their
+    # own: only a *sync* llm.chat() call triggered the probe, so a user
+    # who only ever used the reader panels stayed on the weaker 20 RPM
+    # fallback for the rest of the session even after the 5-hour token
+    # plan reset. The probe is a blocking requests.post, so it must run
+    # in a worker thread.
+    if (
+        model_manager.is_degraded
+        and primary["configured"]
+        and model_manager.should_opportunistic_probe()
+    ):
+        try:
+            await asyncio.to_thread(model_manager.probe_primary)
+        except Exception:
+            pass
+
     if not model_manager.is_degraded and primary["configured"]:
+        # Track whether anything was already streamed. A partial answer
+        # cannot be replayed, so once the primary model has produced
+        # output we must NOT fall back to Agnes: the user would otherwise
+        # see the primary's half-answer glued onto the fallback's complete
+        # answer ("PART-A PART-B FALLBACK-1 FALLBACK-2"), which reads as one
+        # confident nonsense answer.
+        emitted = False
         try:
             async for chunk in _stream_model(
                 primary, messages, max_tokens, temperature, timeout, cancel_event,
             ):
+                emitted = True
                 yield chunk
             return
         except asyncio.CancelledError:
             raise
         except LLMError as e:
             err_msg = str(e)
-            if fallback["configured"] and (
-                "429" in err_msg or "quota" in err_msg.lower()
-            ):
+            if emitted:
+                # Already streamed partial content — fail fast, keep the
+                # partial output the user already has.
+                raise
+            status = getattr(e, "status_code", None)
+            quota_hit = (
+                model_manager.is_quota_exhausted_error(status, err_msg)
+                if status is not None
+                else ("429" in err_msg or "quota" in err_msg.lower())
+            )
+            if fallback["configured"] and quota_hit:
                 model_manager.mark_degraded(err_msg)
             else:
                 raise
 
     if fallback["configured"]:
-        if fallback.get("is_fallback"):
-            await asyncio.to_thread(agnes_limiter.acquire)
+        # The fallback's rate limiting happens inside _stream_model(), so
+        # it is not repeated here.
         async for chunk in _stream_model(
             fallback, messages, max_tokens, temperature, timeout, cancel_event,
         ):
@@ -1009,13 +1448,13 @@ def summarize_paper(meta: dict) -> dict:
     except (LLMError, json.JSONDecodeError, KeyError) as e:
         title = meta.get("title", "(未知标题)")
         return {
-            "tldr": f"({title[:30]}... — LLM 未配置或调用失败: {str(e)[:80]})",
+            "tldr": f"({title[:30]}... — LLM 未配置或调用失败: {_redact_secrets(str(e))[:80]})",
             "key_points": [
                 "⚠️ 请检查 .env 中的 LLM_API_KEY 或 AGNES_API_KEY 配置",
                 f"原文摘要 ({len(meta.get('abstract') or '')} 字) 可手动阅读",
             ],
             "takeaway": "提示: 降级到 Agnes 3.0 Flash 后，在 20 RPM 限制下可稳定完成自动摘要。",
-            "error": str(e),
+            "error": _redact_secrets(str(e)),
         }
 
 
