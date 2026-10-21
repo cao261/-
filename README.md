@@ -49,6 +49,24 @@
 > **AI 功能需要配置模型 Key**：复制根目录 `.env.example` 为 `.env`（本机已复制好），
 > 填入 `LLM_API_KEY`（主模型）或 `AGNES_API_KEY`（备用模型）后重启服务即可启用文献解读与翻译。
 
+### 🤖 模型选择与「直译」参数
+
+| 模型 | 思考模式 | 论文直译实测 |
+| --- | --- | --- |
+| **MiniMax-M3** | 可开关（`thinking.type` 支持 `adaptive` / `disabled`） | ✅ 整页一次翻译 21.5s 出完整译文，公式/术语保留良好 |
+| MiniMax-M3.1-Flash | **强制 adaptive，不可关闭** | ⚠️ 长文输入容易在推理里打转（思考烧光 `max_tokens` → 正文为空） |
+| Agnes 3.0 Flash（备用） | 无思考 | ✅ 兜底可用，20 RPM 限速 |
+
+推荐配置（`.env`）：
+
+```ini
+LLM_MODEL_NAME=MiniMax-M3
+LLM_TRANSLATION_DISABLE_THINKING=1   # 直译任务关掉思考：更快，且不会在推理里打转
+```
+
+`LLM_TRANSLATION_DISABLE_THINKING=1` 只作用于翻译类请求；问答/解读仍保留模型的
+推理能力。若把主模型换成 M3.1-Flash，代码会自动忽略该参数（模型会拒绝）并降级重试。
+
 ---
 
 ## 📁 目录结构与规范说明
