@@ -8,27 +8,46 @@
 
 本工作台采用**“双模协同”**架构，既是标准的 **Obsidian 双链知识库**，也是一个**本地可运行的自动化科研辅助工具**。
 
+### 方式零：桌面快捷方式（最快，30 秒上手）
+本机已配置好两个桌面快捷方式，**双击即可，无需进目录**：
+
+| 快捷方式 | 作用 |
+| --- | --- |
+| **MicroBench 工作台** | 自动启动本地服务 → 等就绪 → 自动打开浏览器到 `http://127.0.0.1:5000` |
+| **MicroBench 项目目录** | 直接打开项目文件夹 |
+
+- 服务端跑在独立的 `MicroBench Server` 控制台窗口里，**日志实时可见**；
+- 停止服务：切到该窗口按 `Ctrl+C`，或直接关闭该窗口；
+- 重复双击不会启动多个实例——脚本会先探测服务是否已存在，已存在就直接开浏览器。
+
 ### 方式一：直接在 Obsidian 中打开使用
-1. 打开 **Obsidian** 软件；
+1. 打开 **Obsidian** 软件（需先安装，本机目前**未安装**）；
 2. 点击 **“打开文件夹作为库 (Open folder as vault)”**；
-3. 选择本工作台根目录：`d:\Desktop\杂物\琐事\个人工作台`；
+3. 选择本工作台根目录：`E:\zaiwu\个人工作台`；
 4. 即可在 Obsidian 中直接查阅、编辑文献精读卡片、双向链接和 LaTeX 物理公式渲染。
    - 主看板入口：[[00_Dashboard/主工作台看板]]
    - 顶会与学术资源：[[00_Dashboard/常用微电子科研资源]]
    - 复现标准规范：[[02_Reproduction/00_复现标准Checklist]]
    - 避坑排错日记：[[03_Knowledge/踩坑与排错日记]]
 
+> 注：`00_Dashboard/`、`01_Literature/` 等笔记目录属于本地私有数据，已被 `.gitignore` 排除，
+> 因此 **GitHub 上看不到这些目录**，克隆仓库 ≠ 恢复笔记。
+
 ---
 
 ### 方式二：双击运行本地 Web 辅助控制台 (推荐)
-双击运行根目录下的 **`start_workbench.bat`**：
-1. 脚本将自动检测环境并启动本地服务；
-2. 默认浏览器将自动打开 **`http://127.0.0.1:5000`**；
-3. **核心功能**：
+双击运行根目录下的 **`start_workbench.bat`**（桌面快捷方式「MicroBench 工作台」执行的就是它）：
+1. 脚本会自动切到项目根目录、校验依赖、启动本地服务；
+2. **等服务真正就绪后**再自动打开浏览器到 **`http://127.0.0.1:5000`**，不会撞上"连接被拒绝"；
+3. 若 5000 端口已被本工作台占用，则直接开浏览器，不会重复起进程；
+4. **核心功能**：
    - 📖 **文献一键抓取与建档**：输入 arXiv ID 或 DOI（如 `2303.15982` 或 `10.1038/nature14539`），一键自动获取标题、作者、摘要并生成结构化 Markdown 精读卡片；
    - 🧪 **复现工程脚手架生成**：输入项目名称，自动生成包含 `configs/`、`scripts/`、`data/`、`plots/` 与基准对齐 `README.md` 的标准化工程；
    - 🛠️ **科研避坑速记**：随时沉淀遇到的 TCAD 收敛发散、EDA 库依赖、CUDA 与 Linux 环境报错；
    - 📊 **一键生成组会周报**：自动汇总近 7 天的工作进展，生成规范 Markdown 周报草稿。
+
+> **AI 功能需要配置模型 Key**：复制根目录 `.env.example` 为 `.env`（本机已复制好），
+> 填入 `LLM_API_KEY`（主模型）或 `AGNES_API_KEY`（备用模型）后重启服务即可启用文献解读与翻译。
 
 ---
 
@@ -64,9 +83,36 @@
 │   └── 05_Troubleshooting_Template.md      # 避坑排错日记模版
 │
 ├── microbench/                 # 本地 Web 工作台源码 (FastAPI + 极简前端)
+│   ├── static/index.html       # 单文件前端（工作台 + PDF 双栏阅读器 + AI 答疑）
+│   └── static/vendor/          # 本地化的 PDF.js / KaTeX（离线可用，见下方说明）
+├── assets/                     # 桌面快捷方式图标 (microbench.ico)
 ├── requirements.txt            # Python 轻量依赖
-└── start_workbench.bat         # Windows 一键启动脚本
+├── .env                        # 模型 API Key 配置（已 gitignore，勿提交）
+└── start_workbench.bat         # Windows 一键启动脚本（桌面快捷方式指向此文件）
 ```
+
+### 🌐 前端依赖已本地化（无需外网）
+
+PDF 双栏阅读器用的 PDF.js、公式渲染用的 KaTeX 原本从 `cdn.jsdelivr.net` 加载，
+该域名在部分网络环境下不可达，会导致阅读器直接报「PDF.js 未加载」。
+
+现在两者都随仓库分发在 `microbench/static/vendor/`，由 FastAPI 的 `/static`
+挂载提供：
+
+```text
+microbench/static/vendor/
+├── pdfjs/    pdf.min.js / pdf.worker.min.js / pdf_viewer.css / images/
+└── katex/    katex.min.js / katex.min.css / fonts/ (woff2 + woff + ttf)
+```
+
+重新生成或升级版本：
+
+```bash
+python _vendor_assets.py      # 从 npmmirror 拉取官方 npm 包并落地到 vendor/
+```
+
+`index.html` 采用「本地优先 + CDN 兜底」：本地文件缺失（全新克隆未执行上述脚本）
+时仍会回退到 CDN，不会因为目录变动再次出现空白阅读器。
 
 ---
 
