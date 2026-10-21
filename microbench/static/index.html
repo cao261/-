@@ -1858,6 +1858,27 @@
       if (el) el.textContent = Math.round((_pdfZoom || 1.0) * 100) + "%";
     }
 
+    // 窗口尺寸变化 -> 按新的栏宽重新渲染 PDF。
+    // PDF 宽度是按左栏可用宽度自适应的（100% = 占满整栏），所以窗口一变
+    // 就得重绘，否则页面宽度和栏宽对不上，两侧又会空出来。
+    let _pdfResizeTimer = null;
+    window.addEventListener("resize", () => {
+      if (_readerMode !== "pdf" || !_pdfState || !_pdfState.pdfDoc) return;
+      const w = document.getElementById("pdf-pages-list")?.clientWidth || 0;
+      if (!w) return;
+      const last = _pdfState.lastRenderWidth || 0;
+      if (last && Math.abs(w - last) < 40) return; // 变化太小不值得重绘
+      clearTimeout(_pdfResizeTimer);
+      _pdfResizeTimer = setTimeout(() => {
+        if (!_pdfState || !_pdfState.rendering) return;
+        const gen = (_pdfState.rendering.generation || 0) + 1;
+        _pdfState.rendering.generation = gen;
+        _pdfState.rendering.cancelled = true;
+        document.getElementById("pdf-pages-list").innerHTML = "";
+        loadPdfDualColumn({ keepTranslations: true, generation: gen });
+      }, 250);
+    });
+
     /**
      * 载入 PDF 文档，worker 源按「本地 vendor -> CDN」顺序尝试。
      *
@@ -2051,11 +2072,13 @@
       const listEl = document.getElementById("pdf-pages-list");
       const page = await _pdfState.pdfDoc.getPage(pageNum);
       const viewport0 = page.getViewport({ scale: 1.0 });
-      // Base width + user-controlled zoom multiplier (PDF dual-column)
-      const baseWidth = 520;
-      const targetWidth = Math.max(220, baseWidth * (_pdfZoom || 1.0));
-      const scale = targetWidth / viewport0.width;
+      // 按左栏「实际可用宽度」自适应：_pdfZoom = 1.0 表示正好占满栏宽。
+      // 原先固定 baseWidth=520px，栏宽一变两侧就空出一大片。
+      const availWidth = Math.max(260, (listEl.clientWidth || 520) - 4);
+      const fitScale = availWidth / viewport0.width;
+      const scale = fitScale * (_pdfZoom || 1.0);
       const viewport = page.getViewport({ scale });
+      if (_pdfState) _pdfState.lastRenderWidth = availWidth;
 
       const wrapper = document.createElement("div");
       wrapper.className = "pdf-page-block";
@@ -2071,10 +2094,17 @@
       canvasWrapper.style.width = `${Math.floor(viewport.width)}px`;
       canvasWrapper.style.height = `${Math.floor(viewport.height)}px`;
 
+      // HiDPI: 画布按 devicePixelRatio 放大渲染，再用 CSS 尺寸缩回，
+      // 否则大尺寸下文字会发虚。
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const renderViewport = page.getViewport({ scale: scale * dpr });
+
       const canvas = document.createElement("canvas");
       canvas.className = "pdf-page-canvas";
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
+      canvas.width = Math.floor(renderViewport.width);
+      canvas.height = Math.floor(renderViewport.height);
+      canvas.style.width = `${Math.floor(viewport.width)}px`;
+      canvas.style.height = `${Math.floor(viewport.height)}px`;
       canvasWrapper.appendChild(canvas);
 
       const textLayerDiv = document.createElement("div");
@@ -2088,7 +2118,7 @@
       listEl.appendChild(wrapper);
 
       const ctx = canvas.getContext("2d");
-      await page.render({ canvasContext: ctx, viewport }).promise;
+      await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
 
       // Extract text via PDF.js (fast + no server roundtrip)
       const tc = await page.getTextContent();
@@ -2180,13 +2210,24 @@
             paper_id: _pdfState.paperId,
             page: pageNum,
             text: text,
+            // 带上 PDF 相对路径：服务端会用 pdfplumber 重新抽取该页文本
+            // （正确恢复丢失的单词空格 + 按栏顺序），翻译质量比 PDF.js 抓取的高。
+            relative_path: (_pdfState && _pdfState.relativePath) || null,
           }),
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
-        
+
+        // 后端可能返回 200 + 空串（思考模型把 token 预算全花在思考上，
+        // 没产出正文）。这种情况必须当失败处理，否则页面只会显示
+        // "已翻译"却没有内容。
+        const translated = (data.translation || "").trim();
+        if (!translated) {
+          throw new Error("模型返回空内容（思考模式可能耗尽了 token 预算），请重试本页");
+        }
+
         textEl.className = "page-text";
-        textEl.innerHTML = formatMarkdownLite(data.translation);
+        textEl.innerHTML = formatMarkdownLite(translated);
         if (typeof renderMathIn === "function") renderMathIn(textEl);
         
         const modelTag = data.model ? ` · ${data.model}` : "";
@@ -3604,7 +3645,8 @@
       flex-direction: column;
       align-items: center;
       margin: 0 auto 24px auto;
-      max-width: 760px;
+      /* 不再固定 760px：PDF 宽度按左栏实际可用宽度自适应，占满整栏 */
+      max-width: 1200px;
       width: 100%;
     }
     .pdf-page-canvas-wrapper {
@@ -3745,7 +3787,8 @@
     .pdf-translation-block {
       padding: 20px 22px;
       margin: 0 auto 22px auto;
-      max-width: 760px;
+      /* 翻译卡片同样按栏宽铺满（超宽屏留白控制在可读范围内） */
+      max-width: 1200px;
       width: 100%;
       background: var(--bg-canvas);
       border: 1px solid var(--card-border);
