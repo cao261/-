@@ -326,11 +326,14 @@ async def api_stats():
 @app.post("/api/paper/fetch")
 async def api_fetch_paper(req: FetchPaperRequest):
     try:
-        data = smart_fetch_paper(req.identifier)
+        # 抓取走 arXiv / Crossref 外网，放线程里执行，避免慢响应冻结事件循环
+        data = await asyncio.to_thread(smart_fetch_paper, req.identifier)
         # Also try to resolve landing URL for DOI papers (for manual download link)
         if data.get("doi") and not data.get("arxiv"):
             try:
-                data["landing_url"] = resolve_doi_landing_url(data["doi"])
+                data["landing_url"] = await asyncio.to_thread(
+                    resolve_doi_landing_url, data["doi"]
+                )
             except Exception:
                 # Non-fatal — landing URL is best-effort
                 data["landing_url"] = None
@@ -442,7 +445,7 @@ async def api_download_pdf(
     if not is_arxiv:
         # For DOI, return landing URL instead of trying direct PDF
         try:
-            landing = resolve_doi_landing_url(identifier)
+            landing = await asyncio.to_thread(resolve_doi_landing_url, identifier)
             return {
                 "status": "manual_required",
                 "reason": "DOI 出版商通常需要浏览器渲染/登录, 无法直接下载 PDF",
@@ -468,7 +471,8 @@ async def api_download_pdf(
     save_to = _safe_path(target_dir, pdf_name)
 
     try:
-        info = download_arxiv_pdf(identifier, save_to)
+        # 下载走 arXiv 外网，放线程里执行
+        info = await asyncio.to_thread(download_arxiv_pdf, identifier, save_to)
         return {
             "status": "success",
             "file_name": pdf_name,
@@ -636,7 +640,8 @@ async def api_upload_pdf(
         raise HTTPException(status_code=413, detail="PDF 文件不能超过 40MB")
 
     try:
-        pages = extract_text_from_pdf(pdf_bytes)
+        # pdfplumber 解析大 PDF 是 CPU 密集型，同步跑会卡住整个事件循环
+        pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF 文本提取失败: {str(e)}")
 
@@ -710,10 +715,11 @@ async def api_export_bibtex(
     if not arxiv and not doi:
         raise HTTPException(status_code=400, detail="必须提供 arxiv 或 doi 之一")
     try:
+        # 元数据抓取走 arXiv / Crossref 外网，放线程里执行
         if arxiv:
-            meta = smart_fetch_paper(arxiv)
+            meta = await asyncio.to_thread(smart_fetch_paper, arxiv)
         else:
-            meta = fetch_crossref_doi_metadata(doi)
+            meta = await asyncio.to_thread(fetch_crossref_doi_metadata, doi)
         bib = generate_bibtex(meta, bib_key=bib_key)
         return {"status": "success", "bibtex": bib}
     except ValueError as e:
@@ -776,7 +782,9 @@ async def api_llm_status():
 @app.post("/api/llm/probe")
 async def api_llm_probe():
     """Manually probe MiniMax to test if quota has reset and trigger auto-upgrade."""
-    res = llm.probe_primary_model()
+    # probe_primary_model() 用 requests.post 同步请求，MiniMax 慢/不可达时会
+    # 阻塞事件循环 -> 整个工作台（含 PDF 阅读器）无响应。丢到线程里执行。
+    res = await asyncio.to_thread(llm.probe_primary_model)
     return res
 
 
@@ -795,7 +803,7 @@ async def api_summarize_paper(req: SummarizeRequest):
             detail="LLM 未配置。请在 .env 设置 LLM_API_KEY 或 AGNES_API_KEY 后重启服务。",
         )
     try:
-        result = llm.summarize_paper(req.model_dump())
+        result = await asyncio.to_thread(llm.summarize_paper, req.model_dump())
         return {"status": "success", "summary": result}
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=f"LLM 调用失败: {str(e)}")
@@ -836,7 +844,7 @@ async def api_ask_question(req: AskRequest):
             "llm_error": None,
         }
     try:
-        answer = llm.answer_with_context(req.question, chunks)
+        answer = await asyncio.to_thread(llm.answer_with_context, req.question, chunks)
         return {
             "status": "success",
             "answer": answer,
@@ -965,7 +973,8 @@ async def api_fetch_full_text(req: FetchFullRequest):
     paste the PDF URL, use an arXiv preprint, or paste the text directly.
     """
     try:
-        result = fetch_full_text(req.identifier)
+        # 全文抓取 = 外网下载 + PDF 解析，放线程里执行
+        result = await asyncio.to_thread(fetch_full_text, req.identifier)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
@@ -988,7 +997,7 @@ async def api_fetch_full_text(req: FetchFullRequest):
             # Re-download to vault only if not already there
             if not save_to.exists():
                 from .paper_fetcher import download_arxiv_pdf
-                download_arxiv_pdf(result["identifier"], save_to)
+                await asyncio.to_thread(download_arxiv_pdf, result["identifier"], save_to)
             pdf_saved_path = str(save_to.relative_to(BASE_DIR)).replace("\\", "/")
         except Exception:
             # Non-fatal — find_pdf will simply not return a match
@@ -1080,20 +1089,25 @@ async def api_translate_section(req: TranslateRequest):
                 user_msg = (
                     f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}"
                 )
+            # 同步 llm.chat 会阻塞事件循环（MiniMax 慢/不可达时整个工作台失去
+            # 响应），丢到线程里执行，事件循环保持可响应。
             translated_parts.append(
-                llm.chat(
-                    messages=[
-                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    # Shorter cap: smaller chunks need shorter responses, and
-                    # faster responses are less likely to be killed mid-stream
-                    # by upstream proxies / load balancers.
-                    max_tokens=1500,
-                    temperature=0.2,
-                    # Generous timeout — MiniMax-M2.7 thinking mode can take 60s
-                    # per chunk; multi-chunk translations need headroom.
-                    timeout=120,
+                (
+                    await asyncio.to_thread(
+                        llm.chat,
+                        messages=[
+                            {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        # Shorter cap: smaller chunks need shorter responses, and
+                        # faster responses are less likely to be killed mid-stream
+                        # by upstream proxies / load balancers.
+                        max_tokens=1500,
+                        temperature=0.2,
+                        # Generous timeout — MiniMax thinking mode can take 60s
+                        # per chunk; multi-chunk translations need headroom.
+                        timeout=120,
+                    )
                 ).strip()
             )
     except llm.LLMError as e:
@@ -1618,15 +1632,19 @@ async def api_translate_page(req: TranslatePageRequest):
                 )
             else:
                 user_msg = f"翻译以下学术论文第 {req.page} 页:\n\n{chunk}"
+            # 同上：同步 llm.chat 必须放进线程，否则单次慢请求会冻结整个后端。
             translated_parts.append(
-                llm.chat(
-                    messages=[
-                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    max_tokens=1500,
-                    temperature=0.2,
-                    timeout=90,
+                (
+                    await asyncio.to_thread(
+                        llm.chat,
+                        messages=[
+                            {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        max_tokens=1500,
+                        temperature=0.2,
+                        timeout=90,
+                    )
                 ).strip()
             )
     except llm.LLMError as e:
@@ -1734,7 +1752,8 @@ async def api_paste_analyze(req: PasteTextRequest):
             return response
         try:
             # Build ExplainRequest context
-            answer = llm.chat(
+            answer = await asyncio.to_thread(
+                llm.chat,
                 messages=[
                     {"role": "system", "content": EXPLAIN_SYSTEM_PROMPT},
                     {"role": "user", "content": (
