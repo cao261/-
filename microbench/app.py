@@ -255,6 +255,12 @@ class TranslatePageRequest(BaseModel):
     page: int = Field(..., ge=1, le=200, description="1-based page number")
     text: str = Field(..., min_length=10, max_length=15000,
                       description="Full page text (single chunk from pdfplumber)")
+    relative_path: Optional[str] = Field(
+        default=None, max_length=500,
+        description=("PDF 在 vault 中的相对路径。提供时服务端会用 pdfplumber "
+                     "重新抽取该页文本（正确恢复丢失的单词空格 + 按栏顺序），"
+                     "比浏览器 PDF.js 抓到的文本质量高得多。"),
+    )
 
 
 class PasteTextRequest(BaseModel):
@@ -1040,6 +1046,9 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 4. 数学符号保持 LaTeX 形式 (如 "$I_{on}$", "$\\tau$", "$\\lambda$")
 5. 中文输出, Markdown 格式
 6. 如果原文含图表引用 (如 "Fig. 3", "Table II"), 保留原样
+7. 原文是从 PDF 自动抽取的纯文本, 双栏页面的句子顺序可能被打乱、公式可能残缺。
+   请直接按语义翻译能读懂的部分, 不要为了重建原文版面结构而反复推敲,
+   不要输出分析过程, 只输出译文本身
 """
 
 
@@ -1102,11 +1111,13 @@ async def api_translate_section(req: TranslateRequest):
                         # Shorter cap: smaller chunks need shorter responses, and
                         # faster responses are less likely to be killed mid-stream
                         # by upstream proxies / load balancers.
-                        max_tokens=1500,
+                        max_tokens=4000,
                         temperature=0.2,
                         # Generous timeout — MiniMax thinking mode can take 60s
                         # per chunk; multi-chunk translations need headroom.
                         timeout=120,
+                        # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
+                        disable_thinking=llm.translation_disable_thinking(),
                     )
                 ).strip()
             )
@@ -1299,7 +1310,7 @@ async def api_cross_qa(req: CrossQARequest, request: Request):
                 {"role": "system", "content": CROSS_QA_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=1500,
+            max_tokens=4000,
             temperature=0.3,
             cancel_event=cancel_event,
         )
@@ -1375,7 +1386,7 @@ async def api_explain_selection(req: ExplainSelectionRequest, request: Request):
                 {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=1500,
+            max_tokens=4000,
             temperature=0.3,
             timeout=120,
             cancel_event=cancel_event,
@@ -1521,7 +1532,7 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
                     {"role": "system", "content": CROSS_QA_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=1500,
+                max_tokens=4000,
                 temperature=0.3,
             )
             async for chunk in _stream_llm_event_gen(chunk_iter):
@@ -1569,7 +1580,7 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
                     {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=1500,
+                max_tokens=4000,
                 temperature=0.3,
                 timeout=120,
             )
@@ -1609,20 +1620,34 @@ async def api_translate_page(req: TranslatePageRequest):
     cfg = llm._config()
     model = cfg["model"]
 
+    # 优先用服务端重新抽取的页面文本：浏览器 PDF.js 抓到的文本在字体子集化
+    # 的 PDF 上会丢掉单词空格（"compositestructureshavebeen"），而 pdfplumber
+    # 用更小的 x_tolerance 能正确切词，并且能按左栏/右栏顺序输出。
+    page_text = req.text
+    if req.relative_path:
+        try:
+            from .generator import BASE_DIR, _safe_path
+            from .paper_text import extract_page_text_from_path
+            pdf_path = _safe_path(BASE_DIR, req.relative_path)
+            extracted = extract_page_text_from_path(pdf_path, req.page)
+            if extracted and len(extracted.strip()) >= 100:
+                page_text = extracted
+        except Exception:
+            pass  # 取不到就用客户端传来的文本
+
     # Cache key includes paper_id + page so each page is cached independently.
-    # We DO NOT include text hash (text might come from different extractions
-    # of the same page); instead we accept text-as-given. A page extract is
-    # deterministic for a given PDF, so this is fine.
+    # 缓存键里还带文本哈希（见 translation.TranslationCache._key_for），
+    # 换用更好的抽取文本后会自动 miss，不会命中旧的坏结果。
     cache_section_key = f"page:{req.paper_id}:{req.page}"
 
-    cached = cache.get(cache_section_key, req.text, model)
+    cached = cache.get(cache_section_key, page_text, model)
     if cached:
         cached["from_cache"] = True
         return cached
 
     # Translate the whole page in one shot (page text is already < 15K chars)
     # If somehow larger, chunk and translate parts.
-    chunks = chunk_section_text(req.text)
+    chunks = chunk_section_text(page_text)
     translated_parts = []
     try:
         for idx, chunk in enumerate(chunks):
@@ -1641,9 +1666,11 @@ async def api_translate_page(req: TranslatePageRequest):
                             {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
                             {"role": "user", "content": user_msg},
                         ],
-                        max_tokens=1500,
+                        max_tokens=4000,
                         temperature=0.2,
                         timeout=90,
+                        # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
+                        disable_thinking=llm.translation_disable_thinking(),
                     )
                 ).strip()
             )
@@ -1664,7 +1691,9 @@ async def api_translate_page(req: TranslatePageRequest):
         "model": curr_st["active_model"],
         "is_degraded": curr_st["is_degraded"],
     }
-    cache.put(cache_section_key, req.text, model, result)
+    # 缓存写入必须用与读取时完全一致的文本（page_text），否则哈希对不上，
+    # 缓存永远不命中。
+    cache.put(cache_section_key, page_text, model, result)
     return result
 
 
