@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -67,6 +68,17 @@ app.add_middleware(
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# ---------------------------------------------------------------------------
+# Static assets (/static)
+#
+# index.html is served by the "/" route, but the vendored front-end libraries
+# (PDF.js + KaTeX under static/vendor/) need a real HTTP path so the browser
+# can load them. They used to come from cdn.jsdelivr.net, which is blocked on
+# this machine -> `pdfjsLib` was undefined -> "PDF.js 未加载" in the reader.
+# Serving them locally makes the workbench fully offline-capable.
+# ---------------------------------------------------------------------------
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # ---------------------------------------------------------------------------
 # Cancellation helpers (Stage 1: async LLM endpoints)

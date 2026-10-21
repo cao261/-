@@ -10,12 +10,36 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <!-- KaTeX for math rendering -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
-  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
-  <!-- PDF.js for the dual-column reader (v1.2.2 — matches worker integrity) -->
-  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/web/pdf_viewer.css">
+  <!-- KaTeX for math rendering（本地 vendor 优先，缺失时回退 CDN） -->
+  <link rel="stylesheet" href="/static/vendor/katex/katex.min.css"
+        onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css'">
+  <script defer src="/static/vendor/katex/katex.min.js"
+          onerror="this.onerror=null;var s=document.createElement('script');s.defer=true;s.src='https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js';document.head.appendChild(s);"></script>
+  <!-- PDF.js for the dual-column reader（本地 vendor 优先，缺失时回退 CDN） -->
+  <script src="/static/vendor/pdfjs/pdf.min.js"
+          onerror="this.onerror=null;var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js';document.head.appendChild(s);"></script>
+  <link rel="stylesheet" href="/static/vendor/pdfjs/pdf_viewer.css"
+        onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/web/pdf_viewer.css'">
+  <script>
+    // PDF.js 就绪等待：本地 vendor 优先，加载失败时自动回退 CDN。
+    // 背景：本机无法访问 cdn.jsdelivr.net，原先直接引用 CDN 会让 pdfjsLib
+    // 保持 undefined，双栏阅读器直接报「PDF.js 未加载」。现改为本地优先，
+    // 本地文件缺失时（全新克隆未 vendor）仍能靠 CDN 兜底。
+    //
+    // 注意：这里不做 worker 的预探测。某些环境下 HEAD 探测会被浏览器标记为
+    // ERR_ABORTED 而产生假阴性，把可用的本地 worker 误判成不可用。worker
+    // 源改为「载入失败再换下一个候选」的方式，见 loadPdfDocument()。
+    window.__pdfjsReady = (function () {
+      return new Promise(function (resolve) {
+        var tries = 0;
+        (function check() {
+          if (typeof pdfjsLib !== "undefined") return resolve(true);
+          if (++tries > 80) return resolve(false); // ~8s 仍未就绪
+          setTimeout(check, 100);
+        })();
+      });
+    })();
+  </script>
   
   <style>
     :root {
@@ -1834,6 +1858,31 @@
       if (el) el.textContent = Math.round((_pdfZoom || 1.0) * 100) + "%";
     }
 
+    /**
+     * 载入 PDF 文档，worker 源按「本地 vendor -> CDN」顺序尝试。
+     *
+     * 本地 worker 随仓库分发（microbench/static/vendor/pdfjs/），正常情况第一档
+     * 即成功；只有在 vendor 缺失（全新克隆未执行 vendor 脚本）时才会落到 CDN。
+     * 不做预探测的原因：某些环境下 HEAD 探测会被浏览器标记为 ERR_ABORTED 而
+     * 产生假阴性，把可用的本地 worker 误判成不可用，反而退回到被墙的 CDN。
+     */
+    async function loadPdfDocument(pdfUrl) {
+      const LOCAL_WORKER = "/static/vendor/pdfjs/pdf.worker.min.js";
+      const CDN_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+      const candidates = [LOCAL_WORKER, CDN_WORKER];
+      let firstErr = null;
+      for (const workerSrc of candidates) {
+        try {
+          pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
+          return await pdfjsLib.getDocument({ url: pdfUrl }).promise;
+        } catch (e) {
+          // 首个错误最有诊断价值（本地路径优先），保留它用于最终提示
+          if (!firstErr) firstErr = e;
+        }
+      }
+      throw firstErr;
+    }
+
     async function loadPdfDualColumn(opts = {}) {
       const { keepTranslations = false, generation = null } = opts;
       const title = _readerState.title || "";
@@ -1891,11 +1940,15 @@
       }
 
       try {
-        if (typeof pdfjsLib === "undefined") {
+        // 等待 PDF.js 就绪（本地 vendor 优先；失败时加载器已自动回退 CDN）
+        if (window.__pdfjsReady) {
+          const pdfjsOk = await window.__pdfjsReady;
+          if (!pdfjsOk || typeof pdfjsLib === "undefined") {
+            throw new Error("PDF.js 未加载（本地 /static/vendor/pdfjs 与 CDN 均不可用）");
+          }
+        } else if (typeof pdfjsLib === "undefined") {
           throw new Error("PDF.js 未加载");
         }
-        pdfjsLib.GlobalWorkerOptions.workerSrc =
-          "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
         const pdfUrl = `/api/paper/serve_pdf?relative_path=${encodeURIComponent(found.relative_path)}`;
 
         // Reuse existing pdfDoc on zoom to avoid re-downloading / re-parsing
@@ -1903,8 +1956,7 @@
         if (keepTranslations && _pdfState && _pdfState.pdfDoc) {
           pdfDoc = _pdfState.pdfDoc;
         } else {
-          const loadingTask = pdfjsLib.getDocument({ url: pdfUrl });
-          pdfDoc = await loadingTask.promise;
+          pdfDoc = await loadPdfDocument(pdfUrl);
         }
 
         // Reset cancelled flag for new render loop. Each loadPdfDualColumn
@@ -2424,11 +2476,22 @@
      * KaTeX replaces each placeholder's textContent with rendered math.
      * Errors render as red text.
      */
-    function renderMathIn(container) {
+    function renderMathIn(container, _attempt) {
       if (!container) return;
       // KaTeX loaded with `defer` — may not be ready on first call
       if (typeof katex === "undefined") {
-        setTimeout(() => renderMathIn(container), 150);
+        const attempt = (_attempt || 0) + 1;
+        if (attempt > 40) {
+          // ~6s 仍未就绪：停止轮询并给出明确提示，避免无限重试刷屏
+          container.querySelectorAll(".math-display-block, .math-placeholder.math-inline")
+            .forEach(el => {
+              if (!el.querySelector(".katex")) {
+                el.innerHTML = `<span style="color:#c43e3e; font-size:0.9em;">⚠ 公式渲染组件未加载</span>`;
+              }
+            });
+          return;
+        }
+        setTimeout(() => renderMathIn(container, attempt), 150);
         return;
       }
       // Display math
