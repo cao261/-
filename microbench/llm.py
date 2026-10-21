@@ -53,7 +53,9 @@ DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_AGNES_BASE_URL = "https://apihub.agnes-ai.com/v1"
 DEFAULT_AGNES_MODEL = "agnes-3.0-flash"
 
-DEFAULT_MAX_TOKENS = 800
+# 注意: MiniMax-M3.1-Flash 强制开启思考模式，思考 token 与输出 token 共用
+# max_tokens 预算。上限给太小会导致思考吃光额度、最终 content 为空或被截断。
+DEFAULT_MAX_TOKENS = 4000
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_TIMEOUT = 60
 
@@ -164,11 +166,11 @@ class DualModelManager:
         # Sensible defaults for MiniMax if model name indicates MiniMax
         if not base_url:
             if "minimax" in model.lower():
-                base_url = "https://api.minimax.chat/v1"
+                base_url = "https://api.minimaxi.com/v1"
             else:
                 base_url = DEFAULT_BASE_URL
         if not model:
-            model = "MiniMax-M2.7" if "minimax" in base_url.lower() else DEFAULT_MODEL
+            model = "MiniMax-M3.1-Flash" if "minimax" in base_url.lower() else DEFAULT_MODEL
 
         return {
             "api_key": api_key,
@@ -979,7 +981,7 @@ def summarize_paper(meta: dict) -> dict:
                 {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=600,
+            max_tokens=4000,  # 思考模式开启时，思考+输出共享该预算
             temperature=0.3,
             json_mode=True,
         )
