@@ -43,6 +43,7 @@ _Templates/
 # Generated audit/scratch artifacts (not source)
 _*.py
 _*.txt
+_*.ps1
 _audit_*.md
 
 # Audit report produced by security-audit skill (kept locally, never in repo)
