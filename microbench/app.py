@@ -1814,6 +1814,25 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 """
 
 
+def _translation_deadline_seconds() -> float:
+    """单次翻译请求的**总**时限（秒）。
+
+    用户的诉求是「质量优先，但别无限等」：强制思考的模型（M3.1-Flash）整页
+    要 45s，一节三段可能要 135s；但不能出现"转十分钟还没完"的情况。
+
+    超时后的行为不是报错，而是**返回已经翻完的部分**并带上 partial 标记，
+    前端明确提示「已翻译前 N 段」。可用 LLM_TRANSLATION_DEADLINE 调整
+    （秒，30~900，默认 180）。
+    """
+    raw = (os.getenv("LLM_TRANSLATION_DEADLINE", "") or "").strip()
+    if not raw:
+        return 180.0
+    try:
+        return max(30.0, min(float(raw), 900.0))
+    except ValueError:
+        return 180.0
+
+
 def _translation_max_tokens(src_len: int, model: str = "") -> int:
     """按源文本长度估算翻译所需的输出预算 (max_tokens)。
 
@@ -1875,9 +1894,17 @@ async def api_translate_section(req: TranslateRequest):
     chunks = chunk_section_text(req.section_text)
     was_segmented = len(chunks) > 1
     translated_parts: list[str] = []
+    # 单次翻译请求的总时限。质量优先，但不能无限等：超时了就返回已经翻完的
+    # 部分 + 明确的「部分完成」标记，而不是继续挂着。
+    deadline = time.monotonic() + _translation_deadline_seconds()
+    stopped_reason = ""
 
     try:
         for idx, chunk in enumerate(chunks):
+            remaining = deadline - time.monotonic()
+            if remaining <= 5:
+                stopped_reason = "deadline"
+                break
             if was_segmented:
                 user_msg = (
                     f"翻译以下学术论文章节 (标题: {req.section_title}, "
@@ -1899,31 +1926,57 @@ async def api_translate_section(req: TranslateRequest):
             # coroutine and raises
             #   "'coroutine' object has no attribute 'strip'"
             # — which broke both translation endpoints completely.
-            translated = await asyncio.to_thread(
-                llm.chat,
-                messages=[
-                    {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                # 输出预算按分块长度自适应（见 _translation_max_tokens）：
-                # 思考型模型的推理 token 与正文共用同一个 max_tokens 池，固定
-                # 4000 正好是最容易被截断的档位，截断了译文就断在半句。
-                max_tokens=_translation_max_tokens(len(chunk), model),
-                temperature=0.2,
-                # Generous timeout — MiniMax thinking mode can take 60s
-                # per chunk; multi-chunk translations need headroom.
-                # 强制思考的模型（M3.1-Flash）单次要跑 100~200s，120s 会把
-                # 它砍在半路（砍掉之后拿到的还是残缺译文）。
-                timeout=300 if llm.model_forces_thinking(model) else 120,
-                # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
-                disable_thinking=llm.translation_disable_thinking(),
-                # 翻译专用模型（LLM_TRANSLATION_MODEL）：M3.1-Flash 强制思考，
-                # 直译会又慢又断句，单独指定一个能关思考的模型更稳。
-                model_name=llm.translation_model_name(),
-            )
+            #
+            # 单次调用的超时取「剩余时间的一半」：截断后 llm 层还可能抬高预算
+            # 重试一次，留一半给它，整条链路才不会越过总时限。
+            call_timeout = int(max(20, min(300, remaining / 2)))
+            try:
+                translated = await asyncio.to_thread(
+                    llm.chat,
+                    messages=[
+                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    # 输出预算按分块长度自适应（见 _translation_max_tokens）：
+                    # 思考型模型的推理 token 与正文共用同一个 max_tokens 池，固定
+                    # 4000 正好是最容易被截断的档位，截断了译文就断在半句。
+                    max_tokens=_translation_max_tokens(len(chunk), model),
+                    temperature=0.2,
+                    # Generous timeout — MiniMax thinking mode can take 60s
+                    # per chunk; multi-chunk translations need headroom.
+                    # 强制思考的模型（M3.1-Flash）单次要跑 100~200s，120s 会把
+                    # 它砍在半路（砍掉之后拿到的还是残缺译文）。
+                    timeout=call_timeout,
+                    # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
+                    disable_thinking=llm.translation_disable_thinking(),
+                    # 翻译专用模型（LLM_TRANSLATION_MODEL）：M3.1-Flash 强制思考，
+                    # 直译会又慢又断句，单独指定一个能关思考的模型更稳。
+                    model_name=llm.translation_model_name(),
+                    # 整条链路（重试 + 抬预算重试）都受这个时限约束
+                    deadline=deadline,
+                )
+            except llm.LLMError:
+                # 前面已经翻完了几段 -> 返回部分结果，别把整节的成果丢掉
+                if translated_parts:
+                    stopped_reason = "error"
+                    break
+                raise
             translated_parts.append((translated or "").strip())
     except llm.LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM 翻译失败: {str(e)}")
+        msg = str(e)
+        if ("时限" in msg or "timed out" in msg.lower()
+                or time.monotonic() >= deadline):
+            # 超时是用户最常遇到的情况，给一句人话，别把 requests 的原始异常
+            # 甩到界面上。
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"翻译超时（超出单次请求时限 "
+                    f"{_translation_deadline_seconds():.0f}s）。"
+                    f"可以调大 .env 的 LLM_TRANSLATION_DEADLINE，或换更快的翻译模型。"
+                ),
+            )
+        raise HTTPException(status_code=502, detail=f"LLM 翻译失败: {msg}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"翻译失败: {str(e)}")
 
@@ -1938,6 +1991,11 @@ async def api_translate_section(req: TranslateRequest):
         "from_cache": False,
         "model": actual_model,
         "is_degraded": curr_st["is_degraded"],
+        # 部分完成：超出总时限，后面的分段没翻。前端要明确提示，不能让用户
+        # 以为整节都翻完了。
+        "partial": bool(stopped_reason),
+        "translated_chunks": len(translated_parts),
+        "stopped_reason": stopped_reason,
     }
 
     # Store in cache under actual producing model so re-translate is instant
@@ -2397,36 +2455,66 @@ async def api_translate_page(req: TranslatePageRequest):
     # If somehow larger, chunk and translate parts.
     chunks = chunk_section_text(page_text)
     translated_parts = []
+    # 单次翻译请求的总时限（见 api_translate_section 的同名逻辑）
+    deadline = time.monotonic() + _translation_deadline_seconds()
+    stopped_reason = ""
     try:
         for idx, chunk in enumerate(chunks):
+            remaining = deadline - time.monotonic()
+            if remaining <= 5:
+                stopped_reason = "deadline"
+                break
             if len(chunks) > 1:
                 user_msg = (
                     f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{len(chunks)} 段):\n\n{chunk}"
                 )
             else:
                 user_msg = f"翻译以下学术论文第 {req.page} 页:\n\n{chunk}"
-            translated = await asyncio.to_thread(
-                llm.chat,
-                messages=[
-                    {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                max_tokens=_translation_max_tokens(len(chunk), model),
-                temperature=0.2,
-                # 强制思考的模型单次要跑 100~200s，超时要放开
-                timeout=300 if llm.model_forces_thinking(model) else 90,
-                # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
-                disable_thinking=llm.translation_disable_thinking(),
-                # 翻译专用模型（LLM_TRANSLATION_MODEL）
-                model_name=llm.translation_model_name(),
-            )
+            # 单次调用的超时取剩余时间的一半，给「截断后抬预算重试」留位置
+            call_timeout = int(max(20, min(300, remaining / 2)))
+            try:
+                translated = await asyncio.to_thread(
+                    llm.chat,
+                    messages=[
+                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=_translation_max_tokens(len(chunk), model),
+                    temperature=0.2,
+                    # 强制思考的模型单次要跑 100~200s，超时要放开；但不能超过
+                    # 这次请求的剩余时间，否则会越过总时限。
+                    timeout=call_timeout,
+                    # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
+                    disable_thinking=llm.translation_disable_thinking(),
+                    # 翻译专用模型（LLM_TRANSLATION_MODEL）
+                    model_name=llm.translation_model_name(),
+                    # 整条链路（重试 + 抬预算重试）都受这个时限约束
+                    deadline=deadline,
+                )
+            except llm.LLMError:
+                # 前面已经翻完了几段 -> 返回部分结果
+                if translated_parts:
+                    stopped_reason = "error"
+                    break
+                raise
             # `.strip()` must apply to the awaited result, not to the
             # coroutine (see the same note in api_translate_section).
             translated_parts.append((translated or "").strip())
     except llm.LLMError as e:
-        raise HTTPException(status_code=502, detail=f"按页翻译失败: {e}")
+        msg = str(e)
+        if ("时限" in msg or "timed out" in msg.lower()
+                or time.monotonic() >= deadline):
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"翻译超时（超出单次请求时限 "
+                    f"{_translation_deadline_seconds():.0f}s）。"
+                    f"可以调大 .env 的 LLM_TRANSLATION_DEADLINE，或换更快的翻译模型。"
+                ),
+            )
+        raise HTTPException(status_code=502, detail=f"按页翻译失败: {msg}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"按页翻译失败: {e}")
+        raise HTTPException(status_code=500, detail=f"按页翻译失败: {str(e)}")
 
     translation = "\n\n".join(translated_parts).strip()
     curr_st = llm.get_llm_status()
@@ -2439,6 +2527,10 @@ async def api_translate_page(req: TranslatePageRequest):
         "from_cache": False,
         "model": llm.translation_active_model(),
         "is_degraded": curr_st["is_degraded"],
+        # 部分完成：超出总时限，后面的分段没翻
+        "partial": bool(stopped_reason),
+        "translated_chunks": len(translated_parts),
+        "stopped_reason": stopped_reason,
     }
     # 缓存写入必须用与读取时完全一致的文本（page_text），否则哈希对不上，
     # 缓存永远不命中。

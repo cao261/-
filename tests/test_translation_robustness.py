@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from microbench import llm  # noqa: E402
-from microbench.app import _translation_max_tokens  # noqa: E402
+from microbench.app import _translation_deadline_seconds, _translation_max_tokens  # noqa: E402
 from microbench.paper_text import _trim_page_tail  # noqa: E402
 
 
@@ -244,3 +245,56 @@ class TestTranslationModel:
     def test_disable_thinking_can_be_turned_off(self, monkeypatch):
         monkeypatch.setenv("LLM_TRANSLATION_DISABLE_THINKING", "0")
         assert llm.translation_disable_thinking() is False
+
+
+# ---------------------------------------------------------------------------
+# 6. 翻译请求的总时限（质量优先，但别无限等）
+# ---------------------------------------------------------------------------
+
+class TestTranslationDeadline:
+    def test_default_is_180s(self, monkeypatch):
+        monkeypatch.delenv("LLM_TRANSLATION_DEADLINE", raising=False)
+        assert _translation_deadline_seconds() == 180.0
+
+    def test_env_is_honoured(self, monkeypatch):
+        monkeypatch.setenv("LLM_TRANSLATION_DEADLINE", "60")
+        assert _translation_deadline_seconds() == 60.0
+
+    def test_is_clamped_to_a_sane_range(self, monkeypatch):
+        monkeypatch.setenv("LLM_TRANSLATION_DEADLINE", "1")
+        assert _translation_deadline_seconds() == 30.0
+        monkeypatch.setenv("LLM_TRANSLATION_DEADLINE", "99999")
+        assert _translation_deadline_seconds() == 900.0
+
+    def test_garbage_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("LLM_TRANSLATION_DEADLINE", "abc")
+        assert _translation_deadline_seconds() == 180.0
+
+    def test_past_deadline_stops_the_call(self, monkeypatch):
+        """deadline 过了就不再发起上游调用 —— 这是「别无限等」的关键。"""
+        import microbench.llm as llm_mod
+
+        called = {"n": 0}
+
+        class _FakePost:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __call__(self, *a, **kw):
+                called["n"] += 1
+                return _FakeResponse({
+                    "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}]
+                })
+
+        monkeypatch.setattr(llm_mod.requests, "post", _FakePost())
+        cfg = {
+            "api_key": "k", "base_url": "https://example.invalid/v1",
+            "model": "MiniMax-M3", "configured": True, "is_fallback": False,
+        }
+        ok, msg, _ = llm_mod._invoke_model(
+            cfg, [{"role": "user", "content": "hi"}], 4000, 0.2, 60, False,
+            max_retries=2, deadline=time.monotonic() - 1,
+        )
+        assert ok is False
+        assert called["n"] == 0
+        assert "时限" in msg

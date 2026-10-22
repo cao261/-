@@ -679,6 +679,7 @@ def _invoke_model(
     max_retries: int = 2,
     budget: Optional[list[int]] = None,
     disable_thinking: bool = False,
+    deadline: Optional[float] = None,
 ) -> tuple[bool, str, Optional[int]]:
     """
     Execute request against a specific model configuration.
@@ -688,6 +689,11 @@ def _invoke_model(
     request. Each upstream attempt decrements it; when it hits zero the
     call gives up instead of continuing to retry. This bounds the worst
     case for a single browser request (see MAX_UPSTREAM_CALLS_PER_REQUEST).
+
+    `deadline` is a `time.monotonic()` timestamp: no new upstream attempt may
+    start after it, and each attempt's own timeout is clamped to the time
+    left. Without it, `max_retries` + the budget-escalation retry could keep a
+    request running for many minutes past the caller's own limit.
 
     disable_thinking=True 会带上 thinking={"type":"disabled"}，让模型直接给
     正文不做推理。适合"长文直译"这类不需要推理的任务：实测 MiniMax-M3
@@ -738,6 +744,19 @@ def _invoke_model(
                 ), last_status
             budget[0] -= 1
 
+        # Deadline: no new upstream attempt may start past it, and this
+        # attempt's own timeout is clamped to whatever time is left. Without
+        # this, `max_retries` (x3 attempts) plus the budget-escalation retry
+        # could keep one browser request running for minutes past the
+        # caller's limit.
+        attempt_timeout = timeout
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            # 剩不到 3 秒就别开新调用了 —— 开了也来不及，还会超出时限
+            if left < 3:
+                return False, "超出本次请求的时限, 已放弃重试", last_status
+            attempt_timeout = max(2, min(timeout, int(left)))
+
         if is_agnes:
             # Respect Agnes 10 RPM rate limit & min spacing
             agnes_limiter.acquire()
@@ -746,10 +765,14 @@ def _invoke_model(
             primary_limiter.acquire()
 
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            resp = requests.post(url, json=payload, headers=headers, timeout=attempt_timeout)
             last_status = resp.status_code
         except RETRYABLE_EXC as e:
             last_err = str(e)
+            if deadline is not None and (deadline - time.monotonic()) < 3:
+                # 这次超时是被时限截断的，不是网络故障 —— 说人话，别把
+                # requests 的原始异常甩给界面。
+                return False, "超出本次请求的时限, 已放弃重试", last_status
             if attempt < max_retries:
                 wait = 2 ** attempt
                 time.sleep(wait)
@@ -855,6 +878,7 @@ def _invoke_with_budget_escalation(
     max_retries: int,
     disable_thinking: bool = False,
     budget: Optional[list[int]] = None,
+    deadline: Optional[float] = None,
 ) -> tuple[bool, str, Optional[int]]:
     """
     调用模型；若正文因 max_tokens 被截断，按截断的形态分别处理：
@@ -876,6 +900,7 @@ def _invoke_with_budget_escalation(
     success, res, status = _invoke_model(
         cfg, messages, max_tokens, temperature, timeout, json_mode,
         max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
+        deadline=deadline,
     )
     if success or TRUNCATED_MARKER not in (res or ""):
         return success, res, status
@@ -883,6 +908,9 @@ def _invoke_with_budget_escalation(
         return success, res, status
     if TRUNCATED_NO_BODY in (res or ""):
         # 形态 2：思考烧光了预算，正文一个字没有。抬预算救不回来，直接降级。
+        return success, res, status
+    if deadline is not None and time.monotonic() >= deadline:
+        # 已经没有时间做"抬高预算重试"了 —— 别让用户为一次重试再等一分钟。
         return success, res, status
 
     bigger = min(
@@ -894,6 +922,7 @@ def _invoke_with_budget_escalation(
     success2, res2, status2 = _invoke_model(
         cfg, messages, bigger, temperature, timeout, json_mode,
         max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
+        deadline=deadline,
     )
     if success2:
         return True, res2, status2
@@ -909,6 +938,7 @@ def chat(
     max_retries: int = 2,
     disable_thinking: bool = False,
     model_name: Optional[str] = None,
+    deadline: Optional[float] = None,
 ) -> str:
     """
     Single-turn chat completion with automatic failover and degradation management.
@@ -923,6 +953,10 @@ def chat(
 
     model_name：临时换模型（同一套 key / base_url）。批量翻译用得上 ——
     MiniMax-M3.1-Flash 强制思考不适合直译，详见 translation_model_name()。
+
+    deadline：`time.monotonic()` 时间戳。过了这个点就不再发起新的上游调用，
+    每次调用的超时也会被压到剩余时间内。翻译这类"质量优先但别无限等"的
+    场景用它把整条链路兜在固定时限内。
     """
     if requests is None:
         raise LLMError("requests 包未安装, 请先 pip install requests")
@@ -960,6 +994,7 @@ def chat(
         success, res, status_code = _invoke_with_budget_escalation(
             primary, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
+            deadline=deadline,
         )
         if success:
             return res
@@ -977,6 +1012,7 @@ def chat(
             retry_success, retry_res, _ = _invoke_model(
                 primary, messages, bigger, temperature, timeout, json_mode,
                 max_retries=0, budget=budget, disable_thinking=disable_thinking,
+                deadline=deadline,
             )
             if retry_success:
                 return retry_res
@@ -1001,6 +1037,7 @@ def chat(
             fb_success, fb_res, _ = _invoke_with_budget_escalation(
                 fallback, messages, max_tokens, temperature, timeout, json_mode,
                 max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
+                deadline=deadline,
             )
             if fb_success:
                 return fb_res
@@ -1014,6 +1051,7 @@ def chat(
         success, res, _ = _invoke_with_budget_escalation(
             fallback, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
+            deadline=deadline,
         )
         if success:
             return res

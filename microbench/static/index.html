@@ -4077,7 +4077,7 @@
               <div>
                 <div style="font-family:var(--font-serif); font-size:20px; font-weight:500;">🔧 翻译诊断面板</div>
                 <div style="font-size:12px; color:var(--text-subtle); margin-top:4px;">
-                  最近 <span id="diag-cap">50</span> 条 translate_page 请求记录。超时(>90s)、错误、模型、耗时一览。
+                  最近 <span id="diag-cap">50</span> 条 translate_page 请求记录。超时(>210s)、错误、模型、耗时一览。
                 </div>
               </div>
               <div style="display:flex; gap:6px;">
@@ -4128,7 +4128,7 @@
           const color = ok ? "#5a8a3e" : "#B25336";
           const icon = ok ? "✓" : "✗";
           const dur = (e.duration_ms / 1000).toFixed(1) + "s";
-          const durColor = e.duration_ms > 30000 ? "#B25336" : (e.duration_ms > 90000 ? "#7a1a1a" : "var(--text-main)");
+          const durColor = e.duration_ms > 30000 ? "#B25336" : (e.duration_ms > 180000 ? "#7a1a1a" : "var(--text-main)");
           const time = (e.ts || "").slice(11, 19);
           return `
             <div style="display:grid; grid-template-columns: 60px 50px 90px 70px 110px 60px 1fr; gap:6px 12px; padding:8px 10px; border-bottom:1px solid var(--card-border-subtle); align-items:center;">
@@ -4386,16 +4386,15 @@
       if (tagEl) tagEl.textContent = isPriority ? "⚡ 优先翻译中..." : "⏳ 翻译中...";
       if (textEl) textEl.innerHTML = `<span class="pdf-translation-loading">⏳ 正在调用 AI 翻译第 ${pageNum} 页...</span>`;
 
-      // AbortController + 90s hard timeout. The thinking-model LLM (M2.7)
-      // routinely takes 50-120s — 90s is a soft ceiling that lets realistic
-      // responses through but caps true hangs (LLM down, network blackhole).
-      // Without this, a stalled request leaves "⏳ 翻译中..." in the UI
-      // forever and the user has no clue if it's still working or dead.
+      // AbortController + 210s hard timeout. 服务端的单次翻译总时限是
+      // LLM_TRANSLATION_DEADLINE（默认 180s），这里留 30s 余量。
+      // 思考型模型（M3.1-Flash 强制思考）整页要 40~60s，一节三段可能 135s，
+      // 90s 原来会把它砍在半路；砍掉之后拿到的还是残缺译文。
       const ac = new AbortController();
       const acTimer = setTimeout(() => {
         ac.abort();
-        if (tagEl) tagEl.textContent = "⏳ 超时(>90s)";
-      }, 90000);
+        if (tagEl) tagEl.textContent = "⏳ 超时(>210s)";
+      }, 210000);
       const t0 = performance.now();
 
       try {
@@ -4455,7 +4454,16 @@
         if (typeof renderMathIn === "function") renderMathIn(textEl);
 
         const modelTag = data.model ? ` · ${data.model}` : "";
-        if (tagEl) tagEl.textContent = `✅ 已翻译${modelTag}`;
+        if (tagEl) {
+          if (data.partial) {
+            // 服务端超出了单次翻译的总时限，只翻完了前面的分段
+            const n = data.translated_chunks || 0;
+            const total = data.chunk_count || n;
+            tagEl.textContent = `⚠️ 已翻译 ${n}/${total} 段 · 超出时限${modelTag}`;
+          } else {
+            tagEl.textContent = `✅ 已翻译${modelTag}`;
+          }
+        }
 
         if (_pdfState && _pdfState.pages) {
           const pObj = _pdfState.pages.find(p => p.num === pageNum);
@@ -4479,7 +4487,7 @@
         clearTimeout(acTimer);
         const t1 = performance.now();
         const isAbort = err && (err.name === "AbortError" || /aborted/i.test(err.message || ""));
-        const detail = isAbort ? "请求超时 (>90s) — LLM 久未响应,请查看诊断面板判断"
+        const detail = isAbort ? "请求超时 (>210s) — LLM 久未响应,请查看诊断面板判断"
                                 : (err?.message || JSON.stringify(err) || "未知错误");
         _recordDiag({
           ts: new Date().toISOString(),
@@ -4491,7 +4499,7 @@
           model: "",
           chars_in: text.length,
           chars_out: 0,
-          error: isAbort ? "AbortError: timeout 90s" : detail,
+          error: isAbort ? "AbortError: timeout 210s" : detail,
         });
         console.error(`[translatePdfPage#${pageNum}]`, err);
         if (tagEl) tagEl.textContent = isAbort ? "⏳ 超时" : "❌ 失败";
@@ -4976,6 +4984,11 @@
 
         if (result.from_cache) {
           showToast(`⚡ 缓存命中 · ${(result.chunk_count || 1)} 段 · 0s`);
+        } else if (result.partial) {
+          // 服务端超出了单次翻译的总时限，只翻完了前面的分段
+          const n = result.translated_chunks || 0;
+          const total = result.chunk_count || n;
+          showToast(`⚠️ 超出时限，只翻了 ${n}/${total} 段 · 可点「重新翻译本节」继续`, true, 6000);
         } else if (result.was_segmented) {
           showToast(`✅ 翻译完成 · 拆 ${result.chunk_count} 段`);
         } else {
