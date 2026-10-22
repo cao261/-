@@ -511,7 +511,19 @@ def sanitize_translation(text: str) -> str:
         pieces.append(_wrap_bare_latex(_fix_overescaped_latex(tail)))
 
     # 4) 落单的 $ 换成全角 ＄（多半是版权行的页价）
-    return _fix_odd_dollars("".join(pieces)).strip()
+    out = _fix_odd_dollars("".join(pieces)).strip()
+
+    # 5) 公式碎片标记 → 人话。
+    #    抽取阶段把「PDF 排版导致无法完整提取的公式」整段标成 ⟦FORMULA⟧，
+    #    提示词要求模型原样输出这个标记（防止它凭空编一个公式出来）。
+    #    这里把它换成用户看得懂的提示：公式没抽出来，请对照 PDF 原文。
+    if "⟦FORMULA⟧" in out:
+        out = out.replace(
+            "⟦FORMULA⟧",
+            "【公式未能完整提取：PDF 排版导致分子/分母与上下标被打散，"
+            "请对照左侧 PDF 原文】",
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------

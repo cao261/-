@@ -351,7 +351,94 @@ def _extract_page_text(page) -> str:
     抽取单页文本，按阅读顺序排列：整宽区域(标题/摘要) -> 左栏 -> 右栏。
     任何一步检测不可靠都退回 pdfplumber 的普通抽取（只是空格仍然修好）。
     """
-    return _clean_cid_markers(_extract_page_text_raw(page))
+    return _mark_broken_formulas(_clean_cid_markers(_extract_page_text_raw(page)))
+
+
+# 公式碎片的标记。送给模型前先把碎公式整段替换成它，模型照抄即可。
+FORMULA_MARKER = "⟦FORMULA⟧"
+
+# 关系符号：= ≈ ≤ ≥ 以及 PDF 里常见的乱码等价物 ¼
+_RELATION_RE = re.compile(r"[=≈≤≥¼]")
+# 数学残片常见符号：括号(乱码) / 分数 / 上下标数字
+_FRAGMENT_CHARS = "ðÞ[]()"
+
+
+def _is_formulaish_line(line: str) -> bool:
+    """判断一行是不是「公式或公式碎片」而不是正文句子。"""
+    s = line.strip()
+    if not s:
+        return False
+    if _RELATION_RE.search(s):
+        # 有关系符号 → 是公式（长度上限放宽，公式行可以很长）
+        return len(s) <= 160
+    # 有正常英文单词（>=4 字母）→ 一定是正文
+    if re.search(r"[A-Za-z]{4,}", s):
+        return False
+    if len(s) > 60:
+        return False
+    has_digit = any(ch.isdigit() for ch in s)
+    has_special = any(ch in _FRAGMENT_CHARS for ch in s)
+    short_words_only = bool(re.fullmatch(r"[A-Za-z]{1,3}(\s+[A-Za-z]{1,3})*", s))
+    return has_digit or has_special or short_words_only
+
+
+def _mark_broken_formulas(text: str) -> str:
+    """把「PDF 排版导致无法完整提取的公式」整段标成 ⟦FORMULA⟧。
+
+    为什么必须标：这类区域的文本是乱序碎片（分子、分母、上下标各占一行），
+    送给模型后它会"顺手补全"出一个看起来很像样的公式 —— 实测把
+        α_E,31 = (n d₃₁ᵐ g₃₁) / (n s₁₁ᴱ (1-(k₃₁ᴱ)²) - (s₃₃ᵐ)(1-n))
+    编成了
+        λ = a_ME/(d₃₁ E₃₁) ≈ nsp(1-n)(k_p+3/2 k_m)(s_m+1/n s_p)
+    原文里根本没有 λ。**错公式比没公式危险得多** —— 用户会照着它去算。
+
+    所以这里把碎公式整段换成标记，提示词要求模型原样输出这个标记，
+    用户看到「公式未能完整提取，请对照 PDF 原文」，而不是一个假公式。
+
+    注意：公式在抽取结果里是**好几行**（分子一行、分母一行、上下标各一行），
+    "=" 和 "[?]" 往往不在同一行 —— 所以按「连续的公式碎片行」成段判定：
+    段里同时出现 [?] 和关系符号，才整段替换。
+    """
+    if not text or "[?]" not in text:
+        return text
+    lines = text.split("\n")
+
+    # 1) 找连续的公式碎片行
+    runs: list[list[int]] = []
+    cur: list[int] = []
+    for idx, line in enumerate(lines):
+        if _is_formulaish_line(line):
+            cur.append(idx)
+        else:
+            if cur:
+                runs.append(cur)
+                cur = []
+    if cur:
+        runs.append(cur)
+
+    # 2) 段里同时有 [?] 和关系符号 → 整段是坏掉的公式
+    drop: set[int] = set()
+    for run in runs:
+        if len(run) > 10:
+            continue
+        seg = "\n".join(lines[i] for i in run)
+        if "[?]" in seg and _RELATION_RE.search(seg):
+            drop.update(run)
+
+    if not drop:
+        return text
+
+    out: list[str] = []
+    in_formula = False
+    for idx, line in enumerate(lines):
+        if idx in drop:
+            if not in_formula:
+                out.append(FORMULA_MARKER)
+                in_formula = True
+            continue
+        in_formula = False
+        out.append(line)
+    return "\n".join(out)
 
 
 def _extract_page_text_raw(page) -> str:
@@ -397,16 +484,25 @@ def _extract_page_text_raw(page) -> str:
     # 2) 水平方向：在双栏区域找栏间空白
     cover = _x_cover(below, width, _X_BINS)
     a, ln = _longest_gap(cover, int(_X_BINS * 0.15), int(_X_BINS * 0.85))
-    if a is None or ln < 2:
-        return plain
-    x_gap0 = width * a / _X_BINS
-    x_gap1 = width * (a + ln) / _X_BINS
-    if x_gap1 - x_gap0 < width * 0.01:
-        return plain
+    x_gap0 = x_gap1 = None
+    if a is not None and ln >= 2:
+        g0 = width * a / _X_BINS
+        g1 = width * (a + ln) / _X_BINS
+        if g1 - g0 >= width * 0.01:
+            left_n = sum(1 for w in below if w["x1"] <= g0 + 1)
+            right_n = sum(1 for w in below if w["x0"] >= g1 - 1)
+            if left_n >= 8 and right_n >= 8:
+                x_gap0, x_gap1 = g0, g1
 
-    left_n = sum(1 for w in below if w["x1"] <= x_gap0 + 1)
-    right_n = sum(1 for w in below if w["x0"] >= x_gap1 - 1)
-    if left_n < 8 or right_n < 8:
+    if x_gap0 is None:
+        # 2b) 整宽元素（跨栏的表格/图注）会把 x 覆盖直方图整段填满，
+        #     全局最长零覆盖段就找不到栏缝了 —— 于是退回 plain，
+        #     两栏正文互相交错，公式被拆散（实测 JACERS 综述第 2 页）。
+        #     这里改成「逐带投票」：每个水平带单独找栏缝，对中点投票，
+        #     取众数当栏缝；再按垂直顺序把双栏块和跨栏块拼回去。
+        split = _extract_by_band_voting(page, words, width, height, y_split)
+        if split:
+            return split
         return plain
 
     # 3) 分区抽取
@@ -433,6 +529,112 @@ def _extract_page_text_raw(page) -> str:
 
     if not parts:
         return plain
+    return "\n\n".join(parts)
+
+
+def _band_column_gap(band_words, width):
+    """在一个水平带里找栏缝，返回栏缝中点（页面坐标）或 None。"""
+    if len(band_words) < 6:
+        return None
+    cover = _x_cover(band_words, width, _X_BINS)
+    a, ln = _longest_gap(cover, int(_X_BINS * 0.15), int(_X_BINS * 0.85))
+    if a is None or ln < 2:
+        return None
+    mid = width * (a + ln / 2.0) / _X_BINS
+    left_n = sum(1 for w in band_words if w["x1"] <= mid)
+    right_n = sum(1 for w in band_words if w["x0"] >= mid)
+    if left_n < 3 or right_n < 3:
+        return None
+    return mid
+
+
+def _has_gap_near(cover, center_bin, tol_bins=3):
+    """cover 在 center_bin 附近是否有空隙（这一带是不是双栏排版）。"""
+    lo = max(0, center_bin - tol_bins)
+    hi = min(len(cover), center_bin + tol_bins + 1)
+    for i in range(lo, hi):
+        if cover[i] <= 0.5:
+            return True
+    return False
+
+
+def _extract_by_band_voting(page, words, width, height, y_split):
+    """整宽元素挡住宿缝时的兜底抽取：逐带投票找栏缝，按块拼回阅读顺序。
+
+    返回 None 表示这条路也不可靠，调用方退回 pdfplumber 的原始抽取。
+    """
+    band_h = max(8.0, height / 40.0)
+    bands = []
+    y = y_split
+    while y < height:
+        bw = [w for w in words if y <= w["top"] < y + band_h]
+        bands.append((y, y + band_h, bw))
+        y += band_h
+
+    # 投票：只有"能找出栏缝"的带才参与
+    votes: dict[int, int] = {}
+    for _, _, bw in bands:
+        mid = _band_column_gap(bw, width)
+        if mid is None:
+            continue
+        key = int(round(mid / width * _X_BINS))
+        votes[key] = votes.get(key, 0) + 1
+    if not votes:
+        return None
+    x_bin = max(votes.items(), key=lambda kv: kv[1])[0]
+    if votes[x_bin] < 3:
+        return None
+    x_mid = width * x_bin / _X_BINS
+
+    left_n = sum(1 for w in words if w["x1"] <= x_mid + 1)
+    right_n = sum(1 for w in words if w["x0"] >= x_mid - 1)
+    if left_n < 8 or right_n < 8:
+        return None
+
+    # 按垂直顺序分块：
+    #   双栏带（这一带在栏缝位置有空隙）→ 左右各裁一段
+    #   跨栏带（整宽表格/图注，栏缝位置被填满）→ 整宽裁一段
+    # 判据是"栏缝位置有没有空隙"，不是"最长空隙在哪"—— 后者会被图注、
+    # 缩进段落带偏，导致整页又按整宽裁回去（两栏正文重新交错）。
+    groups = []   # [kind, y0, y1]
+    for y0, y1, bw in bands:
+        if not bw:
+            continue
+        cover = _x_cover(bw, width, _X_BINS)
+        kind = "split" if _has_gap_near(cover, x_bin) else "span"
+        if groups and groups[-1][0] == kind:
+            groups[-1][2] = y1
+        else:
+            groups.append([kind, y0, y1])
+
+    parts = []
+    try:
+        if y_split > 0:
+            top_txt = page.crop((0, 0, width, y_split)).extract_text(
+                x_tolerance=PDF_X_TOLERANCE
+            ) or ""
+            if top_txt.strip():
+                parts.append(top_txt.strip())
+        for kind, gy0, gy1 in groups:
+            if kind == "split":
+                lt = page.crop((0, gy0, x_mid, gy1)).extract_text(
+                    x_tolerance=PDF_X_TOLERANCE) or ""
+                rt = page.crop((x_mid, gy0, width, gy1)).extract_text(
+                    x_tolerance=PDF_X_TOLERANCE) or ""
+                if lt.strip():
+                    parts.append(lt.strip())
+                if rt.strip():
+                    parts.append(rt.strip())
+            else:
+                st = page.crop((0, gy0, width, gy1)).extract_text(
+                    x_tolerance=PDF_X_TOLERANCE) or ""
+                if st.strip():
+                    parts.append(st.strip())
+    except Exception:
+        return None
+
+    if not parts:
+        return None
     return "\n\n".join(parts)
 
 
