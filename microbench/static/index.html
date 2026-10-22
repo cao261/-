@@ -1493,6 +1493,53 @@
     .anno-item-meta { font-size: 10px; color: var(--fg-subtle); margin-top: 5px; display: flex; gap: 8px; }
     .anno-empty { padding: var(--s-5); text-align: center; color: var(--fg-subtle); font-size: 12px; }
 
+    /* ---------- 同步过程面板 ---------- */
+    .sync-modal {
+      position: fixed; inset: 0; z-index: 1600;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(20, 18, 16, .45);
+    }
+    .sync-modal-card {
+      width: 560px; max-width: calc(100vw - 32px);
+      background: var(--surface-raised);
+      border: 1px solid var(--line-hairline);
+      border-radius: 12px; box-shadow: var(--sh-4);
+      overflow: hidden;
+    }
+    .sync-modal-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 14px; border-bottom: 1px solid var(--line-hairline);
+    }
+    .sync-modal-title { font-weight: 600; color: var(--fg-strong); font-size: 0.96875rem; }
+    .sync-modal-dir {
+      padding: 8px 14px; font-size: 11px; color: var(--fg-subtle);
+      border-bottom: 1px solid var(--line-hairline);
+      word-break: break-all; font-family: var(--font-mono);
+    }
+    .sync-steps {
+      padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
+      max-height: 46vh; overflow-y: auto;
+    }
+    .sync-step { display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: var(--fg-base); }
+    .sync-step .ico { width: 18px; text-align: center; flex-shrink: 0; }
+    /* 步骤名固定宽度不压缩，明细占剩余空间并省略 —— 否则长文件名会把
+       步骤名挤成竖排的一列字 */
+    .sync-step .st-name { flex: 0 0 auto; white-space: nowrap; }
+    .sync-step .st-detail {
+      flex: 1 1 auto; min-width: 0;
+      color: var(--fg-subtle); font-size: 11.5px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .sync-step.done .ico { color: #3f7d3f; }
+    .sync-step.fail .ico { color: #b0403a; }
+    .sync-step.run .ico { color: var(--accent-olive); }
+    .sync-step.skip .ico { color: var(--fg-subtle); }
+    .sync-modal-foot {
+      padding: 10px 14px; border-top: 1px solid var(--line-hairline);
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    }
+    .sync-modal-note { font-size: 11.5px; color: var(--fg-subtle); flex: 1; }
+
     .qa-panel-head {
       display: flex;
       align-items: center;
@@ -3363,6 +3410,12 @@
       initAnnotationFeatures();
       loadTranslationModelChoices();
       try { _setupPdfScrollSync(); } catch (e) { /* 忽略 */ }
+      // 调试/自动化入口：?sync_now=1 直接触发一次同步（不用点按钮）
+      try {
+        if (new URLSearchParams(location.search).get("sync_now") === "1") {
+          setTimeout(() => syncNow(), 800);
+        }
+      } catch (e) { /* 忽略 */ }
       // 支持用链接直接打开仓库里的某篇论文：
       //   http://127.0.0.1:5000/?open_pdf=<vault 相对路径>
       //   http://127.0.0.1:5000/#open_pdf=<vault 相对路径>
@@ -5996,10 +6049,58 @@
       }
     }
 
+    const SYNC_STEPS = [
+      { id: "push_snapshots",  name: "推送 · 译文快照", kind: "snapshots",  dir: "push" },
+      { id: "push_annotations", name: "推送 · 批注（高亮+笔记）", kind: "annotations", dir: "push" },
+      { id: "push_progress",  name: "推送 · 阅读进度", kind: "progress",  dir: "push" },
+      { id: "pull_snapshots",  name: "拉取 · 译文快照", kind: "snapshots",  dir: "pull" },
+      { id: "pull_annotations", name: "拉取 · 批注（高亮+笔记）", kind: "annotations", dir: "pull" },
+      { id: "pull_progress",  name: "拉取 · 阅读进度", kind: "progress",  dir: "pull" },
+    ];
+
+    function _syncStep(id, state, detail) {
+      const el = document.getElementById("sync-step-" + id);
+      if (!el) return;
+      el.className = "sync-step " + state;
+      const ico = { run: "⏳", done: "✅", fail: "❌", skip: "·" }[state] || "·";
+      el.querySelector(".ico").textContent = ico;
+      el.querySelector(".st-detail").textContent = detail || "";
+    }
+
+    function closeSyncModal() {
+      const m = document.getElementById("sync-modal");
+      if (m) m.style.display = "none";
+      if (_syncReloadTimer) { clearTimeout(_syncReloadTimer); _syncReloadTimer = null; }
+    }
+
+    // 拉到新译文后用它重建页面（用户点按钮，或倒计时结束自动执行）
+    let _syncReloadTimer = null;
+    function reloadAfterSync() {
+      closeSyncModal();
+      location.reload();
+    }
+
     async function syncNow() {
+      console.log("[sync] 开始");
+      const modal = document.getElementById("sync-modal");
+      const stepsEl = document.getElementById("sync-steps");
+      const dirEl = document.getElementById("sync-modal-dir");
+      const noteEl = document.getElementById("sync-modal-note");
+      const reloadBtn = document.getElementById("sync-reload-btn");
       const btn = document.getElementById("sync-btn");
-      const orig = btn ? btn.innerText : null;
+      if (modal) modal.style.display = "flex";
       if (btn) { btn.disabled = true; btn.innerText = "☁ 同步中…"; }
+      if (reloadBtn) reloadBtn.style.display = "none";
+      if (_syncReloadTimer) { clearTimeout(_syncReloadTimer); _syncReloadTimer = null; }
+      if (stepsEl) {
+        stepsEl.innerHTML = SYNC_STEPS.map(s =>
+          `<div class="sync-step run" id="sync-step-${s.id}">` +
+          `<span class="ico">⏳</span><span class="st-name">${s.name}</span>` +
+          `<span class="st-detail">进行中…</span></div>`).join("");
+      }
+      if (noteEl) noteEl.textContent = "正在与共享目录交换状态…";
+      const t0 = Date.now();
+
       try {
         const r = await fetch("/api/sync", {
           method: "POST",
@@ -6011,23 +6112,64 @@
         });
         if (!r.ok) throw new Error("HTTP " + r.status);
         const d = await r.json();
-        const nPush = (d.pushed || []).length;
-        const nPull = (d.pulled || []).length;
-        showToast(`同步完成 · 推送 ${nPush} 项 · 拉取 ${nPull} 项`, false, 2600);
-        // 译文快照变了 → 刷新页面，用新的快照重建（省掉重翻）
+        console.log("[sync] 完成", d);
+
+        if (dirEl) dirEl.textContent = "同步目录：" + (d.root || "未知");
+        SYNC_STEPS.forEach(s => {
+          const bucket = (s.dir === "push" ? d.pushed : d.pulled) || {};
+          const list = bucket[s.kind] || [];
+          if (!list.length) {
+            _syncStep(s.id, "skip", s.dir === "push" ? "无需推送" : "没有新内容");
+            return;
+          }
+          const names = list.map(x => {
+            // 文件名是「论文名_哈希」，太长 → 只留中间的论文名尾部
+            const n = String(x).replace(/\.json$/i, "");
+            return n.length > 28 ? "…" + n.slice(-27) : n;
+          }).slice(0, 2).join("、");
+          const more = list.length > 2 ? ` 等 ${list.length} 项` : "";
+          _syncStep(s.id, "done", `${list.length} 项 · ${names}${more}`);
+        });
+
+        const secs = ((Date.now() - t0) / 1000).toFixed(1);
+        const bits = [];
+        const pulledAnno = ((d.pulled || {}).annotations || []).length;
+        if (pulledAnno) bits.push(`更新了 ${pulledAnno} 条批注`);
+        if (d.progress && d.progress.page) bits.push(`阅读进度：第 ${d.progress.page} 页`);
+
         if (d.snapshot_updated) {
-          setTimeout(() => location.reload(), 1000);
+          // 拉到了新译文：结果留在面板上（别一闪而过），给用户看清再刷新
+          if (noteEl) {
+            noteEl.textContent = `✅ 同步成功 · 推送 ${d.pushed_total || 0} 项 / 拉取 ${d.pulled_total || 0} 项`
+              + ` · 耗时 ${secs}s · 拉到了新的译文，10 秒后自动刷新页面重建`
+              + (bits.length ? " · " + bits.join(" · ") : "");
+          }
+          if (reloadBtn) reloadBtn.style.display = "inline-block";
+          let left = 10;
+          const tick = setInterval(() => {
+            left -= 1;
+            if (noteEl) {
+              noteEl.textContent = noteEl.textContent.replace(/\d+ 秒后自动刷新页面重建/, `${left} 秒后自动刷新页面重建`);
+            }
+            if (left <= 0) clearInterval(tick);
+          }, 1000);
+          _syncReloadTimer = setTimeout(reloadAfterSync, 10500);
           return;
         }
-        // 批注可能有变化 → 重新加载并重放高亮
-        if ((d.pulled || []).some(x => x.startsWith("annotations/"))) {
+
+        if (noteEl) {
+          noteEl.textContent = `✅ 同步成功 · 推送 ${d.pushed_total || 0} 项 / 拉取 ${d.pulled_total || 0} 项`
+            + ` · 耗时 ${secs}s` + (bits.length ? " · " + bits.join(" · ") : "");
+        }
+        if (pulledAnno) {
           await loadAnnotationsForPaper((_pdfState && _pdfState.paperId) || null);
         }
         if (d.progress) _applyReadingProgress(d.progress);
       } catch (e) {
-        showToast("同步失败: " + (e.message || e), true, 4000);
+        SYNC_STEPS.forEach(s => _syncStep(s.id, "fail", "同步失败"));
+        if (noteEl) noteEl.textContent = "❌ 同步失败: " + (e.message || e);
       } finally {
-        if (btn) { btn.disabled = false; btn.innerText = orig || "☁ 同步"; }
+        if (btn) { btn.disabled = false; btn.innerText = "☁ 同步"; }
       }
     }
 
@@ -7629,6 +7771,26 @@
           </div>
         </div>
         <div id="anno-drawer-list" class="anno-drawer-list"></div>
+      </div>
+
+      <!-- ---------- 同步过程面板 ---------- -->
+      <div id="sync-modal" class="sync-modal" style="display:none;">
+        <div class="sync-modal-card">
+          <div class="sync-modal-head">
+            <span class="sync-modal-title">☁ 跨设备同步</span>
+            <button class="btn-zoom-toggle" onclick="closeSyncModal()" title="关闭" aria-label="关闭">×</button>
+          </div>
+          <div class="sync-modal-dir" id="sync-modal-dir">同步目录：检测中…</div>
+          <div class="sync-steps" id="sync-steps"></div>
+          <div class="sync-modal-foot">
+            <span class="sync-modal-note" id="sync-modal-note"></span>
+            <div class="row gap-1">
+              <button class="btn-pill-outline" id="sync-reload-btn" onclick="reloadAfterSync()" style="display:none;">↻ 用新译文刷新</button>
+              <button class="btn-pill-outline" onclick="syncNow()">再同步一次</button>
+              <button class="btn-pill" onclick="closeSyncModal()">完成</button>
+            </div>
+          </div>
+        </div>
       </div>
 
     </div>

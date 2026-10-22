@@ -3243,15 +3243,40 @@ ANNOTATION_LEGACY_SUBDIR = ("logs", "_pdf_snapshots", "annotations")
 
 SYNC_KINDS = ("snapshots", "annotations", "progress")
 SYNC_MAX_FILE_BYTES = 8 * 1024 * 1024
+# 坚果云同步空间里的目录名（两台设备必须用同一个名字才能对上）
+NUTSTORE_SUBDIR = "MicroBench同步"
+
+
+def _nutstore_dir():
+    """自动探测坚果云同步空间（%USERPROFILE%\\Nutstore）。
+
+    有了它，"另一台设备克隆下来就能用"：不用改 .env，只要装了坚果云客户端
+    并登录同一账号，同步目录就自动落在它里面。
+    """
+    home = os.path.expanduser("~")
+    for name in ("Nutstore", "坚果云", "Nutstore 同步空间"):
+        p = Path(home) / name
+        if p.is_dir():
+            return p
+    return None
 
 
 def _sync_root() -> Path:
+    """同步根目录。优先级：
+
+    1. .env 的 ANNOTATIONS_DIR（显式指定）
+    2. 坚果云同步空间里的 MicroBench同步（自动探测 → 跨设备零配置）
+    3. vault 内的 01_Literature/_同步（跟着 vault 自己的同步走）
+    """
     raw = (os.getenv("ANNOTATIONS_DIR") or "").strip()
     if raw:
         p = Path(raw).expanduser()
         if not p.is_absolute():
             p = BASE_DIR / p
         return p
+    nut = _nutstore_dir()
+    if nut is not None:
+        return nut / NUTSTORE_SUBDIR
     return BASE_DIR.joinpath(*ANNOTATION_VAULT_SUBDIR)
 
 
@@ -3321,10 +3346,11 @@ async def api_sync(req: SyncRequest):
 
     两台设备点同一个按钮即可：推的是自己，拉的是对方，最后合并。
     """
+    _t0 = time.monotonic()
     root = _sync_root()
     root.mkdir(parents=True, exist_ok=True)
-    pushed: list[str] = []
-    pulled: list[str] = []
+    pushed: dict = {k: [] for k in SYNC_KINDS}
+    pulled: dict = {k: [] for k in SYNC_KINDS}
     snapshot_updated = False
 
     # ---------- 推送：翻译快照 ----------
@@ -3340,7 +3366,7 @@ async def api_sync(req: SyncRequest):
                 if dst.exists() and dst.stat().st_mtime >= fp.stat().st_mtime:
                     continue
                 shutil.copyfile(fp, dst)
-                pushed.append("snapshots/" + fp.name)
+                pushed["snapshots"].append(fp.name)
             except OSError:
                 continue
 
@@ -3360,7 +3386,7 @@ async def api_sync(req: SyncRequest):
                            "schema_version": 2, "annotations": items}
                 dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                                encoding="utf-8")
-                pushed.append("annotations/" + fp.name)
+                pushed["annotations"].append(fp.name)
             except OSError:
                 continue
 
@@ -3374,7 +3400,7 @@ async def api_sync(req: SyncRequest):
             rec["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
             ( _sync_dir("progress") / f"{safe}.json").write_text(
                 json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
-            pushed.append("progress/" + safe + ".json")
+            pushed["progress"].append(safe + ".json")
 
     # ---------- 拉取：翻译快照（共享 → 本机） ----------
     if not req.push_only:
@@ -3388,7 +3414,7 @@ async def api_sync(req: SyncRequest):
                 if dst.exists() and dst.stat().st_mtime >= fp.stat().st_mtime:
                     continue
                 shutil.copyfile(fp, dst)
-                pulled.append("snapshots/" + fp.name)
+                pulled["snapshots"].append(fp.name)
                 snapshot_updated = True
             except OSError:
                 continue
@@ -3410,7 +3436,7 @@ async def api_sync(req: SyncRequest):
                            "schema_version": 2, "annotations": items}
                 dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                                encoding="utf-8")
-                pulled.append("annotations/" + fp.name)
+                pulled["annotations"].append(fp.name)
             except OSError:
                 continue
 
@@ -3424,7 +3450,7 @@ async def api_sync(req: SyncRequest):
             if remote and _anno_is_newer(remote.get("updated_at", ""),
                                          (prog.get(safe) or {}).get("updated_at", "")):
                 prog[safe] = remote
-                pulled.append("progress/" + safe + ".json")
+                pulled["progress"].append(safe + ".json")
         try:
             _write_local_progress(prog)
         except OSError:
@@ -3435,7 +3461,10 @@ async def api_sync(req: SyncRequest):
         "root": str(root),
         "pushed": pushed,
         "pulled": pulled,
+        "pushed_total": sum(len(v) for v in pushed.values()),
+        "pulled_total": sum(len(v) for v in pulled.values()),
         "snapshot_updated": snapshot_updated,
+        "elapsed_ms": int((time.monotonic() - _t0) * 1000) if _t0 else 0,
         "progress": (
             prog.get(_safe_paper_key(req.paper_id)) if req.paper_id else None
         ) if not req.push_only else None,
