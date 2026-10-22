@@ -996,6 +996,7 @@ def chat(
     disable_thinking: bool = False,
     model_name: Optional[str] = None,
     deadline: Optional[float] = None,
+    force_fallback: bool = False,
 ) -> str:
     """
     Single-turn chat completion with automatic failover and degradation management.
@@ -1014,6 +1015,10 @@ def chat(
     deadline：`time.monotonic()` 时间戳。过了这个点就不再发起新的上游调用，
     每次调用的超时也会被压到剩余时间内。翻译这类"质量优先但别无限等"的
     场景用它把整条链路兜在固定时限内。
+
+    force_fallback：强制走备用模型（Agnes 3.0 Flash），无视当前的降级状态。
+    用户在界面上手动"换模型翻译"时用 —— 主模型额度用完了想换免费模型，
+    不该非得等降级探测。
     """
     if requests is None:
         raise LLMError("requests 包未安装, 请先 pip install requests")
@@ -1028,6 +1033,19 @@ def chat(
             "LLM 未配置: 请设置环境变量 LLM_API_KEY (主模型) 或 AGNES_API_KEY (备用模型). "
             "可在工作台根目录编辑 .env 文件."
         )
+
+    # 强制走备用模型：直接用 fallback 配置，跳过主模型与降级探测
+    if force_fallback:
+        if not fallback["configured"]:
+            raise LLMError("备用模型未配置 (AGNES_API_KEY), 无法强制使用")
+        success, res, status_code = _invoke_with_budget_escalation(
+            fallback, messages, max_tokens, temperature, timeout, json_mode,
+            max_retries=max_retries, disable_thinking=disable_thinking,
+            budget=[MAX_UPSTREAM_CALLS_PER_REQUEST], deadline=deadline,
+        )
+        if success:
+            return res
+        raise LLMError(f"备用模型调用失败: {res}")
 
     # Opportunistic auto-recovery probe if degraded and probe cooldown reached
     if model_manager.is_degraded and primary["configured"] and model_manager.should_opportunistic_probe():

@@ -631,6 +631,52 @@ class TranslateRequest(BaseModel):
                                         description="canonical section key e.g. 'introduction'")
     force: bool = Field(default=False,
                         description="忽略缓存强制重译（点「重新翻译」时用）")
+    model: str = Field(default="", max_length=60,
+                       description="临时换模型翻译：空=跟随当前设置, 'agnes'=备用模型, "
+                                   "否则是 MiniMax 系模型名")
+
+def _resolve_translation_model(requested: str):
+    """解析前端传来的 model 参数。
+
+    返回 (model_name, force_fallback, cache_key_model)：
+      - model_name：传给 llm.chat 的临时模型名（空 = 用默认的翻译专用设置）
+      - force_fallback：True = 强制走备用模型（Agnes）
+      - cache_key_model：缓存键里用的模型名 —— 必须反映实际用的模型，
+        否则换模型翻译会命中旧模型的缓存（换模型等于没换）
+    """
+    req = (requested or "").strip()
+    if not req:
+        return "", False, llm.translation_active_model()
+    if req.lower() in ("agnes", "fallback", "agnes-3.0-flash"):
+        fb_name = llm.model_manager.get_fallback_config().get("model") or "agnes-3.0-flash"
+        return "", True, fb_name
+    return req, False, req
+
+
+# 可供界面选择的翻译模型。MiniMax 系共用同一套 key/base_url；
+# 'agnes' 走备用模型（免费无限，但更慢）。
+TRANSLATION_MODEL_CHOICES = (
+    {"id": "", "label": "跟随当前设置", "hint": "默认：LLM_TRANSLATION_MODEL 或主模型"},
+    {"id": "MiniMax-M3", "label": "MiniMax-M3", "hint": "直译最快最稳（推荐）"},
+    {"id": "MiniMax-M3.1-Flash", "label": "MiniMax-M3.1-Flash", "hint": "强制思考，很慢且易截断"},
+    {"id": "MiniMax-M2.7", "label": "MiniMax-M2.7", "hint": "会混入思考文本"},
+    {"id": "agnes", "label": "Agnes 3.0 Flash", "hint": "免费无限额度，较慢"},
+)
+
+
+@app.get("/api/llm/translation_models")
+async def api_llm_translation_models():
+    """界面上的「换模型翻译」下拉框选项。"""
+    return {
+        "models": [
+            dict(m, active=(m["id"] == llm.translation_active_model()))
+            for m in TRANSLATION_MODEL_CHOICES
+        ],
+        "active_model": llm.translation_active_model(),
+        "primary": llm.model_manager.get_primary_config().get("model", ""),
+        "fallback": llm.model_manager.get_fallback_config().get("model", ""),
+    }
+
 
 class OpenVaultPdfRequest(BaseModel):
     """Open a PDF that already exists inside the vault (no upload, no copy)."""
@@ -690,6 +736,9 @@ class TranslatePageRequest(BaseModel):
                      "重新抽取该页文本（正确恢复丢失的单词空格 + 按栏顺序），"
                      "比浏览器 PDF.js 抓到的文本质量高得多。"),
     )
+    model: str = Field(default="", max_length=60,
+                       description="临时换模型翻译：空=跟随当前设置, 'agnes'=备用模型, "
+                                   "否则是 MiniMax 系模型名")
 
 
 class TranslationCacheBatchItem(BaseModel):
@@ -1958,7 +2007,7 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 """
 
 
-def _translation_deadline_seconds() -> float:
+def _translation_deadline_seconds(model: str = "") -> float:
     """单次翻译请求的**总**时限（秒）。
 
     用户的诉求是「质量优先，但别无限等」：强制思考的模型（M3.1-Flash）整页
@@ -1970,11 +2019,18 @@ def _translation_deadline_seconds() -> float:
     """
     raw = (os.getenv("LLM_TRANSLATION_DEADLINE", "") or "").strip()
     if not raw:
-        return 180.0
-    try:
-        return max(30.0, min(float(raw), 900.0))
-    except ValueError:
-        return 180.0
+        base = 180.0
+    else:
+        try:
+            base = max(30.0, min(float(raw), 900.0))
+        except ValueError:
+            base = 180.0
+    # 用户手动挑了更慢的模型 → 放宽总时限，否则慢模型必然撞线（返回 504）
+    if model == "agnes":
+        return min(base * 2.5, 900.0)
+    if model and model != llm.translation_active_model():
+        return min(base * 1.8, 900.0)
+    return base
 
 
 def _translation_max_tokens(src_len: int, model: str = "") -> int:
@@ -2029,7 +2085,8 @@ async def api_translate_section(req: TranslateRequest):
     cache = get_cache()
     curr_st = llm.get_llm_status()
     # 翻译可能走「翻译专用模型」，缓存键和上报都要用它，不能用主模型。
-    model = llm.translation_active_model()
+    # 用户手动换了模型时，缓存键必须跟着换，否则换模型翻译会命中旧译文。
+    _m_name, _m_fallback, model = _resolve_translation_model(req.model)
 
     # Cache lookup: same text + same model = same translation
     # force=True 时跳过读缓存（点「重新翻译」必须真的重译，否则用户按了
@@ -2045,7 +2102,7 @@ async def api_translate_section(req: TranslateRequest):
     translated_parts: list[str] = []
     # 单次翻译请求的总时限。质量优先，但不能无限等：超时了就返回已经翻完的
     # 部分 + 明确的「部分完成」标记，而不是继续挂着。
-    deadline = time.monotonic() + _translation_deadline_seconds()
+    deadline = time.monotonic() + _translation_deadline_seconds(req.model)
     stopped_reason = ""
 
     try:
@@ -2102,7 +2159,9 @@ async def api_translate_section(req: TranslateRequest):
                     disable_thinking=llm.translation_disable_thinking(),
                     # 翻译专用模型（LLM_TRANSLATION_MODEL）：M3.1-Flash 强制思考，
                     # 直译会又慢又断句，单独指定一个能关思考的模型更稳。
-                    model_name=llm.translation_model_name(),
+                    # 用户手动换了模型时以用户的为准。
+                    model_name=_m_name or llm.translation_model_name(),
+                    force_fallback=_m_fallback,
                     # 整条链路（重试 + 抬预算重试）都受这个时限约束
                     deadline=deadline,
                 )
@@ -2123,7 +2182,7 @@ async def api_translate_section(req: TranslateRequest):
                 status_code=504,
                 detail=(
                     f"翻译超时（超出单次请求时限 "
-                    f"{_translation_deadline_seconds():.0f}s）。"
+                    f"{_translation_deadline_seconds(req.model):.0f}s）。"
                     f"可以调大 .env 的 LLM_TRANSLATION_DEADLINE，或换更快的翻译模型。"
                 ),
             )
@@ -2180,7 +2239,8 @@ async def api_translate_section(req: TranslateRequest):
                             disable_thinking=llm.translation_disable_thinking(),
                             # 必须用同一个翻译模型：主模型和翻译模型措辞风格不同，
                             # 混用会让"重译版"看起来像另一份译文
-                            model_name=llm.translation_model_name(),
+                            model_name=_m_name or llm.translation_model_name(),
+                            force_fallback=_m_fallback,
                             deadline=deadline,
                         )
                     ).strip()
@@ -2193,7 +2253,7 @@ async def api_translate_section(req: TranslateRequest):
             pass  # 重译失败就用第一版，不要因此让整个请求失败
 
     curr_st = llm.get_llm_status()
-    actual_model = llm.translation_active_model()
+    actual_model = model
     result = {
         "status": "success",
         "translation": translation,
@@ -2654,7 +2714,8 @@ async def api_translate_page(req: TranslatePageRequest):
     cache = get_cache()
     cfg = llm._config()
     # 翻译可能走「翻译专用模型」，缓存键和上报都要用它。
-    model = llm.translation_active_model()
+    # 用户手动换了模型时，缓存键必须跟着换，否则换模型翻译会命中旧译文。
+    _m_name, _m_fallback, model = _resolve_translation_model(req.model)
 
     # 优先用服务端重新抽取的页面文本：浏览器 PDF.js 抓到的文本在字体子集化
     # 的 PDF 上会丢掉单词空格（"compositestructureshavebeen"），而 pdfplumber
@@ -2687,7 +2748,7 @@ async def api_translate_page(req: TranslatePageRequest):
     chunks = chunk_section_text(page_text)
     translated_parts = []
     # 单次翻译请求的总时限（见 api_translate_section 的同名逻辑）
-    deadline = time.monotonic() + _translation_deadline_seconds()
+    deadline = time.monotonic() + _translation_deadline_seconds(req.model)
     stopped_reason = ""
     try:
         for idx, chunk in enumerate(chunks):
@@ -2718,8 +2779,9 @@ async def api_translate_page(req: TranslatePageRequest):
                     timeout=call_timeout,
                     # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
                     disable_thinking=llm.translation_disable_thinking(),
-                    # 翻译专用模型（LLM_TRANSLATION_MODEL）
-                    model_name=llm.translation_model_name(),
+                    # 翻译专用模型（LLM_TRANSLATION_MODEL）；用户手动换了模型时以用户的为准
+                    model_name=_m_name or llm.translation_model_name(),
+                    force_fallback=_m_fallback,
                     # 整条链路（重试 + 抬预算重试）都受这个时限约束
                     deadline=deadline,
                 )
@@ -2740,7 +2802,7 @@ async def api_translate_page(req: TranslatePageRequest):
                 status_code=504,
                 detail=(
                     f"翻译超时（超出单次请求时限 "
-                    f"{_translation_deadline_seconds():.0f}s）。"
+                    f"{_translation_deadline_seconds(req.model):.0f}s）。"
                     f"可以调大 .env 的 LLM_TRANSLATION_DEADLINE，或换更快的翻译模型。"
                 ),
             )
@@ -2793,7 +2855,8 @@ async def api_translate_page(req: TranslatePageRequest):
                             disable_thinking=llm.translation_disable_thinking(),
                             # 必须用同一个翻译模型：主模型和翻译模型措辞风格不同，
                             # 混用会让"重译版"看起来像另一份译文
-                            model_name=llm.translation_model_name(),
+                            model_name=_m_name or llm.translation_model_name(),
+                            force_fallback=_m_fallback,
                             deadline=deadline,
                         )
                     ).strip()
@@ -2812,7 +2875,7 @@ async def api_translate_page(req: TranslatePageRequest):
         "page": req.page,
         "chunk_count": len(chunks),
         "from_cache": False,
-        "model": llm.translation_active_model(),
+        "model": model,
         "is_degraded": curr_st["is_degraded"],
         # 残留未翻译的英文段数（完整性校验的结果，正常应为 0）
         "untranslated_runs": len(leaked),

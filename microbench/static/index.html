@@ -3361,6 +3361,7 @@
       loadVaultPdfOptions();
       initReaderQAPanelDrag();
       initAnnotationFeatures();
+      loadTranslationModelChoices();
       // 支持用链接直接打开仓库里的某篇论文：
       //   http://127.0.0.1:5000/?open_pdf=<vault 相对路径>
       //   http://127.0.0.1:5000/#open_pdf=<vault 相对路径>
@@ -3879,9 +3880,15 @@
             block.className = "pdf-translation-block";
             block.id = `pdf-trans-block-${pg.num}`;
             block.innerHTML = `
-              <div class="page-num" style="display:flex; justify-content:space-between; align-items:center;">
+              <div class="page-num" style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
                 <span>第 ${pg.num} 页 / Page ${pg.num}</span>
-                <span id="pdf-page-tag-${pg.num}" style="font-size:10px; color:var(--text-subtle); font-family:var(--font-sans);">⏳ 即将翻译</span>
+                <span class="page-num-right" style="display:inline-flex; align-items:center; gap:6px;">
+                  <span id="pdf-page-tag-${pg.num}" style="font-size:10px; color:var(--text-subtle); font-family:var(--font-sans);">⏳ 即将翻译</span>
+                  <span class="anno-badge-slot"></span>
+                  <button class="btn-zoom-toggle" style="font-size:11px; padding:1px 6px;"
+                          onclick="retranslatePdfPage(${pg.num})"
+                          title="用当前模型重新翻译本页（忽略缓存）">🔄</button>
+                </span>
               </div>
               <div class="page-text pdf-translation-loading" id="pdf-page-text-${pg.num}">⏳ 正在翻译本页...</div>
             `;
@@ -4476,10 +4483,16 @@
         transBlock.className = "pdf-translation-block";
         transBlock.id = `pdf-trans-block-${pageNum}`;
         transBlock.innerHTML = `
-        <div class="page-num" style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="page-num" style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
           <span>第 ${pageNum} 页 / Page ${pageNum}</span>
-          <span id="pdf-page-tag-${pageNum}" style="font-size:10px; color:var(--text-subtle); font-family:var(--font-sans);">
-            ${pageNum === 1 ? "⏳ 即将翻译" : `🕒 排队中 (约 ${(pageNum - 1) * _getCurrentRpmInfo().interval}s)`}
+          <span class="page-num-right" style="display:inline-flex; align-items:center; gap:6px;">
+            <span id="pdf-page-tag-${pageNum}" style="font-size:10px; color:var(--text-subtle); font-family:var(--font-sans);">
+              ${pageNum === 1 ? "⏳ 即将翻译" : `🕒 排队中 (约 ${(pageNum - 1) * _getCurrentRpmInfo().interval}s)`}
+            </span>
+            <span class="anno-badge-slot"></span>
+            <button class="btn-zoom-toggle" style="font-size:11px; padding:1px 6px;"
+                    onclick="retranslatePdfPage(${pageNum})"
+                    title="用当前模型重新翻译本页（忽略缓存）">🔄</button>
           </span>
         </div>
         <div class="page-text pdf-translation-loading" id="pdf-page-text-${pageNum}">
@@ -4529,7 +4542,7 @@
       };
     }
 
-    async function translatePdfPage(pageNum, pageText = null, isPriority = false, force = false) {
+    async function translatePdfPage(pageNum, pageText = null, isPriority = false, force = false, model = null) {
       const block = document.getElementById(`pdf-trans-block-${pageNum}`);
       if (!block) return;
       const textEl = document.getElementById(`pdf-page-text-${pageNum}`) || block.querySelector(".page-text");
@@ -4599,6 +4612,8 @@
             // force: 用户显式点「重新翻译」时忽略缓存，否则按了按钮
             // 拿到的还是同一份旧译文。
             force: !!force,
+            // 换模型翻译：空 = 跟随默认设置
+            model: (model != null ? model : (_pdfTransModel || "")),
           }),
           signal: ac.signal,
         });
@@ -5265,6 +5280,8 @@
             section_key: (sec.section || "").slice(0, 50),
             // 点「重新翻译」时忽略缓存，否则拿到的还是同一份旧译文
             force: !!force,
+            // 换模型翻译：空 = 跟随默认设置
+            model: (_pdfTransModel || ""),
           }),
         });
         const result = await res.json();
@@ -5871,6 +5888,66 @@
     }
 
     // ===========================================================================
+    // 翻译：换模型 + 重新翻译
+    // ===========================================================================
+    // _pdfTransModel：工具栏下拉框选中的模型（"" = 跟随 .env 的默认设置）。
+    // 换模型后缓存键也跟着换（服务端按模型分键），所以换模型 = 真的重译。
+    let _pdfTransModel = "";
+
+    async function loadTranslationModelChoices() {
+      const sel = document.getElementById("pdf-trans-model");
+      if (!sel) return;
+      try {
+        const r = await fetch("/api/llm/translation_models");
+        if (!r.ok) return;
+        const d = await r.json();
+        const cur = sel.value;
+        sel.innerHTML = "";
+        (d.models || []).forEach(m => {
+          const o = document.createElement("option");
+          o.value = m.id;
+          o.textContent = m.label + (m.id ? (m.active ? "（当前）" : "") : "");
+          o.title = m.hint || "";
+          sel.appendChild(o);
+        });
+        sel.value = cur || "";
+        _pdfTransModel = sel.value || "";
+      } catch (e) { /* 拉不到就保持"跟随默认" */ }
+    }
+
+    // 重新翻译本页：忽略缓存，用当前选中的模型
+    async function retranslatePdfPage(pageNum) {
+      const tagEl = document.getElementById(`pdf-page-tag-${pageNum}`);
+      const textEl = document.getElementById(`pdf-page-text-${pageNum}`);
+      if (tagEl) tagEl.textContent = "🔄 重译中…";
+      if (textEl) textEl.className = "page-text pdf-translation-loading";
+      await translatePdfPage(pageNum, null, true, true, _pdfTransModel);
+    }
+
+    // 重新翻译整篇：按 RPM 保护排队，一页一页来
+    async function retranslateAllPdfPages() {
+      if (!_pdfState || !_pdfState.pages || !_pdfState.pages.length) {
+        showToast("先打开一篇论文", true);
+        return;
+      }
+      const n = _pdfState.pages.length;
+      const modelName = (_pdfTransModel || "跟随默认");
+      if (!confirm(`用「${modelName}」重新翻译全部 ${n} 页？\n\n` +
+                   `会忽略现有译文重新调用模型，消耗 API 额度；\n` +
+                   `每页约 15~30 秒，按 RPM 保护排队。`)) return;
+      const btn = document.getElementById("pdf-retranslate-all-btn");
+      const orig = btn ? btn.innerText : null;
+      for (const p of _pdfState.pages) {
+        if (btn) btn.innerText = `🔄 ${p.num}/${n}`;
+        await retranslatePdfPage(p.num);
+        const info = _getCurrentRpmInfo();
+        await new Promise(r => setTimeout(r, info.interval * 1000 + 400));
+      }
+      if (btn) btn.innerText = orig || "🔄 全篇重译";
+      showToast(`已重新翻译 ${n} 页 · 记得点「保存快照」`);
+    }
+
+    // ===========================================================================
     // 划词答疑面板：拖动 / 缩放 / 位置记忆
     // ===========================================================================
     // 用户在 27 寸屏上嫌它"只在角落里一小块、只能看一部分"。现在：
@@ -6299,7 +6376,8 @@
           badge = document.createElement("button");
           badge.className = "anno-badge";
           badge.onclick = (e) => { e.stopPropagation(); openAnnoDrawer(pageNum); };
-          head.appendChild(badge);
+          const slot = head.querySelector(".anno-badge-slot");
+          (slot || head).appendChild(badge);
         }
         badge.textContent = "📝 " + count;
         badge.title = "本页有 " + count + " 条批注 · 点击查看";
@@ -7203,6 +7281,15 @@
                     onclick="togglePdfQueuePause()" title="暂停 / 继续自动排队翻译">⏸ 暂停排队</button>
             <button class="btn-zoom-toggle" id="pdf-snapshot-save-btn"
                     onclick="savePdfSnapshot()" title="保存已翻译页面，下次进来直接恢复（免重翻）">保存快照</button>
+            <span class="seg-divider"></span>
+            <select id="pdf-trans-model" class="field-input"
+                    style="font-size:11px; padding:3px 6px; max-width:170px;"
+                    title="选一个模型来翻译。选中后点每页的 🔄 或「全篇重译」用它重新翻译">
+              <option value="">跟随默认</option>
+            </select>
+            <button class="btn-zoom-toggle" id="pdf-retranslate-all-btn"
+                    onclick="retranslateAllPdfPages()"
+                    title="用当前模型重新翻译所有页（忽略缓存，会重新消耗 API 额度）">🔄 全篇重译</button>
           </div>
 
           <!-- Export note -->
