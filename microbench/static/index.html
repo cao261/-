@@ -2181,7 +2181,7 @@
       }
     }
 
-    async function translatePdfPage(pageNum, pageText = null, isPriority = false) {
+    async function translatePdfPage(pageNum, pageText = null, isPriority = false, force = false) {
       const block = document.getElementById(`pdf-trans-block-${pageNum}`);
       if (!block) return;
       const textEl = document.getElementById(`pdf-page-text-${pageNum}`) || block.querySelector(".page-text");
@@ -2213,6 +2213,9 @@
             // 带上 PDF 相对路径：服务端会用 pdfplumber 重新抽取该页文本
             // （正确恢复丢失的单词空格 + 按栏顺序），翻译质量比 PDF.js 抓取的高。
             relative_path: (_pdfState && _pdfState.relativePath) || null,
+            // force: 用户显式点「重新翻译」时忽略缓存，否则按了按钮
+            // 拿到的还是同一份旧译文。
+            force: !!force,
           }),
         });
         const data = await r.json();
@@ -2245,7 +2248,7 @@
         if (tagEl) tagEl.textContent = "❌ 失败";
         if (textEl) {
           textEl.innerHTML = `<span style="color:#B25336;">❌ 翻译失败: ${escapeHtml(String(err.message || err))}</span>
-            <button class="btn-pill-outline" style="font-size:11px; padding:2px 8px; margin-left:8px;" onclick="translatePdfPage(${pageNum}, null, true)">🔄 重试本页</button>`;
+            <button class="btn-pill-outline" style="font-size:11px; padding:2px 8px; margin-left:8px;" onclick="translatePdfPage(${pageNum}, null, true, true)">🔄 重试本页</button>`;
         }
         if (_pdfState && _pdfState.pages) {
           const pObj = _pdfState.pages.find(p => p.num === pageNum);
@@ -2419,7 +2422,7 @@
             <div style="display:flex; gap:8px; align-items:center;">
               <span class="reader-section-meta">${modelName ? `[${modelName}] · ` : ""}${translated.length} 字</span>
               <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copySectionTranslation(${idx})">📋 复制译文</button>
-              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="translateSection(${idx})">🔄 重新翻译</button>
+              <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="translateSection(${idx}, true)">🔄 重新翻译</button>
             </div>
           </div>
           <div class="reader-section-body cn-translation">${formatMarkdownLite(translated)}</div>`;
@@ -2597,7 +2600,7 @@
       renderMathIn(el);
     }
 
-    async function translateSection(idx) {
+    async function translateSection(idx, force = false) {
       const sec = _readerState.sections[idx];
       const transEl = document.getElementById("reader-translation");
       const estChars = (sec.text || "").length;
@@ -2611,6 +2614,8 @@
             section_title: sec.title,
             section_text: sec.text,
             section_key: sec.section,
+            // 点「重新翻译」时忽略缓存，否则拿到的还是同一份旧译文
+            force: !!force,
           }),
         });
         const result = await res.json();
@@ -2641,7 +2646,7 @@
         transEl.innerHTML = `<div style="padding:18px; color:var(--accent-terracotta);">
           <div style="font-weight:600; margin-bottom:6px;">❌ 翻译失败: ${escapeHtml(err.message)}</div>
           <div style="font-size:12px; color:var(--text-subtle); margin-bottom:12px;">提示: 若主模型 429 额度耗尽，系统已自动降格至 Agnes 3.0 Flash，点击重试即可生效。</div>
-          <button class="btn-pill-outline" style="font-size:12px; padding:6px 14px;" onclick="translateSection(${idx})">🔄 重新翻译本节</button>
+          <button class="btn-pill-outline" style="font-size:12px; padding:6px 14px;" onclick="translateSection(${idx}, true)">🔄 重新翻译本节</button>
         </div>`;
       }
     }

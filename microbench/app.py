@@ -226,6 +226,8 @@ class TranslateRequest(BaseModel):
     section_text: str = Field(..., min_length=10, max_length=60000)
     section_key: Optional[str] = Field(default=None, max_length=50,
                                         description="canonical section key e.g. 'introduction'")
+    force: bool = Field(default=False,
+                        description="忽略缓存强制重译（点「重新翻译」时用）")
 
 class ExplainRequest(BaseModel):
     question: str = Field(..., min_length=2, max_length=500)
@@ -255,6 +257,8 @@ class TranslatePageRequest(BaseModel):
     page: int = Field(..., ge=1, le=200, description="1-based page number")
     text: str = Field(..., min_length=10, max_length=15000,
                       description="Full page text (single chunk from pdfplumber)")
+    force: bool = Field(default=False,
+                        description="忽略缓存强制重译（点「重新翻译」时用）")
     relative_path: Optional[str] = Field(
         default=None, max_length=500,
         description=("PDF 在 vault 中的相对路径。提供时服务端会用 pdfplumber "
@@ -1095,10 +1099,13 @@ async def api_translate_section(req: TranslateRequest):
     model = curr_st.get("active_model") or "default"
 
     # Cache lookup: same text + same model = same translation
-    cached = cache.get(req.section_key or "", req.section_text, model)
-    if cached:
-        cached["from_cache"] = True
-        return cached
+    # force=True 时跳过读缓存（点「重新翻译」必须真的重译，否则用户按了
+    # 按钮还是看到同一份坏译文），但写回缓存仍然照常进行。
+    if not req.force:
+        cached = cache.get(req.section_key or "", req.section_text, model)
+        if cached:
+            cached["from_cache"] = True
+            return cached
 
     chunks = chunk_section_text(req.section_text)
     was_segmented = len(chunks) > 1
@@ -1625,6 +1632,21 @@ async def api_translation_cache_stats():
     return get_cache().stats()
 
 
+@app.post("/api/translation/cache_clear")
+async def api_translation_cache_clear():
+    """
+    Clear the in-memory translation cache.
+
+    Needed whenever the translation prompt or the post-processing changes:
+    cached entries were produced by the OLD pipeline and would keep being
+    served, so the user would see the old output even after the fix.
+    """
+    from .translation import get_cache
+    cache = get_cache()
+    cache.clear()
+    return {"status": "success", "message": "翻译缓存已清空"}
+
+
 @app.post("/api/paper/translate_page")
 async def api_translate_page(req: TranslatePageRequest):
     """
@@ -1665,10 +1687,11 @@ async def api_translate_page(req: TranslatePageRequest):
     # 换用更好的抽取文本后会自动 miss，不会命中旧的坏结果。
     cache_section_key = f"page:{req.paper_id}:{req.page}"
 
-    cached = cache.get(cache_section_key, page_text, model)
-    if cached:
-        cached["from_cache"] = True
-        return cached
+    if not req.force:
+        cached = cache.get(cache_section_key, page_text, model)
+        if cached:
+            cached["from_cache"] = True
+            return cached
 
     # Translate the whole page in one shot (page text is already < 15K chars)
     # If somehow larger, chunk and translate parts.
