@@ -229,6 +229,12 @@ class TranslateRequest(BaseModel):
     force: bool = Field(default=False,
                         description="忽略缓存强制重译（点「重新翻译」时用）")
 
+class OpenVaultPdfRequest(BaseModel):
+    """Open a PDF that already exists inside the vault (no upload, no copy)."""
+    relative_path: str = Field(..., min_length=3, max_length=500)
+    title: Optional[str] = Field(default=None, max_length=300)
+
+
 class ExplainRequest(BaseModel):
     question: str = Field(..., min_length=2, max_length=500)
     sections: list = Field(..., min_length=1, max_length=20,
@@ -253,7 +259,7 @@ class TranslatePageRequest(BaseModel):
     `paper_id` is a stable identifier (e.g. arXiv ID or DOI) — used to
     key the page-level translation cache so re-opening a paper is instant.
     """
-    paper_id: str = Field(..., min_length=3, max_length=100)
+    paper_id: str = Field(..., min_length=3, max_length=300)
     page: int = Field(..., ge=1, le=200, description="1-based page number")
     text: str = Field(..., min_length=10, max_length=15000,
                       description="Full page text (single chunk from pdfplumber)")
@@ -715,6 +721,101 @@ async def api_upload_pdf(
     }
 
 
+@app.get("/api/paper/list_vault_pdfs")
+async def api_list_vault_pdfs():
+    """
+    List every PDF already living in the vault's 01_Literature tree.
+
+    Lets the user open a paper that is already archived (or linked in from
+    an external library) without re-uploading it — uploading would copy the
+    file and duplicate it inside the vault.
+    """
+    from .generator import _safe_path
+    root = _safe_path(BASE_DIR, "01_Literature")
+    items: list[dict] = []
+    try:
+        for pdf in root.rglob("*.pdf"):
+            if not pdf.is_file():
+                continue
+            rel = str(pdf.relative_to(BASE_DIR)).replace("\\", "/")
+            try:
+                stat = pdf.stat()
+                size_kb = round(stat.st_size / 1024)
+            except OSError:
+                size_kb = 0
+            parts = rel.split("/")
+            topic = parts[1] if len(parts) > 2 else "01_Literature"
+            items.append({
+                "relative_path": rel,
+                "name": pdf.name,
+                "stem": pdf.stem,
+                "topic": topic,
+                "size_kb": size_kb,
+            })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"扫描 vault 失败: {e}")
+
+    items.sort(key=lambda x: (x["topic"], x["name"]))
+    return {"status": "success", "count": len(items), "pdfs": items}
+
+
+@app.post("/api/paper/open_vault_pdf")
+async def api_open_vault_pdf(req: OpenVaultPdfRequest):
+    """
+    Open a PDF that already lives in the vault: parse it into sections and
+    hand back exactly what the upload endpoint returns, without copying the
+    file anywhere.
+    """
+    from .generator import _safe_path
+    try:
+        pdf_path = _safe_path(BASE_DIR, req.relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"vault 中找不到该 PDF: {req.relative_path}")
+
+    try:
+        pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
+        pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF 文本提取失败: {str(e)}")
+
+    if not pages:
+        raise HTTPException(status_code=400, detail="未能从 PDF 中识别出有效文字 (可能是扫描图片版 PDF)")
+
+    sections = split_into_sections(pages)
+    if not sections:
+        full_text = "\n\n".join(p["text"] for p in pages)
+        sections = [{
+            "section": "full_text",
+            "title": "Full Text",
+            "text": full_text.strip(),
+            "page_start": 1,
+            "page_end": len(pages),
+        }]
+
+    title = (req.title or "").strip() or pdf_path.stem
+    sections_out = [{
+        "section": s["section"],
+        "title": s["title"],
+        "number": s.get("number", ""),
+        "text": s["text"],
+        "page_start": s["page_start"],
+        "page_end": s["page_end"],
+        "char_count": len(s["text"]),
+    } for s in sections]
+
+    return {
+        "status": "success",
+        "title": title,
+        "pdf_path": req.relative_path,
+        "file_name": pdf_path.name,
+        "total_pages": len(pages),
+        "char_count": sum(len(p["text"]) for p in pages),
+        "sections": sections_out,
+    }
+
+
 @app.get("/api/paper/bibtex")
 async def api_export_bibtex(
     arxiv: Optional[str] = Query(default=None, max_length=50),
@@ -1072,8 +1173,9 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
    不要输出分析过程, 只输出译文本身
 10. 严禁输出任何解释、推测或括号注释 (例如"原文此处数值缺损, 可能指……")。
     遇到看不懂或残缺的部分, 跳过即可, 绝不要编造数值、公式或术语
-11. 原文中的 "[?]" 是 PDF 抽取时无法识别的符号占位符, 原样保留,
-    不要臆造具体符号
+11. 原文中的 "[?]" 是 PDF 抽取时无法识别的公式或符号占位符（整段公式通常
+    只出现一个 "[?]"，不会出现一串），保留原样即可，不要臆造具体符号，
+    也不要展开成多个占位符
 12. PDF 抽取常把希腊字母抽成普通字母, 例如磁电电压系数 α_ME 会变成
     "a" + 换行 + "ME" 或 "a_ME"。遇到这种明显失真时, 请按学科标准写法
     还原成规范符号 (如 α_ME), 并统一全文写法

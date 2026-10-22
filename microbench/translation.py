@@ -430,6 +430,30 @@ def find_untranslated_runs(text: str, min_words: int = 8) -> list[str]:
     return runs
 
 
+def _fix_odd_dollars(text: str) -> str:
+    """
+    Make sure every line has an even number of "$".
+
+    A lone "$" is almost always a price in a publisher's copyright line
+    (".../35/$23.00", "1531-7331/10/0804-0153$20.00"). The frontend pairs
+    "$...$" with a non-greedy, single-line regex, so a stray "$" is usually
+    harmless — but if a second one shows up on the same line the two get
+    paired and a chunk of prose is swallowed into a math span.
+
+    Turning the stray half-width "$" into a full-width "＄" keeps the text
+    readable and makes the pairing unambiguous.
+    """
+    if "$" not in text:
+        return text
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.count("$") % 2 == 1:
+            # 落单的 $：替换最后一个（价格通常在数字后面）
+            pos = line.rfind("$")
+            lines[i] = line[:pos] + "＄" + line[pos + 1:]
+    return "\n".join(lines)
+
+
 def sanitize_translation(text: str) -> str:
     """
     Clean up raw model output before it reaches the frontend.
@@ -463,7 +487,14 @@ def sanitize_translation(text: str) -> str:
     text = re.sub(r"\\\((.+?)\\\)", lambda m: "$" + m.group(1) + "$",
                   text, flags=re.DOTALL)
 
-    # 3) 按「数学片段 / 普通文本」分段处理
+    # 3) 修 LaTeX
+    def _repair(m: re.Match) -> str:
+        body = m.group(1) if m.group(1) is not None else m.group(2)
+        fixed = _fix_overescaped_latex(body)
+        if m.group(1) is not None:
+            return "$$" + fixed + "$$"
+        return "$" + fixed + "$"
+
     pieces: list[str] = []
     last = 0
     for m in _MATH_SPAN_RE.finditer(text):
@@ -479,7 +510,8 @@ def sanitize_translation(text: str) -> str:
     if tail:
         pieces.append(_wrap_bare_latex(_fix_overescaped_latex(tail)))
 
-    return "".join(pieces).strip()
+    # 4) 落单的 $ 换成全角 ＄（多半是版权行的页价）
+    return _fix_odd_dollars("".join(pieces)).strip()
 
 
 # ---------------------------------------------------------------------------

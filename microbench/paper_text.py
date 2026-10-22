@@ -193,6 +193,9 @@ _Y_BANDS = 60       # y 方向分带数（用于定位双栏起始位置）
 
 # pdfplumber 无法解码的字符会输出成 "(cid:12)" 这种占位符。
 _CID_RE = re.compile(r"\(cid:\d+\)")
+# 连续多个 cid 通常是一整段公式/符号（一次能抽出十几个），
+# 逐个替换会让译文里出现 "[?][?][?][?][?][?][?][?]" 这种刷屏。
+_CID_RUN_RE = re.compile(r"(?:\(cid:\d+\)[ \t]*){2,}")
 
 
 def _clean_cid_markers(text: str) -> str:
@@ -205,8 +208,15 @@ def _clean_cid_markers(text: str) -> str:
     "(cid:2)" into "\\approx" and "(cid:3)" into "\\times", producing
     formulas that were never in the paper. With "[?]" plus a prompt note,
     the model skips the symbol instead of fabricating one.
+
+    A whole formula that failed to decode comes out as a long run of cid
+    markers; those are collapsed into a single "[?]" so the translation
+    doesn't end up with a wall of placeholders.
     """
-    return _CID_RE.sub("[?]", text or "")
+    if not text:
+        return text
+    text = _CID_RUN_RE.sub("[?]", text)
+    return _CID_RE.sub("[?]", text)
 
 
 def _x_cover(words, page_width: float, nb: int) -> list:

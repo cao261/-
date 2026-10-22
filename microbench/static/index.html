@@ -809,6 +809,14 @@
 
           <div style="display:flex; justify-content:flex-end; gap:10px; flex-wrap:wrap;">
             <input type="file" id="local-pdf-input" accept="application/pdf" style="display:none;" onchange="handleUploadLocalPdf(event)">
+            <select id="vault-pdf-select" class="field-input" style="max-width:320px; font-size:12px; padding:7px 10px;"
+                    onchange="if(this.value) openVaultPdf(this.value);"
+                    title="选择 Obsidian 仓库 01_Literature 里的 PDF，直接进入分屏精读（不会复制文件）">
+              <option value="">📂 从仓库论文库打开…</option>
+            </select>
+            <button class="btn-pill-outline" onclick="loadVaultPdfOptions()" title="重新扫描仓库里的 PDF">
+              <span>🔄</span>
+            </button>
             <button class="btn-pill-outline" onclick="document.getElementById('local-pdf-input').click()" title="直接上传本地 PDF 文件并启动分屏精读与 AI 解答">
               <span>📤 上传本地 PDF 精读</span>
             </button>
@@ -1725,6 +1733,17 @@
       loadStats();
       fetchModelStatus();
       initReaderSelectionListener();
+      loadVaultPdfOptions();
+      // 支持用链接直接打开仓库里的某篇论文：
+      //   http://127.0.0.1:5000/?open_pdf=<vault 相对路径>
+      //   http://127.0.0.1:5000/#open_pdf=<vault 相对路径>
+      try {
+        let p = new URLSearchParams(location.search).get("open_pdf");
+        if (!p && location.hash.indexOf("open_pdf=") >= 0) {
+          p = decodeURIComponent(location.hash.split("open_pdf=")[1] || "");
+        }
+        if (p) openVaultPdf(p);
+      } catch (e) { showToast("打开失败: " + e.message, true); }
     });
 
     // ----- Paper Full-Text Reader (V1.4) -----
@@ -1791,6 +1810,24 @@
     // ---------------------------------------------------------------------------
     // PDF dual-column reader
     // ---------------------------------------------------------------------------
+    /**
+     * Stable short id for a vault PDF.
+     * The old scheme (path → non-alphanumerics to "_") produced 100+ char ids
+     * for Chinese paths, which blew past the API's paper_id limit and made
+     * every page translation fail with 422. Hash keeps it short AND unique.
+     */
+    function _shortPaperId(relativePath) {
+      const s = String(relativePath || "");
+      let h1 = 5381, h2 = 52711;
+      for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        h1 = ((h1 << 5) + h1 + c) >>> 0;
+        h2 = ((h2 << 5) + h2 + c) >>> 0;
+      }
+      const tail = s.split("/").pop().replace(/[^a-zA-Z0-9]+/g, "_").slice(0, 40);
+      return ("p" + h1.toString(36) + h2.toString(36) + "_" + tail).slice(0, 90);
+    }
+
     let _readerMode = "section"; // "section" | "pdf"
     let _pdfZoom = 1.0; // user-controlled PDF zoom multiplier (PDF dual-column view)
     let _pdfState = null; // { paperId, paperTitle, relativePath, pdfDoc, pages: [{num, canvas, text, translated}], rendering }
@@ -1988,7 +2025,7 @@
           : ((_pdfState && _pdfState.rendering && _pdfState.rendering.generation) || 0) + 1;
 
         _pdfState = {
-          paperId: found.relative_path.replace(/[^a-zA-Z0-9]/g, "_"),
+          paperId: _shortPaperId(found.relative_path),
           paperTitle: found.title || title || "",
           relativePath: found.relative_path,
           pdfDoc,
@@ -2219,7 +2256,17 @@
           }),
         });
         const data = await r.json();
-        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        if (!r.ok) {
+          // 后端的 detail 可能是字符串，也可能是 pydantic 的校验错误数组
+          // （例如 paper_id 超长）——直接 String() 会显示成 "[object Object]"
+          let msg = data.detail;
+          if (Array.isArray(msg)) {
+            msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          } else if (typeof msg !== 'string') {
+            msg = JSON.stringify(msg);
+          }
+          throw new Error(msg || `HTTP ${r.status}`);
+        }
 
         // 后端可能返回 200 + 空串（思考模型把 token 预算全花在思考上，
         // 没产出正文）。这种情况必须当失败处理，否则页面只会显示
@@ -2295,6 +2342,88 @@
         showToast(`✅ 已加载 ${result.sections.length} 个章节 (${result.total_pages} 页, ${result.char_count.toLocaleString()} 字)`);
       } catch (err) {
         showToast("拉取失败: " + err.message, true);
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 从 vault 打开已有 PDF（不复制文件、不重复上传）
+    // ---------------------------------------------------------------------------
+    let _vaultPdfOptions = [];
+
+    async function loadVaultPdfOptions() {
+      const sel = document.getElementById("vault-pdf-select");
+      if (!sel) return;
+      sel.innerHTML = `<option value="">📂 从仓库论文库打开…</option>`;
+      try {
+        const res = await fetch("/api/paper/list_vault_pdfs");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        if (!data.pdfs || data.pdfs.length === 0) {
+          sel.innerHTML = `<option value="">📂 仓库里还没有 PDF</option>`;
+          showToast("仓库 01_Literature 下还没有 PDF", true);
+          return;
+        }
+        _vaultPdfOptions = data.pdfs;
+        const groups = {};
+        data.pdfs.forEach(p => { (groups[p.topic] = groups[p.topic] || []).push(p); });
+        Object.keys(groups).sort().forEach(topic => {
+          const og = document.createElement("optgroup");
+          og.label = topic;
+          groups[topic].forEach(p => {
+            const opt = document.createElement("option");
+            opt.value = p.relative_path;
+            opt.textContent = `${p.name}  (${p.size_kb} KB)`;
+            og.appendChild(opt);
+          });
+          sel.appendChild(og);
+        });
+        sel.title = `共 ${data.count} 个 PDF · 选中即打开分屏精读（不会复制文件）`;
+      } catch (err) {
+        sel.innerHTML = `<option value="">📂 扫描失败</option>`;
+        showToast("扫描仓库失败: " + (err.message || err), true);
+      }
+    }
+
+    async function openVaultPdf(relativePath) {
+      const mark = (s) => { console.log("[vault-pdf]", s); };
+      mark("OPENING: " + relativePath);
+      showToast("正在解析 PDF 全文并拆分章节…");
+      try {
+        const res = await fetch("/api/paper/open_vault_pdf", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ relative_path: relativePath }),
+        });
+        const result = await res.json();
+        mark("HTTP " + res.status);
+        if (!res.ok) {
+          let msg = result.detail;
+          if (Array.isArray(msg)) msg = msg.map(e => (e.loc || []).join('.') + " — " + e.msg).join('; ');
+          else if (typeof msg !== 'string') msg = JSON.stringify(msg);
+          throw new Error(msg || `HTTP ${res.status}`);
+        }
+
+        _readerState.title = result.title || "";
+        _readerState.sections = result.sections;
+        _readerState.translations = {};
+        _readerState.translationModels = {};
+        _readerState.activeSection = 0;
+        _readerState.pdfPath = result.pdf_path || null;
+
+        mark("RENDERING...");
+        renderReader();
+        mark("OPENING MODAL...");
+        openReaderModal();
+        mark("SWITCHING TO PDF...");
+        // 直接进 PDF 双栏：用户从仓库挑论文就是为了看逐页译文
+        // （switchReaderMode 内部会调用 loadPdfDualColumn）
+        switchReaderMode("pdf");
+        mark(`OK: ${result.total_pages} 页 / ${result.sections.length} 章节`);
+        showToast(`✅ 已打开 ${result.total_pages} 页 / ${result.sections.length} 章节（${result.char_count.toLocaleString()} 字）`);
+        loadStats();
+      } catch (err) {
+        mark("ERROR: " + (err && err.message ? err.message : err));
+        showToast("打开失败: " + (err && err.message ? err.message : err), true);
       }
     }
 
@@ -3813,9 +3942,22 @@
       text-transform: uppercase;
       margin: 8px 0 4px 0;
     }
+    /* Vault PDF picker list item */
+    .vault-pdf-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 12px; margin-bottom: 4px;
+      border: 1px solid var(--card-border); border-radius: 6px;
+      background: var(--bg-canvas-subtle);
+      font-size: 13px; color: var(--text-main);
+      cursor: pointer; transition: border-color .12s, background .12s;
+    }
+    .vault-pdf-item:hover {
+      border-color: var(--accent-olive);
+      background: var(--accent-olive-subtle, rgba(120,120,80,0.08));
+    }
+
     .pdf-translation-block {
-      padding: 20px 22px;
-      margin: 0 auto 22px auto;
+      padding: 20px 22px;      margin: 0 auto 22px auto;
       /* 翻译卡片同样按栏宽铺满（超宽屏留白控制在可读范围内） */
       max-width: 1200px;
       width: 100%;
