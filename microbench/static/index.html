@@ -5888,6 +5888,98 @@
     }
 
     // ===========================================================================
+    // 一键同步（跨设备）
+    // ===========================================================================
+    // 用户要的是"一个设备上看了论文、做了标注、划了关键词，点个同步，
+    // 另一个设备点下同步就能接着看"。所以同步的是三样东西：
+    //   1) 已翻好的译文（快照）→ 另一台设备直接拿到，不用重翻、不烧额度
+    //   2) 批注（高亮 + 笔记）  → 按 id 合并，两边同时标注不互相覆盖
+    //   3) 阅读进度（第几页/缩放）→ 直接跳过去
+    // 两台设备点同一个按钮即可：推的是自己，拉的是对方，最后合并。
+
+    function _readingProgress() {
+      const pid = (_pdfState && _pdfState.paperId) || "";
+      if (!pid) return null;
+      const list = document.getElementById("pdf-translations-list");
+      let page = 0, scrollTop = 0;
+      if (list) {
+        const scroller = list.closest(".pdf-split-pane") || list.parentElement;
+        scrollTop = scroller ? (scroller.scrollTop || 0) : 0;
+        // 当前页 = 离滚动容器顶部最近的那一页
+        const top = scroller ? scroller.getBoundingClientRect().top : 0;
+        let best = null, bestD = Infinity;
+        list.querySelectorAll(".pdf-translation-block").forEach(b => {
+          const d = Math.abs(b.getBoundingClientRect().top - top);
+          if (d < bestD) { bestD = d; best = b; }
+        });
+        const m = best && best.id.match(/(\d+)$/);
+        if (m) page = parseInt(m[1], 10);
+      }
+      return {
+        paper_id: pid,
+        relative_path: (_pdfState && _pdfState.relativePath) || "",
+        title: (_pdfState && _pdfState.paperTitle) || "",
+        page: page,
+        zoom: _pdfZoom,
+        scroll_top: Math.round(scrollTop),
+        mode: _readerMode,
+        updated_at: new Date().toISOString(),
+      };
+    }
+
+    function _applyReadingProgress(prog) {
+      if (!prog) return;
+      const pid = (_pdfState && _pdfState.paperId) || "";
+      if (prog.paper_id && pid && prog.paper_id !== pid) return;   // 不是这一篇
+      if (prog.zoom && Math.abs((_pdfZoom || 1) - prog.zoom) > 0.01) {
+        _pdfZoom = prog.zoom;
+        updateZoomLabel();
+      }
+      if (prog.page) {
+        const block = document.getElementById(`pdf-trans-block-${prog.page}`);
+        if (block) {
+          setTimeout(() => block.scrollIntoView({ behavior: "auto", block: "start" }), 350);
+          showToast(`已跳到第 ${prog.page} 页（另一台设备读到这里）`);
+        }
+      }
+    }
+
+    async function syncNow() {
+      const btn = document.getElementById("sync-btn");
+      const orig = btn ? btn.innerText : null;
+      if (btn) { btn.disabled = true; btn.innerText = "☁ 同步中…"; }
+      try {
+        const r = await fetch("/api/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            paper_id: (_pdfState && _pdfState.paperId) || "",
+            progress: _readingProgress(),
+          }),
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const d = await r.json();
+        const nPush = (d.pushed || []).length;
+        const nPull = (d.pulled || []).length;
+        showToast(`同步完成 · 推送 ${nPush} 项 · 拉取 ${nPull} 项`, false, 2600);
+        // 译文快照变了 → 刷新页面，用新的快照重建（省掉重翻）
+        if (d.snapshot_updated) {
+          setTimeout(() => location.reload(), 1000);
+          return;
+        }
+        // 批注可能有变化 → 重新加载并重放高亮
+        if ((d.pulled || []).some(x => x.startsWith("annotations/"))) {
+          await loadAnnotationsForPaper((_pdfState && _pdfState.paperId) || null);
+        }
+        if (d.progress) _applyReadingProgress(d.progress);
+      } catch (e) {
+        showToast("同步失败: " + (e.message || e), true, 4000);
+      } finally {
+        if (btn) { btn.disabled = false; btn.innerText = orig || "☁ 同步"; }
+      }
+    }
+
+    // ===========================================================================
     // 翻译：换模型 + 重新翻译
     // ===========================================================================
     // _pdfTransModel：工具栏下拉框选中的模型（"" = 跟随 .env 的默认设置）。
@@ -7304,6 +7396,8 @@
 
           <button class="btn-pill-outline" id="reader-qa-top-btn" onclick="toggleReaderQAPanel()"
                   title="开启 / 关闭划词答疑助手">划词答疑</button>
+          <button class="btn-pill-outline" id="sync-btn" onclick="syncNow()"
+                  title="把当前阅读进度 / 已翻好的译文 / 批注推到共享目录，同时拉回另一台设备的内容">☁ 同步</button>
           <button class="btn-pill-outline" id="translate-all-btn" onclick="translateAllSections()">批量翻译</button>
           <button class="btn-pill" onclick="closeReaderModal()"><span>关闭</span></button>
         </div>

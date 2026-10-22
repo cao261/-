@@ -9,6 +9,30 @@ import ipaddress
 import socket
 import requests
 
+from . import netutil
+
+
+def _get(url, **kw):
+    """带代理兜底的 GET：环境代理不可用时自动改直连并重试一次。"""
+    try:
+        return requests.get(url, **netutil.direct_kwargs(), **kw)
+    except requests.exceptions.ProxyError as e:
+        if netutil.proxy_bypassed():
+            raise
+        netutil.mark_proxy_dead(e)
+        return requests.get(url, **netutil.direct_kwargs(), **kw)
+
+
+def _head(url, **kw):
+    """带代理兜底的 HEAD。"""
+    try:
+        return requests.head(url, **netutil.direct_kwargs(), **kw)
+    except requests.exceptions.ProxyError as e:
+        if netutil.proxy_bypassed():
+            raise
+        netutil.mark_proxy_dead(e)
+        return requests.head(url, **netutil.direct_kwargs(), **kw)
+
 # Use defusedxml to safely parse untrusted XML from external APIs
 # (arXiv Atom feed). Standard xml.etree.ElementTree is vulnerable to
 # XXE / billion-laughs / quadratic blowup attacks on adversarial input.
@@ -141,7 +165,7 @@ def fetch_arxiv_metadata(arxiv_id: str) -> dict:
     last_err = None
     for api_url in api_urls:
         try:
-            resp = requests.get(api_url, headers=HEADERS, timeout=15)
+            resp = _get(api_url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             break
         except (requests.RequestException, requests.Timeout) as e:
@@ -213,7 +237,7 @@ def download_arxiv_pdf(arxiv_id: str, save_path) -> dict:
     clean_id = _normalize_arxiv_id(arxiv_id)
     pdf_url = f"https://arxiv.org/pdf/{clean_id}"
 
-    resp = requests.get(
+    resp = _get(
         pdf_url,
         headers=HEADERS,
         timeout=PDF_DOWNLOAD_TIMEOUT,
@@ -266,7 +290,7 @@ def fetch_crossref_doi_metadata(doi: str) -> dict:
     """
     clean_doi = _normalize_doi(doi)
     url = f"https://api.crossref.org/works/{urllib.parse.quote(clean_doi)}"
-    resp = requests.get(url, headers=HEADERS, timeout=30)
+    resp = _get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
 
     data = resp.json()
@@ -341,7 +365,7 @@ def _fetch_semantic_scholar_abstract(doi: str) -> str:
     """
     try:
         url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
-        resp = requests.get(
+        resp = _get(
             url,
             headers=HEADERS,
             params={"fields": "title,abstract,year,venue,authors"},
@@ -366,7 +390,7 @@ def _fetch_arxiv_fallback_semanticscholar(arxiv_id: str) -> dict:
     """
     # Semantic Scholar accepts arXiv IDs via the ARXIV: prefix
     url = f"https://api.semanticscholar.org/graph/v1/paper/ARXIV:{arxiv_id}"
-    resp = requests.get(
+    resp = _get(
         url,
         headers=HEADERS,
         params={"fields": "title,abstract,year,venue,authors,externalIds"},
@@ -410,7 +434,7 @@ def _scrape_ieee_abstract(landing_url: str) -> str:
         # 127.0.0.1 / 169.254.169.254 makes the server probe the user's
         # own network.
         safe_url = _safe_redirect_chain(landing_url, method="GET")
-        resp = requests.get(
+        resp = _get(
             safe_url,
             headers={**HEADERS, "Accept": "text/html"},
             timeout=20,
@@ -479,7 +503,7 @@ def resolve_doi_landing_url(doi: str) -> str:
     allow a DOI registrant to bounce the request to an internal host.
     """
     clean_doi = _normalize_doi(doi)
-    resp = requests.head(
+    resp = _head(
         f"https://doi.org/{clean_doi}",
         headers=HEADERS,
         timeout=15,

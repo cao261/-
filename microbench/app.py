@@ -15,6 +15,7 @@ import re
 import hmac
 import ipaddress
 import asyncio
+import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -3228,6 +3229,239 @@ ANNOTATION_VAULT_SUBDIR = ("01_Literature", "_批注与笔记")
 ANNOTATION_LEGACY_SUBDIR = ("logs", "_pdf_snapshots", "annotations")
 
 
+# ---------------------------------------------------------------------------
+# 跨设备同步（一键「☁ 同步」）
+# ---------------------------------------------------------------------------
+# 用户要的是："在一个设备上看了论文、做了标注、划了关键词，点个同步，
+# 另一个设备点下同步就能接着看"。所以同步的不只是批注，还有：
+#   snapshots/  翻译快照 —— 另一台设备直接拿到已翻好的页，不用重翻、不烧额度
+#   annotations/ 批注（高亮 + 笔记）
+#   progress/   阅读进度 —— 翻到第几页、缩放多少，直接跳过去
+#
+# 同步根目录 = ANNOTATIONS_DIR（坚果云目录）→ 那里已经被坚果云客户端同步了。
+# 没配的话用 vault 内的 01_Literature/_同步（跟着 vault 自己的同步走）。
+
+SYNC_KINDS = ("snapshots", "annotations", "progress")
+SYNC_MAX_FILE_BYTES = 8 * 1024 * 1024
+
+
+def _sync_root() -> Path:
+    raw = (os.getenv("ANNOTATIONS_DIR") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        return p
+    return BASE_DIR.joinpath(*ANNOTATION_VAULT_SUBDIR)
+
+
+def _sync_dir(kind: str) -> Path:
+    p = _sync_root() / kind
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _safe_paper_key(paper_id: str) -> str:
+    """论文 id → 可用作文件名/字典键的安全串。"""
+    return "".join(c for c in (paper_id or "") if c.isalnum() or c in "_-")[:128] or "progress"
+
+
+def _local_progress_path() -> Path:
+    return BASE_DIR / "logs" / "_reading_state.json"
+
+
+def _read_local_progress() -> dict:
+    return _safe_read_json(_local_progress_path()) or {}
+
+
+def _write_local_progress(data: dict) -> None:
+    p = _local_progress_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _merge_annotation_lists(existing: list, incoming: list, deleted: list) -> list:
+    """按 id 合并两边的批注（跨设备不互相覆盖）。
+
+    磁盘没有的 id 新增；两边都有按 updated_at 取新的；deleted 里的删掉
+    （墓碑必须最后应用，否则同 id 会被 upsert 又加回来）。
+    """
+    merged: dict = {}
+    for a in existing or []:
+        if isinstance(a, dict) and a.get("id"):
+            merged[a["id"]] = a
+    for a in incoming or []:
+        item = a if isinstance(a, dict) else {}
+        if not item.get("id"):
+            continue
+        if item.get("color") not in ANNOTATION_COLORS:
+            item = dict(item, color="yellow")
+        old = merged.get(item["id"])
+        if old is None or _anno_is_newer(item.get("updated_at", ""), old.get("updated_at", "")):
+            merged[item["id"]] = item
+    for did in deleted or []:
+        merged.pop(did, None)
+    return sorted(merged.values(),
+                  key=lambda x: (x.get("created_at") or "", x.get("id") or ""))
+
+
+class SyncRequest(BaseModel):
+    paper_id: Optional[str] = Field(default=None, max_length=128)
+    progress: Optional[dict] = Field(default=None,
+                                      description="本机的阅读进度（页码/缩放/滚动位置）")
+    push_only: bool = Field(default=False)
+    pull_only: bool = Field(default=False)
+
+
+@app.post("/api/sync")
+async def api_sync(req: SyncRequest):
+    """一键同步：推送本机状态 + 拉取共享目录里的状态（两边都做，幂等）。
+
+    两台设备点同一个按钮即可：推的是自己，拉的是对方，最后合并。
+    """
+    root = _sync_root()
+    root.mkdir(parents=True, exist_ok=True)
+    pushed: list[str] = []
+    pulled: list[str] = []
+    snapshot_updated = False
+
+    # ---------- 推送：翻译快照 ----------
+    local_snap_dir = BASE_DIR / "logs" / "_pdf_snapshots"
+    if not req.pull_only and local_snap_dir.is_dir():
+        dst_dir = _sync_dir("snapshots")
+        for fp in local_snap_dir.glob("*.json"):
+            try:
+                if fp.stat().st_size > SYNC_MAX_FILE_BYTES:
+                    continue
+                dst = dst_dir / fp.name
+                # 共享目录里更新才覆盖（两台设备轮流翻同一篇时不会互相回退）
+                if dst.exists() and dst.stat().st_mtime >= fp.stat().st_mtime:
+                    continue
+                shutil.copyfile(fp, dst)
+                pushed.append("snapshots/" + fp.name)
+            except OSError:
+                continue
+
+    # ---------- 推送：批注（本机 → 共享） ----------
+    ann_local_dir = BASE_DIR / "logs" / "_pdf_snapshots" / "annotations"
+    if not req.pull_only and ann_local_dir.is_dir():
+        dst_dir = _sync_dir("annotations")
+        for fp in ann_local_dir.glob("*.json"):
+            try:
+                dst = dst_dir / fp.name
+                cur = _safe_read_json(dst) or {}
+                new = _safe_read_json(fp) or {}
+                items = _merge_annotation_lists(
+                    cur.get("annotations") or [], new.get("annotations") or [], [])
+                payload = {"paper_id": new.get("paper_id", fp.stem),
+                           "updated_at": _dt.datetime.now().isoformat(timespec="seconds"),
+                           "schema_version": 2, "annotations": items}
+                dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                               encoding="utf-8")
+                pushed.append("annotations/" + fp.name)
+            except OSError:
+                continue
+
+    # ---------- 推送：阅读进度 ----------
+    if not req.pull_only and req.progress:
+        pid = (req.paper_id or req.progress.get("paper_id") or "").strip()
+        if pid:
+            safe = "".join(c for c in pid if c.isalnum() or c in "_-")[:128] or "progress"
+            rec = dict(req.progress)
+            rec["paper_id"] = pid
+            rec["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+            ( _sync_dir("progress") / f"{safe}.json").write_text(
+                json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+            pushed.append("progress/" + safe + ".json")
+
+    # ---------- 拉取：翻译快照（共享 → 本机） ----------
+    if not req.push_only:
+        src_dir = _sync_dir("snapshots")
+        local_snap_dir.mkdir(parents=True, exist_ok=True)
+        for fp in src_dir.glob("*.json"):
+            try:
+                if fp.stat().st_size > SYNC_MAX_FILE_BYTES:
+                    continue
+                dst = local_snap_dir / fp.name
+                if dst.exists() and dst.stat().st_mtime >= fp.stat().st_mtime:
+                    continue
+                shutil.copyfile(fp, dst)
+                pulled.append("snapshots/" + fp.name)
+                snapshot_updated = True
+            except OSError:
+                continue
+
+        # ---------- 拉取：批注（共享 → 本机，按 id 合并） ----------
+        src_ann = _sync_dir("annotations")
+        ann_local_dir.mkdir(parents=True, exist_ok=True)
+        for fp in src_ann.glob("*.json"):
+            try:
+                new = _safe_read_json(fp) or {}
+                dst = ann_local_dir / fp.name
+                cur = _safe_read_json(dst) or {}
+                items = _merge_annotation_lists(
+                    cur.get("annotations") or [], new.get("annotations") or [], [])
+                if len(items) == len(cur.get("annotations") or []):
+                    continue
+                payload = {"paper_id": new.get("paper_id", fp.stem),
+                           "updated_at": _dt.datetime.now().isoformat(timespec="seconds"),
+                           "schema_version": 2, "annotations": items}
+                dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                               encoding="utf-8")
+                pulled.append("annotations/" + fp.name)
+            except OSError:
+                continue
+
+        # ---------- 拉取：阅读进度 ----------
+        prog = _read_local_progress()
+        target_pid = (req.paper_id or "").strip()
+        if target_pid:
+            safe = "".join(c for c in target_pid if c.isalnum() or c in "_-")[:128] or "progress"
+            src = _sync_dir("progress") / f"{safe}.json"
+            remote = _safe_read_json(src)
+            if remote and _anno_is_newer(remote.get("updated_at", ""),
+                                         (prog.get(safe) or {}).get("updated_at", "")):
+                prog[safe] = remote
+                pulled.append("progress/" + safe + ".json")
+        try:
+            _write_local_progress(prog)
+        except OSError:
+            pass
+
+    return {
+        "status": "success",
+        "root": str(root),
+        "pushed": pushed,
+        "pulled": pulled,
+        "snapshot_updated": snapshot_updated,
+        "progress": (
+            prog.get(_safe_paper_key(req.paper_id)) if req.paper_id else None
+        ) if not req.push_only else None,
+    }
+
+
+@app.get("/api/sync/status")
+async def api_sync_status():
+    """同步目录里有什么、什么时候更新的。"""
+    root = _sync_root()
+    out = {"root": str(root), "exists": root.is_dir(), "kinds": {}}
+    for kind in SYNC_KINDS:
+        d = root / kind
+        files = []
+        if d.is_dir():
+            for fp in sorted(d.glob("*.json")):
+                try:
+                    files.append({"name": fp.name, "size": fp.stat().st_size,
+                                  "mtime": _dt.datetime.fromtimestamp(
+                                      fp.stat().st_mtime).isoformat(timespec="seconds")})
+                except OSError:
+                    continue
+        out["kinds"][kind] = files
+    return out
+
+
 class AnnotationItem(BaseModel):
     id: str = Field(..., min_length=1, max_length=64)
     page: int = Field(default=0, ge=0, le=2000,
@@ -3251,27 +3485,19 @@ class AnnotationSaveRequest(BaseModel):
 
 
 def _annotations_dir() -> Path:
-    """批注存放目录。
-
-    默认在 vault 内（01_Literature/_批注与笔记）—— 只要 vault 被同步
-    （坚果云 / Obsidian Sync / OneDrive），批注就跟着走，零配置。
-
-    .env 里设 `ANNOTATIONS_DIR=` 可以指到别处，比如坚果云的同步目录：
-        ANNOTATIONS_DIR=C:/Users/<你>/Nutstore/MicroBench批注
-    这样只同步批注本身（KB 级），不会拖着上百 MB 的 PDF 一起同步。
-    """
-    raw = (os.getenv("ANNOTATIONS_DIR") or "").strip()
-    if raw:
-        p = Path(raw).expanduser()
-        if not p.is_absolute():
-            p = BASE_DIR / p
-        return p
-    return BASE_DIR.joinpath(*ANNOTATION_VAULT_SUBDIR)
+    """批注存放目录 = 同步根目录下的 annotations/（和其他同步内容在一起）。"""
+    d = _sync_root() / "annotations"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def _legacy_annotation_path(paper_id: str) -> Path:
+def _legacy_annotation_paths(paper_id: str) -> list:
+    """更早的批注存放位置（读时回落，升级不丢数据）。"""
     safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
-    return BASE_DIR.joinpath(*ANNOTATION_LEGACY_SUBDIR) / f"{safe}.json"
+    return [
+        _sync_root() / f"{safe}.json",                                   # 扁平布局
+        BASE_DIR.joinpath(*ANNOTATION_LEGACY_SUBDIR) / f"{safe}.json",   # 只在本机 logs/ 下
+    ]
 
 
 def _annotation_path(paper_id: str) -> Path:
@@ -3295,7 +3521,10 @@ async def api_pdf_annotations_load(
     """
     data = _safe_read_json(_annotation_path(paper_id))
     if not data:
-        data = _safe_read_json(_legacy_annotation_path(paper_id))
+        for legacy in _legacy_annotation_paths(paper_id):
+            data = _safe_read_json(legacy)
+            if data:
+                break
     if not data:
         return {"paper_id": paper_id, "annotations": []}
     items = data.get("annotations")
@@ -3321,26 +3550,20 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
     target = _annotation_path(safe_id)
     existing = _safe_read_json(target)
     if not existing:
-        existing = _safe_read_json(_legacy_annotation_path(safe_id))
-    merged: dict = {}
-    for a in (existing or {}).get("annotations") or []:
-        if isinstance(a, dict) and a.get("id"):
-            merged[a["id"]] = a
-
+        for legacy in _legacy_annotation_paths(safe_id):
+            existing = _safe_read_json(legacy)
+            if existing:
+                break
+    incoming = []
     for a in req.annotations:
         item = a.model_dump()
         if item.get("color") not in ANNOTATION_COLORS:
             item["color"] = "yellow"
-        old = merged.get(a.id)
-        if old is None or _anno_is_newer(item.get("updated_at", ""), old.get("updated_at", "")):
-            merged[a.id] = item
+        incoming.append(item)
 
-    # 删除墓碑**最后**应用，优先级高于 upsert：
-    # 否则"这条同时出现在 annotations 和 deleted 里"时会被 upsert 又加回来。
-    for did in req.deleted or []:
-        merged.pop(did, None)
-
-    items = sorted(merged.values(), key=lambda x: (x.get("created_at") or "", x.get("id") or ""))
+    # 合并规则（删除墓碑最后应用，优先级高于 upsert）
+    items = _merge_annotation_lists(
+        (existing or {}).get("annotations") or [], incoming, req.deleted or [])
 
     payload = {
         "paper_id": safe_id,
@@ -3385,7 +3608,7 @@ async def api_pdf_annotations_delete(
 ):
     """Delete one annotation by id. Idempotent."""
     deleted = 0
-    for path in (_annotation_path(paper_id), _legacy_annotation_path(paper_id)):
+    for path in [_annotation_path(paper_id)] + _legacy_annotation_paths(paper_id):
         data = _safe_read_json(path)
         if not data:
             continue

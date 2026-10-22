@@ -24,6 +24,8 @@ import time
 import asyncio
 import weakref
 from pathlib import Path
+
+from . import netutil
 from threading import Lock
 from typing import Optional, AsyncIterator
 
@@ -677,7 +679,6 @@ def translation_active_model() -> str:
 # 直接绕过代理；直连再失败才把原始错误抛给上层。
 
 _sessions: dict = {}
-_proxy_bypassed = False   # 环境代理不可用 → 全局改为直连
 
 
 def _get_session(use_env_proxy: bool):
@@ -696,16 +697,12 @@ def _get_session(use_env_proxy: bool):
 
 
 def _mark_proxy_dead(err: Exception) -> None:
-    """Remember that the environment proxy is unusable (once)."""
-    global _proxy_bypassed
-    if _proxy_bypassed:
-        return
-    _proxy_bypassed = True
-    print(
-        f"[MicroBench] 本地代理不可用 ({err})，后续请求改为直连",
-        file=sys.stderr,
-    )
+    """Remember that the environment proxy is unusable (once).
 
+    状态放在 netutil 里，和 paper_fetcher 共用同一份 —— 抓论文和调模型
+    走的是同一个本地代理，代理挂了要一起知道。
+    """
+    netutil.mark_proxy_dead(err)
 
 # ---------------------------------------------------------------------------
 # Core Chat Implementation with Failover & Agnes Rate Limiting
@@ -807,20 +804,23 @@ def _invoke_model(
             primary_limiter.acquire()
 
         try:
-            if _proxy_bypassed:
-                # 已经确认环境代理是死的 —— 走 trust_env=False 的直连 session
-                resp = _get_session(False).post(
-                    url, json=payload, headers=headers, timeout=attempt_timeout
+            if netutil.proxy_bypassed():
+                # 已经确认环境代理是死的 → 用 proxies 显式置空来直连。
+                # 不要换成 requests.Session：调用路径一变，测试对
+                # requests.post 的 monkeypatch 就失效（会静默真的发出网请求，
+                # 而且全局的"代理已死"标志会让后续用例全部走偏）。
+                # proxies 置空同样能直连：requests 的 merge_environment_settings
+                # 用 setdefault，键已存在就不会被环境变量覆盖。
+                resp = requests.post(
+                    url, json=payload, headers=headers, timeout=attempt_timeout,
+                    proxies={"http": None, "https": None},
                 )
             else:
-                # 正常路径仍然用模块级 requests.post：
-                # 测试可以 monkeypatch requests.post 来注入假响应，
-                # 换成 Session 实例会让那些 patch 失效（测试会真的发出网请求）。
                 resp = requests.post(url, json=payload, headers=headers, timeout=attempt_timeout)
             last_status = resp.status_code
         except requests.exceptions.ProxyError as e:
             # 本机配了本地代理但代理软件没运行 → 记下来，改直连重试一次
-            if not _proxy_bypassed:
+            if not netutil.proxy_bypassed():
                 _mark_proxy_dead(e)
                 continue
             return False, f"代理连接失败: {e}", last_status
@@ -1193,7 +1193,7 @@ def _get_async_client(default_timeout: int = DEFAULT_TIMEOUT, trust_env: Optiona
     if httpx is None:
         raise LLMError("httpx 包未安装, 请先 pip install httpx")
     if trust_env is None:
-        trust_env = not _proxy_bypassed
+        trust_env = not netutil.proxy_bypassed()
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -1326,7 +1326,7 @@ async def _invoke_model_async(
             last_status = resp.status_code
         except httpx.ProxyError as e:
             # 本机配了本地代理但代理软件没运行 → 记下来，改直连重试一次
-            if not _proxy_bypassed:
+            if not netutil.proxy_bypassed():
                 _mark_proxy_dead(e)
                 continue
             return False, f"代理连接失败: {e}", last_status
