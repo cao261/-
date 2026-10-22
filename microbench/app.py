@@ -3154,6 +3154,11 @@ async def api_pdf_snapshot_delete(
 ANNOTATION_MAX_BYTES = 2 * 1024 * 1024
 ANNOTATION_MAX_ITEMS = 500
 ANNOTATION_COLORS = ("yellow", "green", "blue", "pink", "purple")
+# vault 内的默认位置。放在 vault 里 = 跟着 vault 的同步走
+# （坚果云 / Obsidian Sync / OneDrive 都一样），不用额外配置。
+ANNOTATION_VAULT_SUBDIR = ("01_Literature", "_批注与笔记")
+# 旧版本（只在本机 logs/ 下）的位置，保留用于迁移。
+ANNOTATION_LEGACY_SUBDIR = ("logs", "_pdf_snapshots", "annotations")
 
 
 class AnnotationItem(BaseModel):
@@ -3174,20 +3179,56 @@ class AnnotationSaveRequest(BaseModel):
     paper_id: str = Field(..., min_length=3, max_length=128)
     annotations: list[AnnotationItem] = Field(default_factory=list,
                                               max_length=ANNOTATION_MAX_ITEMS)
+    deleted: list[str] = Field(default_factory=list, max_length=ANNOTATION_MAX_ITEMS,
+                               description="本次删除掉的批注 id（跨设备合并不复活）")
+
+
+def _annotations_dir() -> Path:
+    """批注存放目录。
+
+    默认在 vault 内（01_Literature/_批注与笔记）—— 只要 vault 被同步
+    （坚果云 / Obsidian Sync / OneDrive），批注就跟着走，零配置。
+
+    .env 里设 `ANNOTATIONS_DIR=` 可以指到别处，比如坚果云的同步目录：
+        ANNOTATIONS_DIR=C:/Users/<你>/Nutstore/MicroBench批注
+    这样只同步批注本身（KB 级），不会拖着上百 MB 的 PDF 一起同步。
+    """
+    raw = (os.getenv("ANNOTATIONS_DIR") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        return p
+    return BASE_DIR.joinpath(*ANNOTATION_VAULT_SUBDIR)
+
+
+def _legacy_annotation_path(paper_id: str) -> Path:
+    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    return BASE_DIR.joinpath(*ANNOTATION_LEGACY_SUBDIR) / f"{safe}.json"
 
 
 def _annotation_path(paper_id: str) -> Path:
     safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
-    return _snapshot_dir() / "annotations" / f"{safe}.json"
+    return _annotations_dir() / f"{safe}.json"
+
+
+def _anno_is_newer(a: str, b: str) -> bool:
+    """Compare two ISO-8601 timestamps (both produced by toISOString())."""
+    return (a or "") > (b or "")
 
 
 @app.get("/api/pdf/annotations/load")
 async def api_pdf_annotations_load(
     paper_id: str = Query(..., min_length=3, max_length=128),
 ):
-    """Load every annotation of one paper. Missing file -> empty list (not 404)."""
-    target = _annotation_path(paper_id)
-    data = _safe_read_json(target)
+    """Load every annotation of one paper. Missing file -> empty list (not 404).
+
+    新位置（vault 内 / ANNOTATIONS_DIR）没有时，回落到旧的本机位置 ——
+    这样升级前的批注不会消失，下次保存就自动迁到新位置。
+    """
+    data = _safe_read_json(_annotation_path(paper_id))
+    if not data:
+        data = _safe_read_json(_legacy_annotation_path(paper_id))
     if not data:
         return {"paper_id": paper_id, "annotations": []}
     items = data.get("annotations")
@@ -3198,24 +3239,47 @@ async def api_pdf_annotations_load(
 
 @app.post("/api/pdf/annotations/save")
 async def api_pdf_annotations_save(req: AnnotationSaveRequest):
-    """Replace the whole annotation list of one paper (write-through, atomic)."""
+    """Upsert annotations for one paper (write-through, atomic).
+
+    **跨设备合并**：这台机器发来的列表不是"最终状态"，而是"我这边知道的部分"。
+    服务端会把它与磁盘上已有的内容按 id 合并：
+      - 磁盘上没有的 id → 新增
+      - 两边都有 → 谁的 updated_at 新用谁
+      - deleted 里的 id → 从磁盘上删掉（否则另一台设备会把已删的批注"复活"）
+    这样在两台设备上分别标注不会互相覆盖。
+    """
     safe_id = "".join(c for c in req.paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
     now = _dt.datetime.now().isoformat(timespec="seconds")
-    items = []
-    seen_ids = set()
+
+    target = _annotation_path(safe_id)
+    existing = _safe_read_json(target)
+    if not existing:
+        existing = _safe_read_json(_legacy_annotation_path(safe_id))
+    merged: dict = {}
+    for a in (existing or {}).get("annotations") or []:
+        if isinstance(a, dict) and a.get("id"):
+            merged[a["id"]] = a
+
     for a in req.annotations:
-        if a.id in seen_ids:
-            continue          # 同 id 只保留一条（后写的覆盖先写的）
-        seen_ids.add(a.id)
-        if a.color not in ANNOTATION_COLORS:
-            a = a.model_copy(update={"color": "yellow"})
-        items.append(a.model_dump())
+        item = a.model_dump()
+        if item.get("color") not in ANNOTATION_COLORS:
+            item["color"] = "yellow"
+        old = merged.get(a.id)
+        if old is None or _anno_is_newer(item.get("updated_at", ""), old.get("updated_at", "")):
+            merged[a.id] = item
+
+    # 删除墓碑**最后**应用，优先级高于 upsert：
+    # 否则"这条同时出现在 annotations 和 deleted 里"时会被 upsert 又加回来。
+    for did in req.deleted or []:
+        merged.pop(did, None)
+
+    items = sorted(merged.values(), key=lambda x: (x.get("created_at") or "", x.get("id") or ""))
 
     payload = {
         "paper_id": safe_id,
         "saved_at": now,
         "updated_at": now,
-        "schema_version": 1,
+        "schema_version": 2,
         "annotations": items,
     }
     serialized = json.dumps(payload, ensure_ascii=False, indent=1)
@@ -3225,10 +3289,9 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
             detail=f"批注过多(>{ANNOTATION_MAX_BYTES // 1024 // 1024}MB),请先删掉一些",
         )
 
-    target = _annotation_path(safe_id)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".json.tmp")
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".json.tmp")
         tmp.write_text(serialized, encoding="utf-8")
         os.replace(tmp, target)
     except Exception as e:
@@ -3244,6 +3307,7 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
         "paper_id": safe_id,
         "saved": len(items),
         "updated_at": now,
+        "dir": str(target.parent),
     }
 
 
@@ -3253,23 +3317,27 @@ async def api_pdf_annotations_delete(
     annotation_id: str = Query(..., min_length=1, max_length=64),
 ):
     """Delete one annotation by id. Idempotent."""
-    target = _annotation_path(paper_id)
-    data = _safe_read_json(target) or {}
-    items = data.get("annotations") or []
-    kept = [a for a in items if a.get("id") != annotation_id]
-    if len(kept) == len(items):
-        return {"status": "success", "paper_id": paper_id, "deleted": 0}
-    payload = dict(data)
-    payload["annotations"] = kept
-    payload["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, target)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"批注删除失败: {e}")
-    return {"status": "success", "paper_id": paper_id, "deleted": 1}
+    deleted = 0
+    for path in (_annotation_path(paper_id), _legacy_annotation_path(paper_id)):
+        data = _safe_read_json(path)
+        if not data:
+            continue
+        items = data.get("annotations") or []
+        kept = [a for a in items if a.get("id") != annotation_id]
+        if len(kept) == len(items):
+            continue
+        deleted += len(items) - len(kept)
+        payload = dict(data)
+        payload["annotations"] = kept
+        payload["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"批注删除失败: {e}")
+    return {"status": "success", "paper_id": paper_id, "deleted": deleted}
 
 
 @app.get("/api/pdf/info")

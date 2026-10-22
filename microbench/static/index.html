@@ -3896,6 +3896,8 @@
           try {
             textEl.className = "page-text";
             textEl.innerHTML = formatMarkdownLite(snapPage.translation);
+            // 快照恢复后立刻重放这一页的批注高亮（在 KaTeX 渲染之前）
+            applyAnnotationsToPage(pg.num, textEl);
             if (typeof renderMathIn === "function") renderMathIn(textEl);
             const modelTag = snapPage.model ? ` · ${snapPage.model}` : "";
             const staleMark = hashOk ? "" : " ⚠️原文微变";
@@ -4636,6 +4638,9 @@
 
         textEl.className = "page-text";
         textEl.innerHTML = formatMarkdownLite(translated);
+        // 先打高亮再渲染公式：引文里含公式时，用的是 TeX 源，
+        // 在 KaTeX 渲染前匹配最准（渲染后也能匹配，但这里更直接）
+        applyAnnotationsToPage(pageNum, textEl);
         if (typeof renderMathIn === "function") renderMathIn(textEl);
 
         const modelTag = data.model ? ` · ${data.model}` : "";
@@ -4991,6 +4996,8 @@
             </div>
           </div>
           <div class="reader-section-body cn-translation">${formatMarkdownLite(translated)}</div>`;
+        // 章节视图的批注（page=0）同样先打高亮再渲染公式
+        applyAnnotationsToPage(0, transEl.querySelector(".cn-translation") || transEl);
         renderMathIn(transEl);
       } else {
         transEl.innerHTML = `
@@ -5744,7 +5751,10 @@
         if (annoEditorEl && annoEditorEl.contains(e.target)) return;
 
         const sel = window.getSelection();
-        const text = sel ? sel.toString().trim() : "";
+        // 用 _currentSelectionQuote() 而不是 sel.toString()：
+        // 后者会把看不见的 KaTeX MathML 副本（重复字母 + 换行）一起带出来，
+        // 引文存下来就对不上，重开时高亮不回来。
+        const text = _currentSelectionQuote();
         const bubble = document.getElementById("reader-selection-bubble");
         const floatingTag = document.getElementById("reader-floating-sel-tag");
 
@@ -5944,7 +5954,7 @@
     // ===========================================================================
     // 数据落在服务端 logs/_pdf_snapshots/annotations/<paperId>.json，
     // 跨会话保留 —— 下次点开同一篇论文，高亮和笔记自动回来。
-    const _annoState = { paperId: null, items: [], editingId: null, color: "yellow" };
+    const _annoState = { paperId: null, items: [], editingId: null, color: "yellow", deleted: [] };
     const _ANNO_COLORS = [
       { id: "yellow", hex: "#FACC15" },
       { id: "green",  hex: "#4ADE80" },
@@ -5972,8 +5982,10 @@
         if (!r.ok) throw new Error("HTTP " + r.status);
         const data = await r.json();
         _annoState.items = Array.isArray(data.annotations) ? data.annotations : [];
+        _annoState.deleted = [];
       } catch (e) {
         _annoState.items = [];
+        _annoState.deleted = [];
       }
       refreshAnnoBadges();
       reapplyAnnotations();
@@ -5986,9 +5998,15 @@
         const r = await fetch("/api/pdf/annotations/save", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ paper_id: pid, annotations: _annoState.items }),
+          // deleted 一起发上去：服务端按 id 合并，别让另一台设备把已删的批注"复活"
+          body: JSON.stringify({
+            paper_id: pid,
+            annotations: _annoState.items,
+            deleted: _annoState.deleted,
+          }),
         });
         if (!r.ok) throw new Error("HTTP " + r.status);
+        _annoState.deleted = [];
         return true;
       } catch (e) {
         showToast("批注保存失败: " + (e.message || e), true);
@@ -6103,6 +6121,8 @@
       const before = _annoState.items.length;
       _annoState.items = _annoState.items.filter(a => a.id !== id);
       if (_annoState.items.length === before) return;
+      // 记下删除的 id，保存时一并告诉服务端（跨设备合并用）
+      if (_annoState.deleted.indexOf(id) === -1) _annoState.deleted.push(id);
       const ok = await saveAnnotationsToServer();
       closeAnnotationEditor();
       refreshAnnoBadges();
@@ -6110,43 +6130,116 @@
       if (ok) showToast("批注已删除");
     }
 
-    // 把某页译文里的引文包进 <mark>。只匹配普通文本节点，跳过公式内部，
-    // 避免把 KaTeX 的 MathML 文本也当成正文去高亮。
-    function _wrapTextWithMark(container, quote, id, color) {
-      if (!container || !quote || quote.length < 2) return false;
+    // 取当前划选作为「引文」。两个坑：
+    //  1. KaTeX 的 MathML 副本用户根本看不见（position:absolute + clip），
+    //     但 sel.toString() 会把它一起吐出来（还会带上重复的字母和换行）。
+    //  2. 公式要用它的 **TeX 源** 表示，而不是渲染后的样子 ——
+    //     因为重放高亮时匹配的是"渲染前"的 DOM（占位符里存的就是 TeX 源），
+    //     两者才能对上。
+    function _currentSelectionQuote() {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return "";
+      let frag;
+      try { frag = sel.getRangeAt(0).cloneContents(); }
+      catch (e) { return (sel.toString() || "").trim(); }
+      frag.querySelectorAll(".katex-mathml").forEach(n => n.remove());
+      frag.querySelectorAll(".katex").forEach(k => {
+        const ann = k.querySelector("annotation[encoding='application/x-tex']");
+        const tex = ann ? ann.textContent
+                        : ((k.querySelector(".katex-html") || {}).textContent || "");
+        try { k.replaceWith(document.createTextNode(tex)); } catch (e) {}
+      });
+      return (frag.textContent || "").replace(/[ \t]+/g, " ").replace(/\n+/g, " ").trim();
+    }
+
+    // 公式的"统一表示"：一律用 TeX 源（annotation 里的原文）。
+    // 这样引文既能在 KaTeX 渲染前的 DOM（占位符里就是 TeX 源）匹配，
+    // 也能在渲染后的 DOM 匹配 —— 否则 α_ME 这类公式的批注重开后就找不到位置了。
+    function _annoTexOf(ph) {
+      const ann = ph.querySelector("annotation[encoding='application/x-tex']");
+      if (ann) return ann.textContent;
+      if (ph.querySelector(".katex")) return null;   // 渲染了但取不到源，放弃
+      return ph.textContent;
+    }
+
+    // 把容器里的可见文本拼成一条"虚拟行"：普通文本原样，公式用 TeX 源替代。
+    function _annoVirtualText(container) {
+      let v = "";
+      const pieces = [];
+      const seen = new Set();
       const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
         acceptNode: function (node) {
-          if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+          if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
           const p = node.parentElement;
           if (!p) return NodeFilter.FILTER_REJECT;
-          if (p.closest(".katex, .math-placeholder, .anno-mark, script, style")) return NodeFilter.FILTER_REJECT;
+          // MathML 副本用户看不见，不能算进来
+          if (p.closest(".katex-mathml, .anno-mark, script, style")) return NodeFilter.FILTER_REJECT;
           return NodeFilter.FILTER_ACCEPT;
         },
       });
       let node;
       while ((node = walker.nextNode())) {
-        const idx = node.nodeValue.indexOf(quote);
-        if (idx === -1) continue;
-        const range = document.createRange();
-        range.setStart(node, idx);
-        range.setEnd(node, idx + quote.length);
-        const mark = document.createElement("mark");
-        mark.className = "anno-mark";
-        mark.dataset.annoId = id;
-        mark.dataset.color = color || "yellow";
-        mark.title = "点击查看 / 编辑这条批注";
-        try {
-          range.surroundContents(mark);
-        } catch (err) {
+        const p = node.parentElement;
+        const ph = p.closest(".math-placeholder");
+        if (ph) {
+          if (seen.has(ph)) continue;
+          seen.add(ph);
+          const tex = _annoTexOf(ph);
+          if (tex == null) continue;
+          v += tex;
+          pieces.push({ node: node, ph: ph, tex: true, vStart: v.length - tex.length, vEnd: v.length });
           continue;
         }
-        const sup = document.createElement("sup");
-        sup.className = "anno-num";
-        sup.textContent = String(_annoSeq(id));
-        mark.appendChild(sup);
-        return true;
+        const t = node.nodeValue;
+        v += t;
+        pieces.push({ node: node, ph: null, tex: false, vStart: v.length - t.length, vEnd: v.length });
       }
-      return false;
+      return { text: v, pieces: pieces };
+    }
+
+    // 把某页译文里的引文包进 <mark>。引文可能横跨多个文本节点（中间夹着公式），
+    // 所以要先拼成虚拟行定位，再映射回真实节点。
+    function _wrapTextWithMark(container, quote, id, color) {
+      if (!container || !quote || quote.length < 2) return false;
+      const { text, pieces } = _annoVirtualText(container);
+      if (!text) return false;
+      const idx = text.indexOf(quote);
+      if (idx === -1) return false;
+      const end = idx + quote.length;
+      let first = null, last = null;
+      for (const p of pieces) {
+        if (p.vEnd > idx && !first) first = p;
+        if (p.vEnd >= end) { last = p; break; }
+      }
+      if (!first || !last) return false;
+
+      const range = document.createRange();
+      try {
+        if (first.tex) range.setStartBefore(first.ph);
+        else range.setStart(first.node, Math.max(0, idx - first.vStart));
+        if (last.tex) range.setEndAfter(last.ph);
+        else range.setEnd(last.node, Math.max(0, end - last.vStart));
+      } catch (err) {
+        return false;
+      }
+      const mark = document.createElement("mark");
+      mark.className = "anno-mark";
+      mark.dataset.annoId = id;
+      mark.dataset.color = color || "yellow";
+      mark.title = "点击查看 / 编辑这条批注";
+      try {
+        // extract + insert 可以跨元素边界；surroundContents 不行
+        const frag = range.extractContents();
+        mark.appendChild(frag);
+        range.insertNode(mark);
+      } catch (err) {
+        return false;
+      }
+      const sup = document.createElement("sup");
+      sup.className = "anno-num";
+      sup.textContent = String(_annoSeq(id));
+      mark.appendChild(sup);
+      return true;
     }
 
     function _clearAnnoMarks(container) {
