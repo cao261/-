@@ -1047,28 +1047,36 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 1. 严格忠于原文, 不要添加原文没有的内容
 2. 翻译要学术化、平实, 避免文学化或口语化
 3. 中文输出, Markdown 格式
-4. 只有以下三类词保留英文原文:
-   (a) 缩写与专有名词 (ME、PZT、MEMS、FET、作者名、单位名)
-   (b) 没有通行中文译法的术语 (GAA-FET、hydrodynamic model、DIBL)
-   (c) 图表与文献引用 (Fig. 3、Table II、[14])
+4. 必须逐句翻译, 不得省略、跳过或合并任何一句。页眉版权行、作者单位与
+   院系大学名称、章节标题、图表说明、编辑与收稿信息, 统统都要翻译
+5. 保留英文原文的只有这四类:
+   (a) 人名与作者署名
+   (b) 缩写/专有名词 (ME、PZT、MEMS、FET)
+   (c) 没有通行中文译法的术语 (GAA-FET、hydrodynamic model、DIBL)
+   (d) 图表与文献引用 (Fig. 3、Table II、[14])
+   机构与院系名请译成中文, 必要时在括号内附英文原名, 例如:
+   "Department of Materials Science and Engineering, Virginia Tech"
+   → "弗吉尼亚理工学院材料科学与工程系 (Virginia Tech)"
    其余普通学术名词一律译成中文, 例如:
    composite→复合材料, laminate→层状材料, magnetostrictive→磁致伸缩,
    piezoelectric→压电, materials→材料, structure→结构,
    single crystals→单晶, polymers→聚合物, alloys→合金,
    voltage coefficient→电压系数, ceramic→陶瓷
-5. 数学符号保持 LaTeX 形式 (如 "$I_{on}$", "$\\tau$", "$\\lambda$"),
-   不要过度转义 (不要写 "\\{" "\\}" "\\/", 直接写 "{" "}" "/")
-6. 如果原文含图表引用 (如 "Fig. 3", "Table II"), 保留原样
-7. 原文是从 PDF 自动抽取的纯文本, 双栏页面的句子顺序可能被打乱、公式可能残缺。
+6. 数学符号保持 LaTeX 形式 (如 "$I_{on}$", "$\\tau$", "$\\lambda$"),
+   不要过度转义 (不要写 "\\{" "\\}" "\\/", 直接写 "{" "}" "/")。
+   引用上标请写成 "<sup>3,4</sup>" 或 "$^{3,4}$", 不要裸写 "^3,4"
+7. 全文的术语、公式写法、符号必须前后一致: 同一个量在全文只能用一种写法
+8. 如果原文含图表引用 (如 "Fig. 3", "Table II"), 保留原样
+9. 原文是从 PDF 自动抽取的纯文本, 双栏页面的句子顺序可能被打乱、公式可能残缺。
    请直接按语义翻译能读懂的部分, 不要为了重建原文版面结构而反复推敲,
    不要输出分析过程, 只输出译文本身
-8. 严禁输出任何解释、推测或括号注释 (例如"原文此处数值缺损, 可能指……")。
-   遇到看不懂或残缺的部分, 跳过即可, 绝不要编造数值、公式或术语
-9. 原文中的 "[?]" 是 PDF 抽取时无法识别的符号占位符, 原样保留,
-   不要臆造具体符号
-10. PDF 抽取常把希腊字母抽成普通字母, 例如磁电电压系数 α_ME 会变成
-   "a" + 换行 + "ME" 或 "a_ME"。遇到这种明显失真时, 请按学科标准写法
-   还原成规范符号 (如 α_ME), 并统一全文写法
+10. 严禁输出任何解释、推测或括号注释 (例如"原文此处数值缺损, 可能指……")。
+    遇到看不懂或残缺的部分, 跳过即可, 绝不要编造数值、公式或术语
+11. 原文中的 "[?]" 是 PDF 抽取时无法识别的符号占位符, 原样保留,
+    不要臆造具体符号
+12. PDF 抽取常把希腊字母抽成普通字母, 例如磁电电压系数 α_ME 会变成
+    "a" + 换行 + "ME" 或 "a_ME"。遇到这种明显失真时, 请按学科标准写法
+    还原成规范符号 (如 α_ME), 并统一全文写法
 """
 
 
@@ -1093,7 +1101,7 @@ async def api_translate_section(req: TranslateRequest):
         )
 
     from .translation import (chunk_section_text, get_cache, merge_translation_parts,
-                              sanitize_translation)
+                              sanitize_translation, find_untranslated_runs)
     cache = get_cache()
     curr_st = llm.get_llm_status()
     model = curr_st.get("active_model") or "default"
@@ -1110,6 +1118,8 @@ async def api_translate_section(req: TranslateRequest):
     chunks = chunk_section_text(req.section_text)
     was_segmented = len(chunks) > 1
     translated_parts: list[str] = []
+    leak_retry = 0
+    leaked: list[str] = []
 
     try:
         for idx, chunk in enumerate(chunks):
@@ -1136,7 +1146,7 @@ async def api_translate_section(req: TranslateRequest):
                         # max_tokens 给小会触发 finish_reason=length，
                         # 结果是「只翻译了一半」——llm 层会检测并自动加倍重试。
                         max_tokens=16000,
-                        temperature=0.2,
+                        temperature=0.0,
                         # Generous timeout — MiniMax thinking mode can take 60s
                         # per chunk; multi-chunk translations need headroom.
                         timeout=180,
@@ -1158,6 +1168,54 @@ async def api_translate_section(req: TranslateRequest):
             detail="翻译结果为空。模型可能把 token 预算耗在推理上没产出正文，"
                    "请重试或点「探测升格」切回主模型。",
         )
+
+    # 完整性校验：模型偶尔会整段漏译（尤其是 PDF 抽取残缺的那些句子）。
+    # 提示词管不住，只能在服务端查——发现成段英文就重译一次。
+    leaked = find_untranslated_runs(translation)
+    if leaked:
+        print(
+            f"[MicroBench] ⚠️ 译文检测到 {len(leaked)} 段未翻译，重译一次: "
+            f"{leaked[0][:60]!r}",
+            file=sys.stderr,
+        )
+        try:
+            retry_parts: list[str] = []
+            for idx, chunk in enumerate(chunks):
+                hint = ""
+                if leaked:
+                    hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
+                            + "\n".join(x[:200] for x in leaked[:5]))
+                if was_segmented:
+                    user_msg = (
+                        f"翻译以下学术论文章节 (标题: {req.section_title}, "
+                        f"第 {idx + 1}/{len(chunks)} 段):\n\n{chunk}{hint}"
+                    )
+                else:
+                    user_msg = (
+                        f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}{hint}"
+                    )
+                retry_parts.append(
+                    (
+                        await asyncio.to_thread(
+                            llm.chat,
+                            messages=[
+                                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            max_tokens=16000,
+                            temperature=0.0,
+                            timeout=180,
+                            disable_thinking=llm.translation_disable_thinking(),
+                        )
+                    ).strip()
+                )
+            retry_text = sanitize_translation(merge_translation_parts(retry_parts))
+            if retry_text and len(retry_text) >= len(translation) * 0.9:
+                translation = retry_text
+                leaked = find_untranslated_runs(translation)
+        except Exception:
+            pass  # 重译失败就用第一版，不要因此让整个请求失败
+
     curr_st = llm.get_llm_status()
     actual_model = curr_st.get("active_model") or model
     result = {
@@ -1168,6 +1226,7 @@ async def api_translate_section(req: TranslateRequest):
         "from_cache": False,
         "model": actual_model,
         "is_degraded": curr_st["is_degraded"],
+        "untranslated_runs": len(leaked),
     }
 
     # Store in cache under actual producing model so re-translate is instant
@@ -1662,7 +1721,7 @@ async def api_translate_page(req: TranslatePageRequest):
         )
 
     from .translation import (chunk_section_text, get_cache, merge_translation_parts,
-                              sanitize_translation)
+                              sanitize_translation, find_untranslated_runs)
     cache = get_cache()
     cfg = llm._config()
     model = cfg["model"]
@@ -1715,7 +1774,7 @@ async def api_translate_page(req: TranslatePageRequest):
                             {"role": "user", "content": user_msg},
                         ],
                         max_tokens=16000,
-                        temperature=0.2,
+                        temperature=0.0,
                         timeout=180,
                         # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
                         disable_thinking=llm.translation_disable_thinking(),
@@ -1735,6 +1794,49 @@ async def api_translate_page(req: TranslatePageRequest):
             detail="翻译结果为空。模型可能把 token 预算耗在推理上没产出正文，"
                    "请重试或点「探测升格」切回主模型。",
         )
+
+    # 完整性校验：发现成段英文（模型整段漏译）就带着漏译清单重译一次。
+    # 提示词管不住模型不漏，只能在服务端查出来并重试。
+    leaked = find_untranslated_runs(translation)
+    if leaked:
+        print(
+            f"[MicroBench] ⚠️ 第 {req.page} 页译文检测到 {len(leaked)} 段未翻译，重译一次: "
+            f"{leaked[0][:60]!r}",
+            file=sys.stderr,
+        )
+        try:
+            retry_parts: list[str] = []
+            for idx, chunk in enumerate(chunks):
+                hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
+                        + "\n".join(x[:200] for x in leaked[:5]))
+                if len(chunks) > 1:
+                    user_msg = (
+                        f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{len(chunks)} 段):"
+                        f"\n\n{hint}\n\n{chunk}"
+                    )
+                else:
+                    user_msg = f"翻译以下学术论文第 {req.page} 页:\n\n{hint}\n\n{chunk}"
+                retry_parts.append(
+                    (
+                        await asyncio.to_thread(
+                            llm.chat,
+                            messages=[
+                                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            max_tokens=16000,
+                            temperature=0.0,
+                            timeout=180,
+                            disable_thinking=llm.translation_disable_thinking(),
+                        )
+                    ).strip()
+                )
+            retry_text = sanitize_translation(merge_translation_parts(retry_parts))
+            if retry_text and len(retry_text) >= len(translation) * 0.9:
+                translation = retry_text
+                leaked = find_untranslated_runs(translation)
+        except Exception:
+            pass  # 重译失败就用第一版，不要因此让整个请求失败
     curr_st = llm.get_llm_status()
     result = {
         "status": "success",
@@ -1745,6 +1847,8 @@ async def api_translate_page(req: TranslatePageRequest):
         "from_cache": False,
         "model": curr_st["active_model"],
         "is_degraded": curr_st["is_degraded"],
+        # 残留未翻译的英文段数（完整性校验的结果，正常应为 0）
+        "untranslated_runs": len(leaked),
     }
     # 缓存写入必须用与读取时完全一致的文本（page_text），否则哈希对不上，
     # 缓存永远不命中。

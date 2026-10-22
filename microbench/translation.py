@@ -397,6 +397,39 @@ def _wrap_bare_latex(text: str) -> str:
     return "".join(out)
 
 
+def find_untranslated_runs(text: str, min_words: int = 8) -> list[str]:
+    """
+    Find stretches of English that the model left untranslated.
+
+    This is the safety net for "有的翻译有的不翻译": the model sometimes
+    silently drops a sentence (typically a garbled one from the PDF text
+    layer). Prompting alone cannot prevent that — the only reliable fix is
+    to CHECK the output and retry when whole passages came back in English.
+
+    A run is only reported when it contains ordinary lower-case words.
+    All-capitalised runs (author lists, institution names, citation
+    abbreviations) are legitimate English in a Chinese translation and are
+    ignored.
+    """
+    if not text:
+        return []
+    runs: list[str] = []
+    for m in re.finditer(r"[A-Za-z][A-Za-z\-']*(?:[ \t]+[A-Za-z][A-Za-z\-']*){%d,}"
+                         % (min_words - 1), text):
+        frag = m.group(0)
+        words = re.findall(r"[A-Za-z][A-Za-z\-']*", frag)
+        if len(words) < min_words:
+            continue
+        # 全是首字母大写 / 短缩写 → 人名、机构名、引用缩写，保留英文是合理的
+        if all(w[0].isupper() or len(w) <= 2 for w in words):
+            continue
+        # 邮箱 / DOI / 图表引用 / 链接
+        if re.search(r"@|Fig\.|Table\s|Eq\.|doi|https?://|arXiv", frag, re.I):
+            continue
+        runs.append(frag.strip())
+    return runs
+
+
 def sanitize_translation(text: str) -> str:
     """
     Clean up raw model output before it reaches the frontend.
@@ -575,6 +608,7 @@ __all__ = [
     "chunk_section_text",
     "merge_translation_parts",
     "sanitize_translation",
+    "find_untranslated_runs",
     "TranslationCache",
     "get_cache",
     "reset_cache",
