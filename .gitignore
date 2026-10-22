@@ -35,6 +35,13 @@ _/_v*_smoke*.py
 _/_liu_*.py
 /_clean_*.py
 
+# Vendored KaTeX dist (rebuild with:
+#   npm install katex --prefix microbench/_vendor --registry=https://registry.npmmirror.com)
+microbench/_vendor/
+
+# Generated offline bundle — a build artifact, not source
+MicroBench_离线阅读版.html
+
 # Vault contents (user actual notes/literature) — keep on disk only
 00_Dashboard/
 01_Literature/

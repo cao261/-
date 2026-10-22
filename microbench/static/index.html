@@ -2,9 +2,22 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- viewport-fit=cover lets the layout reach under the iPad's rounded
+       corners and home indicator; the safe-area insets are applied in the
+       tablet stylesheet further down. User scaling is deliberately NOT
+       disabled — pinch-zoom has to keep working. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>MicroBench | 研途静界 · 微电子与半导体科研工坊</title>
   <meta name="version" content="v2.0-design-system">
+  <!-- PWA / add-to-home-screen -->
+  <meta name="theme-color" content="#F7F4ED">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="MicroBench">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/pwa/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/pwa/icon-192.png">
   <!-- Theme bootstrap. Must run before the stylesheet paints or the user
        gets a white flash before night mode applies. Kept inline + tiny for
        exactly that reason; the toggle itself lives in the main script. -->
@@ -1584,6 +1597,123 @@
     .row-between { display: flex; align-items: center; justify-content: space-between; }
     .wrap { display: flex; flex-wrap: wrap; align-items: center; }
     .gap-1 { gap: var(--s-1); } .gap-2 { gap: var(--s-2); }
+
+    /* ===================================================================
+       Tablet / touch adaptation
+       -------------------------------------------------------------------
+       The workbench was designed for a desktop browser on this PC. Three
+       things change when the same page runs on a tablet:
+
+         1. Touch targets. The desktop sizes (27-30px icon buttons, 11px
+            chips) are far below the 44pt that iOS HIG / 48dp that Material
+            ask for. Under a coarse pointer we scale them up.
+         2. Safe areas. A notched iPad has rounded corners and a home
+            indicator; fixed elements need to stay clear of both.
+         3. Viewport height. iOS Safari's collapsing toolbar makes 100vh
+            taller than what is actually visible, which pushes anything
+            anchored to the bottom off screen. dvh tracks the real height.
+       =================================================================== */
+
+    :root {
+      --sa-top: env(safe-area-inset-top, 0px);
+      --sa-bottom: env(safe-area-inset-bottom, 0px);
+      --sa-left: env(safe-area-inset-left, 0px);
+      --sa-right: env(safe-area-inset-right, 0px);
+      --app-vh: 100vh;
+    }
+    @supports (height: 100dvh) {
+      :root { --app-vh: 100dvh; }
+    }
+
+    /* ---- 1. Touch targets (only for real touch input) ---------------- */
+    @media (pointer: coarse) {
+      .icon-btn { width: 44px; height: 44px; }
+      .icon-btn .ico { width: 18px; height: 18px; }
+
+      .pill-badge[data-clickable="true"] {
+        padding: 10px 16px;
+        font-size: var(--t-sm);
+      }
+      .pill-badge .ico { width: 15px; height: 15px; }
+
+      .btn-pill { padding: 13px 24px; }
+      .btn-pill-outline { padding: 12px 20px; }
+      .btn-ghost { padding: 10px 12px; font-size: var(--t-sm); }
+
+      .chip, .btn-pill.chip { padding: 9px 14px; font-size: var(--t-sm); }
+      .qa-chip { padding: 8px 14px; font-size: var(--t-sm); }
+
+      .btn-mode-toggle, .btn-zoom-toggle { padding: 9px 13px; }
+
+      /* Inline modals build their own markup with inline styles, so the
+         form controls inside them are styled here rather than by class.
+         16px is the threshold below which iOS zooms the page on focus. */
+      .field-input, .field-select, .field-textarea {
+        padding: 12px 14px;
+        font-size: 16px;
+      }
+      input[type="text"]:not([data-pdfjs]),
+      input[type="password"],
+      input[type="search"],
+      select,
+      textarea {
+        font-size: 16px !important;
+      }
+      button, [role="button"] { touch-action: manipulation; }
+    }
+
+    /* ---- 2. Safe areas for fixed / sticky chrome -------------------- */
+    .top-meta-banner { padding-top: var(--sa-top); }
+    header {
+      padding-top: calc(var(--s-4) + var(--sa-top));
+      padding-left: calc(var(--s-12) + var(--sa-left));
+      padding-right: calc(var(--s-12) + var(--sa-right));
+    }
+    .container {
+      padding-left: calc(var(--s-12) + var(--sa-left));
+      padding-right: calc(var(--s-12) + var(--sa-right));
+    }
+    .reader-floating-copilot-btn {
+      right: calc(var(--s-6) + var(--sa-right));
+      bottom: calc(var(--s-5) + var(--sa-bottom));
+    }
+    .reader-qa-panel {
+      right: calc(var(--s-5) + var(--sa-right));
+      bottom: calc(var(--s-5) + var(--sa-bottom));
+      height: min(600px, calc(var(--app-vh) - 120px - var(--sa-bottom)));
+    }
+    /* The reader modal is a full-screen overlay; let it breathe around
+       the notch and the home indicator. */
+    #reader-modal { padding: var(--sa-top) var(--sa-right) var(--sa-bottom) var(--sa-left); }
+
+    /* ---- 3. Viewport height ---------------------------------------- */
+    .reader-shell { height: var(--app-vh); }
+    .reader-qa-panel { max-height: calc(var(--app-vh) - 40px); }
+
+    /* ---- 4. Tablet breakpoints -------------------------------------- */
+    /* iPad portrait is 768pt wide, landscape 1024pt. The desktop grid
+       switches to a single column at 1080px, so landscape iPad already
+       stacks — but the reading column gets too wide to scan comfortably,
+       so cap it. */
+    @media (max-width: 1100px) {
+      .reader-body { grid-template-columns: 1fr; }
+      .pdf-split { grid-template-columns: 1fr; }
+    }
+    @media (min-width: 700px) and (max-width: 1100px) {
+      .container { max-width: 860px; }
+      /* A comfortable measure for long-form reading on a tablet. */
+      .reader-shell > * { max-width: 860px; margin-left: auto; margin-right: auto; }
+    }
+    @media (max-width: 700px) {
+      header { padding-left: calc(var(--s-6) + var(--sa-left)); padding-right: calc(var(--s-6) + var(--sa-right)); }
+      .container { padding-left: calc(var(--s-6) + var(--sa-left)); padding-right: calc(var(--s-6) + var(--sa-right)); }
+    }
+
+    /* A tablet in landscape has plenty of width; the 1280px cap plus the
+       generous side padding makes the board feel like a wide desktop. */
+    @media (pointer: coarse) and (min-width: 1180px) {
+      .container { padding-top: var(--s-8); }
+    }
 </style>
 </head>
 <body>

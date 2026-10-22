@@ -32,6 +32,69 @@
 
 ---
 
+## 📱 平板版（iPad / Android 平板）
+
+工作台有**两个**平板入口，取决于平板在不在你的电脑旁边：
+
+| | 实时版（LAN） | 离线阅读版 |
+|---|---|---|
+| **启动方式** | 双击 `start_workbench_lan.bat` | 双击 `start_offline_sync.bat` |
+| **需要电脑开着** | ✅ 必须 | ❌ 不需要 |
+| **需要同一局域网** | ✅ 必须（同一个 Wi-Fi） | ❌ 不需要，文件带在平板上 |
+| **能做什么** | 全功能：抓论文、AI 解读/翻译、建卡、生成复现工程、周报 | 只读：看全部笔记与公式、全文搜索 |
+| **拿到最新内容** | 实时 | 需重新导出（见下） |
+
+### 实时版（电脑在旁边时用）
+
+1. 双击 **`start_workbench_lan.bat`**，窗口里会打印：
+   ```
+   [推荐] 一键配对 (自动填入口令):
+      http://192.168.1.101:5000/?k=XXXXXXXXXXXX
+   ```
+2. 平板连**同一个 Wi-Fi**，用 Safari 打开上面那行带 `?k=` 的地址 → 自动完成配对，浏览器会记住口令，之后直接开 `http://192.168.1.101:5000/` 即可；
+3. **iPad**：分享按钮 → 添加到主屏幕，即可全屏运行（已配置 PWA manifest + standalone 模式）；
+   **Android**：Chrome 菜单 → 添加到主屏幕；
+4. 页面已针对平板适配：触控目标 ≥44pt、安全区避让、竖屏单栏、阅读栏宽限制。
+
+> **关于口令**：工作台开到局域网后，同一个 Wi-Fi 下任何设备只要知道地址就能访问——能读你的全部笔记、写入文件、消耗你的 API 额度。所以这里加了一道**一次性口令**：
+> - 口令由 `logs/lan_token.txt` 持久保存，**重启不变**，平板只需配对一次；
+> - 配对后存进 **HttpOnly + SameSite=Lax** 的 Cookie，页面脚本读不到，跨站请求也不会带上；
+> - 本机（`127.0.0.1`）访问**完全不受影响**，不需要口令，桌面用法与以前一模一样；
+> - 端口不对外时，口令存在也不会有人能连上——两道锁是独立的。
+
+> **连不上怎么办**：99% 是 Windows 防火墙。启动脚本会检测并提示放行命令（需管理员身份）：
+> ```
+> netsh advfirewall firewall add rule name="MicroBench 5000" dir=in action=allow protocol=TCP localport=5000 profile=private
+> ```
+
+### 离线阅读版（没带电脑时用）
+
+把整个 vault 烘焙成**一个自包含的 HTML 文件**（`MicroBench_离线阅读版.html`）：
+
+- **零外部依赖**——KaTeX 公式在导出时就渲染成静态 HTML，字体以 base64 内嵌，没有一个网络请求，飞机上、地铁上、图书馆都能开；
+- 公式渲染规则与在线版**完全一致**（同一套 `$$`/`$` 提取逻辑）；
+- 目录树导航 + 全文搜索 + 深色模式 + 触控适配；
+- 1.3 MB 一个文件，AirDrop / 微信文件传输 / U 盘都能拷。
+
+**保持内容最新**（这是离线版唯一需要操心的点）：
+
+```bash
+# 手动导出一次
+python microbench/export_offline.py
+
+# 或者常驻监视,笔记一改就自动重导 (每 60 秒检查)
+python microbench/export_offline.py --watch
+
+# 输出到云盘目录 —— 平板用云盘 App 直接打开,永远是最新的
+python microbench/export_offline.py "D:/OneDrive/MicroBench.html"
+```
+
+双击 **`start_offline_sync.bat`** 更省事：把一个云盘文件夹拖到它上面，它会先导一次然后常驻监视，之后你只管写笔记。
+
+> **能不能在平板上编辑？** 离线版是只读的。想在平板上**读 + 改**，把整个 vault 放进 OneDrive / 坚果云 / Obsidian Sync，用 iPad 版 Obsidian 打开——Obsidian 原生支持 LaTeX 公式和双链，体验比这个 HTML 还好。代价是需要处理同步冲突。
+
+---
+
 ## 📁 目录结构与规范说明
 
 ```text
@@ -64,8 +127,19 @@
 │   └── 05_Troubleshooting_Template.md      # 避坑排错日记模版
 │
 ├── microbench/                 # 本地 Web 工作台源码 (FastAPI + 极简前端)
+│   ├── app.py                  # 后端 API + 鉴权/跨站守卫
+│   ├── lan.py                  # 局域网模式: 口令与 IP 解析
+│   ├── export_offline.py       # 导出单文件离线阅读版
+│   ├── static/
+│   │   ├── index.html          # 主界面 (单文件前端)
+│   │   ├── pair.html           # 平板配对口令页
+│   │   └── manifest.webmanifest# PWA 清单
+│   └── _test_lan.py            # 局域网模式回归测试
 ├── requirements.txt            # Python 轻量依赖
-└── start_workbench.bat         # Windows 一键启动脚本
+├── start_workbench.bat         # Windows 一键启动脚本 (仅本机)
+├── start_workbench_lan.bat     # Windows 一键启动脚本 (平板 / 局域网)
+├── start_offline_sync.bat      # 离线阅读版同步器 (可导出到云盘)
+└── MicroBench_离线阅读版.html   # 离线快照 (单文件, 平板可离线阅读)
 ```
 
 ---

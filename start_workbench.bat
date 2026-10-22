@@ -37,6 +37,9 @@ echo   日志: logs\uvicorn.log
 if not exist logs mkdir logs
 start "MicroBench-Server" /MIN cmd /c "python -m uvicorn microbench.app:app --host 127.0.0.1 --port 5000 > logs\uvicorn.log 2>&1"
 
+REM 顺手把离线阅读版刷新一次,免得平板上拿到的还是旧快照
+start "MicroBench-Offline" /MIN cmd /c "python microbench\export_offline.py > logs\offline_export.log 2>&1"
+
 echo.
 echo [4/4] 轮询等 127.0.0.1:5000 就绪 (最多 30 秒)...
 powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; for ($i=1; $i -le 30; $i++) { if (Test-NetConnection -ComputerName 127.0.0.1 -Port 5000 -InformationLevel Quiet -WarningAction SilentlyContinue) { exit 0 }; Start-Sleep -Seconds 1 }; exit 1" >nul 2>&1

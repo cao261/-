@@ -12,6 +12,8 @@ V1.1 hardening:
 import os
 import json
 import re
+import hmac
+import ipaddress
 import asyncio
 import time
 from contextlib import asynccontextmanager
@@ -20,7 +22,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -58,6 +60,8 @@ from .plot_compare import (
     _parse_csv_points,
 )
 from .paper_text import fetch_full_text, split_into_sections, extract_text_from_pdf
+from . import lan as lan_helpers
+from .lan import resolve_token as _resolve_lan_token
 
 
 @asynccontextmanager
@@ -87,12 +91,27 @@ app = FastAPI(
 # preflight for DELETE /api/vault/file and DELETE /api/pdf/snapshot/delete
 # whenever the page is loaded from a slightly different origin (e.g. the
 # desktop webview on a custom --port).
+#
+# allow_origin_regex additionally admits private-LAN origins (192.168.x.x /
+# 10.x / 172.16-31.x). That is only reachable when the server is actually
+# bound to 0.0.0.0, and every non-loopback caller still has to pass the
+# token guard below — CORS alone never grants access.
+_LAN_ORIGIN_RE = (
+    r"^https?://("
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+    r"|\[[0-9a-fA-F:]+\]"
+    r")(:\d{1,5})?$"
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://127.0.0.1:5000",
         "http://localhost:5000",
     ],
+    allow_origin_regex=_LAN_ORIGIN_RE,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -124,6 +143,47 @@ app.add_middleware(
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
+# The shared token for LAN (tablet) access. Empty means "LAN access is
+# closed" — we never fall back to "no token = open". The launcher script
+# provisions it into logs/lan_token.txt; MB_LAN_TOKEN overrides it.
+_LAN_TOKEN = _resolve_lan_token()
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for 127.0.0.0/8, localhost and ::1."""
+    h = (host or "").strip().lower()
+    if h in _LOOPBACK_HOSTS:
+        return True
+    if h.startswith("127."):
+        parts = h.split(".")
+        if len(parts) == 4:
+            try:
+                return all(0 <= int(p) <= 255 for p in parts[1:])
+            except ValueError:
+                return False
+    return False
+
+
+def _is_remote_peer(host: str) -> bool:
+    """True only for a real network peer outside the loopback interface.
+
+    This is the gate for every LAN-specific rule (token, same-origin
+    relaxation). A peer address that is not an IP address at all cannot be
+    a machine on the Wi-Fi: Starlette's in-process TestClient reports the
+    literal string "testclient", and uvicorn always reports the socket's
+    real peer IP. So "not an IP" means "not a network client" and the
+    strict loopback rules apply — exactly as they did before LAN mode
+    existed.
+    """
+    h = (host or "").strip()
+    if not h:
+        return False
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return not ip.is_loopback
+
 
 def _origin_is_local(origin: str, allowed_ports: set) -> bool:
     """True if `origin` is the loopback interface on a port we serve."""
@@ -152,49 +212,255 @@ def _origin_is_local(origin: str, allowed_ports: set) -> bool:
     return port in allowed_ports
 
 
+def _origin_matches_host(origin: str, host_header: str) -> bool:
+    """True if `origin` and the Host header address the same host:port.
+
+    This is the LAN counterpart of _origin_is_local(). A cross-site form
+    post from evil.com targets http://192.168.1.101:5000, so the browser
+    sends `Origin: https://evil.com` while `Host: 192.168.1.101:5000` — the
+    two do not match and the request is rejected. The page controls the
+    target URL, never the Host header.
+    """
+    if not origin or origin == "null":
+        return False
+    try:
+        parsed = urlparse(origin)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    origin_host = (parsed.hostname or "").lower()
+    try:
+        origin_port = parsed.port
+    except ValueError:
+        return False
+    if origin_port is None:
+        origin_port = 443 if parsed.scheme == "https" else 80
+
+    hh = (host_header or "").strip().lower()
+    if not hh:
+        return False
+    if hh.startswith("["):
+        # IPv6 literal: [::1]:5000
+        end = hh.find("]")
+        if end == -1:
+            return False
+        host_part = hh[1:end]
+        port_part = hh[end + 1:].lstrip(":")
+    elif ":" in hh:
+        host_part, _, port_part = hh.rpartition(":")
+    else:
+        host_part, port_part = hh, ""
+    host_part = host_part.strip("[]")
+    try:
+        host_port = int(port_part) if port_part else None
+    except ValueError:
+        return False
+    if host_part != origin_host:
+        return False
+    # A Host header without a port implies the default port for the scheme.
+    if host_port is None:
+        return True
+    return host_port == origin_port
+
+
+def _token_supplied(request: Request) -> str:
+    """The token the client presented, from the header or the cookie.
+
+    Two channels on purpose:
+      * the `X-MB-Token` header — set by JS, used by the pairing page and by
+        any scripted client
+      * the `mb_token` cookie — set by the server after a successful
+        pairing, HttpOnly so page scripts cannot read it, and SameSite=Lax
+        so browsers refuse to attach it to cross-site requests
+    """
+    header = (request.headers.get("x-mb-token") or "").strip()
+    if header:
+        return header
+    cookie = (request.cookies.get("mb_token") or "").strip()
+    return cookie
+
+
+def _token_valid(request: Request) -> bool:
+    """Constant-time comparison of the presented token against the secret."""
+    if not _LAN_TOKEN:
+        return False
+    supplied = _token_supplied(request)
+    if not supplied:
+        return False
+    return hmac.compare_digest(supplied, _LAN_TOKEN)
+
+
+def _client_is_local(request: Request) -> bool:
+    """True when the caller is this machine (loopback) or an in-process client."""
+    client = request.client
+    return not _is_remote_peer(client.host if client else "")
+
+
+def _set_token_cookie(response, token: str) -> None:
+    response.set_cookie(
+        key="mb_token",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 180,  # half a year
+        path="/",
+    )
+
+
 @app.middleware("http")
 async def csrf_origin_guard(request: Request, call_next):
-    """Reject cross-origin state-changing requests (see block comment above)."""
-    if request.method.upper() not in _SAFE_METHODS:
-        # The ports this server answers on: the socket it is bound to, and
-        # the port in the Host header (which is what the browser actually
-        # used to reach us). The Host header cannot be forged by a
-        # cross-site page — the page controls the *target* URL, not the
-        # Host of the request it triggers.
-        allowed_ports = set()
-        server = request.scope.get("server") or ()
-        if len(server) > 1 and server[1]:
-            allowed_ports.add(int(server[1]))
-        host_header = request.headers.get("host") or ""
-        try:
-            if ":" in host_header:
-                allowed_ports.add(int(host_header.rsplit(":", 1)[1]))
-            elif host_header:
-                allowed_ports.add(80)
-        except ValueError:
-            pass
-        if not allowed_ports:
-            allowed_ports = {5000}
+    """Reject cross-origin state-changing requests (see block comment above).
 
+    Two paths, because "this machine" and "my tablet" need different
+    definitions of "same origin":
+
+      * loopback client -> the Origin/Referer host must literally be a
+        loopback name on a port we serve. This is what defeats DNS
+        rebinding (evil.com resolving to 127.0.0.1), because the browser
+        would send `Origin: https://evil.com`.
+
+      * LAN client -> the Origin/Referer host:port must equal the Host
+        header the browser connected to. Same-origin requests pass; a
+        cross-site form post from evil.com does not.
+
+    Both paths are additionally covered by the token guard above, so even a
+    same-origin-looking request from a LAN device needs the secret.
+    """
+    if request.method.upper() not in _SAFE_METHODS:
         origin = request.headers.get("origin")
         referer = request.headers.get("referer")
-        if origin:
-            if not _origin_is_local(origin, allowed_ports):
-                return HTMLResponse(
-                    f"<h1>403</h1><p>拒绝跨站请求 (Origin: {origin})。</p>",
-                    status_code=403,
-                )
-        elif referer:
-            ref_origin = f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"
-            if not _origin_is_local(ref_origin, allowed_ports):
-                return HTMLResponse(
-                    f"<h1>403</h1><p>拒绝跨站请求 (Referer: {referer})。</p>",
-                    status_code=403,
-                )
-        # No Origin AND no Referer -> not a browser form post. Allow.
+        client_host = request.client.host if request.client else ""
+        host_header = request.headers.get("host") or ""
+
+        if _is_remote_peer(client_host):
+            # LAN client: same-origin only. The Origin/Referer host:port has
+            # to equal the Host header the browser actually connected to.
+            if origin:
+                if not _origin_matches_host(origin, host_header):
+                    return HTMLResponse(
+                        f"<h1>403</h1><p>拒绝跨站请求 (Origin: {origin})。</p>",
+                        status_code=403,
+                    )
+            elif referer:
+                ref_origin = f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"
+                if not _origin_matches_host(ref_origin, host_header):
+                    return HTMLResponse(
+                        f"<h1>403</h1><p>拒绝跨站请求 (Referer: {referer})。</p>",
+                        status_code=403,
+                    )
+        else:
+            # Local / in-process client: the Origin/Referer host must
+            # literally be a loopback name on a port we serve.
+            #
+            # The ports this server answers on: the socket it is bound to, and
+            # the port in the Host header (which is what the browser actually
+            # used to reach us). The Host header cannot be forged by a
+            # cross-site page — the page controls the *target* URL, not the
+            # Host of the request it triggers.
+            allowed_ports = set()
+            server = request.scope.get("server") or ()
+            if len(server) > 1 and server[1]:
+                allowed_ports.add(int(server[1]))
+            try:
+                if ":" in host_header:
+                    allowed_ports.add(int(host_header.rsplit(":", 1)[1]))
+                elif host_header:
+                    allowed_ports.add(80)
+            except ValueError:
+                pass
+            if not allowed_ports:
+                allowed_ports = {5000}
+
+            if origin:
+                if not _origin_is_local(origin, allowed_ports):
+                    return HTMLResponse(
+                        f"<h1>403</h1><p>拒绝跨站请求 (Origin: {origin})。</p>",
+                        status_code=403,
+                    )
+            elif referer:
+                ref_origin = f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"
+                if not _origin_is_local(ref_origin, allowed_ports):
+                    return HTMLResponse(
+                        f"<h1>403</h1><p>拒绝跨站请求 (Referer: {referer})。</p>",
+                        status_code=403,
+                    )
+            # No Origin AND no Referer -> not a browser form post. Allow.
     return await call_next(request)
 
+
+# NOTE: registered *after* csrf_origin_guard on purpose. FastAPI inserts each
+# @app.middleware at the front of the stack, so the last one registered is the
+# outermost and therefore runs first. We want the token check to run before any
+# origin reasoning, so every authentication failure surfaces as the same 401
+# JSON body instead of a mix of 401 and 403 HTML pages.
+@app.middleware("http")
+async def lan_token_guard(request: Request, call_next):
+    """Require the shared token for every non-loopback client.
+
+    Loopback callers (this PC) are never asked for a token, so desktop use is
+    completely unaffected. Everyone else must present the shared token — that
+    covers reads as well as writes, because the vault itself is worth
+    protecting.
+
+    `/api/auth/*` is exempt so the tablet can ask "do I need a token?" and
+    then hand one in.
+    """
+    path = request.url.path
+    if path.startswith("/api/") and not path.startswith("/api/auth/"):
+        if not _client_is_local(request):
+            if not _token_valid(request):
+                return JSONResponse(
+                    {
+                        "detail": "需要访问口令",
+                        "error": "token_required",
+                        "hint": "在平板上输入 PC 窗口显示的口令，或用带 ?k= 的配对链接打开",
+                    },
+                    status_code=401,
+                )
+    return await call_next(request)
+
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Files under static/ that may be fetched directly by the browser. The app
+# itself is a single self-contained index.html, so this whitelist only has to
+# cover the PWA assets.
+_PWA_ASSETS = {
+    "manifest.webmanifest": "application/manifest+json",
+    "icon-192.png": "image/png",
+    "icon-512.png": "image/png",
+    "icon-maskable-512.png": "image/png",
+    "apple-touch-icon.png": "image/png",
+}
+
+
+def _pairing_page_response(request: Request, error: str = ""):
+    """The small "enter your access code" page a fresh tablet sees.
+
+    Served instead of the app shell so an unpaired device never loads 6 000
+    lines of UI that would immediately fail every API call.
+    """
+    page = STATIC_DIR / "pair.html"
+    if not page.exists():
+        return HTMLResponse(
+            "<h1>需要访问口令</h1>"
+            "<p>请在 PC 上用 start_workbench_lan.bat 启动，并用它显示的口令配对。</p>",
+            status_code=401,
+        )
+    html = page.read_text(encoding="utf-8")
+    if not _LAN_TOKEN:
+        notice = "服务端没有配置局域网口令，LAN 访问已关闭。请在 PC 上用 start_workbench_lan.bat 重新启动。"
+    elif error:
+        notice = error
+    else:
+        notice = ""
+    html = html.replace("{{NOTICE}}", notice)
+    html = html.replace(
+        "{{HOST}}",
+        (request.headers.get("host") or "127.0.0.1").split(":")[0],
+    )
+    return HTMLResponse(html, status_code=403 if not _LAN_TOKEN else 200)
 
 
 # ---------------------------------------------------------------------------
@@ -433,8 +699,84 @@ class ExportQARequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+class AuthVerifyBody(BaseModel):
+    token: str = Field(default="", max_length=200, description="局域网访问口令")
+
+
+@app.get("/api/auth/status")
+async def api_auth_status(request: Request):
+    """Tell the client whether it needs the shared token, and whether it has it.
+
+    The tablet calls this on boot. If `auth_required` is true and `ok` is
+    false, the UI shows the token prompt instead of the dashboard.
+    """
+    loopback = _client_is_local(request)
+    if loopback:
+        # This PC never needs a token; desktop behaviour is untouched.
+        return {
+            "auth_required": False,
+            "ok": True,
+            "loopback": True,
+            "token_configured": bool(_LAN_TOKEN),
+            "server": "microbench",
+        }
+    return {
+        "auth_required": True,
+        "ok": _token_valid(request),
+        "loopback": False,
+        "token_configured": bool(_LAN_TOKEN),
+        "server": "microbench",
+    }
+
+
+@app.post("/api/auth/verify")
+async def api_auth_verify(request: Request, payload: AuthVerifyBody):
+    """Accept a token the user typed in on the tablet.
+
+    On success the token is stored in an HttpOnly, SameSite=Lax cookie so
+    the browser attaches it to every later request on its own — no page
+    script ever has to see it, and cross-site requests never carry it.
+    """
+    if not _LAN_TOKEN:
+        return JSONResponse(
+            {
+                "detail": "服务端未配置局域网口令，LAN 访问已关闭",
+                "error": "token_not_configured",
+            },
+            status_code=403,
+        )
+    supplied = (payload.token or "").strip()
+    if supplied and hmac.compare_digest(supplied, _LAN_TOKEN):
+        response = JSONResponse({"ok": True})
+        _set_token_cookie(response, supplied)
+        return response
+    return JSONResponse(
+        {"detail": "口令不正确", "error": "token_invalid"},
+        status_code=401,
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
-async def serve_index():
+async def serve_index(request: Request, k: Optional[str] = None):
+    """Serve the app shell — or the pairing page for an unpaired tablet.
+
+    A pairing link looks like `http://192.168.1.101:5000/?k=<token>`.
+    The token is validated here, parked in an HttpOnly cookie and the URL is
+    rewritten without `?k=` so the secret does not linger in the address bar,
+    the browser history or a screenshot.
+    """
+    if k and not _client_is_local(request) and _LAN_TOKEN:
+        if hmac.compare_digest(k.strip(), _LAN_TOKEN):
+            response = RedirectResponse(url="/", status_code=303)
+            _set_token_cookie(response, k.strip())
+            return response
+        # Wrong token in the link -> fall through to the pairing page, which
+        # shows an explicit "口令不正确" instead of a silent blank screen.
+        return _pairing_page_response(request, error="配对链接里的口令不正确")
+
+    if not _client_is_local(request) and not _token_valid(request):
+        return _pairing_page_response(request)
+
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
         return HTMLResponse("<h1>MicroBench static/index.html not found</h1>", status_code=404)
@@ -446,6 +788,36 @@ async def serve_index():
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
+
+
+@app.get("/manifest.webmanifest")
+async def serve_manifest():
+    """PWA manifest — lets the tablet install the workbench to its home screen."""
+    path = STATIC_DIR / "manifest.webmanifest"
+    if not path.exists():
+        return JSONResponse({"detail": "manifest not found"}, status_code=404)
+    return FileResponse(
+        path,
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/pwa/{filename}")
+async def serve_pwa_asset(filename: str):
+    """Serve the PWA icons (and nothing else) from static/.
+
+    Whitelisted by name — there is no path traversal surface here because
+    the filename never touches the filesystem as a path.
+    """
+    media_type = _PWA_ASSETS.get(filename)
+    if not media_type:
+        raise HTTPException(status_code=404, detail="Not found")
+    path = STATIC_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "max-age=86400"})
+
 
 @app.get("/api/stats")
 def api_stats():
