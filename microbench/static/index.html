@@ -1448,7 +1448,12 @@
       font-size: 1.03em;
     }
     .math-display-block .katex-display { margin: 0 !important; }
-    .math-placeholder.math-inline { display: inline-block; padding: 0 2px; color: var(--fg-strong); }
+    /* 行内公式占位符必须是 inline，不能是 inline-block。
+       inline-block 会开 BFC，KaTeX 的 MathML 节点(<math>)被算进内在宽度，
+       占位符实测比公式本身宽 34px —— 公式两侧就出现两道大空档，读起来像坏了。
+       实测（同一段文本）：inline-block 占位符 50.6px / inline 占位符 20.6px
+       （= 公式 16.6 + 左右内边距 4），后者才是贴合的。 */
+    .math-placeholder.math-inline { display: inline; padding: 0 2px; color: var(--fg-strong); }
     .math-placeholder.math-inline .katex { font-size: 1.02em; }
     .katex { font-family: var(--font-display), "Latin Modern Math", KaTeX_Main, serif !important; color: var(--fg-strong); }
     .katex .mord, .katex .mrel, .katex .mbin,
