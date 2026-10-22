@@ -3141,6 +3141,137 @@ async def api_pdf_snapshot_delete(
     return {"status": "success", "paper_id": paper_id}
 
 
+# ---------------------------------------------------------------------------
+# PDF reading annotations (人工批注 / 笔记)
+# ---------------------------------------------------------------------------
+# 用户在读论文时划选一段原文/译文，写下自己的理解。这些批注要能跨会话保留，
+# 所以落在 logs/_pdf_snapshots/annotations/<paperId>.json —— 跟翻译快照同一个
+# 目录（logs/ 已被 gitignore，不会泄进公开的 Obsidian vault）。
+#
+# 存储结构：整篇论文一个文件，list of items。前端做增删改后整份 PUT，
+# 避免每条批注一次往返（划词标注是高频操作）。
+
+ANNOTATION_MAX_BYTES = 2 * 1024 * 1024
+ANNOTATION_MAX_ITEMS = 500
+ANNOTATION_COLORS = ("yellow", "green", "blue", "pink", "purple")
+
+
+class AnnotationItem(BaseModel):
+    id: str = Field(..., min_length=1, max_length=64)
+    page: int = Field(default=0, ge=0, le=2000,
+                      description="页码；0 = 章节视图（没有页码）")
+    source: str = Field(default="translation", max_length=20,
+                        description="translation=译文里的划选, pdf=原文侧划选")
+    quote: str = Field(..., min_length=1, max_length=4000,
+                       description="被划选的原文片段")
+    note: str = Field(default="", max_length=8000, description="用户自己写的笔记")
+    color: str = Field(default="yellow", max_length=16)
+    created_at: str = Field(default="", max_length=40)
+    updated_at: str = Field(default="", max_length=40)
+
+
+class AnnotationSaveRequest(BaseModel):
+    paper_id: str = Field(..., min_length=3, max_length=128)
+    annotations: list[AnnotationItem] = Field(default_factory=list,
+                                              max_length=ANNOTATION_MAX_ITEMS)
+
+
+def _annotation_path(paper_id: str) -> Path:
+    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    return _snapshot_dir() / "annotations" / f"{safe}.json"
+
+
+@app.get("/api/pdf/annotations/load")
+async def api_pdf_annotations_load(
+    paper_id: str = Query(..., min_length=3, max_length=128),
+):
+    """Load every annotation of one paper. Missing file -> empty list (not 404)."""
+    target = _annotation_path(paper_id)
+    data = _safe_read_json(target)
+    if not data:
+        return {"paper_id": paper_id, "annotations": []}
+    items = data.get("annotations")
+    if not isinstance(items, list):
+        items = []
+    return {"paper_id": paper_id, "annotations": items, "updated_at": data.get("updated_at", "")}
+
+
+@app.post("/api/pdf/annotations/save")
+async def api_pdf_annotations_save(req: AnnotationSaveRequest):
+    """Replace the whole annotation list of one paper (write-through, atomic)."""
+    safe_id = "".join(c for c in req.paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    now = _dt.datetime.now().isoformat(timespec="seconds")
+    items = []
+    seen_ids = set()
+    for a in req.annotations:
+        if a.id in seen_ids:
+            continue          # 同 id 只保留一条（后写的覆盖先写的）
+        seen_ids.add(a.id)
+        if a.color not in ANNOTATION_COLORS:
+            a = a.model_copy(update={"color": "yellow"})
+        items.append(a.model_dump())
+
+    payload = {
+        "paper_id": safe_id,
+        "saved_at": now,
+        "updated_at": now,
+        "schema_version": 1,
+        "annotations": items,
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, indent=1)
+    if len(serialized.encode("utf-8")) > ANNOTATION_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"批注过多(>{ANNOTATION_MAX_BYTES // 1024 // 1024}MB),请先删掉一些",
+        )
+
+    target = _annotation_path(safe_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(serialized, encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception as e:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"批注写盘失败: {e}")
+
+    return {
+        "status": "success",
+        "paper_id": safe_id,
+        "saved": len(items),
+        "updated_at": now,
+    }
+
+
+@app.delete("/api/pdf/annotations/delete")
+async def api_pdf_annotations_delete(
+    paper_id: str = Query(..., min_length=3, max_length=128),
+    annotation_id: str = Query(..., min_length=1, max_length=64),
+):
+    """Delete one annotation by id. Idempotent."""
+    target = _annotation_path(paper_id)
+    data = _safe_read_json(target) or {}
+    items = data.get("annotations") or []
+    kept = [a for a in items if a.get("id") != annotation_id]
+    if len(kept) == len(items):
+        return {"status": "success", "paper_id": paper_id, "deleted": 0}
+    payload = dict(data)
+    payload["annotations"] = kept
+    payload["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批注删除失败: {e}")
+    return {"status": "success", "paper_id": paper_id, "deleted": 1}
+
+
 @app.get("/api/pdf/info")
 async def api_pdf_info(
     relative_path: str = Query(..., min_length=3, max_length=500),

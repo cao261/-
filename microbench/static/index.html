@@ -1285,6 +1285,17 @@
       animation: popInBubble var(--dur-2) var(--ease-in);
     }
     .reader-selection-bubble:hover { transform: translateY(-2px) scale(1.015); }
+    .reader-selection-bubble .bubble-act {
+      background: transparent;
+      border: 0;
+      color: inherit;
+      font: inherit;
+      font-family: var(--font-sans);
+      padding: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .reader-selection-bubble .bubble-act:hover { color: #E8C97A; }
     @keyframes popInBubble {
       from { opacity: 0; transform: translateY(6px) scale(0.95); }
       to   { opacity: 1; transform: translateY(0) scale(1); }
@@ -1341,6 +1352,147 @@
     }
     .reader-qa-panel.minimized { height: 46px !important; }
     .reader-qa-panel.minimized .qa-body { display: none !important; }
+
+    /* ---------- QA panel: 可拖动 + 可缩放 ----------
+       用户在 27 寸屏上嫌它"只在角落里一小块、只能看一部分"：
+       - resize:both 给右下角一个原生缩放手柄（overflow 必须不是 visible）
+       - 拖动由 JS 接管标题栏，位置/尺寸写进 localStorage，下次打开还在
+       拖动/缩放后会从 right/bottom 锚定切成 left/top 锚定。 */
+    .reader-qa-panel {
+      resize: both;
+      overflow: hidden;
+      min-width: 340px;
+      min-height: 220px;
+    }
+    .reader-qa-panel .qa-panel-head { cursor: grab; }
+    .reader-qa-panel.dragging { user-select: none; }
+    .reader-qa-panel.dragging .qa-panel-head { cursor: grabbing; }
+    .reader-qa-panel .qa-resize-tip {
+      position: absolute;
+      right: 4px; bottom: 2px;
+      font-size: 9px;
+      color: var(--fg-subtle);
+      opacity: .55;
+      pointer-events: none;
+    }
+    .reader-qa-panel.dragging .qa-resize-tip { opacity: 0; }
+
+    /* ---------- 阅读批注（高亮 + 个人笔记） ---------- */
+    .anno-mark {
+      background: var(--anno-bg, rgba(250, 204, 21, .38));
+      border-bottom: 2px solid var(--anno-line, rgba(202, 138, 4, .8));
+      border-radius: 2px;
+      padding: 0 1px;
+      cursor: pointer;
+      color: inherit;
+    }
+    .anno-mark:hover { background: var(--anno-bg-h, rgba(250, 204, 21, .62)); }
+    .anno-mark[data-color="yellow"] { --anno-bg: rgba(250,204,21,.38); --anno-bg-h: rgba(250,204,21,.62); --anno-line: rgba(202,138,4,.85); }
+    .anno-mark[data-color="green"]  { --anno-bg: rgba(74,222,128,.34); --anno-bg-h: rgba(74,222,128,.58); --anno-line: rgba(22,163,74,.85); }
+    .anno-mark[data-color="blue"]   { --anno-bg: rgba(96,165,250,.34); --anno-bg-h: rgba(96,165,250,.58); --anno-line: rgba(37,99,235,.85); }
+    .anno-mark[data-color="pink"]   { --anno-bg: rgba(244,114,182,.34); --anno-bg-h: rgba(244,114,182,.58); --anno-line: rgba(219,39,119,.85); }
+    .anno-mark[data-color="purple"] { --anno-bg: rgba(192,132,252,.34); --anno-bg-h: rgba(192,132,252,.58); --anno-line: rgba(147,51,234,.85); }
+    .anno-mark .anno-num {
+      font-size: 9px;
+      vertical-align: super;
+      margin-left: 1px;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--anno-line);
+      user-select: none;
+    }
+    .anno-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      font-size: 10px;
+      padding: 1px 7px;
+      border-radius: 10px;
+      background: rgba(202, 138, 4, .14);
+      color: #8a5a00;
+      border: 1px solid rgba(202, 138, 4, .32);
+      cursor: pointer;
+      font-family: var(--font-sans);
+      white-space: nowrap;
+    }
+    .anno-badge:hover { background: rgba(202, 138, 4, .26); }
+
+    .anno-editor {
+      position: fixed;
+      z-index: 1400;
+      width: 360px;
+      max-width: calc(100vw - 24px);
+      background: var(--surface-raised);
+      border: 1px solid var(--line-hairline);
+      border-radius: var(--r-md);
+      box-shadow: var(--sh-4);
+      padding: var(--s-3);
+      display: none;
+      flex-direction: column;
+      gap: var(--s-2);
+    }
+    .anno-editor-title { font-size: 0.9375rem; font-weight: 600; color: var(--fg-strong); }
+    .anno-quote {
+      font-size: 0.8125rem;
+      line-height: 1.6;
+      color: var(--fg-muted);
+      background: var(--surface-quiet);
+      border-left: 3px solid rgba(202, 138, 4, .55);
+      border-radius: 3px;
+      padding: 6px 9px;
+      max-height: 92px;
+      overflow-y: auto;
+      word-break: break-word;
+    }
+    .anno-color-row { display: flex; gap: 6px; align-items: center; }
+    .anno-swatch {
+      width: 20px; height: 20px; border-radius: 50%;
+      border: 2px solid transparent; cursor: pointer; padding: 0;
+    }
+    .anno-swatch[aria-pressed="true"] { border-color: var(--fg-strong); transform: scale(1.12); }
+    .anno-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+    .anno-drawer {
+      position: fixed;
+      left: var(--s-5);
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 1350;
+      width: 380px;
+      max-width: calc(100vw - 32px);
+      max-height: min(70vh, 640px);
+      background: var(--surface-raised);
+      border: 1px solid var(--line-hairline);
+      border-radius: var(--r-md);
+      box-shadow: var(--sh-4);
+      display: none;
+      flex-direction: column;
+    }
+    .anno-drawer-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: var(--s-3);
+      border-bottom: 1px solid var(--line-hairline);
+      font-weight: 600; color: var(--fg-strong); font-size: 0.9375rem;
+    }
+    .anno-drawer-list { overflow-y: auto; padding: var(--s-2); display: flex; flex-direction: column; gap: 8px; }
+    .anno-item {
+      border: 1px solid var(--line-hairline);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: var(--surface-canvas);
+      cursor: pointer;
+    }
+    .anno-item:hover { border-color: rgba(202,138,4,.5); }
+    .anno-item-quote {
+      font-size: 11.5px; color: var(--fg-muted); font-style: italic;
+      border-left: 3px solid var(--anno-line, rgba(202,138,4,.7));
+      padding-left: 7px; margin-bottom: 5px;
+      max-height: 48px; overflow: hidden;
+    }
+    .anno-item-note { font-size: 12.5px; color: var(--fg-strong); line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+    .anno-item-meta { font-size: 10px; color: var(--fg-subtle); margin-top: 5px; display: flex; gap: 8px; }
+    .anno-empty { padding: var(--s-5); text-align: center; color: var(--fg-subtle); font-size: 12px; }
+
     .qa-panel-head {
       display: flex;
       align-items: center;
@@ -3207,6 +3359,8 @@
       _restoreLocalState();
       _restoreFromHash();
       loadVaultPdfOptions();
+      initReaderQAPanelDrag();
+      initAnnotationFeatures();
       // 支持用链接直接打开仓库里的某篇论文：
       //   http://127.0.0.1:5000/?open_pdf=<vault 相对路径>
       //   http://127.0.0.1:5000/#open_pdf=<vault 相对路径>
@@ -3519,6 +3673,8 @@
           pages: [],
           rendering: { cancelled: false, generation: myGen },
         };
+        // 打开这篇论文的历史批注（高亮 + 我的笔记），下次进来直接可见
+        loadAnnotationsForPaper(paperId);
         // Mark cancelled flag when modal closes. Only ONE watcher may be
         // alive — a setInterval per load leaked one timer per PDF load.
         if (_pdfModalWatcher) clearInterval(_pdfModalWatcher);
@@ -5578,6 +5734,15 @@
           return;
         }
 
+        // 气泡 / 批注编辑器上的点击**不能**重新采集划选状态：
+        // 点「✍ 标注笔记」时 e.target 落在气泡上（不在译文块里），
+        // 若继续往下走会把 _readerSelState 重置成 source="general"、pageNum=null，
+        // 保存时发出 page=0 → 后端 422，批注静默丢失。
+        const bubbleEl = document.getElementById("reader-selection-bubble");
+        if (bubbleEl && bubbleEl.contains(e.target)) return;
+        const annoEditorEl = document.getElementById("anno-editor");
+        if (annoEditorEl && annoEditorEl.contains(e.target)) return;
+
         const sel = window.getSelection();
         const text = sel ? sel.toString().trim() : "";
         const bubble = document.getElementById("reader-selection-bubble");
@@ -5691,6 +5856,426 @@
         submitReaderQA();
       } else {
         document.getElementById("qa-question-input").focus();
+      }
+      initReaderQAPanelDrag();
+    }
+
+    // ===========================================================================
+    // 划词答疑面板：拖动 / 缩放 / 位置记忆
+    // ===========================================================================
+    // 用户在 27 寸屏上嫌它"只在角落里一小块、只能看一部分"。现在：
+    //   - 拖标题栏移动（位置写进 localStorage，下次打开还在原位）
+    //   - 右下角原生手柄缩放（尺寸同样记住）
+    const _qaGeo = { drag: null };
+
+    function _qaPanelStorageKey() { return "microbench.qaPanel.geometry"; }
+
+    function saveReaderQAPanelGeometry() {
+      const panel = document.getElementById("reader-qa-panel");
+      if (!panel) return;
+      try {
+        const r = panel.getBoundingClientRect();
+        localStorage.setItem(_qaPanelStorageKey(), JSON.stringify({
+          left: Math.round(r.left), top: Math.round(r.top),
+          width: Math.round(r.width), height: Math.round(r.height),
+        }));
+      } catch (e) { /* localStorage 不可用（隐私模式）时静默降级 */ }
+    }
+
+    function restoreReaderQAPanelGeometry() {
+      const panel = document.getElementById("reader-qa-panel");
+      if (!panel) return;
+      let g = null;
+      try { g = JSON.parse(localStorage.getItem(_qaPanelStorageKey()) || "null"); } catch (e) { g = null; }
+      if (!g) return;
+      if (g.width)  panel.style.width  = Math.max(340, Math.min(g.width,  window.innerWidth - 24)) + "px";
+      if (g.height) panel.style.height = Math.max(220, Math.min(g.height, window.innerHeight - 24)) + "px";
+      if (typeof g.left === "number" && typeof g.top === "number") {
+        const x = Math.max(0, Math.min(g.left, window.innerWidth - 80));
+        const y = Math.max(0, Math.min(g.top, window.innerHeight - 50));
+        panel.style.right = "auto"; panel.style.bottom = "auto";
+        panel.style.left = x + "px"; panel.style.top = y + "px";
+      }
+    }
+
+    function initReaderQAPanelDrag() {
+      const panel = document.getElementById("reader-qa-panel");
+      if (!panel) return;
+      const head = panel.querySelector(".qa-panel-head");
+      if (!head || head.dataset.dragBound === "1") return;
+      head.dataset.dragBound = "1";
+
+      head.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        if (e.target.closest("button, input, textarea, select")) return;
+        const r = panel.getBoundingClientRect();
+        _qaGeo.drag = { sx: e.clientX, sy: e.clientY, ox: r.left, oy: r.top };
+        // 从 right/bottom 锚定切成 left/top 锚定：之后位置完全由我们说了算
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+        panel.style.left = r.left + "px";
+        panel.style.top = r.top + "px";
+        panel.classList.add("dragging");
+        e.preventDefault();
+      });
+
+      document.addEventListener("mousemove", (e) => {
+        const d = _qaGeo.drag;
+        if (!d) return;
+        const x = Math.max(0, Math.min(window.innerWidth - 60, d.ox + e.clientX - d.sx));
+        const y = Math.max(0, Math.min(window.innerHeight - 40, d.oy + e.clientY - d.sy));
+        panel.style.left = x + "px";
+        panel.style.top = y + "px";
+      });
+
+      document.addEventListener("mouseup", () => {
+        if (!_qaGeo.drag) return;
+        _qaGeo.drag = null;
+        panel.classList.remove("dragging");
+        saveReaderQAPanelGeometry();
+      });
+      // CSS resize 拖完也要落盘（鼠标在面板内松开）
+      panel.addEventListener("mouseup", saveReaderQAPanelGeometry);
+      restoreReaderQAPanelGeometry();
+    }
+
+    // ===========================================================================
+    // 阅读批注：在原文/译文上高亮一段，并写下自己的理解
+    // ===========================================================================
+    // 数据落在服务端 logs/_pdf_snapshots/annotations/<paperId>.json，
+    // 跨会话保留 —— 下次点开同一篇论文，高亮和笔记自动回来。
+    const _annoState = { paperId: null, items: [], editingId: null, color: "yellow" };
+    const _ANNO_COLORS = [
+      { id: "yellow", hex: "#FACC15" },
+      { id: "green",  hex: "#4ADE80" },
+      { id: "blue",   hex: "#60A5FA" },
+      { id: "pink",   hex: "#F472B6" },
+      { id: "purple", hex: "#C084FC" },
+    ];
+
+    function _annoPaperId() {
+      return (_pdfState && _pdfState.paperId) || null;
+    }
+
+    function _annoSeq(id) {
+      // 序号按创建顺序排，页面上显示成 ①②③
+      const idx = _annoState.items.findIndex(a => a.id === id);
+      return idx >= 0 ? idx + 1 : 0;
+    }
+
+    async function loadAnnotationsForPaper(paperId) {
+      const pid = paperId || _annoPaperId();
+      if (!pid) return;
+      _annoState.paperId = pid;
+      try {
+        const r = await fetch("/api/pdf/annotations/load?paper_id=" + encodeURIComponent(pid));
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        _annoState.items = Array.isArray(data.annotations) ? data.annotations : [];
+      } catch (e) {
+        _annoState.items = [];
+      }
+      refreshAnnoBadges();
+      reapplyAnnotations();
+    }
+
+    async function saveAnnotationsToServer() {
+      const pid = _annoPaperId();
+      if (!pid) return false;
+      try {
+        const r = await fetch("/api/pdf/annotations/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ paper_id: pid, annotations: _annoState.items }),
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return true;
+      } catch (e) {
+        showToast("批注保存失败: " + (e.message || e), true);
+        return false;
+      }
+    }
+
+    function renderAnnoColorPicker() {
+      const row = document.getElementById("anno-color-row");
+      if (!row) return;
+      row.innerHTML = "";
+      _ANNO_COLORS.forEach(c => {
+        const b = document.createElement("button");
+        b.className = "anno-swatch";
+        b.style.background = c.hex;
+        b.title = c.id;
+        b.setAttribute("aria-pressed", _annoState.color === c.id ? "true" : "false");
+        b.onclick = () => {
+          _annoState.color = c.id;
+          renderAnnoColorPicker();
+          const mk = document.querySelector(".anno-mark.is-editing");
+          if (mk) mk.dataset.color = c.id;
+        };
+        row.appendChild(b);
+      });
+    }
+
+    function openAnnotationEditor(annoId) {
+      const editor = document.getElementById("anno-editor");
+      if (!editor) return;
+      const quoteEl = document.getElementById("anno-quote");
+      const noteEl = document.getElementById("anno-note");
+      const titleEl = document.getElementById("anno-editor-title");
+      const delBtn = document.getElementById("anno-delete-btn");
+      const sel = _readerSelState || {};
+
+      if (annoId) {
+        const a = _annoState.items.find(x => x.id === annoId);
+        if (!a) return;
+        _annoState.editingId = annoId;
+        _annoState.color = a.color || "yellow";
+        if (quoteEl) quoteEl.textContent = a.quote;
+        if (noteEl) noteEl.value = a.note || "";
+        if (titleEl) titleEl.textContent = "✍ 编辑批注";
+        if (delBtn) delBtn.style.display = "inline-block";
+      } else {
+        const quote = (sel.text || "").trim();
+        if (!quote) { showToast("请先划选一段文字再标注", true); return; }
+        _annoState.editingId = null;
+        _annoState.color = "yellow";
+        if (quoteEl) quoteEl.textContent = quote;
+        if (noteEl) noteEl.value = "";
+        if (titleEl) titleEl.textContent = "✍ 新建批注";
+        if (delBtn) delBtn.style.display = "none";
+      }
+
+      // 位置：贴着划词气泡（没有气泡就放屏幕中间偏上）
+      const bubble = document.getElementById("reader-selection-bubble");
+      const br = (bubble && bubble.style.display !== "none") ? bubble.getBoundingClientRect() : null;
+      const x = br ? br.left : Math.max(12, (window.innerWidth - 360) / 2);
+      const y = br ? br.bottom + 8 : Math.max(12, (window.innerHeight - 320) / 2);
+      editor.style.left = Math.max(12, Math.min(x, window.innerWidth - 372)) + "px";
+      editor.style.top = Math.max(12, Math.min(y, window.innerHeight - 300)) + "px";
+      editor.style.display = "flex";
+      renderAnnoColorPicker();
+      if (noteEl) noteEl.focus();
+    }
+
+    function closeAnnotationEditor() {
+      const editor = document.getElementById("anno-editor");
+      if (editor) editor.style.display = "none";
+      _annoState.editingId = null;
+    }
+
+    async function saveAnnotation() {
+      const pid = _annoPaperId();
+      if (!pid) { showToast("请先打开一篇论文再标注", true); return; }
+      const quote = (document.getElementById("anno-quote")?.textContent || "").trim();
+      const note = (document.getElementById("anno-note")?.value || "").trim();
+      if (!quote) return;
+      const now = new Date().toISOString();
+      const sel = _readerSelState || {};
+      const page = (sel.pageNum != null) ? sel.pageNum : 0;
+      const id = _annoState.editingId
+        || ("a" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+
+      const existing = _annoState.items.find(x => x.id === id);
+      if (existing) {
+        existing.quote = quote;
+        existing.note = note;
+        existing.color = _annoState.color;
+        existing.updated_at = now;
+      } else {
+        _annoState.items.push({
+          id, page,
+          source: sel.source || "translation",
+          quote, note, color: _annoState.color,
+          created_at: now, updated_at: now,
+        });
+      }
+      const ok = await saveAnnotationsToServer();
+      if (!ok) return;
+      closeAnnotationEditor();
+      refreshAnnoBadges();
+      reapplyAnnotations();
+      showToast(existing ? "批注已更新 ✓" : "批注已保存 · 下次打开还在 ✓");
+    }
+
+    async function deleteCurrentAnnotation() {
+      const id = _annoState.editingId;
+      if (!id) return;
+      const before = _annoState.items.length;
+      _annoState.items = _annoState.items.filter(a => a.id !== id);
+      if (_annoState.items.length === before) return;
+      const ok = await saveAnnotationsToServer();
+      closeAnnotationEditor();
+      refreshAnnoBadges();
+      reapplyAnnotations();
+      if (ok) showToast("批注已删除");
+    }
+
+    // 把某页译文里的引文包进 <mark>。只匹配普通文本节点，跳过公式内部，
+    // 避免把 KaTeX 的 MathML 文本也当成正文去高亮。
+    function _wrapTextWithMark(container, quote, id, color) {
+      if (!container || !quote || quote.length < 2) return false;
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+        acceptNode: function (node) {
+          if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+          const p = node.parentElement;
+          if (!p) return NodeFilter.FILTER_REJECT;
+          if (p.closest(".katex, .math-placeholder, .anno-mark, script, style")) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      let node;
+      while ((node = walker.nextNode())) {
+        const idx = node.nodeValue.indexOf(quote);
+        if (idx === -1) continue;
+        const range = document.createRange();
+        range.setStart(node, idx);
+        range.setEnd(node, idx + quote.length);
+        const mark = document.createElement("mark");
+        mark.className = "anno-mark";
+        mark.dataset.annoId = id;
+        mark.dataset.color = color || "yellow";
+        mark.title = "点击查看 / 编辑这条批注";
+        try {
+          range.surroundContents(mark);
+        } catch (err) {
+          continue;
+        }
+        const sup = document.createElement("sup");
+        sup.className = "anno-num";
+        sup.textContent = String(_annoSeq(id));
+        mark.appendChild(sup);
+        return true;
+      }
+      return false;
+    }
+
+    function _clearAnnoMarks(container) {
+      if (!container) return;
+      container.querySelectorAll(".anno-mark").forEach(mark => {
+        const sup = mark.querySelector(".anno-num");
+        if (sup) sup.remove();
+        const parent = mark.parentNode;
+        if (!parent) return;
+        while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+        parent.removeChild(mark);
+        parent.normalize();
+      });
+    }
+
+    function applyAnnotationsToPage(pageNum, container) {
+      if (!container) return 0;
+      let applied = 0;
+      _annoState.items.forEach(a => {
+        if (a.page !== pageNum) return;
+        if (_wrapTextWithMark(container, a.quote, a.id, a.color)) applied++;
+      });
+      return applied;
+    }
+
+    function reapplyAnnotations() {
+      document.querySelectorAll(".pdf-translation-block").forEach(block => {
+        const m = block.id.match(/(\d+)$/);
+        if (!m) return;
+        const textEl = block.querySelector(".page-text");
+        if (!textEl) return;
+        _clearAnnoMarks(textEl);
+        applyAnnotationsToPage(parseInt(m[1], 10), textEl);
+      });
+      // 章节视图（没有页码，page=0）
+      const secEl = document.getElementById("reader-translation");
+      if (secEl) {
+        _clearAnnoMarks(secEl);
+        applyAnnotationsToPage(0, secEl);
+      }
+      // 页块可能是这次才渲染出来的（快照恢复 / 排队翻译），
+      // 徽标必须跟着重算一次，否则高亮有了、页头的「📝 N」却是空的
+      refreshAnnoBadges();
+    }
+
+    function refreshAnnoBadges() {
+      document.querySelectorAll(".pdf-translation-block").forEach(block => {
+        const m = block.id.match(/(\d+)$/);
+        if (!m) return;
+        const pageNum = parseInt(m[1], 10);
+        const count = _annoState.items.filter(a => a.page === pageNum).length;
+        const head = block.querySelector(".page-num");
+        if (!head) return;
+        let badge = head.querySelector(".anno-badge");
+        if (!count) { if (badge) badge.remove(); return; }
+        if (!badge) {
+          badge = document.createElement("button");
+          badge.className = "anno-badge";
+          badge.onclick = (e) => { e.stopPropagation(); openAnnoDrawer(pageNum); };
+          head.appendChild(badge);
+        }
+        badge.textContent = "📝 " + count;
+        badge.title = "本页有 " + count + " 条批注 · 点击查看";
+      });
+    }
+
+    function openAnnoDrawer(pageNum) {
+      const drawer = document.getElementById("anno-drawer");
+      const list = document.getElementById("anno-drawer-list");
+      const countEl = document.getElementById("anno-drawer-count");
+      if (!drawer || !list) return;
+      const items = _annoState.items.slice().sort((a, b) => (a.page || 0) - (b.page || 0));
+      if (countEl) countEl.textContent = items.length ? "(" + items.length + " 条)" : "";
+      list.innerHTML = "";
+      if (!items.length) {
+        list.innerHTML = '<div class="anno-empty">还没有批注。<br>在左侧 PDF 或右侧译文里划选一段文字，点「✍ 标注笔记」即可。</div>';
+      } else {
+        items.forEach(a => {
+          const el = document.createElement("div");
+          el.className = "anno-item";
+          const color = _ANNO_COLORS.find(c => c.id === a.color);
+          el.innerHTML =
+            '<div class="anno-item-quote" style="--anno-line:' + ((color && color.hex) || "#FACC15") + '">'
+            + escapeHtml(a.quote) + '</div>'
+            + (a.note ? '<div class="anno-item-note">' + escapeHtml(a.note) + '</div>' : '<div class="anno-item-note" style="color:var(--fg-subtle);font-style:italic;">（只高亮，没有笔记）</div>')
+            + '<div class="anno-item-meta"><span>' + (a.page > 0 ? "第 " + a.page + " 页" : "章节视图") + '</span><span>' + escapeHtml((a.updated_at || a.created_at || "").slice(0, 10)) + '</span></div>';
+          el.onclick = () => {
+            if (a.page > 0) {
+              const block = document.getElementById("pdf-trans-block-" + a.page);
+              if (block) block.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+            openAnnotationEditor(a.id);
+          };
+          list.appendChild(el);
+        });
+      }
+      drawer.style.display = "flex";
+      if (pageNum) {
+        const el = list.querySelector(".anno-item");
+        if (el) el.scrollIntoView({ block: "nearest" });
+      }
+    }
+
+    function toggleAnnoDrawer(pageNum) {
+      const drawer = document.getElementById("anno-drawer");
+      if (!drawer) return;
+      if (drawer.style.display === "flex") { drawer.style.display = "none"; return; }
+      openAnnoDrawer(pageNum);
+    }
+
+    function initAnnotationFeatures() {
+      // 点高亮 → 编辑对应批注
+      document.addEventListener("click", (e) => {
+        const mark = e.target.closest(".anno-mark");
+        if (mark) {
+          e.preventDefault();
+          e.stopPropagation();
+          openAnnotationEditor(mark.dataset.annoId);
+        }
+      });
+      // 译文内容变化（翻译完成 / 快照恢复）后自动重放高亮
+      const list = document.getElementById("pdf-translations-list");
+      if (list && list.dataset.annoObs !== "1") {
+        list.dataset.annoObs = "1";
+        const obs = new MutationObserver(() => {
+          if (!_annoState.items.length) return;
+          setTimeout(reapplyAnnotations, 80);
+        });
+        obs.observe(list, { childList: true, subtree: true, characterData: true });
       }
     }
 
@@ -6622,8 +7207,9 @@
       </div>
 
       <!-- ---------------------- Floating affordances ---------------------- -->
-      <div id="reader-selection-bubble" class="reader-selection-bubble" onclick="openReaderQAPanel()">
-        <span>问 AI 解答</span>
+      <div id="reader-selection-bubble" class="reader-selection-bubble">
+        <button class="bubble-act" onclick="openReaderQAPanel()">💬 问 AI 解答</button>
+        <button class="bubble-act" onclick="openAnnotationEditor()">✍ 标注笔记</button>
         <span class="bubble-count" id="reader-sel-bubble-count"></span>
       </div>
 
@@ -6689,6 +7275,34 @@
             </div>
           </div>
         </div>
+        <div class="qa-resize-tip">◢ 拖右下角可缩放 · 拖标题栏可移动</div>
+      </div>
+
+      <!-- ---------- 阅读批注：编辑器 + 笔记抽屉 ---------- -->
+      <div id="anno-editor" class="anno-editor">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div id="anno-editor-title" class="anno-editor-title">✍ 新建批注</div>
+          <button class="btn-zoom-toggle" onclick="closeAnnotationEditor()" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <div id="anno-quote" class="anno-quote"></div>
+        <div class="anno-color-row" id="anno-color-row"></div>
+        <textarea id="anno-note" class="field-textarea" rows="3"
+                  placeholder="写下你的理解、疑问或结论（可留空，只高亮）…"></textarea>
+        <div class="anno-editor-actions">
+          <button id="anno-delete-btn" class="btn-ghost" onclick="deleteCurrentAnnotation()" style="display:none;">🗑 删除</button>
+          <button class="btn-ghost" onclick="closeAnnotationEditor()">取消</button>
+          <button class="btn-pill" onclick="saveAnnotation()">保存批注</button>
+        </div>
+      </div>
+
+      <div id="anno-drawer" class="anno-drawer">
+        <div class="anno-drawer-head">
+          <span>📝 我的批注 <span id="anno-drawer-count" class="qa-panel-sub"></span></span>
+          <div class="row gap-1">
+            <button class="btn-zoom-toggle" onclick="toggleAnnoDrawer()" title="关闭" aria-label="关闭">×</button>
+          </div>
+        </div>
+        <div id="anno-drawer-list" class="anno-drawer-list"></div>
       </div>
 
     </div>
