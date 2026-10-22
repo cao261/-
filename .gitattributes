@@ -2,12 +2,19 @@
 # 从而在 git 合并时产生「整文件冲突」（每个字节都不同）。
 #
 # `text=auto eol=lf`：文本文件统一以 LF 存入仓库、以 LF 出现在工作区。
-# 例外：.bat 脚本在 cmd.exe 下必须保持 CRLF，用 `-text` 让 git 原样存取，
-#       不做任何转换（否则每次提交都会冒出一整个文件的假 diff）。
+#
+# 例外：`.bat` 必须反过来 —— 仓库里存 LF（保证跨平台 diff 干净），
+# 但**检出到工作区时必须是 CRLF**。cmd.exe 解析 LF-only 批处理会按字节
+# 偏移读错位置，把 "rt" / "goto :READY" 这类片段当命令执行，
+# 脚本直接跑飞（表现：双击快捷方式毫无反应）。
+# `eol=crlf` 由 git 在检出时保证，本机的 core.autocrlf=false 也不会影响。
+#
+# 注意：.bat 必须用 `text eol=crlf`（而不是 `-text`）。`-text` 是"原样存取"，
+# 仓库里存成什么样就检出成什么样 —— 那等于把上面那个坑固化下来。
 
 * text=auto eol=lf
 
-*.bat -text
+*.bat text eol=crlf
 *.ico binary
 *.png binary
 *.pdf binary
