@@ -61,6 +61,7 @@ _Templates/
 /_*.py
 /_*.txt
 /_audit_*.md
+/_*.md
 /_*.log
 /_*.ps1
 

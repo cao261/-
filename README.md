@@ -42,9 +42,14 @@
 3. 若 5000 端口已被本工作台占用，则直接开浏览器，不会重复起进程；
 4. **核心功能**：
    - 📖 **文献一键抓取与建档**：输入 arXiv ID 或 DOI（如 `2303.15982` 或 `10.1038/nature14539`），一键自动获取标题、作者、摘要并生成结构化 Markdown 精读卡片；
+   - 📂 **从仓库论文库直接开读**：下拉框一键列出 `01_Literature/**/01_论文原文_PDF/` 里的论文，选中即进入双栏精读（**不复制文件**）；也可用深链 `http://127.0.0.1:5000/?open_pdf=<vault 相对路径>` 直接打开某篇；
    - 🧪 **复现工程脚手架生成**：输入项目名称，自动生成包含 `configs/`、`scripts/`、`data/`、`plots/` 与基准对齐 `README.md` 的标准化工程；
    - 🛠️ **科研避坑速记**：随时沉淀遇到的 TCAD 收敛发散、EDA 库依赖、CUDA 与 Linux 环境报错；
    - 📊 **一键生成组会周报**：自动汇总近 7 天的工作进展，生成规范 Markdown 周报草稿。
+
+> **模板从哪来**：`_Templates/` 属于你的 Obsidian vault（被 gitignore），但 `microbench/templates/`
+> 里随代码带了一份**同款副本**。vault 里没有 → 自动用包内副本（全新克隆不会 500）；
+> vault 里有 → 用你的版本，服务启动时只补缺失的，**绝不覆盖你改过的模板**。
 
 > **AI 功能需要配置模型 Key**：复制根目录 `.env.example` 为 `.env`（本机已复制好），
 > 填入 `LLM_API_KEY`（主模型）或 `AGNES_API_KEY`（备用模型）后重启服务即可启用文献解读与翻译。
@@ -86,6 +91,24 @@ LLM_TRANSLATION_DEADLINE=180               # 单次翻译请求的总时限（�
 - 翻译结果按 (章节, 文本哈希, 模型) 缓存。换模型或改提示词后缓存键会变，
   不会命中旧结果；但**只改代码不换模型**时，旧译文仍在内存缓存里，
   重启服务即可清空。
+
+### 🔍 翻译完整性：为什么「有的翻译有的不翻译」被治好了
+
+模型「整段漏译」是提示词管不住的行为，所以校验放在**服务端**：
+
+1. 提示词要求**逐句翻译**，并点名「页眉版权行 / 作者单位 / 章节标题 / 图表说明 / 编辑收稿信息」必须译；
+2. 译完扫描译文，找出**成段没翻译的英文**（判据：连续 ≥8 个英文词且含小写实词，
+   避开人名机构名与图表引用的误报）；
+3. 检出漏译就带着**漏译清单**重译一次；重译失败保留第一版，不让整个请求失败；
+4. 结果里带 `untranslated_runs` 计数（正常为 0）。
+
+配套的两个细节：
+
+- **「重新翻译」必须真的重译**：翻译端点带 `force` 参数跳过读缓存。
+  没有它时，用户点了「重新翻译」服务端直接命中旧缓存返回同一份坏译文，
+  看起来像按钮没生效。
+- **翻译用 `temperature=0`**：同一段原文每次都该得到同一份译文，否则措辞一变，
+  混着未译的元信息，看着就像「时翻时不翻」。
 
 ---
 
@@ -176,7 +199,7 @@ python microbench/export_offline.py "D:/OneDrive/MicroBench.html"
 │
 ├── 04_Weekly_Reports/          # 历次组会周报沉淀归档
 │
-├── _Templates/                 # Obsidian 专业模版库
+├── _Templates/                 # Obsidian 专业模版库 (本地私有, 服务启动时自动补齐)
 │   ├── 01_Literature_Note_Template.md      # 微电子专属精读卡片模版
 │   ├── 02_TCAD_Reproduction_Template.md    # TCAD 物理仿真复现模版
 │   ├── 03_EDA_Circuit_Reproduction_Template.md # IC设计与EDA复现模版
@@ -187,6 +210,8 @@ python microbench/export_offline.py "D:/OneDrive/MicroBench.html"
 │   ├── app.py                  # 后端 API + 鉴权/跨站守卫
 │   ├── lan.py                  # 局域网模式: 口令与 IP 解析
 │   ├── export_offline.py       # 导出单文件离线阅读版
+│   ├── translation.py          # 翻译管线: 分块 / 拼接去重 / LaTeX 清洗 / 漏译检出
+│   ├── templates/              # 随代码走的模版副本 (vault 缺模板时的兜底)
 │   ├── static/
 │   │   ├── index.html          # 主界面 (单文件前端: 工作台 + PDF 双栏阅读器 + AI 答疑)
 │   │   ├── pair.html           # 平板配对口令页
@@ -226,6 +251,22 @@ npm install katex@0.16.11 pdfjs-dist@3.11.174 --prefix microbench/_vendor --regi
 
 `index.html` 采用「本地优先 + CDN 兜底」：本地文件缺失（全新克隆未执行上述脚本）
 时仍会回退到 CDN，不会因为目录变动再次出现空白阅读器。
+
+---
+
+## 🧪 开发与自检
+
+```bash
+pip install -r requirements.txt          # 含 pytest / markdown 等全部依赖
+
+python -m pytest tests -v                # 端点 / 安全 / 翻译鲁棒性 (161 项)
+python -m microbench._test_regressions    # 回归守卫 (40 项)
+python -m microbench._test_lan            # 局域网模式守卫 (39 项)
+python -m microbench._test_offline_export # 离线导出 (需先生成离线 HTML)
+```
+
+> 测试用的 vault 是**临时目录**（`tests/conftest.py` 的 `sandbox` fixture），
+> 不会写到你的真实 vault；真实 vault 只被只读用例碰。
 
 ---
 
