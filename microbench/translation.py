@@ -4,6 +4,10 @@ Translation utilities for MicroBench.
 Provides:
 - chunk_section_text(): split long sections into LLM-friendly chunks at
   paragraph boundaries, with overlap to preserve context continuity.
+- merge_translation_parts(): stitch chunk translations back together without
+  the duplicated sentences that the overlap window would otherwise cause.
+- sanitize_translation(): repair LaTeX the model over-escaped, and normalize
+  inline/display math delimiters into the $...$ / $$...$$ the frontend renders.
 - TranslationCache: in-memory LRU cache for translations, keyed by section
   text hash + section_key + model name. Skips redundant LLM calls when the
   user re-clicks translate or reopens a paper.
@@ -12,6 +16,7 @@ Provides:
 import hashlib
 import re
 from collections import OrderedDict
+from difflib import SequenceMatcher
 from threading import Lock
 from typing import Optional
 
@@ -94,8 +99,43 @@ def chunk_section_text(text: str,
 
 
 def _split_oversized(para: str, hard_max: int) -> list[str]:
-    """Split a single paragraph that exceeds hard_max on sentence ends."""
-    sentences = re.split(r"(?<=[.!?])\s+", para)
+    """
+    Split a single paragraph that exceeds hard_max.
+
+    Order matters: try hard line breaks first (PDF text keeps the paper's
+    line layout, so a line break is the most natural cut), then fall back to
+    sentence ends. Cutting mid-line makes the model stitch unrelated
+    sentences together and produces garbled output.
+    """
+    # 1) Prefer line breaks — PDF 抽取的文本保留了论文的换行
+    lines = [ln.strip() for ln in para.split("\n") if ln.strip()]
+    if len(lines) > 1:
+        groups: list[str] = []
+        cur: list[str] = []
+        cur_len = 0
+        for ln in lines:
+            if cur and cur_len + len(ln) + 1 > hard_max:
+                groups.append("\n".join(cur))
+                cur, cur_len = [], 0
+            cur.append(ln)
+            cur_len += len(ln) + 1
+        if cur:
+            groups.append("\n".join(cur))
+        # 2) 仍然超长的组按句子切
+        out: list[str] = []
+        for g in groups:
+            if len(g) <= hard_max:
+                out.append(g)
+            else:
+                out.extend(_split_on_sentences(g, hard_max))
+        return out
+
+    return _split_on_sentences(para, hard_max)
+
+
+def _split_on_sentences(para: str, hard_max: int) -> list[str]:
+    """Split a paragraph on sentence ends (no line breaks available)."""
+    sentences = re.split(r"(?<=[.!?。！？])\s+", para)
     out: list[str] = []
     cur: list[str] = []
     cur_len = 0
@@ -111,7 +151,12 @@ def _split_oversized(para: str, hard_max: int) -> list[str]:
 
 
 def _tail_overlap(text: str, overlap: int) -> str:
-    """Return the last `overlap` chars of `text` (rounded to word boundary)."""
+    """
+    Return the tail of `text` (~`overlap` chars) as complete sentences.
+
+    Cutting the overlap mid-sentence makes the model translate a fragment
+    twice, which shows up in the final page as a duplicated half-sentence.
+    """
     if len(text) <= overlap:
         return text
     tail = text[-overlap:]
@@ -119,7 +164,289 @@ def _tail_overlap(text: str, overlap: int) -> str:
     space = tail.find(" ")
     if space > 0 and space < overlap // 2:
         tail = tail[space + 1:]
-    return tail
+    # Prefer starting at a sentence boundary when one is close enough
+    m = list(re.finditer(r"(?<=[.!?。！？])\s+", tail))
+    if m and m[0].start() < overlap * 0.4:
+        tail = tail[m[0].end():]
+    return tail.strip()
+
+
+# ---------------------------------------------------------------------------
+# Merging chunk translations (removing overlap duplication)
+# ---------------------------------------------------------------------------
+
+# 判定重复的最小字符数。太短容易误判（中文单字重复率很高）。
+_DUP_MIN_CHARS = 16
+_DUP_WINDOW = 600
+
+# 段落级重复判定：相似度阈值 + 最多比对几段。
+_DUP_PARA_RATIO = 0.72
+_DUP_PARA_MAX = 4
+
+
+def _split_paragraphs(text: str) -> list[tuple[str, str]]:
+    """Split into (content, separator) pairs so we can drop leading ones."""
+    pieces = re.split(r"(\n\s*\n)", text)
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(pieces):
+        content = pieces[i]
+        sep = pieces[i + 1] if i + 1 < len(pieces) else ""
+        if content.strip():
+            out.append((content, sep))
+        i += 2
+    return out
+
+
+def _duplicate_paragraph_count(prev: str, nxt: str) -> int:
+    """
+    How many leading paragraphs of `nxt` repeat the tail of `prev`.
+
+    The overlap window makes the model translate the same source region
+    twice, but the two renderings differ slightly ("获批" vs "批准通过",
+    "D. Johnson" vs "Johnson"), so an exact character match misses it.
+    Comparing whole paragraphs with a similarity ratio catches it.
+    """
+    prev_ps = [p.strip() for p in prev.split("\n\n") if p.strip()]
+    next_ps = [p.strip() for p in nxt.split("\n\n") if p.strip()]
+    if not prev_ps or not next_ps:
+        return 0
+
+    for k in range(min(_DUP_PARA_MAX, len(prev_ps), len(next_ps)), 0, -1):
+        a = " ".join(prev_ps[-k:])
+        for j in range(min(_DUP_PARA_MAX, len(next_ps)), 0, -1):
+            b = " ".join(next_ps[:j])
+            if not a or not b:
+                continue
+            if SequenceMatcher(None, a, b).ratio() >= _DUP_PARA_RATIO:
+                return j
+    return 0
+
+
+def _duplicate_prefix_len(prev: str, nxt: str,
+                          window: int = _DUP_WINDOW) -> int:
+    """
+    Length of `nxt`'s prefix that repeats the tail of `prev`.
+
+    Character-level fallback for overlaps that land mid-paragraph.
+    """
+    if not prev or not nxt:
+        return 0
+    tail = prev[-window:]
+    head = nxt[:window]
+    if not tail or not head:
+        return 0
+    sm = SequenceMatcher(None, tail, head, autojunk=False)
+    m = sm.find_longest_match(0, len(tail), 0, len(head))
+    if m.size < _DUP_MIN_CHARS:
+        return 0
+    # 命中必须贴着 head 的开头，且几乎延伸到 tail 的结尾
+    if m.b > 40 or m.a + m.size < len(tail) - 60:
+        return 0
+    return m.b + m.size
+
+
+def merge_translation_parts(parts: list[str]) -> str:
+    """
+    Join chunk translations, dropping the text the overlap made redundant.
+
+    Without this, a page split into 2+ chunks shows the overlap paragraph
+    twice — the reader sees the same passage appear again out of place,
+    which looks exactly like "翻译翻了一半又跳回去".
+    """
+    merged = ""
+    for raw in parts:
+        # 先归一化换行符：模型常返回 CRLF，而下面的段落切分用的是 "\n\n"，
+        # CRLF 下切不开，段落级去重会完全失效。
+        part = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not part:
+            continue
+        if not merged:
+            merged = part
+            continue
+
+        # 先按段落去重（能扛住措辞差异），失败再退回字符级
+        dup_paras = _duplicate_paragraph_count(merged, part)
+        if dup_paras:
+            blocks = _split_paragraphs(part)
+            part = "".join(c + s for c, s in blocks[dup_paras:]).strip()
+        else:
+            dup = _duplicate_prefix_len(merged, part)
+            if dup and dup < len(part):
+                part = part[dup:].lstrip()
+
+        if not part:
+            continue
+        merged = f"{merged}\n\n{part}"
+    return merged.strip()
+
+
+# ---------------------------------------------------------------------------
+# Translation output sanitizing
+# ---------------------------------------------------------------------------
+
+# 模型偶尔把 LaTeX 写成"过度转义"的形式：
+#     \alpha_{\mathrm{ME}}      → \/alpha_\{\mathrm{ME}\}
+#     \mathrm{V/cm\text{-}Oe}  → \mathrm{V\/cm\text{-}Oe}
+# KaTeX 解析不了这种写法，整条公式会被原样用红字显示出来 —— 用户在页面上
+# 看到的就是一串 \/ 和 \{ 的乱码。这里把它们还原成合法 LaTeX。
+_MATH_SPAN_RE = re.compile(r"\$\$(.+?)\$\$|\$([^\$\n]+?)\$", re.DOTALL)
+
+# 常见的 LaTeX 命令。用来判断"这串东西是公式"以及"被转义坏掉的命令"，
+# 而不是去乱猜正文里的反斜杠。
+_LATEX_COMMANDS = {
+    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+    "iota", "kappa", "lambda", "mu", "nu", "xi", "rho", "sigma", "tau",
+    "upsilon", "phi", "chi", "psi", "omega", "varphi", "vartheta",
+    "Gamma", "Delta", "Theta", "Lambda", "Xi", "Sigma", "Phi", "Psi", "Omega",
+    "mathrm", "mathbf", "mathit", "mathcal", "mathbb", "mathsf", "boldsymbol",
+    "text", "textbf", "textit", "operatorname", "overline", "underline",
+    "frac", "dfrac", "tfrac", "sqrt", "sum", "prod", "int", "oint", "lim",
+    "log", "ln", "exp", "sin", "cos", "tan", "cot", "sec", "csc", "arcsin",
+    "cdot", "cdots", "ldots", "times", "div", "approx", "neq", "equiv",
+    "leq", "geq", "ll", "gg", "subset", "subseteq", "supset", "supseteq",
+    "cup", "cap", "in", "notin", "ni", "pm", "mp", "rightarrow", "leftarrow",
+    "leftrightarrow", "Rightarrow", "Leftarrow", "to", "infty", "partial",
+    "nabla", "forall", "exists", "propto", "sim", "cong", "doteq",
+    "left", "right", "big", "Big", "bigg", "Bigg", "quad", "qquad",
+    "begin", "end", "mathrm", "circ", "degree", "prime", "hbar", "ell",
+}
+
+# "\/alpha" → "\alpha"：斜杠紧跟一个已知 LaTeX 命令时，它是坏掉的反斜杠。
+# 注意不能用 \b 做词边界："alpha_" 后面跟的是下划线（属于单词字符），
+# \b 在那里不成立，会导致整条规则永远匹配不上。
+_LATEX_CMD_ALT = "|".join(sorted(_LATEX_COMMANDS, key=len, reverse=True))
+_MANGLED_CMD_RE = re.compile(r"\\/(?=(?:%s)(?![A-Za-z]))" % _LATEX_CMD_ALT)
+
+
+def _fix_overescaped_latex(tex: str) -> str:
+    """Repair over-escaped LaTeX inside a single math expression."""
+    if "\\/" not in tex and "\\{" not in tex and "\\}" not in tex:
+        return tex
+
+    # 1) 斜杠：LaTeX 里 "/" 不需要转义，"\/" 是模型过度防御的产物。
+    #    但 "\/alpha" 说明本该是反斜杠（命令），"\/cm" 才是普通斜杠。
+    tex = _MANGLED_CMD_RE.sub("\\\\", tex)
+    tex = tex.replace("\\/", "/")
+
+    # 2) 花括号：只在下标/上标后面的组边界上还原。
+    #    "_\{" 一定是"要开一个组"，不是字面量花括号；"{\}" 配套闭合。
+    #    其它位置的 "\{" 是合法的字面花括号（\text{\{}），保持不动。
+    tex = re.sub(r"([_^])\\\{", r"\1{", tex)
+    if re.search(r"([_^])\{", tex) and "\\}" in tex:
+        tex = tex.replace("\\}", "}")
+    return tex
+
+
+def _wrap_bare_latex(text: str) -> str:
+    """
+    Wrap LaTeX fragments that the model left outside $...$ delimiters.
+
+    The model sometimes emits a formula as plain prose — "\\alpha_{ME}" with
+    no dollar signs. The frontend's KaTeX pipeline only picks up $...$, so
+    the raw LaTeX ends up visible as text. Wrapping those fragments makes the
+    formula render instead of leaking "\\alpha_{\\mathrm{ME}}" onto the page.
+    """
+    if "\\" not in text:
+        return text
+
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1].isalpha():
+            j = i + 1
+            while j < n and text[j].isalpha():
+                j += 1
+            cmd = text[i + 1:j]          # 命令名不含反斜杠
+            if cmd not in _LATEX_COMMANDS:
+                out.append(ch)
+                i += 1
+                continue
+            # 吃掉紧随其后的 {...} / _{...} / ^{...}
+            while True:
+                k = j
+                while k < n and text[k] in " \t":
+                    k += 1
+                if k < n and text[k] in "_^":
+                    k += 1
+                    while k < n and text[k] in " \t":
+                        k += 1
+                if k < n and text[k] == "{":
+                    depth = 0
+                    m = k
+                    while m < n:
+                        if text[m] == "{":
+                            depth += 1
+                        elif text[m] == "}":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        m += 1
+                    if depth != 0:
+                        break  # 括号没闭合，别吞
+                    j = m + 1
+                    continue
+                break
+            out.append("$" + text[i:j] + "$")
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def sanitize_translation(text: str) -> str:
+    """
+    Clean up raw model output before it reaches the frontend.
+
+    Four jobs:
+      1. Drop any leaked <think> reasoning block (defence in depth — llm.py
+         already strips them, but a truncated one can slip through).
+      2. Normalize inline/display math delimiters into $...$ / $$...$$, because
+         the frontend's KaTeX pipeline only understands the dollar form.
+         Models switch between the two notations freely.
+      3. Repair over-escaped LaTeX (see _fix_overescaped_latex).
+      4. Wrap LaTeX the model left as bare prose so KaTeX can render it
+         (see _wrap_bare_latex).
+    """
+    if not text:
+        return ""
+
+    # 0) 统一换行符。模型经常返回 CRLF，而前端按 "\n{2,}" 切段落——
+    #    "\r\n\r\n" 切不开，整篇译文会挤成一个段落、到处冒出 <br>，
+    #    服务端的段落级去重也会跟着失效。必须先归一化。
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 1) 泄漏的思考块
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*\Z", "", text, flags=re.DOTALL)
+    text = text.replace("</think>", "").replace("<think>", "")
+
+    # 2) 定界符归一化：\( ... \) → $ ... $，\[ ... \] → $$ ... $$
+    text = re.sub(r"\\\[(.+?)\\\]", lambda m: "$$" + m.group(1) + "$$",
+                  text, flags=re.DOTALL)
+    text = re.sub(r"\\\((.+?)\\\)", lambda m: "$" + m.group(1) + "$",
+                  text, flags=re.DOTALL)
+
+    # 3) 按「数学片段 / 普通文本」分段处理
+    pieces: list[str] = []
+    last = 0
+    for m in _MATH_SPAN_RE.finditer(text):
+        between = text[last:m.start()]
+        if between:
+            pieces.append(_wrap_bare_latex(_fix_overescaped_latex(between)))
+        body = m.group(1) if m.group(1) is not None else m.group(2)
+        fixed = _fix_overescaped_latex(body)
+        pieces.append(("$$" + fixed + "$$") if m.group(1) is not None
+                       else ("$" + fixed + "$"))
+        last = m.end()
+    tail = text[last:]
+    if tail:
+        pieces.append(_wrap_bare_latex(_fix_overescaped_latex(tail)))
+
+    return "".join(pieces).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +573,8 @@ __all__ = [
     "CHUNK_OVERLAP",
     "PER_SECTION_BUDGET",
     "chunk_section_text",
+    "merge_translation_parts",
+    "sanitize_translation",
     "TranslationCache",
     "get_cache",
     "reset_cache",

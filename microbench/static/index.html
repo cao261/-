@@ -2462,19 +2462,35 @@
       const D_OPEN = "\u0001", D_CLOSE = "\u0002";
       const I_OPEN = "\u0003", I_CLOSE = "\u0004";
 
+      // 0) Normalize line endings first. Models often emit CRLF, and the
+      //    paragraph splitter below looks for "\n{2,}" — "\r\n\r\n" does not
+      //    match, which collapses the whole translation into one paragraph
+      //    full of stray <br> tags.
+      //    Then normalize math delimiters: models alternate between $..$ and
+      //    \(..\) / \[..\] freely; the KaTeX pipeline only understands the
+      //    dollar form, so anything else would show up as literal
+      //    "\(\alpha\)" text in the translation.
+      let h = String(s).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      h = h.replace(/\\\[([\s\S]+?)\\\]/g, (m, body) => "$$" + body + "$$");
+      h = h.replace(/\\\(([\s\S]+?)\\\)/g, (m, body) => "$" + body + "$");
+
       // 1) Extract $$..$$ display math FIRST. Heuristic: if body is a single line
       //    AND short (≤ 60 chars / no multi-line / no \begin..\end), LLM almost
       //    always meant inline; downgrade to inline so layout stays compact and
       //    these short formulas don't push the paragraph apart.
       const INLINE_MAX_CHARS = 60;
-      let h = s.replace(/\$\$([\s\S]+?)\$\$/g, (m, body) => {
+      h = h.replace(/\$\$([\s\S]+?)\$\$/g, (m, body) => {
         const trimmed = body.trim();
-        const isMultiLine = /\n/.test(trimmed);
+        // Multi-line test uses the RAW body on purpose: a display formula
+        // written as "$$\n...\n$$" trims down to one line, but downgrading it
+        // to inline leaves the newlines behind and they turn into stray
+        // <br> breaks inside the rendered formula.
+        const isMultiLine = /\n/.test(body);
         const hasEnv = /\\(begin|end)\s*\{[^}]+\}/.test(trimmed);
         const tooLong = trimmed.length > INLINE_MAX_CHARS;
         if (!isMultiLine && !hasEnv && !tooLong) {
           // downgrade short inline-shaped display → inline
-          return I_OPEN + body + I_CLOSE;
+          return I_OPEN + trimmed + I_CLOSE;
         }
         return D_OPEN + body + D_CLOSE;
       });
@@ -2482,6 +2498,10 @@
       h = h.replace(/(?<!\$)\$([^\$\n]+?)\$(?!\$)/g, (m, body) => I_OPEN + body + I_CLOSE);
       // 3) HTML escape everything
       h = escapeHtml(h);
+      // 3b) Restore <sup>/<sub> that the model emitted for citation
+      //     superscripts — escaped they would show up as literal tags.
+      h = h.replace(/&lt;sup&gt;([\s\S]*?)&lt;\/sup&gt;/g, "<sup>$1</sup>");
+      h = h.replace(/&lt;sub&gt;([\s\S]*?)&lt;\/sub&gt;/g, "<sub>$1</sub>");
       // 4) Bold
       h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
       // 4b) Markdown headings (LLM translations often use # / ## on their own line)
@@ -2504,7 +2524,11 @@
       const wrapped = segments.map(seg => {
         const trimmed = seg.trim();
         if (!trimmed) return "";
-        if (/^<(h\d|math-display-block|math-placeholder|code|pre|ul|ol|blockquote)/.test(trimmed)) {
+        // NB: the display-math placeholder is a <div class="math-display-block">,
+        // not a <math-display-block> tag — matching the bare tag name silently
+        // failed, so display formulas got wrapped in <p> and their line breaks
+        // turned into stray <br> inside the rendered formula.
+        if (/^<(h\d|div\b|math-display-block|math-placeholder|code|pre|ul|ol|blockquote)/.test(trimmed)) {
           return trimmed; // already a block-level tag
         }
         return "<p>" + trimmed.replace(/\n/g, "<br>") + "</p>";

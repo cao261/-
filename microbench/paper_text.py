@@ -191,6 +191,23 @@ PDF_X_TOLERANCE = 1.5
 _X_BINS = 120       # x 方向直方图分箱数
 _Y_BANDS = 60       # y 方向分带数（用于定位双栏起始位置）
 
+# pdfplumber 无法解码的字符会输出成 "(cid:12)" 这种占位符。
+_CID_RE = re.compile(r"\(cid:\d+\)")
+
+
+def _clean_cid_markers(text: str) -> str:
+    """
+    Replace pdfplumber's undecodable-character markers with "[?]".
+
+    Publisher PDFs often use subsetted fonts without a ToUnicode table, so
+    pdfplumber can only emit "(cid:2)" for a symbol it cannot map. Handing
+    those to the model invites it to *invent* a symbol — in testing it turned
+    "(cid:2)" into "\\approx" and "(cid:3)" into "\\times", producing
+    formulas that were never in the paper. With "[?]" plus a prompt note,
+    the model skips the symbol instead of fabricating one.
+    """
+    return _CID_RE.sub("[?]", text or "")
+
 
 def _x_cover(words, page_width: float, nb: int) -> list:
     """每个 x 分箱被文字覆盖的宽度。"""
@@ -224,6 +241,10 @@ def _extract_page_text(page) -> str:
     抽取单页文本，按阅读顺序排列：整宽区域(标题/摘要) -> 左栏 -> 右栏。
     任何一步检测不可靠都退回 pdfplumber 的普通抽取（只是空格仍然修好）。
     """
+    return _clean_cid_markers(_extract_page_text_raw(page))
+
+
+def _extract_page_text_raw(page) -> str:
     plain = ""
     try:
         plain = page.extract_text(x_tolerance=PDF_X_TOLERANCE) or ""

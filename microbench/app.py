@@ -1042,13 +1042,29 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 规则:
 1. 严格忠于原文, 不要添加原文没有的内容
 2. 翻译要学术化、平实, 避免文学化或口语化
-3. 专业术语保留英文 (如 "GAA-FET", "hydrodynamic model", "DIBL")
-4. 数学符号保持 LaTeX 形式 (如 "$I_{on}$", "$\\tau$", "$\\lambda$")
-5. 中文输出, Markdown 格式
+3. 中文输出, Markdown 格式
+4. 只有以下三类词保留英文原文:
+   (a) 缩写与专有名词 (ME、PZT、MEMS、FET、作者名、单位名)
+   (b) 没有通行中文译法的术语 (GAA-FET、hydrodynamic model、DIBL)
+   (c) 图表与文献引用 (Fig. 3、Table II、[14])
+   其余普通学术名词一律译成中文, 例如:
+   composite→复合材料, laminate→层状材料, magnetostrictive→磁致伸缩,
+   piezoelectric→压电, materials→材料, structure→结构,
+   single crystals→单晶, polymers→聚合物, alloys→合金,
+   voltage coefficient→电压系数, ceramic→陶瓷
+5. 数学符号保持 LaTeX 形式 (如 "$I_{on}$", "$\\tau$", "$\\lambda$"),
+   不要过度转义 (不要写 "\\{" "\\}" "\\/", 直接写 "{" "}" "/")
 6. 如果原文含图表引用 (如 "Fig. 3", "Table II"), 保留原样
 7. 原文是从 PDF 自动抽取的纯文本, 双栏页面的句子顺序可能被打乱、公式可能残缺。
    请直接按语义翻译能读懂的部分, 不要为了重建原文版面结构而反复推敲,
    不要输出分析过程, 只输出译文本身
+8. 严禁输出任何解释、推测或括号注释 (例如"原文此处数值缺损, 可能指……")。
+   遇到看不懂或残缺的部分, 跳过即可, 绝不要编造数值、公式或术语
+9. 原文中的 "[?]" 是 PDF 抽取时无法识别的符号占位符, 原样保留,
+   不要臆造具体符号
+10. PDF 抽取常把希腊字母抽成普通字母, 例如磁电电压系数 α_ME 会变成
+   "a" + 换行 + "ME" 或 "a_ME"。遇到这种明显失真时, 请按学科标准写法
+   还原成规范符号 (如 α_ME), 并统一全文写法
 """
 
 
@@ -1072,7 +1088,8 @@ async def api_translate_section(req: TranslateRequest):
             detail="翻译需要 LLM 配置。请在 .env 中设置 LLM_API_KEY 或 AGNES_API_KEY + LLM_BASE_URL。",
         )
 
-    from .translation import chunk_section_text, get_cache
+    from .translation import (chunk_section_text, get_cache, merge_translation_parts,
+                              sanitize_translation)
     cache = get_cache()
     curr_st = llm.get_llm_status()
     model = curr_st.get("active_model") or "default"
@@ -1108,14 +1125,14 @@ async def api_translate_section(req: TranslateRequest):
                             {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
                             {"role": "user", "content": user_msg},
                         ],
-                        # Shorter cap: smaller chunks need shorter responses, and
-                        # faster responses are less likely to be killed mid-stream
-                        # by upstream proxies / load balancers.
-                        max_tokens=4000,
+                        # 长章节译文可能上千 token，给足预算。
+                        # max_tokens 给小会触发 finish_reason=length，
+                        # 结果是「只翻译了一半」——llm 层会检测并自动加倍重试。
+                        max_tokens=16000,
                         temperature=0.2,
                         # Generous timeout — MiniMax thinking mode can take 60s
                         # per chunk; multi-chunk translations need headroom.
-                        timeout=120,
+                        timeout=180,
                         # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
                         disable_thinking=llm.translation_disable_thinking(),
                     )
@@ -1126,7 +1143,14 @@ async def api_translate_section(req: TranslateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"翻译失败: {str(e)}")
 
-    translation = "\n\n".join(translated_parts).strip()
+    # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
+    translation = sanitize_translation(merge_translation_parts(translated_parts))
+    if not translation:
+        raise HTTPException(
+            status_code=502,
+            detail="翻译结果为空。模型可能把 token 预算耗在推理上没产出正文，"
+                   "请重试或点「探测升格」切回主模型。",
+        )
     curr_st = llm.get_llm_status()
     actual_model = curr_st.get("active_model") or model
     result = {
@@ -1615,7 +1639,8 @@ async def api_translate_page(req: TranslatePageRequest):
             detail="按页翻译需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
         )
 
-    from .translation import chunk_section_text, get_cache
+    from .translation import (chunk_section_text, get_cache, merge_translation_parts,
+                              sanitize_translation)
     cache = get_cache()
     cfg = llm._config()
     model = cfg["model"]
@@ -1666,9 +1691,9 @@ async def api_translate_page(req: TranslatePageRequest):
                             {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
                             {"role": "user", "content": user_msg},
                         ],
-                        max_tokens=4000,
+                        max_tokens=16000,
                         temperature=0.2,
-                        timeout=90,
+                        timeout=180,
                         # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
                         disable_thinking=llm.translation_disable_thinking(),
                     )
@@ -1679,7 +1704,14 @@ async def api_translate_page(req: TranslatePageRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"按页翻译失败: {e}")
 
-    translation = "\n\n".join(translated_parts).strip()
+    # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
+    translation = sanitize_translation(merge_translation_parts(translated_parts))
+    if not translation:
+        raise HTTPException(
+            status_code=502,
+            detail="翻译结果为空。模型可能把 token 预算耗在推理上没产出正文，"
+                   "请重试或点「探测升格」切回主模型。",
+        )
     curr_st = llm.get_llm_status()
     result = {
         "status": "success",

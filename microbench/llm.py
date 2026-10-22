@@ -63,9 +63,18 @@ DEFAULT_TIMEOUT = 60
 # 还没产出正文。上层据此抬高预算重试，或降级到非思考型备用模型。
 TRUNCATED_MARKER = "__TRUNCATED_BY_MAX_TOKENS__"
 
+# 标记：正文已经产出，但被 max_tokens 从中间截断（finish_reason=length）。
+# 这是"译文只翻译了一半"的直接原因——上层必须抬高预算重试，
+# 绝不能把半截译文当成成功返回（否则页面显示"已翻译"，内容却是残缺的）。
+PARTIAL_MARKER = "__PARTIAL_BY_MAX_TOKENS__"
+
 # 思考型模型（M3.1-Flash）的最小合理输出预算。低于这个值几乎必然被思考
 # 吃光；达到这个值还失败，说明是输入本身让模型陷入无限思考，应直接降级。
 MIN_REASONABLE_MAX_TOKENS = 4000
+
+# 抬高预算重试时的上限。长文翻译（一整页论文）中文译文可能要 3000~5000
+# token，4000 经常不够。
+MAX_ESCALATION_TOKENS = 16000
 
 
 class LLMError(Exception):
@@ -408,6 +417,32 @@ def translation_disable_thinking() -> bool:
 # Core Chat Implementation with Failover & Agnes Rate Limiting
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# HTTP session helpers (proxy-aware)
+# ---------------------------------------------------------------------------
+
+_sessions: dict = {}
+
+
+def _get_session(use_env_proxy: bool):
+    """
+    Get a requests.Session, optionally honoring environment proxies.
+
+    Why this exists: many Chinese users run a local proxy client (VPN) that
+    sets HTTP_PROXY/HTTPS_PROXY to 127.0.0.1:<port>. If that client is not
+    running, EVERY outbound call dies with ProxyError — the workbench then
+    looks "broken" with no obvious cause. When we see a ProxyError we retry
+    once with trust_env=False (direct connection), which fixes it instantly.
+    """
+    key = bool(use_env_proxy)
+    sess = _sessions.get(key)
+    if sess is None:
+        sess = requests.Session()
+        sess.trust_env = key
+        _sessions[key] = sess
+    return sess
+
+
 def _invoke_model(
     cfg: dict,
     messages: list[dict],
@@ -459,6 +494,7 @@ def _invoke_model(
 
     last_err = ""
     last_status = None
+    bypassed_proxy = False
 
     for attempt in range(max_retries + 1):
         if is_agnes:
@@ -466,8 +502,21 @@ def _invoke_model(
             agnes_limiter.acquire()
 
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            resp = _get_session(not bypassed_proxy).post(
+                url, json=payload, headers=headers, timeout=timeout
+            )
             last_status = resp.status_code
+        except requests.exceptions.ProxyError as e:
+            # 本机配了本地代理但代理软件没运行 → 直接绕过代理重试一次
+            if not bypassed_proxy:
+                bypassed_proxy = True
+                print(
+                    f"[MicroBench] 本地代理不可用 ({e}), 改为直连重试",
+                    file=sys.stderr,
+                )
+                continue
+            last_err = str(e)
+            return False, f"代理连接失败: {e}", last_status
         except RETRYABLE_EXC as e:
             last_err = str(e)
             if attempt < max_retries:
@@ -535,6 +584,13 @@ def _invoke_model(
                     f"模型返回空内容 (finish_reason={finish_reason!r}, "
                     f"思考约占 {len(reasoning)} 字符)"
                 ), 200
+            if finish_reason == "length":
+                # 有正文、但从中间被截断 —— 这就是「译文只翻译了一半」。
+                # 绝不能当成成功返回：页面会显示"已翻译"，内容却是残缺的。
+                return False, (
+                    f"{PARTIAL_MARKER}: 输出被 max_tokens 截断"
+                    f"(finish_reason=length, 已产出 {len(content)} 字正文但不完整)"
+                ), 200
             return True, content, 200
         except (KeyError, IndexError, ValueError) as e:
             return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
@@ -568,7 +624,28 @@ def _invoke_with_budget_escalation(
         cfg, messages, max_tokens, temperature, timeout, json_mode,
         max_retries=max_retries, disable_thinking=disable_thinking,
     )
-    if success or TRUNCATED_MARKER not in (res or ""):
+    if success:
+        return success, res, status
+
+    # 正文被截断（有内容但不完整）→ 抬高预算重试。
+    # 长文翻译最容易踩这个坑：一整页英文译成中文要 3000~5000 token，
+    # max_tokens 给小了就会「只翻译一半」。这里无条件加倍预算重来一次。
+    if PARTIAL_MARKER in (res or ""):
+        bigger = min(max(max_tokens * 2, MIN_REASONABLE_MAX_TOKENS),
+                     MAX_ESCALATION_TOKENS)
+        if bigger <= max_tokens:
+            return success, res, status
+        success2, res2, status2 = _invoke_model(
+            cfg, messages, bigger, temperature, timeout, json_mode,
+            max_retries=max_retries, disable_thinking=disable_thinking,
+        )
+        if success2:
+            return True, res2, status2
+        return False, (
+            f"{res} | 抬高 max_tokens 至 {bigger} 重试后仍失败: {res2}"
+        ), status2
+
+    if TRUNCATED_MARKER not in (res or ""):
         return success, res, status
     if max_tokens >= MIN_REASONABLE_MAX_TOKENS:
         return success, res, status
@@ -638,6 +715,7 @@ def chat(
         #      思考（32000 token 仍不产出正文），此时必须切到非思考型 Agnes。
         no_usable_output = (
             TRUNCATED_MARKER in (res or "")
+            or PARTIAL_MARKER in (res or "")
             or "返回空内容" in (res or "")
             or "响应格式异常" in (res or "")
         )
@@ -747,6 +825,7 @@ async def _invoke_model_async(
 
     last_err = ""
     last_status = None
+    bypassed_proxy = False
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -765,9 +844,21 @@ async def _invoke_model_async(
             await asyncio.to_thread(agnes_limiter.acquire)
 
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout,
+                                         trust_env=not bypassed_proxy) as client:
                 resp = await client.post(url, json=payload, headers=headers)
             last_status = resp.status_code
+        except httpx.ProxyError as e:
+            # 本机配了本地代理但代理软件没运行 → 绕过代理直连重试一次
+            if not bypassed_proxy:
+                bypassed_proxy = True
+                print(
+                    f"[MicroBench] 本地代理不可用 ({e}), 改为直连重试",
+                    file=sys.stderr,
+                )
+                continue
+            last_err = str(e)
+            return False, f"代理连接失败: {e}", last_status
         except RETRYABLE_EXC as e:
             last_err = str(e)
             if _cancelled():
@@ -833,6 +924,13 @@ async def _invoke_model_async(
                 return False, (
                     f"模型返回空内容 (finish_reason={finish_reason!r}, "
                     f"思考约占 {len(reasoning)} 字符)"
+                ), 200
+            if finish_reason == "length":
+                # 有正文、但从中间被截断 —— 这就是「译文只翻译了一半」。
+                # 绝不能当成成功返回：页面会显示"已翻译"，内容却是残缺的。
+                return False, (
+                    f"{PARTIAL_MARKER}: 输出被 max_tokens 截断"
+                    f"(finish_reason=length, 已产出 {len(content)} 字正文但不完整)"
                 ), 200
             return True, content, 200
         except (KeyError, IndexError, ValueError) as e:
@@ -1074,13 +1172,26 @@ async def chat_stream_async(
 
 
 _THINKING_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+# 未闭合的 think 块：模型思考到一半被 max_tokens 截断时不会写出 </think>，
+# 这时整段英文推理会原样漏进译文——用户看到的"有的翻译有的不翻译"就是它。
+_UNCLOSED_THINKING_RE = re.compile(r"<think>.*\Z", re.DOTALL)
+# 孤立的 think 标签（只有闭合没有开启，或反之）
+_STRAY_THINK_TAG_RE = re.compile(r"</?think>")
 
 
 def _strip_thinking_blocks(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks from reasoning-model output."""
+    """Remove <think>...</think> reasoning blocks from reasoning-model output.
+
+    边界情况一并处理：
+      - 未闭合的 <think>（思考途中被 max_tokens 截断）→ 整段丢弃，
+        否则几千字符英文推理会漏进译文面板
+      - 孤立的 </think> / <think> 标签 → 丢弃
+    """
     if not text:
         return text
     cleaned = _THINKING_RE.sub("", text)
+    cleaned = _UNCLOSED_THINKING_RE.sub("", cleaned)
+    cleaned = _STRAY_THINK_TAG_RE.sub("", cleaned)
     return cleaned.strip()
 
 
