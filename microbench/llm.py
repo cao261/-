@@ -76,6 +76,42 @@ MAX_UPSTREAM_CALLS_PER_REQUEST = 6
 # 还没产出正文。上层据此抬高预算重试，或降级到非思考型备用模型。
 TRUNCATED_MARKER = "__TRUNCATED_BY_MAX_TOKENS__"
 
+# 截断有两种形态，处理方式相反，必须区分开：
+#   TRUNCATED_NO_BODY  —— 思考烧光了预算，正文一个字没产出：抬预算救不回来，
+#                         应该降级到非思考型模型（否则白等一两分钟）。
+#   TRUNCATED_BODY_CUT —— 正文出来了但被截断（译文断在半句）：抬预算重试即可。
+TRUNCATED_NO_BODY = "未产出正文"
+TRUNCATED_BODY_CUT = "译文不完整"
+
+# 抬高预算重试时的上限。再大也没有意义：M3.1-Flash 强制思考，实测 32000
+# token 也可能不产出正文。
+MAX_ESCALATION_MAX_TOKENS = 32000
+
+# 已经确认「不接受 thinking.type=disabled」的模型名。
+# MiniMax-M3.1-Flash 强制 adaptive thinking，传 disabled 直接 400。记住之后
+# 就不再发这个参数，省掉每个分块一次 400 + 重试的往返（翻译一章要发好几次）。
+_THINKING_DISABLE_UNSUPPORTED: set[str] = set()
+
+# 已知「强制开启思考模式」的模型：推理 token 和正文共用同一个 max_tokens
+# 预算池，预算给小了正文就一个字都出不来。给这类模型要预留更大的预算。
+_THINKING_FORCED_MODELS: set[str] = {"MiniMax-M3.1-Flash"}
+
+
+def model_forces_thinking(model: str) -> bool:
+    """该模型是否强制开启思考模式。
+
+    两种来源：
+      1) 已知的强制思考模型（M3.1-Flash）—— 不接受 thinking.type=disabled。
+      2) 运行期撞过 400 的模型（记在 _THINKING_DISABLE_UNSUPPORTED 里）。
+
+    翻译这类「长文直译」任务要用它来决定预算：强制思考的模型，光给正文留
+    额度是不够的，推理会先吃光（实测 M3.1-Flash 4000 token 时正文只剩 291
+    字符，8000 token 时正文一个字都没有）。
+    """
+    if not model:
+        return False
+    return model in _THINKING_FORCED_MODELS or model in _THINKING_DISABLE_UNSUPPORTED
+
 # 思考型模型（M3.1-Flash）的最小合理输出预算。低于这个值几乎必然被思考
 # 吃光；达到这个值还失败，说明是输入本身让模型陷入无限思考，应直接降级。
 MIN_REASONABLE_MAX_TOKENS = 4000
@@ -584,15 +620,49 @@ def translation_disable_thinking() -> bool:
     """
     翻译任务是否关闭思考模式。
 
-    实测：MiniMax-M3 对整页论文直译，关思考 21.5s 输出完整译文；开着思考
-    容易在推理里打转（reasoning 吃掉整个 max_tokens 预算，正文为空）。
-    M3.1-Flash 强制 adaptive thinking，不接受该参数 —— llm 层会自动去掉
-    参数重试，所以这里可以无条件开启。
+    实测（2015 IEEE 双栏论文整页 2766 字符，max_tokens=4000）:
+        MiniMax-M2.7        开着思考 23.0s，且 thinking.type=disabled 被
+                            **静默忽略**（content 2630 字符里约 1500 字符是
+                            思考），译文本身是完整的
+        MiniMax-M3          关掉思考  8.4s，译文完整、无思考泄漏
+        MiniMax-M3.1-Flash  强制思考，传 disabled 直接 400；
+                            开着思考 41.7s，14688 字符的推理把 4000 token
+                            预算吃光，正文只剩 291 字符还被截断 —— 这就是
+                            「慢 + 乱」的来源
 
     可用环境变量 LLM_TRANSLATION_DISABLE_THINKING=0 关掉。
     """
     v = (os.getenv("LLM_TRANSLATION_DISABLE_THINKING", "1") or "1").strip().lower()
     return v not in ("0", "false", "no", "off")
+
+
+def translation_model_name() -> str:
+    """
+    翻译任务专用的模型名（空串 = 跟随主模型）。
+
+    为什么需要单独指定：MiniMax-M3.1-Flash **强制**开启思考模式
+    （thinking.type=disabled 直接 400），实测整页翻译 41.7s、83.2s，推理把
+    预算吃光导致正文被截断；MiniMax-M3 支持关思考，同一页只要 8.4s 且译文
+    完整。所以「读论文」和「做推理」用不同模型更合适：
+
+        LLM_MODEL_NAME=MiniMax-M3.1-Flash   # 解读 / 答疑（要推理）
+        LLM_TRANSLATION_MODEL=MiniMax-M3    # 批量直译（要快、要完整）
+
+    两者用同一把 key、同一个 base_url，只是模型名不同。
+    """
+    return (os.getenv("LLM_TRANSLATION_MODEL", "") or "").strip()
+
+
+def translation_active_model() -> str:
+    """翻译任务实际会用到的模型名（翻译专用模型优先，否则跟随主模型）。
+
+    上报和缓存键都要用这个 —— 之前用主模型的 active_model 上报，翻译其实
+    走的是另一个模型，界面上显示的模型名是错的，缓存也会串。
+    """
+    t = translation_model_name()
+    if t:
+        return t
+    return model_manager.get_status().get("active_model") or "default"
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +706,7 @@ def _invoke_model(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
-    if disable_thinking:
+    if disable_thinking and cfg["model"] not in _THINKING_DISABLE_UNSUPPORTED:
         payload["thinking"] = {"type": "disabled"}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -702,10 +772,12 @@ def _invoke_model(
             last_err = err
 
             # 模型不支持 thinking 参数（例如 M3.1-Flash 强制 adaptive thinking），
-            # 去掉该参数重试一次，别直接失败。
+            # 去掉该参数重试一次，别直接失败。顺便把这个模型记下来：之后
+            # 直接不再发该参数，省掉每个分块一次 400 + 重试的往返。
             if resp.status_code == 400 and "thinking" in payload and "thinking" in err.lower():
                 payload.pop("thinking", None)
                 disable_thinking = False
+                _THINKING_DISABLE_UNSUPPORTED.add(cfg["model"])
                 if attempt < max_retries:
                     continue
 
@@ -755,6 +827,17 @@ def _invoke_model(
                     f"模型返回空内容 (finish_reason={finish_reason!r}, "
                     f"思考约占 {len(reasoning)} 字符, max_tokens={max_tokens})"
                 ), 200
+            if finish_reason == "length":
+                # 正文有内容但被 max_tokens 截断（思考 token 与正文共用同一个
+                # 预算池，思考吃多了正文就断在半句）。在翻译场景这就是"译文断
+                # 在半截"，绝不能当成成功返回 —— 否则前端显示"已翻译"，用户
+                # 拿到的却是残缺译文。必须上报截断，让上层抬高预算重试。
+                return False, (
+                    f"{TRUNCATED_MARKER}: 输出被 max_tokens 截断"
+                    f"(finish_reason=length, 正文 {len(content)} 字符, "
+                    f"思考 {len(message.get('reasoning_content') or '')} 字符), "
+                    f"译文不完整"
+                ), 200
             return True, content, 200
         except (KeyError, IndexError, ValueError, AttributeError) as e:
             return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
@@ -774,16 +857,18 @@ def _invoke_with_budget_escalation(
     budget: Optional[list[int]] = None,
 ) -> tuple[bool, str, Optional[int]]:
     """
-    调用模型；若正文为空且原因是 max_tokens 被截断（思考模型把额度全花在
-    reasoning_content 上），在预算明显偏小的情况下抬高额度重试一次。
+    调用模型；若正文因 max_tokens 被截断，按截断的形态分别处理：
 
-    MiniMax-M3.1-Flash 强制开启思考模式，思考 token 与输出 token 共享
-    max_tokens 预算；额度给小了模型只会思考、不产出正文。
+    1) 正文被截断（"译文不完整"）—— 预算不够，抬高额度重试一次。
+       思考 token 与正文共享同一个 max_tokens 预算池，思考吃多了正文就断在
+       半句。旧逻辑是「max_tokens >= MIN_REASONABLE 就不抬」，而翻译默认
+       用的就是 4000 —— 恰恰是最容易被截断的档位，截断了却不重试，等于把
+       残缺译文直接抛给用户（表现为「已翻译但内容是乱的」）。
 
-    只在 max_tokens < MIN_REASONABLE_MAX_TOKENS 时才抬高重试：预算本来就给
-    到位还失败，说明是输入让模型陷入无限思考（实测 pdfplumber 抽出的乱序
-    双栏文本会这样，32000 token 仍不产出正文），再抬预算只是白白多等一两
-    分钟 —— 这种情况下应该直接让 chat() 降级到非思考型的备用模型。
+    2) 一个字正文都没产出（"未产出正文"）—— 思考型模型把整个预算烧在推理上
+       （实测 pdfplumber 抽出的乱序双栏文本会这样，32000 token 仍不产出正文）。
+       这时再抬预算只是白白多等一两分钟，应该直接让 chat() 降级到非思考型
+       的备用模型。
 
     `budget` 与 chat() 共享同一个上游调用计数器，抬高重试同样计入总预算，
     避免"重试 + 降级 + 抬高"叠在一起把单次请求的上游调用数放大到失控。
@@ -794,12 +879,18 @@ def _invoke_with_budget_escalation(
     )
     if success or TRUNCATED_MARKER not in (res or ""):
         return success, res, status
-    if max_tokens >= MIN_REASONABLE_MAX_TOKENS:
-        return success, res, status
     if budget is not None and budget[0] <= 0:
         return success, res, status
+    if TRUNCATED_NO_BODY in (res or ""):
+        # 形态 2：思考烧光了预算，正文一个字没有。抬预算救不回来，直接降级。
+        return success, res, status
 
-    bigger = max(max_tokens * 3, MIN_REASONABLE_MAX_TOKENS)
+    bigger = min(
+        max(max_tokens * 2, MIN_REASONABLE_MAX_TOKENS),
+        MAX_ESCALATION_MAX_TOKENS,
+    )
+    if bigger <= max_tokens:
+        return success, res, status
     success2, res2, status2 = _invoke_model(
         cfg, messages, bigger, temperature, timeout, json_mode,
         max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
@@ -817,6 +908,7 @@ def chat(
     json_mode: bool = False,
     max_retries: int = 2,
     disable_thinking: bool = False,
+    model_name: Optional[str] = None,
 ) -> str:
     """
     Single-turn chat completion with automatic failover and degradation management.
@@ -828,11 +920,16 @@ def chat(
 
     disable_thinking=True：请求时带 thinking={"type":"disabled"}，让模型直接
     输出正文不做推理（长文直译这类任务用它又快又稳；模型不支持时自动降级）。
+
+    model_name：临时换模型（同一套 key / base_url）。批量翻译用得上 ——
+    MiniMax-M3.1-Flash 强制思考不适合直译，详见 translation_model_name()。
     """
     if requests is None:
         raise LLMError("requests 包未安装, 请先 pip install requests")
 
     primary = model_manager.get_primary_config()
+    if model_name and model_name != primary["model"]:
+        primary = dict(primary, model=model_name)
     fallback = model_manager.get_fallback_config()
 
     if not primary["configured"] and not fallback["configured"]:
@@ -1172,6 +1269,15 @@ async def _invoke_model_async(
                 return False, (
                     f"模型返回空内容 (finish_reason={finish_reason!r}, "
                     f"思考约占 {len(reasoning)} 字符, max_tokens={max_tokens})"
+                ), 200
+            if finish_reason == "length":
+                # 同同步路径：正文有内容但被 max_tokens 截断 = 译文断在半截，
+                # 不能当成成功。
+                return False, (
+                    f"{TRUNCATED_MARKER}: 输出被 max_tokens 截断"
+                    f"(finish_reason=length, 正文 {len(content)} 字符, "
+                    f"思考 {len(message.get('reasoning_content') or '')} 字符), "
+                    f"译文不完整"
                 ), 200
             return True, content, 200
         except (KeyError, IndexError, ValueError, AttributeError) as e:
@@ -1520,13 +1626,35 @@ async def chat_stream_async(
 
 
 _THINKING_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINKING_OPEN = "<think>"
+_THINKING_CLOSE = "</think>"
 
 
 def _strip_thinking_blocks(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks from reasoning-model output."""
+    """Remove <think>...</think> reasoning blocks from reasoning-model output.
+
+    Also handles the *unterminated* case, which is the dangerous one: when the
+    response is cut off (finish_reason=length) inside the reasoning, the model
+    never emits the closing tag, so the regex below matches nothing and the raw
+    English reasoning would be served to the user as if it were the answer —
+    which is exactly what "已翻译但内容是乱的" looked like.
+
+    A stray closing tag without an opening one is dropped as well.
+    """
     if not text:
         return text
     cleaned = _THINKING_RE.sub("", text)
+
+    # Unterminated block: everything from the last opening tag to the end is
+    # reasoning, not an answer.
+    idx = cleaned.rfind(_THINKING_OPEN)
+    if idx != -1:
+        cleaned = cleaned[:idx]
+
+    # Orphan closing tag (some servers put the answer *after* </think>).
+    if cleaned.lstrip().startswith(_THINKING_CLOSE):
+        cleaned = cleaned.lstrip()[len(_THINKING_CLOSE):]
+
     return cleaned.strip()
 
 

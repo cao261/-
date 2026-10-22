@@ -1796,7 +1796,15 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 规则:
 1. 严格忠于原文, 不要添加原文没有的内容
 2. 翻译要学术化、平实, 避免文学化或口语化
-3. 专业术语保留英文 (如 "GAA-FET", "hydrodynamic model", "DIBL")
+3. **输出必须是完整的中文段落, 不要中英混杂。** 只有下面这些保留英文:
+   - 缩略语 / 器件名: GAA-FET, CFET, DIBL, MRAM, FMR, PMN-PT, FeGaB
+   - 公认的专有术语 / 模型名: hydrodynamic model, Gilbert damping, spin-orbit coupling
+   而普通词组必须译成中文, 例如:
+   - magnetization state → 磁化状态 (不要写成 "magnetization state")
+   - electric field → 电场
+   - power dissipation → 功率耗散
+   - multiferroic magnetoelectric materials → 多铁性磁电材料
+   - ferromagnetic resonance → 铁磁共振
 4. 数学符号保持 LaTeX 形式 (如 "$I_{on}$", "$\\tau$", "$\\lambda$")
 5. 中文输出, Markdown 格式
 6. 如果原文含图表引用 (如 "Fig. 3", "Table II"), 保留原样
@@ -1804,6 +1812,33 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
    请直接按语义翻译能读懂的部分, 不要为了重建原文版面结构而反复推敲,
    不要输出分析过程, 只输出译文本身
 """
+
+
+def _translation_max_tokens(src_len: int, model: str = "") -> int:
+    """按源文本长度估算翻译所需的输出预算 (max_tokens)。
+
+    为什么不能固定 4000:
+    MiniMax 的思考型模型（M2.7 / M3.1-Flash 强制思考）的**推理 token 与
+    正文共用同一个 max_tokens 预算池**。预算给小了，思考先吃光，正文就断在
+    半句 —— 前端表现为「已翻译」，但内容是残的。
+
+    实测（2019 IEEE 双栏论文整页，2700 字符）:
+        M2.7   开着思考 5.3s，思考文本混在 content 里
+        M3     开着思考 16.1s
+        M3     关掉思考 3.0s，输出干净
+        M3.1-Flash 强制思考，8.9s，且传 thinking.type=disabled 直接 400
+
+    英文 1 字符 ≈ 0.3 个中文 token，译文长度大致是源文的 1/2。1.6 倍系数给
+    思考 token 和格式开销留出余量；上下限防止极端输入把预算撑爆。
+
+    强制思考的模型（M3.1-Flash）要再乘 2.5：它的推理量级跟输入长度成正比
+    （实测 2627 字符的页面推理了 14688 字符 ≈ 4000 token），按正文需求给
+    预算必然被推理吃光 —— 那样会先失败一次再升级重试，白等一倍时间。
+    """
+    base = max(4000, min(int(src_len * 1.6), 16000))
+    if llm.model_forces_thinking(model):
+        base = min(int(base * 2.5), llm.MAX_ESCALATION_MAX_TOKENS)
+    return base
 
 
 @app.post("/api/paper/translate_section")
@@ -1828,7 +1863,8 @@ async def api_translate_section(req: TranslateRequest):
 
     cache = get_cache()
     curr_st = llm.get_llm_status()
-    model = curr_st.get("active_model") or "default"
+    # 翻译可能走「翻译专用模型」，缓存键和上报都要用它，不能用主模型。
+    model = llm.translation_active_model()
 
     # Cache lookup: same text + same model = same translation
     cached = cache.get(req.section_key or "", req.section_text, model)
@@ -1869,16 +1905,21 @@ async def api_translate_section(req: TranslateRequest):
                     {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                # Shorter cap: smaller chunks need shorter responses, and
-                # faster responses are less likely to be killed mid-stream
-                # by upstream proxies / load balancers.
-                max_tokens=4000,
+                # 输出预算按分块长度自适应（见 _translation_max_tokens）：
+                # 思考型模型的推理 token 与正文共用同一个 max_tokens 池，固定
+                # 4000 正好是最容易被截断的档位，截断了译文就断在半句。
+                max_tokens=_translation_max_tokens(len(chunk), model),
                 temperature=0.2,
                 # Generous timeout — MiniMax thinking mode can take 60s
                 # per chunk; multi-chunk translations need headroom.
-                timeout=120,
+                # 强制思考的模型（M3.1-Flash）单次要跑 100~200s，120s 会把
+                # 它砍在半路（砍掉之后拿到的还是残缺译文）。
+                timeout=300 if llm.model_forces_thinking(model) else 120,
                 # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
                 disable_thinking=llm.translation_disable_thinking(),
+                # 翻译专用模型（LLM_TRANSLATION_MODEL）：M3.1-Flash 强制思考，
+                # 直译会又慢又断句，单独指定一个能关思考的模型更稳。
+                model_name=llm.translation_model_name(),
             )
             translated_parts.append((translated or "").strip())
     except llm.LLMError as e:
@@ -1888,7 +1929,7 @@ async def api_translate_section(req: TranslateRequest):
 
     translation = "\n\n".join(translated_parts).strip()
     curr_st = llm.get_llm_status()
-    actual_model = curr_st.get("active_model") or model
+    actual_model = llm.translation_active_model()
     result = {
         "status": "success",
         "translation": translation,
@@ -2324,7 +2365,8 @@ async def api_translate_page(req: TranslatePageRequest):
 
     cache = get_cache()
     cfg = llm._config()
-    model = cfg["model"]
+    # 翻译可能走「翻译专用模型」，缓存键和上报都要用它。
+    model = llm.translation_active_model()
 
     # 优先用服务端重新抽取的页面文本：浏览器 PDF.js 抓到的文本在字体子集化
     # 的 PDF 上会丢掉单词空格（"compositestructureshavebeen"），而 pdfplumber
@@ -2369,11 +2411,14 @@ async def api_translate_page(req: TranslatePageRequest):
                     {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=4000,
+                max_tokens=_translation_max_tokens(len(chunk), model),
                 temperature=0.2,
-                timeout=90,
+                # 强制思考的模型单次要跑 100~200s，超时要放开
+                timeout=300 if llm.model_forces_thinking(model) else 90,
                 # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
                 disable_thinking=llm.translation_disable_thinking(),
+                # 翻译专用模型（LLM_TRANSLATION_MODEL）
+                model_name=llm.translation_model_name(),
             )
             # `.strip()` must apply to the awaited result, not to the
             # coroutine (see the same note in api_translate_section).
@@ -2392,7 +2437,7 @@ async def api_translate_page(req: TranslatePageRequest):
         "page": req.page,
         "chunk_count": len(chunks),
         "from_cache": False,
-        "model": curr_st["active_model"],
+        "model": llm.translation_active_model(),
         "is_degraded": curr_st["is_degraded"],
     }
     # 缓存写入必须用与读取时完全一致的文本（page_text），否则哈希对不上，

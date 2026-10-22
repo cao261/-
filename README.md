@@ -51,21 +51,35 @@
 
 ### 🤖 模型选择与「直译」参数
 
-| 模型 | 思考模式 | 论文直译实测 |
+实测口径：2015 IEEE 双栏论文**整页**（2627 字符，pdfplumber 抽取），
+走真实 HTTP 接口，统计端到端耗时与译文完整性。
+
+| 模型 | 思考模式 | 整页直译实测 |
 | --- | --- | --- |
-| **MiniMax-M3** | 可开关（`thinking.type` 支持 `adaptive` / `disabled`） | ✅ 整页一次翻译 21.5s 出完整译文，公式/术语保留良好 |
-| MiniMax-M3.1-Flash | **强制 adaptive，不可关闭** | ⚠️ 长文输入容易在推理里打转（思考烧光 `max_tokens` → 正文为空） |
+| **MiniMax-M3** | 可关（`thinking.type=disabled` 支持） | ✅ **10.4s**，译文完整、无思考泄漏、无中英混杂 —— 直译首选 |
+| MiniMax-M2.7 | 传 `disabled` 会被**静默忽略** | ⚠️ 13~25s，译文完整但 content 里混着思考文本；译文质量偏好时可作主模型 |
+| MiniMax-M3.1-Flash | **强制 adaptive，不可关闭**（传 `disabled` 直接 400） | ⚠️ 44.9s；推理会把输出预算吃光，预算给小了正文被截断（代码已自动加大预算并检测截断） |
 | Agnes 3.0 Flash（备用） | 无思考 | ✅ 兜底可用，20 RPM 限速 |
 
-推荐配置（`.env`）：
+> **为什么「慢 + 乱」**：MiniMax 的**思考 token 与正文共用同一个 `max_tokens`
+> 预算池**。预算给小了，推理先吃光，正文就断在半句，而前端仍显示「已翻译」。
+> M3.1-Flash 强制思考，最容易踩这个坑。
+
+推荐配置（`.env`）—— **读论文和做推理解耦**：
 
 ```ini
-LLM_MODEL_NAME=MiniMax-M3
-LLM_TRANSLATION_DISABLE_THINKING=1   # 直译任务关掉思考：更快，且不会在推理里打转
+LLM_MODEL_NAME=MiniMax-M2.7      # 主模型：解读 / 答疑（要推理）
+LLM_TRANSLATION_MODEL=MiniMax-M3  # 翻译专用：批量直译（要快、要完整）
+LLM_TRANSLATION_DISABLE_THINKING=1
 ```
 
-`LLM_TRANSLATION_DISABLE_THINKING=1` 只作用于翻译类请求；问答/解读仍保留模型的
-推理能力。若把主模型换成 M3.1-Flash，代码会自动忽略该参数（模型会拒绝）并降级重试。
+- `LLM_TRANSLATION_MODEL` 留空 = 翻译跟随主模型。
+- `LLM_TRANSLATION_DISABLE_THINKING=1` 只作用于翻译类请求；问答/解读仍保留模型的推理能力。
+- 若把翻译模型换成 M3.1-Flash，代码会自动忽略 `disabled` 参数（模型会拒绝）、
+  自动加大输出预算、并在正文被截断时**报错而不是把残缺译文当成成功**。
+- 翻译结果按 (章节, 文本哈希, 模型) 缓存。换模型或改提示词后缓存键会变，
+  不会命中旧结果；但**只改代码不换模型**时，旧译文仍在内存缓存里，
+  重启服务即可清空。
 
 ---
 

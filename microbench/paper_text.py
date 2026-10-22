@@ -228,13 +228,55 @@ def extract_page_text_from_path(pdf_path, page_no: int) -> str:
     the server re-extracts the page with the correct word spacing and
     column order instead of trusting the text the browser scraped via
     PDF.js (which loses spaces on fonts without space glyphs).
+
+    The tail is trimmed: a page normally ends with a hyphenated word that
+    continues on the next page ("...in a highly mag-") plus a lone page
+    number. Feeding that to the model makes the translation end on a
+    half-word ("在高度磁——"), which reads as "已翻译但内容是乱的".
     """
     import pdfplumber
     path = Path(pdf_path)
     with pdfplumber.open(str(path)) as pdf:
         if page_no < 1 or page_no > len(pdf.pages):
             return ""
-        return _extract_page_text(pdf.pages[page_no - 1])
+        return _trim_page_tail(_extract_page_text(pdf.pages[page_no - 1]))
+
+
+_PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
+_SENTENCE_END_RE = re.compile(r"[.!?。！？]")
+# 末尾残片最多砍掉这么多字符，防止整页没有句号时把大半页都砍掉。
+_MAX_TAIL_TRIM_CHARS = 1500
+
+
+def _trim_page_tail(text: str) -> str:
+    """去掉页尾的页码行和没写完的末句。
+
+    只用于「按页翻译」这条路径（单页独立成文）。整篇章节翻译不能这么切：
+    章节里各页是拼起来的，页尾的 "mag-" 正是下一页 "netic" 的前半截，
+    切掉反而会拼出一个新词。
+
+    为什么必须切：一页的最后一句往往跨页续写，页尾还常带一个单独的页码
+    行。直接丢给模型翻译，译文就会以半截词收尾（"在高度磁——"），读起来
+    像翻译坏了。按「最后一个句末标点」一刀切掉尾巴，可以同时解决三件事：
+    跨页断词、页码行、没写完的末句。
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+
+    # 1) 末尾孤立的页码行（单独一个数字）
+    while lines and _PAGE_NUMBER_RE.match(lines[-1]):
+        lines.pop()
+    text = "\n".join(lines).rstrip()
+
+    # 2) 砍掉最后一个句末标点之后的残片
+    ends = list(_SENTENCE_END_RE.finditer(text))
+    if ends:
+        cut = ends[-1].end()
+        if cut < len(text) and (len(text) - cut) <= _MAX_TAIL_TRIM_CHARS:
+            text = text[:cut]
+
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
