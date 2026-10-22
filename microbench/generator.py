@@ -11,6 +11,7 @@ V1.1 hardening:
 import datetime
 import os
 import re
+import shutil
 import time
 import threading
 from pathlib import Path
@@ -18,6 +19,15 @@ from pathlib import Path
 import jinja2
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# 模板的「随代码走」副本。_Templates/ 属于用户的 Obsidian vault，被 .gitignore
+# 排除在外，所以全新克隆的仓库里根本没有它 —— 直接读模板会 500
+# ("模板不存在")，保存文献卡片 / 复现工程 / 周报全线失败。
+# 因此包内必须自带一份兜底副本，vault 里没有就回退到它。
+_BUNDLED_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+
+# vault 里的模板目录（用户可自由改写；缺失时自动从包内副本补齐）
+VAULT_TEMPLATES_DIRNAME = "_Templates"
 
 # Serialises writes to the *shared* vault files (the troubleshooting diary
 # and the weekly report folder). The server runs its sync endpoints in a
@@ -113,6 +123,51 @@ _JINJA_ENV = jinja2.Environment(  # nosec B701
     trim_blocks=False,
     lstrip_blocks=False,
 )
+
+
+def _resolve_template(name: str) -> Path:
+    """定位一个模板文件：vault 里的优先，缺失时回退到包内自带副本。
+
+    vault 的 `_Templates/` 是用户的地盘（可以随手改成自己的模板），但它被
+    .gitignore 排除，克隆下来的仓库里没有；此时必须能用包内副本顶上，否则
+    "保存文献卡片" 这类最基本的动作会直接 500。
+    """
+    user_tpl = BASE_DIR / VAULT_TEMPLATES_DIRNAME / name
+    if user_tpl.exists():
+        return user_tpl
+    bundled = _BUNDLED_TEMPLATES_DIR / name
+    if bundled.exists():
+        return bundled
+    raise FileNotFoundError(
+        f"模板不存在: {name}（vault: {user_tpl} / 包内: {bundled}）"
+    )
+
+
+def ensure_vault_templates() -> list[str]:
+    """把包内模板补进 vault 的 `_Templates/`（已存在的绝不覆盖）。
+
+    用户的 vault 里应该有一份可自由改写的模板；全新克隆时它是空的，
+    这里用包内副本补齐，让用户一眼就能找到并改成自己的格式。
+    返回本次新写入的文件名列表。
+    """
+    written: list[str] = []
+    if not _BUNDLED_TEMPLATES_DIR.is_dir():
+        return written
+    target_dir = BASE_DIR / VAULT_TEMPLATES_DIRNAME
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return written
+    for src in sorted(_BUNDLED_TEMPLATES_DIR.glob("*.md")):
+        dst = target_dir / src.name
+        if dst.exists():
+            continue
+        try:
+            shutil.copyfile(src, dst)
+            written.append(src.name)
+        except OSError:
+            continue
+    return written
 
 
 def _render_template(tpl_path: Path, **vars) -> str:
@@ -513,7 +568,7 @@ def save_literature_card(data: dict) -> dict:
             f"允许值: {ALLOWED_TOPIC_CATEGORIES}"
         )
 
-    tpl_path = BASE_DIR / "_Templates" / "01_Literature_Note_Template.md"
+    tpl_path = _resolve_template("01_Literature_Note_Template.md")
     today = datetime.date.today().isoformat()
     safe_title = sanitize_filename(title)
     pdf_name = f"{year}_{safe_title[:30]}.pdf"
@@ -641,7 +696,7 @@ def create_reproduction_workspace(data: dict) -> dict:
 
     today = datetime.date.today().isoformat()
     if project_type == "TCAD":
-        tpl_path = BASE_DIR / "_Templates" / "02_TCAD_Reproduction_Template.md"
+        tpl_path = _resolve_template("02_TCAD_Reproduction_Template.md")
         rendered = _render_template(
             tpl_path,
             project_name=project_name,
@@ -652,7 +707,7 @@ def create_reproduction_workspace(data: dict) -> dict:
             date=today,
         )
     else:  # EDA
-        tpl_path = BASE_DIR / "_Templates" / "03_EDA_Circuit_Reproduction_Template.md"
+        tpl_path = _resolve_template("03_EDA_Circuit_Reproduction_Template.md")
         rendered = _render_template(
             tpl_path,
             project_name=project_name,
@@ -756,7 +811,7 @@ def generate_weekly_report() -> dict:
     week_num = today.strftime("%W")
     week_id = f"{today.year}_Week{week_num}"
 
-    tpl_path = BASE_DIR / "_Templates" / "04_Weekly_Report_Template.md"
+    tpl_path = _resolve_template("04_Weekly_Report_Template.md")
     stats = get_vault_stats()
 
     # Filter to the last 7 days. The old code took the 3 most recently

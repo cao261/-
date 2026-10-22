@@ -46,6 +46,7 @@ from .generator import (
     search_vault,
     ALLOWED_TOPIC_CATEGORIES,
     sanitize_filename,
+    ensure_vault_templates,
     _safe_path,             # exported once; used by all vault-file endpoints
 )
 from .translation import (
@@ -72,6 +73,14 @@ async def _lifespan(app: "FastAPI"):
     Uses the modern `lifespan` hook — `app.on_event("shutdown")` is
     deprecated and emitted a DeprecationWarning on every startup.
     """
+    # 把包内模板补进 vault 的 _Templates/（已存在的绝不覆盖）。
+    # 全新克隆的仓库里这个目录是空的，用户也就看不到、也改不了自己的模板。
+    try:
+        written = ensure_vault_templates()
+        if written:
+            print(f"[MicroBench] 已补齐 vault 模板: {', '.join(written)}", file=sys.stderr)
+    except Exception:
+        pass
     yield
     try:
         from .llm import close_async_clients

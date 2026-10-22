@@ -48,9 +48,14 @@ def sandbox(tmp_path, monkeypatch) -> Path:
     from microbench import generator as gen_mod
 
     # Copy the templates so the card/report writers work.
+    # The vault's _Templates/ is gitignored (it belongs to the user's Obsidian
+    # vault), so a fresh clone has none — fall back to the bundled copies that
+    # ship inside the package.
     tpl_src = PROJECT_ROOT / "_Templates"
+    if not tpl_src.exists():
+        tpl_src = PROJECT_ROOT / "microbench" / "templates"
     if tpl_src.exists():
-        shutil.copytree(tpl_src, tmp_path / "_Templates")
+        shutil.copytree(tpl_src, tmp_path / "_Templates", dirs_exist_ok=True)
 
     for d in ("01_Literature", "02_Reproduction", "03_Knowledge",
               "04_Weekly_Reports", "logs"):

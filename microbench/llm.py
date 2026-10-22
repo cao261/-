@@ -807,9 +807,16 @@ def _invoke_model(
             primary_limiter.acquire()
 
         try:
-            resp = _get_session(not _proxy_bypassed).post(
-                url, json=payload, headers=headers, timeout=attempt_timeout
-            )
+            if _proxy_bypassed:
+                # 已经确认环境代理是死的 —— 走 trust_env=False 的直连 session
+                resp = _get_session(False).post(
+                    url, json=payload, headers=headers, timeout=attempt_timeout
+                )
+            else:
+                # 正常路径仍然用模块级 requests.post：
+                # 测试可以 monkeypatch requests.post 来注入假响应，
+                # 换成 Session 实例会让那些 patch 失效（测试会真的发出网请求）。
+                resp = requests.post(url, json=payload, headers=headers, timeout=attempt_timeout)
             last_status = resp.status_code
         except requests.exceptions.ProxyError as e:
             # 本机配了本地代理但代理软件没运行 → 记下来，改直连重试一次
