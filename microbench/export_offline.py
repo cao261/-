@@ -191,10 +191,19 @@ def extract_math(text: str) -> tuple[str, list[tuple[str, bool]]]:
 # 3. KaTeX
 # ---------------------------------------------------------------------------
 
-def render_formulas(all_formulas: list[tuple[str, bool]]) -> dict[int, dict]:
-    """Render every unique formula in one Node pass."""
+def render_formulas(all_formulas: list[tuple[str, bool]]) -> dict:
+    """Render every unique formula in one Node pass.
+
+    Returns {"_per_occurrence": [...]} — one rendered entry per *occurrence*
+    (not per unique formula), so the caller can slice it per note.
+
+    NOTE: the empty case must still return the "_per_occurrence" key.
+    Returning a bare {} made every formula-free vault die with
+    KeyError: '_per_occurrence' — which is exactly the state of a brand-new
+    vault, i.e. the first export anyone ever runs.
+    """
     if not all_formulas:
-        return {}
+        return {"_per_occurrence": []}
     unique: dict[tuple[str, bool], int] = {}
     payload = []
     for tex, display in all_formulas:

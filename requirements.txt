@@ -25,6 +25,12 @@ defusedxml>=0.7.1
 #   之后, 所有 AI 功能会静默失效 (llm.py 把 httpx 置为 None 并抛错)。
 httpx>=0.24.0
 
+# 离线阅读版导出 (export_offline.py) 把 vault 笔记转成单文件 HTML,
+# 走的是 Python-Markdown。它是**懒加载**的 (import 在函数体内), 所以服务本身
+# 不受影响 —— 但一旦执行导出就会 ModuleNotFoundError, 而 requirements.txt
+# 里从来没声明过它, 干净环境装完依赖仍然导不出。
+markdown>=3.5
+
 # 把删除的文件送进系统回收站 (可恢复), 而不是永久 unlink。
 # app.py 的 DELETE /api/vault/file 依赖它; 缺失时会退化为不可恢复的删除。
 send2trash>=1.8.0
