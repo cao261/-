@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -434,6 +435,27 @@ _PWA_ASSETS = {
     "apple-touch-icon.png": "image/png",
 }
 
+# ---------------------------------------------------------------------------
+# Vendored front-end libraries (/static/vendor)
+#
+# index.html is served by the "/" route, but the vendored front-end libraries
+# (PDF.js + KaTeX under static/vendor/) need a real HTTP path so the browser
+# can load them. They used to come from cdn.jsdelivr.net, which is blocked on
+# this machine -> `pdfjsLib` was undefined -> "PDF.js 未加载" in the reader.
+# Serving them locally makes the workbench fully offline-capable.
+#
+# Only the vendor/ subtree is mounted on purpose: the rest of static/
+# (index.html, pair.html) keeps being served by the routes below, so the LAN
+# pairing gate and the PWA whitelist are unaffected.
+# ---------------------------------------------------------------------------
+_VENDOR_DIR = STATIC_DIR / "vendor"
+if _VENDOR_DIR.is_dir():
+    app.mount(
+        "/static/vendor",
+        StaticFiles(directory=str(_VENDOR_DIR)),
+        name="static-vendor",
+    )
+
 
 def _pairing_page_response(request: Request, error: str = ""):
     """The small "enter your access code" page a fresh tablet sees.
@@ -640,6 +662,12 @@ class TranslatePageRequest(BaseModel):
     page: int = Field(..., ge=1, le=200, description="1-based page number")
     text: str = Field(..., min_length=10, max_length=15000,
                       description="Full page text (single chunk from pdfplumber)")
+    relative_path: Optional[str] = Field(
+        default=None, max_length=500,
+        description=("PDF 在 vault 中的相对路径。提供时服务端会用 pdfplumber "
+                     "重新抽取该页文本（正确恢复丢失的单词空格 + 按栏顺序），"
+                     "比浏览器 PDF.js 抓到的文本质量高得多。"),
+    )
 
 
 class TranslationCacheBatchItem(BaseModel):
@@ -896,6 +924,9 @@ def api_fetch_paper(req: FetchPaperRequest):
     the dashboard's live counters and the SSE readers).
     """
     try:
+        # 抓取走 arXiv / Crossref 外网，慢响应确实存在 —— 但本端点是同步 def，
+        # FastAPI 已经把它丢进 anyio 线程池执行，慢响应不会冻结事件循环，
+        # 所以这里直接调用即可，不需要再套一层 asyncio.to_thread。
         data = smart_fetch_paper(req.identifier)
         # Also try to resolve landing URL for DOI papers (for manual download link)
         if data.get("doi") and not data.get("arxiv"):
@@ -1012,7 +1043,7 @@ async def api_download_pdf(
     if not is_arxiv:
         # For DOI, return landing URL instead of trying direct PDF
         try:
-            landing = resolve_doi_landing_url(identifier)
+            landing = await asyncio.to_thread(resolve_doi_landing_url, identifier)
             return {
                 "status": "manual_required",
                 "reason": "DOI 出版商通常需要浏览器渲染/登录, 无法直接下载 PDF",
@@ -1038,7 +1069,8 @@ async def api_download_pdf(
     save_to = _safe_path(target_dir, pdf_name)
 
     try:
-        info = download_arxiv_pdf(identifier, save_to)
+        # 下载走 arXiv 外网，放线程里执行
+        info = await asyncio.to_thread(download_arxiv_pdf, identifier, save_to)
         return {
             "status": "success",
             "file_name": pdf_name,
@@ -1414,6 +1446,8 @@ def api_export_bibtex(
     if not arxiv and not doi:
         raise HTTPException(status_code=400, detail="必须提供 arxiv 或 doi 之一")
     try:
+        # 元数据抓取走 arXiv / Crossref 外网。本端点是同步 def，FastAPI 已把
+        # 它放进 anyio 线程池，慢响应不会冻结事件循环，直接调用即可。
         if arxiv:
             meta = smart_fetch_paper(arxiv)
         else:
@@ -1698,6 +1732,8 @@ def api_fetch_full_text(req: FetchFullRequest):
     event loop and froze every other request for the duration.
     """
     try:
+        # 全文抓取 = 外网下载 + PDF 解析。本端点是同步 def，FastAPI 已把它放进
+        # anyio 线程池执行，慢任务不会冻结事件循环，直接调用即可。
         result = fetch_full_text(req.identifier)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1764,6 +1800,9 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 4. 数学符号保持 LaTeX 形式 (如 "$I_{on}$", "$\\tau$", "$\\lambda$")
 5. 中文输出, Markdown 格式
 6. 如果原文含图表引用 (如 "Fig. 3", "Table II"), 保留原样
+7. 原文是从 PDF 自动抽取的纯文本, 双栏页面的句子顺序可能被打乱、公式可能残缺。
+   请直接按语义翻译能读懂的部分, 不要为了重建原文版面结构而反复推敲,
+   不要输出分析过程, 只输出译文本身
 """
 
 
@@ -1833,11 +1872,13 @@ async def api_translate_section(req: TranslateRequest):
                 # Shorter cap: smaller chunks need shorter responses, and
                 # faster responses are less likely to be killed mid-stream
                 # by upstream proxies / load balancers.
-                max_tokens=1500,
+                max_tokens=4000,
                 temperature=0.2,
-                # Generous timeout — MiniMax-M2.7 thinking mode can take 60s
+                # Generous timeout — MiniMax thinking mode can take 60s
                 # per chunk; multi-chunk translations need headroom.
                 timeout=120,
+                # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
+                disable_thinking=llm.translation_disable_thinking(),
             )
             translated_parts.append((translated or "").strip())
     except llm.LLMError as e:
@@ -2171,7 +2212,7 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
                     {"role": "system", "content": CROSS_QA_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=1500,
+                max_tokens=4000,
                 temperature=0.3,
             )
             async for chunk in _stream_llm_event_gen(chunk_iter):
@@ -2247,7 +2288,7 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
                     {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=1500,
+                max_tokens=4000,
                 temperature=0.3,
                 timeout=120,
             )
@@ -2285,20 +2326,34 @@ async def api_translate_page(req: TranslatePageRequest):
     cfg = llm._config()
     model = cfg["model"]
 
+    # 优先用服务端重新抽取的页面文本：浏览器 PDF.js 抓到的文本在字体子集化
+    # 的 PDF 上会丢掉单词空格（"compositestructureshavebeen"），而 pdfplumber
+    # 用更小的 x_tolerance 能正确切词，并且能按左栏/右栏顺序输出。
+    page_text = req.text
+    if req.relative_path:
+        try:
+            from .generator import BASE_DIR, _safe_path
+            from .paper_text import extract_page_text_from_path
+            pdf_path = _safe_path(BASE_DIR, req.relative_path)
+            extracted = extract_page_text_from_path(pdf_path, req.page)
+            if extracted and len(extracted.strip()) >= 100:
+                page_text = extracted
+        except Exception:
+            pass  # 取不到就用客户端传来的文本
+
     # Cache key includes paper_id + page so each page is cached independently.
-    # We DO NOT include text hash (text might come from different extractions
-    # of the same page); instead we accept text-as-given. A page extract is
-    # deterministic for a given PDF, so this is fine.
+    # 缓存键里还带文本哈希（见 translation.TranslationCache._key_for），
+    # 换用更好的抽取文本后会自动 miss，不会命中旧的坏结果。
     cache_section_key = f"page:{req.paper_id}:{req.page}"
 
-    cached = cache.get(cache_section_key, req.text, model)
+    cached = cache.get(cache_section_key, page_text, model)
     if cached:
         cached["from_cache"] = True
         return cached
 
     # Translate the whole page in one shot (page text is already < 15K chars)
     # If somehow larger, chunk and translate parts.
-    chunks = chunk_section_text(req.text)
+    chunks = chunk_section_text(page_text)
     translated_parts = []
     try:
         for idx, chunk in enumerate(chunks):
@@ -2314,9 +2369,11 @@ async def api_translate_page(req: TranslatePageRequest):
                     {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=1500,
+                max_tokens=4000,
                 temperature=0.2,
                 timeout=90,
+                # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
+                disable_thinking=llm.translation_disable_thinking(),
             )
             # `.strip()` must apply to the awaited result, not to the
             # coroutine (see the same note in api_translate_section).
@@ -2338,7 +2395,9 @@ async def api_translate_page(req: TranslatePageRequest):
         "model": curr_st["active_model"],
         "is_degraded": curr_st["is_degraded"],
     }
-    cache.put(cache_section_key, req.text, model, result)
+    # 缓存写入必须用与读取时完全一致的文本（page_text），否则哈希对不上，
+    # 缓存永远不命中。
+    cache.put(cache_section_key, page_text, model, result)
     return result
 
 

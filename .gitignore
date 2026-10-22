@@ -52,19 +52,20 @@ _Templates/
 .obsidian/
 
 # Generated audit/scratch artifacts (not source)
-_/_*.txt
+# NOTE: these patterns are anchored to the repo ROOT on purpose. The
+# unanchored `_*.py` form would also match microbench/_test_lan.py,
+# microbench/_e2e_lan.py and microbench/_test_offline_export.py -- real
+# regression suites that must stay in version control.
+/_*.txt
 /_audit_*.md
 /_*.log
+/_*.ps1
 
 # Audit report produced by security-audit skill (kept locally, never in repo)
 AUDIT_REPORT.md
 
-# Runtime artifacts. app.py's snapshot code claims logs/
-
-# Backup copies of the launcher (kept on disk, never in the repo)
-start_workbench.bat.bak is gitignored so
-# translated paper text never leaks into the public Obsidian vault — it was
-# not actually ignored, so a `git add -A` would have committed them.
+# Runtime artifacts -- logs/ holds uvicorn.log, offline_export.log and
+# translated paper text, none of which may leak into the public Obsidian vault
 logs/
 
 # Backup copies of the launcher (kept on disk, never in the repo)

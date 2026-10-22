@@ -1185,7 +1185,8 @@
       display: flex;
       flex-direction: column;
       align-items: center;
-      max-width: 760px;
+      /* 不再固定 760px：PDF 宽度按左栏实际可用宽度自适应，占满整栏 */
+      max-width: 1200px;
       width: 100%;
       margin: 0 auto var(--s-6) auto;
     }
@@ -1209,7 +1210,8 @@
     .pdf-translation-block {
       box-sizing: border-box;
       width: 100%;
-      max-width: 760px;
+      /* 翻译卡片同样按栏宽铺满（超宽屏留白控制在可读范围内） */
+      max-width: 1200px;
       margin: 0 auto var(--s-5) auto;
       padding: var(--s-5) var(--s-6);
       background: var(--surface-raised);
@@ -2938,49 +2940,85 @@
     // ---------------------------------------------------------------
     let _pdfJsPromise = null;
     let _katexPromise = null;
-    function _appendLazyCss(href, crossorigin) {
+    // 本地 vendor 优先、CDN 兜底。
+    // 背景：本机访问不了 cdn.jsdelivr.net，只引 CDN 会让 pdfjsLib / katex 一直
+    // undefined（阅读器报「PDF.js 未加载」、公式不渲染）。vendor 文件随仓库分发
+    // （microbench/static/vendor/），缺失时才回退 CDN。
+    const _VENDOR = {
+      pdfJsCss: "/static/vendor/pdfjs/pdf_viewer.css",
+      pdfJsJs: "/static/vendor/pdfjs/pdf.min.js",
+      pdfWorker: "/static/vendor/pdfjs/pdf.worker.min.js",
+      katexCss: "/static/vendor/katex/katex.min.css",
+      katexJs: "/static/vendor/katex/katex.min.js",
+    };
+    const _CDN = {
+      pdfJsCss: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/web/pdf_viewer.css",
+      pdfJsJs: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js",
+      pdfWorker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js",
+      katexCss: "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css",
+      katexJs: "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js",
+    };
+    function _appendLazyCss(href, crossorigin, fallbackHref) {
       // CSS is render-blocking once attached, but appendChild + cdn fetch
       // can race ahead of the JS tag below — Chromium parallelizes.
       const l = document.createElement("link");
       l.rel = "stylesheet";
       l.href = href;
       if (crossorigin) l.crossOrigin = crossorigin;
+      if (fallbackHref) {
+        // 本地 vendor 404/缺失时自动切到 CDN，别让公式样式彻底消失
+        l.onerror = () => {
+          if (l.href !== fallbackHref) l.href = fallbackHref;
+        };
+      }
       document.head.appendChild(l);
       return l;
     }
-    function loadPdfJs() {
-      if (_pdfJsPromise) return _pdfJsPromise;
-      _pdfJsPromise = new Promise((resolve, reject) => {
-        // CSS first — only used in PDF mode, no impact on first paint.
-        _appendLazyCss("https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/web/pdf_viewer.css");
+    // 脚本同理：先试本地 vendor，onerror 再换 CDN；两处都失败才 reject。
+    function _loadScriptWithFallback(primary, fallback, crossorigin) {
+      return new Promise((resolve, reject) => {
         const s = document.createElement("script");
-        s.src = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js";
-        s.onload = () => {
-          try {
-            if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
-              window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-                "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
-            }
-            resolve(window.pdfjsLib);
-          } catch (e) { reject(e); }
+        if (crossorigin) s.crossOrigin = crossorigin;
+        s.onload = () => resolve(s);
+        s.onerror = () => {
+          if (fallback && s.src !== fallback) {
+            s.src = fallback;
+          } else {
+            reject(new Error("脚本加载失败（本地 vendor 与 CDN 均不可用）: " + primary));
+          }
         };
-        s.onerror = reject;
+        s.src = primary;
         document.head.appendChild(s);
       });
+    }
+    function loadPdfJs() {
+      if (_pdfJsPromise) return _pdfJsPromise;
+      _pdfJsPromise = (async () => {
+        // CSS first — only used in PDF mode, no impact on first paint.
+        _appendLazyCss(_VENDOR.pdfJsCss, null, _CDN.pdfJsCss);
+        await _loadScriptWithFallback(_VENDOR.pdfJsJs, _CDN.pdfJsJs);
+        if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
+          // 默认指本地 worker；loadPdfDocument() 里还有 LOCAL→CDN 候选链兜底。
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = _VENDOR.pdfWorker;
+        }
+        if (!window.pdfjsLib) {
+          throw new Error("PDF.js 未加载（本地 /static/vendor/pdfjs 与 CDN 均不可用）");
+        }
+        return window.pdfjsLib;
+      })();
       return _pdfJsPromise;
     }
     function loadKatex() {
       if (_katexPromise) return _katexPromise;
-      _katexPromise = new Promise((resolve, reject) => {
+      _katexPromise = (async () => {
         // CSS first — only used when first QA / translation renders math.
-        _appendLazyCss("https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css", "anonymous");
-        const s = document.createElement("script");
-        s.src = "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js";
-        s.crossOrigin = "anonymous";
-        s.onload = () => resolve(window.katex);
-        s.onerror = reject;
-        document.head.appendChild(s);
-      });
+        _appendLazyCss(_VENDOR.katexCss, "anonymous", _CDN.katexCss);
+        await _loadScriptWithFallback(_VENDOR.katexJs, _CDN.katexJs, "anonymous");
+        if (!window.katex) {
+          throw new Error("KaTeX 未加载（本地 /static/vendor/katex 与 CDN 均不可用）");
+        }
+        return window.katex;
+      })();
       return _katexPromise;
     }
     // 把全局别名指向懒加载版本,避免后续代码改写
@@ -3300,6 +3338,52 @@
       if (el) el.textContent = Math.round((_pdfZoom || 1.0) * 100) + "%";
     }
 
+    // 窗口尺寸变化 -> 按新的栏宽重新渲染 PDF。
+    // PDF 宽度是按左栏可用宽度自适应的（100% = 占满整栏），所以窗口一变
+    // 就得重绘，否则页面宽度和栏宽对不上，两侧又会空出来。
+    let _pdfResizeTimer = null;
+    window.addEventListener("resize", () => {
+      if (_readerMode !== "pdf" || !_pdfState || !_pdfState.pdfDoc) return;
+      const w = document.getElementById("pdf-pages-list")?.clientWidth || 0;
+      if (!w) return;
+      const last = _pdfState.lastRenderWidth || 0;
+      if (last && Math.abs(w - last) < 40) return; // 变化太小不值得重绘
+      clearTimeout(_pdfResizeTimer);
+      _pdfResizeTimer = setTimeout(() => {
+        if (!_pdfState || !_pdfState.rendering) return;
+        const gen = (_pdfState.rendering.generation || 0) + 1;
+        _pdfState.rendering.generation = gen;
+        _pdfState.rendering.cancelled = true;
+        document.getElementById("pdf-pages-list").innerHTML = "";
+        loadPdfDualColumn({ keepTranslations: true, generation: gen });
+      }, 250);
+    });
+
+    /**
+     * 载入 PDF 文档，worker 源按「本地 vendor -> CDN」顺序尝试。
+     *
+     * 本地 worker 随仓库分发（microbench/static/vendor/pdfjs/），正常情况第一档
+     * 即成功；只有在 vendor 缺失（全新克隆未执行 vendor 脚本）时才会落到 CDN。
+     * 不做预探测的原因：某些环境下 HEAD 探测会被浏览器标记为 ERR_ABORTED 而
+     * 产生假阴性，把可用的本地 worker 误判成不可用，反而退回到被墙的 CDN。
+     */
+    async function loadPdfDocument(pdfUrl) {
+      const LOCAL_WORKER = "/static/vendor/pdfjs/pdf.worker.min.js";
+      const CDN_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+      const candidates = [LOCAL_WORKER, CDN_WORKER];
+      let firstErr = null;
+      for (const workerSrc of candidates) {
+        try {
+          pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
+          return await pdfjsLib.getDocument({ url: pdfUrl }).promise;
+        } catch (e) {
+          // 首个错误最有诊断价值（本地路径优先），保留它用于最终提示
+          if (!firstErr) firstErr = e;
+        }
+      }
+      throw firstErr;
+    }
+
     async function loadPdfDualColumn(opts = {}) {
       const { keepTranslations = false, generation = null, restoreSnapshot = null } = opts;
       const title = _readerState.title || "";
@@ -3365,8 +3449,7 @@
         if (keepTranslations && _pdfState && _pdfState.pdfDoc) {
           pdfDoc = _pdfState.pdfDoc;
         } else {
-          const loadingTask = pdfjsLib.getDocument({ url: pdfUrl });
-          pdfDoc = await loadingTask.promise;
+          pdfDoc = await loadPdfDocument(pdfUrl);
         }
 
         // Reset cancelled flag for new render loop. Each loadPdfDualColumn
@@ -4129,11 +4212,13 @@
       const listEl = document.getElementById("pdf-pages-list");
       const page = await _pdfState.pdfDoc.getPage(pageNum);
       const viewport0 = page.getViewport({ scale: 1.0 });
-      // Base width + user-controlled zoom multiplier (PDF dual-column)
-      const baseWidth = 520;
-      const targetWidth = Math.max(220, baseWidth * (_pdfZoom || 1.0));
-      const scale = targetWidth / viewport0.width;
+      // 按左栏「实际可用宽度」自适应：_pdfZoom = 1.0 表示正好占满栏宽。
+      // 原先固定 baseWidth=520px，栏宽一变两侧就空出一大片。
+      const availWidth = Math.max(260, (listEl.clientWidth || 520) - 4);
+      const fitScale = availWidth / viewport0.width;
+      const scale = fitScale * (_pdfZoom || 1.0);
       const viewport = page.getViewport({ scale });
+      if (_pdfState) _pdfState.lastRenderWidth = availWidth;
 
       const wrapper = document.createElement("div");
       wrapper.className = "pdf-page-block";
@@ -4149,13 +4234,15 @@
       canvasWrapper.style.width = `${Math.floor(viewport.width)}px`;
       canvasWrapper.style.height = `${Math.floor(viewport.height)}px`;
 
+      // HiDPI: 画布按 devicePixelRatio 放大渲染，再用 CSS 尺寸缩回，
+      // 否则大尺寸下文字会发虚。
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const renderViewport = page.getViewport({ scale: scale * dpr });
+
       const canvas = document.createElement("canvas");
       canvas.className = "pdf-page-canvas";
-      // HiDPI: 用 devicePixelRatio 让 canvas 物理像素 = CSS 像素 * DPR
-      // 没这一步时 125% / 200% 缩放下文字会糊
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.floor(viewport.width * dpr);
-      canvas.height = Math.floor(viewport.height * dpr);
+      canvas.width = Math.floor(renderViewport.width);
+      canvas.height = Math.floor(renderViewport.height);
       canvas.style.width = `${Math.floor(viewport.width)}px`;
       canvas.style.height = `${Math.floor(viewport.height)}px`;
       canvasWrapper.appendChild(canvas);
@@ -4171,10 +4258,7 @@
       listEl.appendChild(wrapper);
 
       const ctx = canvas.getContext("2d");
-      // 把 canvasContext 用 DPR 缩放,渲染时 PDF.js 输出按 CSS 像素,
-      // 但写入物理像素 buffer,放大时仍然清晰
-      ctx.scale(dpr, dpr);
-      await page.render({ canvasContext: ctx, viewport }).promise;
+      await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
 
       // Extract text via PDF.js (fast + no server roundtrip)
       const tc = await page.getTextContent();
@@ -4325,6 +4409,10 @@
             // IEEE page exceeds that and 422s. The server chunks the text
             // itself, so truncating here is safe.
             text: String(text).slice(0, 15000),
+            // 带上 PDF 相对路径：服务端会用 pdfplumber 重新抽取该页文本
+            // （正确恢复丢失的单词空格 + 按栏顺序），翻译质量比 PDF.js 抓取的高。
+            // relative_path 有效时服务端用自己的抽取结果，前端这份只作兜底。
+            relative_path: (_pdfState && _pdfState.relativePath) || null,
           }),
           signal: ac.signal,
         });
@@ -4354,8 +4442,16 @@
           throw new Error(detail || `HTTP ${r.status}`);
         }
 
+        // 后端可能返回 200 + 空串（思考模型把 token 预算全花在思考上，
+        // 没产出正文）。这种情况必须当失败处理，否则页面只会显示
+        // "已翻译"却没有内容。
+        const translated = (data.translation || "").trim();
+        if (!translated) {
+          throw new Error("模型返回空内容（思考模式可能耗尽了 token 预算），请重试本页");
+        }
+
         textEl.className = "page-text";
-        textEl.innerHTML = formatMarkdownLite(data.translation);
+        textEl.innerHTML = formatMarkdownLite(translated);
         if (typeof renderMathIn === "function") renderMathIn(textEl);
 
         const modelTag = data.model ? ` · ${data.model}` : "";
@@ -4782,12 +4878,26 @@
      * KaTeX replaces each placeholder's textContent with rendered math.
      * Errors render as red text.
      */
-    async function renderMathIn(container) {
+    async function renderMathIn(container, _attempt) {
       if (!container) return;
       // KaTeX lazy-loaded on first need
       if (typeof katex === "undefined") {
         try { await loadKatex(); }
-        catch (e) { setTimeout(() => renderMathIn(container), 150); return; }
+        catch (e) {
+          const attempt = (_attempt || 0) + 1;
+          if (attempt > 40) {
+            // ~6s 仍未就绪：停止轮询并给出明确提示，避免无限重试刷屏
+            container.querySelectorAll(".math-display-block, .math-placeholder.math-inline")
+              .forEach(el => {
+                if (!el.querySelector(".katex")) {
+                  el.innerHTML = `<span style="color:#c43e3e; font-size:0.9em;">⚠ 公式渲染组件未加载</span>`;
+                }
+              });
+            return;
+          }
+          setTimeout(() => renderMathIn(container, attempt), 150);
+          return;
+        }
       }
       // Display math
       container.querySelectorAll(".math-display-block").forEach(el => {

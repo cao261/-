@@ -1,57 +1,111 @@
 @echo off
-setlocal
 chcp 65001 >nul
-title MicroBench - 微电子与半导体科研复现工作台
+setlocal EnableExtensions
+title MicroBench Launcher
 
-REM ============================================================
-REM  关键修复: 切到脚本所在目录 (修复 microbench 模块找不到)
-REM ============================================================
+rem ============================================================
+rem   MicroBench - 微电子与半导体科研复现工作台
+rem   一键启动：启动本地服务 -> 等待就绪 -> 自动打开浏览器
+rem ============================================================
+
+rem [关键] 无论从快捷方式 / 资源管理器 / 任意目录启动，
+rem        都先把工作目录切到项目根目录，保证 microbench 包能被正确导入。
 cd /d "%~dp0"
 
+set "APP_DIR=%~dp0"
+if "%APP_DIR:~-1%"=="\" set "APP_DIR=%APP_DIR:~0,-1%"
+set "URL=http://127.0.0.1:5000"
+
+rem [关键] 端口探测必须精确：Windows 上 127.0.0.1:50000 等相邻端口很常见
+rem        例如 Zotero 插件就占用 50000，用 findstr 子串匹配会误判成"已启动"。
+rem        这里直接请求首页并校验页面特征串，确保"是我们自己的服务"。
+set "PROBE=python -c "import urllib.request as u,sys;o=u.build_opener(u.ProxyHandler({}));b=o.open('http://127.0.0.1:5000/',timeout=3).read();sys.exit(0 if b'MicroBench' in b else 1)" 2>nul"
+
+rem 用 ping 代替 timeout 做等待，不依赖标准输入句柄，
+rem 这样从快捷方式、计划任务、脚本里调用都能正常等待。
+set "SLEEP=ping -n 2 127.0.0.1 >nul"
+
+echo.
 echo ============================================================
-echo      MicroBench V1.0 - 西交大微电子与半导体科研复现工作台
+echo      MicroBench - 西交大微电子与半导体科研复现工作台 V1.0
 echo ============================================================
 echo.
 
-echo [1/4] 检查 Python 依赖 (fastapi/uvicorn/requests/pydantic)...
-python -c "import fastapi, uvicorn, requests, pydantic" 2>nul
-if %errorlevel% neq 0 (
-    echo   缺少依赖,正在从清华镜像安装...
-    python -m pip install -r "%~dp0requirements.txt" -i https://pypi.tuna.tsinghua.edu.cn/simple --quiet --disable-pip-version-check
-    if %errorlevel% neq 0 (
-        echo   清华镜像失败,改用官方源...
-        python -m pip install -r "%~dp0requirements.txt" --quiet --disable-pip-version-check
-    )
-)
+rem ------------------------------------------------------------
+echo [1/4] 检查 Python 环境与依赖...
+python -c "import fastapi, uvicorn, requests, pydantic, multipart" 2>nul
+if errorlevel 1 goto :INSTALL_DEPS
+echo     依赖就绪。
+goto :AFTER_DEPS
 
-echo.
-echo [2/4] 清理残留的 5000 端口进程...
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":5000.*LISTENING"') do (
-    echo   杀掉占用 5000 的进程 PID %%p
-    taskkill /PID %%p /F >nul 2>&1
-)
+:INSTALL_DEPS
+echo     依赖缺失，正在安装 fastapi / uvicorn / requests / python-multipart ...
+pip install -r "%APP_DIR%\requirements.txt" -i https://pypi.tuna.tsinghua.edu.cn/simple --quiet --disable-pip-version-check
+if errorlevel 1 goto :INSTALL_DEPS_FALLBACK
+goto :DEPS_DONE
 
+:INSTALL_DEPS_FALLBACK
+echo     清华镜像源不可用，改用官方源 ...
+pip install -r "%APP_DIR%\requirements.txt" --quiet --disable-pip-version-check
+if errorlevel 1 goto :DEPS_FAILED
+goto :DEPS_DONE
+
+:DEPS_FAILED
+echo     [X] 依赖安装失败。请手动执行下面这行命令，然后重新双击本快捷方式：
+echo         pip install -r "%APP_DIR%\requirements.txt"
+pause
+exit /b 1
+
+:DEPS_DONE
+echo     依赖安装完成。
+
+:AFTER_DEPS
 echo.
-echo [3/4] 启动 uvicorn (生产模式,启动更快,不卡 watcher)...
-echo   日志: logs\uvicorn.log
+
+rem ------------------------------------------------------------
+echo [2/4] 检查服务是否已在运行...
+%PROBE%
+if not errorlevel 1 goto :ALREADY
+
+echo     正在启动本地科研工作台服务 %URL% ...
+rem 服务端单独开一个窗口：日志可见，Ctrl+C 或关闭该窗口即可停止。
+rem 不加 --reload：生产模式启动更快，也不会留下常驻的 reloader 进程。
+start "MicroBench Server" /D "%APP_DIR%" cmd /k python -m uvicorn microbench.app:app --host 127.0.0.1 --port 5000
+
+rem 顺手把离线阅读版刷新一次，免得平板上拿到的还是旧快照
 if not exist logs mkdir logs
-start "MicroBench-Server" /MIN cmd /c "python -m uvicorn microbench.app:app --host 127.0.0.1 --port 5000 > logs\uvicorn.log 2>&1"
+start "MicroBench Offline" /MIN cmd /c "python microbench\export_offline.py > logs\offline_export.log 2>&1"
 
-REM 顺手把离线阅读版刷新一次,免得平板上拿到的还是旧快照
-start "MicroBench-Offline" /MIN cmd /c "python microbench\export_offline.py > logs\offline_export.log 2>&1"
+echo [3/4] 等待服务就绪...
+set /a TRIES=0
+:WAIT_LOOP
+%SLEEP%
+set /a TRIES+=1
+%PROBE%
+if not errorlevel 1 goto :READY
+if %TRIES% lss 45 goto :WAIT_LOOP
 
 echo.
-echo [4/4] 轮询等 127.0.0.1:5000 就绪 (最多 30 秒)...
-powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; for ($i=1; $i -le 30; $i++) { if (Test-NetConnection -ComputerName 127.0.0.1 -Port 5000 -InformationLevel Quiet -WarningAction SilentlyContinue) { exit 0 }; Start-Sleep -Seconds 1 }; exit 1" >nul 2>&1
+echo     [X] 服务在 45 秒内未就绪。
+echo     请切换到 "MicroBench Server" 窗口查看具体报错，通常是依赖缺失或端口被占用。
+%SLEEP%
+exit /b 1
 
-if %errorlevel% equ 0 (
-    echo   ✅ 服务已就绪
-    echo   自动打开浏览器...
-    start "" "http://127.0.0.1:5000"
-    exit /b 0
-) else (
-    echo   ⚠️ 30 秒内服务未就绪
-    echo   查看日志: type logs\uvicorn.log
-    echo   手动访问: http://127.0.0.1:5000
-    pause
-)
+:READY
+echo     服务已就绪，正在打开浏览器 ...
+start "" "%URL%"
+goto :DONE
+
+:ALREADY
+echo     检测到工作台已在运行，直接打开浏览器。
+start "" "%URL%"
+
+:DONE
+echo.
+echo   ------------------------------------------------------------
+echo     工作台地址 : %URL%
+echo     停止服务   : 切换到 "MicroBench Server" 窗口按 Ctrl+C，或关闭该窗口。
+echo   ------------------------------------------------------------
+echo.
+%SLEEP%
+exit /b 0

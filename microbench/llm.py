@@ -54,7 +54,9 @@ DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_AGNES_BASE_URL = "https://apihub.agnes-ai.com/v1"
 DEFAULT_AGNES_MODEL = "agnes-3.0-flash"
 
-DEFAULT_MAX_TOKENS = 800
+# 注意: MiniMax-M3.1-Flash 强制开启思考模式，思考 token 与输出 token 共用
+# max_tokens 预算。上限给太小会导致思考吃光额度、最终 content 为空或被截断。
+DEFAULT_MAX_TOKENS = 4000
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_TIMEOUT = 60
 
@@ -69,6 +71,14 @@ DEFAULT_TIMEOUT = 60
 # times, so it could fire 21 upstream calls inside one minute — enough to
 # trip the very per-minute cap the rate limiter exists to protect.
 MAX_UPSTREAM_CALLS_PER_REQUEST = 6
+
+# 标记：本次响应因为 max_tokens 被截断（思考模型把额度全花在 reasoning 上），
+# 还没产出正文。上层据此抬高预算重试，或降级到非思考型备用模型。
+TRUNCATED_MARKER = "__TRUNCATED_BY_MAX_TOKENS__"
+
+# 思考型模型（M3.1-Flash）的最小合理输出预算。低于这个值几乎必然被思考
+# 吃光；达到这个值还失败，说明是输入本身让模型陷入无限思考，应直接降级。
+MIN_REASONABLE_MAX_TOKENS = 4000
 
 
 def _is_empty_content_error(msg: str) -> bool:
@@ -288,11 +298,11 @@ class DualModelManager:
         # Sensible defaults for MiniMax if model name indicates MiniMax
         if not base_url:
             if "minimax" in model.lower():
-                base_url = "https://api.minimax.chat/v1"
+                base_url = "https://api.minimaxi.com/v1"
             else:
                 base_url = DEFAULT_BASE_URL
         if not model:
-            model = "MiniMax-M2.7" if "minimax" in base_url.lower() else DEFAULT_MODEL
+            model = "MiniMax-M3.1-Flash" if "minimax" in base_url.lower() else DEFAULT_MODEL
 
         return {
             "api_key": api_key,
@@ -315,15 +325,26 @@ class DualModelManager:
             "is_fallback": True,
         }
 
-    def mark_degraded(self, reason: str):
+    def mark_degraded(self, reason: str, sticky: bool = False):
+        """
+        标记主模型降格。
+
+        sticky=True 用于「主模型不是不可用，而是对当前任务产不出有效正文」
+        这类情况（例如思考模型遇到乱序 PDF 文本陷入无限思考）：这种降格
+        不能靠 15 分钟一次的通用探针自动恢复——探针只是发个 "1"，必然成功，
+        但真正的翻译任务还是会失败，来回升格/降格只会白白多等几十秒。
+        这类情况需要用户手动点「探测升格」。
+        """
         with self._lock:
             self.is_degraded = True
             self.degraded_reason = reason
             self.degraded_at = time.time()
             self.last_primary_probe = time.time()
+            self.sticky_degraded = sticky
             print(
                 f"[MicroBench] ⚠️ 主模型触发降格: {reason}. "
-                f"已自动切换至备用模型 (Agnes 3.0 Flash, 20 RPM 保护).",
+                f"已自动切换至备用模型 (Agnes 3.0 Flash, 20 RPM 保护)."
+                + (" [需手动探测升格]" if sticky else ""),
                 file=sys.stderr,
             )
 
@@ -331,6 +352,7 @@ class DualModelManager:
         with self._lock:
             self.is_degraded = False
             self.degraded_reason = ""
+            self.sticky_degraded = False
             self.last_primary_probe = time.time()
             print(
                 "[MicroBench] 🚀 主模型额度已恢复正常，系统已自动升格回主模型 (MiniMax)!",
@@ -342,6 +364,8 @@ class DualModelManager:
         with self._lock:
             if not self.is_degraded:
                 return False
+            if getattr(self, "sticky_degraded", False):
+                return False  # 需要用户手动探测升格
             now = time.time()
             return (now - self.last_primary_probe) >= self.probe_interval_seconds
 
@@ -556,6 +580,21 @@ def probe_primary_model() -> dict:
     return model_manager.probe_primary()
 
 
+def translation_disable_thinking() -> bool:
+    """
+    翻译任务是否关闭思考模式。
+
+    实测：MiniMax-M3 对整页论文直译，关思考 21.5s 输出完整译文；开着思考
+    容易在推理里打转（reasoning 吃掉整个 max_tokens 预算，正文为空）。
+    M3.1-Flash 强制 adaptive thinking，不接受该参数 —— llm 层会自动去掉
+    参数重试，所以这里可以无条件开启。
+
+    可用环境变量 LLM_TRANSLATION_DISABLE_THINKING=0 关掉。
+    """
+    v = (os.getenv("LLM_TRANSLATION_DISABLE_THINKING", "1") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 # ---------------------------------------------------------------------------
 # Core Chat Implementation with Failover & Agnes Rate Limiting
 # ---------------------------------------------------------------------------
@@ -569,6 +608,7 @@ def _invoke_model(
     json_mode: bool,
     max_retries: int = 2,
     budget: Optional[list[int]] = None,
+    disable_thinking: bool = False,
 ) -> tuple[bool, str, Optional[int]]:
     """
     Execute request against a specific model configuration.
@@ -578,6 +618,14 @@ def _invoke_model(
     request. Each upstream attempt decrements it; when it hits zero the
     call gives up instead of continuing to retry. This bounds the worst
     case for a single browser request (see MAX_UPSTREAM_CALLS_PER_REQUEST).
+
+    disable_thinking=True 会带上 thinking={"type":"disabled"}，让模型直接给
+    正文不做推理。适合"长文直译"这类不需要推理的任务：实测 MiniMax-M3
+    整页直译关思考 21.5s 就有完整译文，开启思考反而容易在推理里打转。
+
+    注意不是所有 MiniMax 模型都接受这个参数：M3.1-Flash 强制 adaptive
+    thinking，传 disabled 会返回 400。这里遇到 400 且错误信息提到 thinking
+    时会自动去掉该参数重试一次。
     """
     is_agnes = cfg.get("is_fallback") or "agnes" in cfg.get("base_url", "").lower() or "agnes" in cfg.get("model", "").lower()
 
@@ -588,6 +636,8 @@ def _invoke_model(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    if disable_thinking:
+        payload["thinking"] = {"type": "disabled"}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
@@ -651,6 +701,14 @@ def _invoke_model(
 
             last_err = err
 
+            # 模型不支持 thinking 参数（例如 M3.1-Flash 强制 adaptive thinking），
+            # 去掉该参数重试一次，别直接失败。
+            if resp.status_code == 400 and "thinking" in payload and "thinking" in err.lower():
+                payload.pop("thinking", None)
+                disable_thinking = False
+                if attempt < max_retries:
+                    continue
+
             # Agnes 429 rate limit backoff (exponential wait then retry)
             if resp.status_code == 429 and is_agnes and attempt < max_retries:
                 wait = 3.5 * (attempt + 1)
@@ -667,29 +725,88 @@ def _invoke_model(
 
         try:
             data = resp.json()
-            content = data["choices"][0]["message"].get("content")
-            if not isinstance(content, str) or not content.strip():
-                # Two ways to land here:
-                #  a) the provider returned content: null — we used to
-                #     return that as a *successful* call, and the caller
-                #     then crashed with a TypeError (HTTP 500) or, worse,
-                #     answered the user with `null`;
-                #  b) a reasoning model burned its whole token budget on
-                #     a <think> block and produced no visible text. This
-                #     is the common case with MiniMax-M2.7: at
-                #     max_tokens=200 the answer is often empty.
-                # Treat both as a failed attempt so the caller can retry
-                # with a bigger budget instead of showing a blank answer.
-                return False, f"LLM 返回空内容 (max_tokens={max_tokens}): {resp.text[:160]}", 200
+            choice = data["choices"][0]
+            message = choice.get("message", {}) or {}
+            finish_reason = choice.get("finish_reason", "")
+            content = message.get("content")
+            if not isinstance(content, str):
+                # provider 返回 content: null —— 绝不能当成成功返回，
+                # 否则调用方会拿着 None 继续走，最终 500 或把 null 回给用户。
+                content = ""
             content = _strip_thinking_blocks(content)
             if not content.strip():
-                # All of the answer was inside a <think> block.
-                return False, f"LLM 仅返回思考过程, 无正文 (max_tokens={max_tokens})", 200
+                # 思考模型（MiniMax-M3.1-Flash 强制开思考）可能把 max_tokens
+                # 全部花在 reasoning_content 上，正文为空。这种情况必须显式
+                # 报错并抬高预算重试，绝不能把空串当成"翻译成功"返回 ——
+                # 否则前端会显示"已翻译"但页面里什么都没有。
+                reasoning = message.get("reasoning_content") or ""
+                if finish_reason == "length":
+                    return False, (
+                        f"{TRUNCATED_MARKER}: 输出被 max_tokens 截断"
+                        f"(finish_reason=length, 思考约占 {len(reasoning)} 字符), 未产出正文"
+                    ), 200
+                if reasoning.strip():
+                    # 正文全在 <think> 块里，剥掉思考后没有可见文本。
+                    return False, (
+                        f"LLM 仅返回思考过程, 无正文 (finish_reason={finish_reason!r}, "
+                        f"思考约占 {len(reasoning)} 字符, max_tokens={max_tokens})"
+                    ), 200
+                return False, (
+                    f"模型返回空内容 (finish_reason={finish_reason!r}, "
+                    f"思考约占 {len(reasoning)} 字符, max_tokens={max_tokens})"
+                ), 200
             return True, content, 200
         except (KeyError, IndexError, ValueError, AttributeError) as e:
             return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
 
     return False, last_err, last_status
+
+
+def _invoke_with_budget_escalation(
+    cfg: dict,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
+    json_mode: bool,
+    max_retries: int,
+    disable_thinking: bool = False,
+    budget: Optional[list[int]] = None,
+) -> tuple[bool, str, Optional[int]]:
+    """
+    调用模型；若正文为空且原因是 max_tokens 被截断（思考模型把额度全花在
+    reasoning_content 上），在预算明显偏小的情况下抬高额度重试一次。
+
+    MiniMax-M3.1-Flash 强制开启思考模式，思考 token 与输出 token 共享
+    max_tokens 预算；额度给小了模型只会思考、不产出正文。
+
+    只在 max_tokens < MIN_REASONABLE_MAX_TOKENS 时才抬高重试：预算本来就给
+    到位还失败，说明是输入让模型陷入无限思考（实测 pdfplumber 抽出的乱序
+    双栏文本会这样，32000 token 仍不产出正文），再抬预算只是白白多等一两
+    分钟 —— 这种情况下应该直接让 chat() 降级到非思考型的备用模型。
+
+    `budget` 与 chat() 共享同一个上游调用计数器，抬高重试同样计入总预算，
+    避免"重试 + 降级 + 抬高"叠在一起把单次请求的上游调用数放大到失控。
+    """
+    success, res, status = _invoke_model(
+        cfg, messages, max_tokens, temperature, timeout, json_mode,
+        max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
+    )
+    if success or TRUNCATED_MARKER not in (res or ""):
+        return success, res, status
+    if max_tokens >= MIN_REASONABLE_MAX_TOKENS:
+        return success, res, status
+    if budget is not None and budget[0] <= 0:
+        return success, res, status
+
+    bigger = max(max_tokens * 3, MIN_REASONABLE_MAX_TOKENS)
+    success2, res2, status2 = _invoke_model(
+        cfg, messages, bigger, temperature, timeout, json_mode,
+        max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
+    )
+    if success2:
+        return True, res2, status2
+    return False, f"{res} | 抬高 max_tokens 至 {bigger} 重试后仍失败: {res2}", status2
 
 
 def chat(
@@ -699,6 +816,7 @@ def chat(
     timeout: int = DEFAULT_TIMEOUT,
     json_mode: bool = False,
     max_retries: int = 2,
+    disable_thinking: bool = False,
 ) -> str:
     """
     Single-turn chat completion with automatic failover and degradation management.
@@ -707,6 +825,9 @@ def chat(
     2. Otherwise, if not degraded, calls Primary. If Primary returns quota 429,
        immediately triggers degradation and fails over to Agnes 3.0 Flash seamlessly.
     3. If degraded, calls Agnes 3.0 Flash with 20 RPM sliding window rate limiting.
+
+    disable_thinking=True：请求时带 thinking={"type":"disabled"}，让模型直接
+    输出正文不做推理（长文直译这类任务用它又快又稳；模型不支持时自动降级）。
     """
     if requests is None:
         raise LLMError("requests 包未安装, 请先 pip install requests")
@@ -739,9 +860,9 @@ def chat(
 
     # If NOT degraded and Primary is configured, try Primary first
     if not model_manager.is_degraded and primary["configured"]:
-        success, res, status_code = _invoke_model(
-            primary, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries,
-            budget=budget,
+        success, res, status_code = _invoke_with_budget_escalation(
+            primary, messages, max_tokens, temperature, timeout, json_mode,
+            max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
         )
         if success:
             return res
@@ -752,23 +873,37 @@ def chat(
         # empty. Measured: max_tokens=200 → empty, 800 → fine, and the
         # exact threshold moves with the question's difficulty. Retry once
         # with a doubled budget instead of showing the user a blank box.
+        # (被 max_tokens 截断的情况已在 _invoke_with_budget_escalation 内部
+        #  抬高预算重试过，这里只兜底"没截断但正文为空"的情况。)
         if _is_empty_content_error(res) and budget[0] > 0:
             bigger = min(max_tokens * 2, 4096)
             retry_success, retry_res, _ = _invoke_model(
                 primary, messages, bigger, temperature, timeout, json_mode,
-                max_retries=0, budget=budget,
+                max_retries=0, budget=budget, disable_thinking=disable_thinking,
             )
             if retry_success:
                 return retry_res
             res = f"{res} (重试 {bigger} tokens 仍为空)"
 
-        # Check if Primary failed due to 429 quota exhaustion (e.g. MiniMax 5-hour limit)
-        if fallback["configured"] and model_manager.is_quota_exhausted_error(status_code or 0, res):
+        # 降级条件有两种：
+        #   1) 429 配额耗尽（如 MiniMax 5 小时限额）
+        #   2) 主模型没产出有效正文（思考模式把额度烧光 / 响应格式异常）
+        #      实测：pdfplumber 抽出的乱序双栏文本会让 M3.1-Flash 陷入无限
+        #      思考（32000 token 仍不产出正文），此时必须切到非思考型 Agnes。
+        no_usable_output = (
+            TRUNCATED_MARKER in (res or "")
+            or "返回空内容" in (res or "")
+            or "响应格式异常" in (res or "")
+        )
+        if fallback["configured"] and (
+            model_manager.is_quota_exhausted_error(status_code or 0, res)
+            or no_usable_output
+        ):
             model_manager.mark_degraded(res)
             # Seamlessly fail over to fallback!
-            fb_success, fb_res, _ = _invoke_model(
-                fallback, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries,
-                budget=budget,
+            fb_success, fb_res, _ = _invoke_with_budget_escalation(
+                fallback, messages, max_tokens, temperature, timeout, json_mode,
+                max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
             )
             if fb_success:
                 return fb_res
@@ -779,9 +914,9 @@ def chat(
 
     # Degraded or Primary not configured: use Fallback (Agnes)
     if fallback["configured"]:
-        success, res, _ = _invoke_model(
-            fallback, messages, max_tokens, temperature, timeout, json_mode, max_retries=max_retries,
-            budget=budget,
+        success, res, _ = _invoke_with_budget_escalation(
+            fallback, messages, max_tokens, temperature, timeout, json_mode,
+            max_retries=max_retries, disable_thinking=disable_thinking, budget=budget,
         )
         if success:
             return res
@@ -1014,24 +1149,30 @@ async def _invoke_model_async(
 
         try:
             data = resp.json()
-            content = data["choices"][0]["message"].get("content")
-            if not isinstance(content, str) or not content.strip():
-                # Two ways to land here:
-                #  a) the provider returned content: null — we used to
-                #     return that as a *successful* call, and the caller
-                #     then crashed with a TypeError (HTTP 500) or, worse,
-                #     answered the user with `null`;
-                #  b) a reasoning model burned its whole token budget on
-                #     a <think> block and produced no visible text. This
-                #     is the common case with MiniMax-M2.7: at
-                #     max_tokens=200 the answer is often empty.
-                # Treat both as a failed attempt so the caller can retry
-                # with a bigger budget instead of showing a blank answer.
-                return False, f"LLM 返回空内容 (max_tokens={max_tokens}): {resp.text[:160]}", 200
+            choice = data["choices"][0]
+            message = choice.get("message", {}) or {}
+            finish_reason = choice.get("finish_reason", "")
+            content = message.get("content")
+            if not isinstance(content, str):
+                content = ""
             content = _strip_thinking_blocks(content)
             if not content.strip():
-                # All of the answer was inside a <think> block.
-                return False, f"LLM 仅返回思考过程, 无正文 (max_tokens={max_tokens})", 200
+                # 同同步路径：思考模型可能把 max_tokens 全花在思考上，正文为空。
+                reasoning = message.get("reasoning_content") or ""
+                if finish_reason == "length":
+                    return False, (
+                        f"{TRUNCATED_MARKER}: 输出被 max_tokens 截断"
+                        f"(finish_reason=length, 思考约占 {len(reasoning)} 字符), 未产出正文"
+                    ), 200
+                if reasoning.strip():
+                    return False, (
+                        f"LLM 仅返回思考过程, 无正文 (finish_reason={finish_reason!r}, "
+                        f"思考约占 {len(reasoning)} 字符, max_tokens={max_tokens})"
+                    ), 200
+                return False, (
+                    f"模型返回空内容 (finish_reason={finish_reason!r}, "
+                    f"思考约占 {len(reasoning)} 字符, max_tokens={max_tokens})"
+                ), 200
             return True, content, 200
         except (KeyError, IndexError, ValueError, AttributeError) as e:
             return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
@@ -1435,7 +1576,7 @@ def summarize_paper(meta: dict) -> dict:
                 {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=600,
+            max_tokens=4000,  # 思考模式开启时，思考+输出共享该预算
             temperature=0.3,
             json_mode=True,
         )
