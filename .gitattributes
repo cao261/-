@@ -1,0 +1,13 @@
+# 统一行尾，避免 Windows 上的编辑器把整个文件转成 CRLF，
+# 从而在 git 合并时产生「整文件冲突」（每个字节都不同）。
+#
+# `text=auto eol=lf`：文本文件统一以 LF 存入仓库、以 LF 出现在工作区。
+# 例外：.bat 脚本在 cmd.exe 下必须保持 CRLF，用 `-text` 让 git 原样存取，
+#       不做任何转换（否则每次提交都会冒出一整个文件的假 diff）。
+
+* text=auto eol=lf
+
+*.bat -text
+*.ico binary
+*.png binary
+*.pdf binary
