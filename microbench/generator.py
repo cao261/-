@@ -11,11 +11,20 @@ V1.1 hardening:
 import datetime
 import os
 import re
+import time
+import threading
 from pathlib import Path
 
 import jinja2
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Serialises writes to the *shared* vault files (the troubleshooting diary
+# and the weekly report folder). The server runs its sync endpoints in a
+# thread pool, so two requests can genuinely be inside the same file at the
+# same time; without a lock, a read-modify-write loses one of the two
+# entries. Card writes go to distinct files and do not need it.
+_VAULT_WRITE_LOCK = threading.Lock()
 
 # Whitelist of topic categories (kept in sync with frontend <select> options).
 # Empty tuple entries (=those in the frontend dropdown) intentionally excluded here
@@ -46,6 +55,17 @@ def _safe_path(base_dir: Path, *parts) -> Path:
     Raises ValueError on path-traversal attempts (e.g. parts containing '..' or absolute paths).
     """
     base_resolved = base_dir.resolve()
+    # Reject dot-only components outright. Containment alone is NOT enough:
+    # base/"02_Reproduction"/".." resolves to base_resolved itself, which passes
+    # the relative_to() check below while silently meaning "the parent dir".
+    for p in parts:
+        if p is None:
+            continue
+        text = str(p)
+        if text.strip(". ") == "":
+            raise ValueError(
+                f"非法路径分量: '{text!r}' 解析为目录本身/父目录 (拒绝遍历攻击)"
+            )
     # First join as-is to detect early traversal in raw parts
     joined = base_dir.joinpath(*parts)
     resolved = joined.resolve()
@@ -61,32 +81,58 @@ def sanitize_filename(name: str) -> str:
     """Make string safe for Windows filesystem while preserving meaning."""
     name = re.sub(r'[\\/*?:"<>|]', "", name)
     name = re.sub(r"\s+", "_", name).strip("_")
+    # Windows silently strips trailing dots and spaces from a file name, so
+    # "paper." and "paper " both land as "paper" — and a title ending in
+    # "." produced "2026_Title..md" (two dots) because the ".md" suffix
+    # was appended afterwards. Strip them so the name on disk matches the
+    # name the app reports.
+    name = name.rstrip(". ")
+    # A component made only of dots ('.', '..', '...') is not a filename — it
+    # resolves to a directory. Returning "" makes callers reject it, which is
+    # what stops `project_name=".."` from walking out of 02_Reproduction and
+    # overwriting the vault-root README.md. Mid-name dots are still allowed
+    # ("v1.2_results" must keep working).
+    if name.strip(".") == "":
+        return ""
     return name[:80]  # Avoid excessively long path names
 
 # ---------------------------------------------------------------------------
 # Jinja2 template engine
 # ---------------------------------------------------------------------------
 
+# One Environment for the whole process. Previously a fresh
+# jinja2.Environment was constructed on every _render_template() call —
+# i.e. on every card / report the user saves. Building an Environment
+# parses the Jinja lexer and sets up the template machinery, so this was
+# pure per-call overhead for an object whose configuration never varies.
+_JINJA_ENV = jinja2.Environment(  # nosec B701
+    loader=jinja2.BaseLoader(),
+    undefined=jinja2.StrictUndefined,
+    autoescape=False,           # nosec B701 — Markdown output (not HTML); see docstring
+    keep_trailing_newline=True,
+    trim_blocks=False,
+    lstrip_blocks=False,
+)
+
+
 def _render_template(tpl_path: Path, **vars) -> str:
     """
     Read a markdown template file and render with Jinja2.
     Uses StrictUndefined so that any {{var}} typo or missing variable is caught
     at write-time rather than silently rendering as empty string.
+
+    autoescape=False is INTENTIONAL: the templates produce Obsidian-flavoured
+    Markdown / LaTeX which is rendered by Obsidian, not a browser. HTML
+    auto-escape would corrupt LaTeX subscripts like alpha_{b}. Output is
+    written to disk and consumed only by Obsidian — not served as HTML.
     """
     if not tpl_path.exists():
         # Caller is responsible for handling missing template; raise loudly.
         raise FileNotFoundError(f"模板不存在: {tpl_path}")
     src = tpl_path.read_text(encoding="utf-8")
-    env = jinja2.Environment(
-        loader=jinja2.BaseLoader(),
-        undefined=jinja2.StrictUndefined,
-        autoescape=False,           # markdown / LaTeX, no HTML escaping
-        keep_trailing_newline=True,
-        trim_blocks=False,
-        lstrip_blocks=False,
-    )
-    tmpl = env.from_string(src)
-    return tmpl.render(**vars)
+    tmpl = _JINJA_ENV.from_string(src)
+    # Re-escape the YAML frontmatter after rendering (see _safe_frontmatter).
+    return _safe_frontmatter(tmpl.render(**vars))
 
 def search_vault(query: str, top_k: int = 5, snippet_chars: int = 400) -> list[dict]:
     """
@@ -144,6 +190,11 @@ def search_vault(query: str, top_k: int = 5, snippet_chars: int = 400) -> list[d
             tags_str = fm.get("tags", "")
             category_str = fm.get("category", "")
 
+            # The heading list was recomputed for EVERY keyword — O(keywords
+            # x body) with a regex over the whole document each time. It
+            # does not depend on the keyword, so hoist it out.
+            headings = _re.findall(r"^#{1,3}\s+(.+)$", body, _re.MULTILINE)
+
             for pat in patterns:
                 if pat.search(title_str):
                     score += 10
@@ -151,7 +202,6 @@ def search_vault(query: str, top_k: int = 5, snippet_chars: int = 400) -> list[d
                     score += 5
                 if pat.search(category_str):
                     score += 3
-                headings = _re.findall(r"^#{1,3}\s+(.+)$", body, _re.MULTILINE)
                 for h in headings:
                     if pat.search(h):
                         score += 4
@@ -208,8 +258,51 @@ def _build_snippet(body: str, patterns: list, max_chars: int = 400) -> str:
 # Vault stats
 # ---------------------------------------------------------------------------
 
+# 30s in-memory cache for get_vault_stats. The dashboard's loadStats() fires
+# on every page mount, and walking 01_Literature/**/*.md every time is the
+# single biggest cold-start cost in the recent-feed path. A 30s TTL means:
+#   - Dashboard load: cache miss → real scan (acceptable, ~100ms)
+#   - Within 30s of any other load: cache hit → ~0ms
+#   - After save_*: writes invalidate the cache (see save_* functions below).
+_VAULT_STATS_CACHE: dict | None = None
+_VAULT_STATS_TS: float = 0.0
+_VAULT_STATS_TTL = 30.0  # seconds
+
+
+def _invalidate_vault_stats_cache() -> None:
+    """Drop the cached vault-stats dict (called by all save_* functions)."""
+    global _VAULT_STATS_CACHE, _VAULT_STATS_TS
+    _VAULT_STATS_CACHE = None
+    _VAULT_STATS_TS = 0.0
+
+
+def _copy_stats(stats: dict) -> dict:
+    """Shallow copy of the cached stats, with the two list fields copied too.
+
+    Enough to stop a caller from mutating the shared cache (the entries
+    themselves are never modified in place).
+    """
+    out = dict(stats)
+    for key in ("literature_list", "reproduction_list"):
+        if isinstance(out.get(key), list):
+            out[key] = list(out[key])
+    return out
+
+
 def get_vault_stats() -> dict:
-    """Analyze current literature and reproduction status across the vault."""
+    """Analyze current literature and reproduction status across the vault.
+
+    Result is cached in-process for 30s. Writes to the vault invalidate the
+    cache so the next read sees fresh numbers.
+    """
+    # Cache hit: return a COPY. The cached object was handed out by
+    # reference, so any caller that mutated it poisoned the cache for the
+    # next 30 seconds (e.g. setting `literature_total = 99999`).
+    global _VAULT_STATS_CACHE, _VAULT_STATS_TS
+    now = time.monotonic()
+    if _VAULT_STATS_CACHE is not None and (now - _VAULT_STATS_TS) < _VAULT_STATS_TTL:
+        return _copy_stats(_VAULT_STATS_CACHE)
+
     lit_dir = BASE_DIR / "01_Literature"
     repro_dir = BASE_DIR / "02_Reproduction"
     trouble_file = BASE_DIR / "03_Knowledge" / "踩坑与排错日记.md"
@@ -242,18 +335,154 @@ def get_vault_stats() -> dict:
     trouble_count = 0
     if trouble_file.exists():
         content = trouble_file.read_text(encoding="utf-8")
-        trouble_count = len(re.findall(r"###\s+坑\s+\d+", content))
+        # The counter used to match a LEGACY heading format ("### 坑 01：…")
+        # that the writer no longer produces — it writes "### 坑记录：[…]
+        # (date)". On the real vault this reported 4 instead of 10.
+        #
+        # The whitespace classes MUST be horizontal-only ([ \t]) and not
+        # \s: \s matches newlines, so `^###\s+坑(?:\s*\d+|\s*记录)` happily
+        # spanned several lines and counted the same heading many times
+        # over — it reported 76 for a file that holds 10 entries.
+        trouble_count = len(
+            re.findall(
+                r"^###[ \t]+坑(?:[ \t]*\d+|[ \t]*记录)[：:]",
+                content,
+                re.MULTILINE,
+            )
+        )
 
     weekly_count = len(list(weekly_dir.glob("*.md"))) if weekly_dir.exists() else 0
 
-    return {
+    result = {
         "literature_total": len(lit_files),
-        "literature_list": sorted(lit_files, key=lambda x: x["mtime"], reverse=True)[:10],
+        # Full sorted list — NOT truncated. /api/vault/literature paginates on
+        # top of this and reports `filtered_total` from it; a [:10] cap here
+        # silently capped the feed too, made `has_more` permanently False, and
+        # made this endpoint's total disagree with `literature_total` above.
+        "literature_list": sorted(lit_files, key=lambda x: x["mtime"], reverse=True),
         "reproduction_total": len(repro_projects),
         "reproduction_list": repro_projects,
         "troubleshoot_count": trouble_count,
         "weekly_count": weekly_count,
     }
+    _VAULT_STATS_CACHE = result
+    _VAULT_STATS_TS = time.monotonic()
+    return result
+
+# ---------------------------------------------------------------------------
+# YAML frontmatter helpers
+# ---------------------------------------------------------------------------
+
+def _yaml_quoted(value) -> str:
+    """Escape a value for use INSIDE a YAML double-quoted scalar.
+
+    The templates render `title: "{{title}}"`, so the value ends up inside
+    double quotes. A title such as `A study of "band-to-band tunneling" in
+    CFET` therefore produced `title: "A study of "band-to-band tunneling" in
+    CFET"` — invalid YAML. Obsidian then renders the properties block as
+    broken text and the note loses its tags / date / status. An embedded
+    newline could even inject extra frontmatter keys.
+
+    Escapes used are the ones YAML's double-quoted style defines:
+    \\\\ \\" \\r \\n \\t
+    """
+    s = "" if value is None else str(value)
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    s = s.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    return s
+
+
+def _yaml_bare(value) -> str:
+    """Escape a value used as a BARE YAML scalar (no surrounding quotes)."""
+    s = "" if value is None else str(value)
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    s = s.replace("#", "")            # a bare '#' starts a comment
+    s = s.replace("[", "").replace("]", "")
+    s = s.replace("{", "").replace("}", "")
+    s = s.replace(",", "")            # a bare ',' would start a new list item
+    s = s.replace(":", " ")           # a bare ':' is a mapping separator
+    return s.strip()
+
+
+def _one_line(value) -> str:
+    """Collapse a user-supplied string to a single line.
+
+    A newline inside a frontmatter value breaks out of the YAML scalar
+    before any escaping can help: the template renders `title: "{{title}}"`,
+    so a title containing a newline produced
+
+        title: "Evil "quoted"
+        status: 已精读
+        injected: yes"
+
+    — i.e. the attacker injected real frontmatter keys. Collapsing newlines
+    at the data level (before rendering) removes the vector entirely.
+    """
+    s = "" if value is None else str(value)
+    return s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+
+
+# A YAML inline list item that needs no quoting.
+_YAML_SAFE_ITEM = re.compile(r"^[A-Za-z0-9_一-鿿][A-Za-z0-9_.一-鿿 \-]*$")
+_FM_QUOTED_LINE = re.compile(r'^(\s*)([A-Za-z_][\w\-]*)\s*:\s*"(.*)"\s*$')
+_FM_LIST_LINE = re.compile(r'^(\s*)([A-Za-z_][\w\-]*)\s*:\s*\[(.*)\]\s*$')
+
+
+def _safe_frontmatter(text: str) -> str:
+    """Re-escape the YAML frontmatter of a rendered note.
+
+    The templates render `title: "{{title}}"`, so a value containing a
+    double quote (e.g. `A study of "band-to-band tunneling" in CFET`)
+    produced `title: "A study of "band-to-band tunneling" in CFET"` —
+    invalid YAML. Obsidian then rendered the properties block as broken
+    text and the note lost its tags / date / status. An embedded newline
+    could even inject extra frontmatter keys.
+
+    This walks only the frontmatter block and re-escapes the values that
+    are already written as double-quoted scalars (plus inline lists),
+    leaving every other line — comments, bare numbers, nested list items
+    — exactly as the template produced it. Doing it here (rather than
+    editing each template) fixes the literature, bilingual, QA and
+    reproduction templates in one place, and keeps the body text free of
+    escape characters.
+    """
+    if not text.startswith("---"):
+        return text
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        return text
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return text
+
+    out = list(lines)
+    for i in range(1, end):
+        line = out[i]
+        m = _FM_QUOTED_LINE.match(line)
+        if m:
+            indent, key, value = m.groups()
+            out[i] = f'{indent}{key}: "{_yaml_quoted(value)}"'
+            continue
+        m = _FM_LIST_LINE.match(line)
+        if m:
+            indent, key, items = m.groups()
+            parts = [p.strip() for p in items.split(",") if p.strip()]
+            quoted = []
+            for p in parts:
+                if len(p) >= 2 and p.startswith('"') and p.endswith('"'):
+                    quoted.append('"' + _yaml_quoted(p[1:-1]) + '"')
+                elif _YAML_SAFE_ITEM.match(p):
+                    quoted.append(p)
+                else:
+                    quoted.append('"' + _yaml_quoted(p) + '"')
+            out[i] = f"{indent}{key}: [{', '.join(quoted)}]"
+    return "\n".join(out)
+
 
 # ---------------------------------------------------------------------------
 # Literature card
@@ -261,16 +490,21 @@ def get_vault_stats() -> dict:
 
 def save_literature_card(data: dict) -> dict:
     """Generate and write a structured literature note from template."""
-    title = data.get("title", "Untitled").strip()
-    authors = data.get("authors", "").strip()
-    year = str(data.get("year", datetime.datetime.now().year))
-    venue = data.get("venue", "").strip()
-    doi = data.get("doi", "").strip()
-    arxiv = data.get("arxiv", "").strip()
-    topic_category = data.get("topic_category", "01_Device_TCAD_器件仿真")
-    tags = data.get("tags", "TCAD, NanoDevice")
-    abstract = data.get("abstract", "").strip()
-    status = data.get("status", "待精读")
+    # `or ""` instead of `get(key, "")`: the Pydantic models declare these
+    # fields Optional, so a client may legitimately send `"venue": null`.
+    # `dict.get(key, default)` returns None (the key EXISTS) and the
+    # following .strip() raised AttributeError -> HTTP 500. With `year`
+    # it was worse: it silently produced the file name "None_Title.md".
+    title = _one_line((data.get("title") or "Untitled").strip())
+    authors = _one_line((data.get("authors") or "").strip())
+    year = str(data.get("year") or datetime.datetime.now().year)
+    venue = _one_line((data.get("venue") or "").strip())
+    doi = _one_line((data.get("doi") or "").strip())
+    arxiv = _one_line((data.get("arxiv") or "").strip())
+    topic_category = data.get("topic_category") or "01_Device_TCAD_器件仿真"
+    tags = _one_line(data.get("tags") or "TCAD, NanoDevice")
+    abstract = _one_line((data.get("abstract") or "").strip())
+    status = _one_line(data.get("status") or "待精读")
 
     # Category whitelist
     if topic_category not in ALLOWED_TOPIC_CATEGORIES:
@@ -286,10 +520,12 @@ def save_literature_card(data: dict) -> dict:
 
     # Parse all tags (comma-separated) and format as YAML list for the frontmatter.
     # The template uses {{tags_csv}} which is comma-separated (YAML inline list syntax).
+    # Each tag is emitted as a quoted YAML scalar so a tag containing a comma,
+    # a bracket or a colon cannot break the properties block.
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
     if not tag_list:
         tag_list = ["Research"]
-    tags_csv = ", ".join(tag_list)
+    tags_csv = ", ".join(f'"{_yaml_quoted(t)}"' for t in tag_list)
     topic_tag = tag_list[0]  # First tag is the "primary" used in template body
 
     rendered = _render_template(
@@ -339,6 +575,15 @@ def save_literature_card(data: dict) -> dict:
         # Strip .md if user added it; we re-attach the canonical extension.
         if filename_override.lower().endswith(".md"):
             filename_override = filename_override[:-3]
+        # Reject any traversal hints BEFORE sanitization. sanitize_filename()
+        # only removes Windows-illegal characters and slashes; it doesn't
+        # detect "..", so "../../etc/passwd" becomes "..etcpasswd.md" —
+        # which is technically inside BASE_DIR (so not a real escape), but
+        # is clearly user error / attack intent and should be rejected.
+        if ".." in filename_override:
+            raise ValueError(
+                f"非法 filename_override: '{filename_override}' 含 '..', 请输入单层文件名"
+            )
         safe_base = sanitize_filename(filename_override)
         if not safe_base:
             raise ValueError(f"filename 清理后为空: '{filename_override}'")
@@ -347,7 +592,15 @@ def save_literature_card(data: dict) -> dict:
         filename = f"{year}_{safe_title}.md"
     file_path = _safe_path(target_dir, filename)
 
+    # Make sure the destination folder exists. It normally does (the vault
+    # ships with the standard sub-folders), but if the user removed or
+    # renamed one, the write used to fail with a raw
+    # "[Errno 2] No such file or directory: 'C:\\Users\\...\\vault\\...'" —
+    # a 500 that also leaked the user's absolute filesystem path to the
+    # browser.
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(rendered, encoding="utf-8")
+    _invalidate_vault_stats_cache()
     return {
         "status": "success",
         "file_name": filename,
@@ -370,10 +623,10 @@ def create_reproduction_workspace(data: dict) -> dict:
     if not project_name:
         raise ValueError("project_name 净化后为空, 请使用合法字符 (字母/数字/下划线/短横线)")
 
-    target_paper = data.get("target_paper", "待关联论文").strip()
-    project_type = data.get("project_type", "TCAD").upper()
-    toolchain = data.get("toolchain", "Sentaurus TCAD 2023").strip()
-    description = data.get("description", "").strip()
+    target_paper = _one_line(data.get("target_paper") or "待关联论文").strip()
+    project_type = (data.get("project_type") or "TCAD").upper()
+    toolchain = _one_line(data.get("toolchain") or "Sentaurus TCAD 2023").strip()
+    description = _one_line(data.get("description") or "").strip()
 
     if project_type not in ALLOWED_PROJECT_TYPES:
         raise ValueError(
@@ -406,13 +659,24 @@ def create_reproduction_workspace(data: dict) -> dict:
             target_paper_link=target_paper,
             type=description or "EDA Placement/Routing/STA",
             toolchain=toolchain,
-            repo_url=data.get("repo_url", "https://github.com/"),
+            repo_url=_one_line(data.get("repo_url") or "https://github.com/"),
             commit_hash="main",
             date=today,
         )
 
     readme_path = _safe_path(proj_dir, "README.md")
+    if readme_path.exists():
+        # Re-running the wizard with the same project name used to
+        # overwrite the existing README with a freshly rendered template,
+        # silently destroying whatever the user had written there (notes,
+        # checklists, parameters). The subfolders survived, so the project
+        # still looked intact while its README had been replaced.
+        raise ValueError(
+            f"复现工程 '{project_name}' 已存在, 请换一个名字, "
+            f"或直接在 {readme_path} 上继续编辑。"
+        )
     readme_path.write_text(rendered, encoding="utf-8")
+    _invalidate_vault_stats_cache()
 
     return {
         "status": "success",
@@ -451,22 +715,33 @@ def record_troubleshoot(data: dict) -> dict:
 ### 坑记录：[{category}] {error_keyword} ({today})
 - **工具/环境**：{tool_name}
 - **错误现场**：
-```text
+````text
 {raw_error}
-```
+````
 - **根本原因**：
 {root_cause}
 - **解决方案**：
-```bash
+````bash
 {solution}
-```
+````
 """
     if trouble_file.exists():
-        existing = trouble_file.read_text(encoding="utf-8")
-        trouble_file.write_text(existing + entry, encoding="utf-8")
+        # Append under a lock instead of read-modify-write.
+        #
+        # The old code did read_text() -> concat -> write_text(). With two
+        # browser tabs open, both threads read the same "before" state and
+        # the second write clobbered the first entry — a silent loss of a
+        # hard-won debugging note. Appending is atomic enough for our
+        # purposes (single process, entries well under the pipe buffer),
+        # and the lock serialises concurrent requests in this process.
+        with _VAULT_WRITE_LOCK:
+            with open(trouble_file, "a", encoding="utf-8") as f:
+                f.write(entry)
     else:
-        trouble_file.write_text(f"# 踩坑与排错日记\n{entry}", encoding="utf-8")
-
+        with _VAULT_WRITE_LOCK:
+            with open(trouble_file, "a", encoding="utf-8") as f:
+                f.write(f"# 踩坑与排错日记\n{entry}")
+    _invalidate_vault_stats_cache()
     return {"status": "success", "keyword": error_keyword}
 
 # ---------------------------------------------------------------------------
@@ -483,7 +758,22 @@ def generate_weekly_report() -> dict:
 
     tpl_path = BASE_DIR / "_Templates" / "04_Weekly_Report_Template.md"
     stats = get_vault_stats()
-    recent_lits = stats.get("literature_list", [])[:3]
+
+    # Filter to the last 7 days. The old code took the 3 most recently
+    # *modified* notes with no date filter, so a report labelled "本周"
+    # happily listed notes from three weeks earlier — and then claimed a
+    # hardcoded "本周推进了核心器件仿真网格收敛与最新文献调研" while the
+    # real weekly activity was zero.
+    cutoff = (today - datetime.timedelta(days=7)).isoformat()
+    week_lits = [
+        l for l in stats.get("literature_list", [])
+        if str(l.get("mtime", ""))[:10] >= cutoff
+    ]
+    recent_lits = week_lits[:3]
+    week_repro = [
+        p for p in stats.get("reproduction_list", [])
+        if str(p.get("mtime", "")) >= cutoff
+    ]
 
     # Build the bullet list of literature progress for the template.
     # Template has a single {{paper_1_link}} placeholder; we pass a single string
@@ -496,21 +786,49 @@ def generate_weekly_report() -> dict:
     else:
         lit_lines = "- [ ] 本周待记录新精读文献"
 
+    # The one-line summary used to be a hardcoded sentence that was always
+    # printed, even when the week had no activity at all. Derive it from
+    # what actually happened in the window.
+    if week_lits or week_repro:
+        summary = (
+            f"本周共更新 {len(week_lits)} 篇文献笔记、"
+            f"{len(week_repro)} 个复现工程目录。"
+        )
+    else:
+        summary = "本周暂无新的文献录入或复现工程更新, 待补充进展。"
+
+    # Link the most recently touched reproduction project instead of a
+    # hard-coded one. The old value pointed at "repro_cfet_sub3nm", so the
+    # moment the user deleted or renamed that project, every weekly report
+    # shipped a dead Obsidian link. Falls back to a neutral placeholder
+    # when the vault has no reproduction project yet.
+    repro_link = "02_Reproduction/|复现工程 (待创建)"
+    repro_list = stats.get("reproduction_list") or []
+    if repro_list:
+        latest = max(repro_list, key=lambda r: (r.get("mtime") or "", r.get("name") or ""))
+        repro_link = f"{latest.get('path', '')}/README|{latest.get('name', '复现工程')}"
+
     rendered = _render_template(
         tpl_path,
         week_id=week_id,
         start_date=start_date,
         end_date=end_date,
-        one_line_summary="本周推进了核心器件仿真网格收敛与最新文献调研。",
+        one_line_summary=summary,
         paper_1_link=lit_lines,
-        reproduction_link="02_Reproduction/repro_cfet_sub3nm/README|CFET仿真复现",
+        reproduction_link=repro_link,
     )
 
     weekly_dir = _safe_path(BASE_DIR, "04_Weekly_Reports")
     weekly_dir.mkdir(parents=True, exist_ok=True)
     filename = f"Weekly_{today.strftime('%Y%m%d')}_{week_id}.md"
     file_path = _safe_path(weekly_dir, filename)
-    file_path.write_text(rendered, encoding="utf-8")
+    # Write via a temp file + atomic replace so a concurrent request (or a
+    # crash) can never leave a half-written report in the vault.
+    tmp_path = file_path.with_suffix(".md.tmp")
+    with _VAULT_WRITE_LOCK:
+        tmp_path.write_text(rendered, encoding="utf-8")
+        os.replace(tmp_path, file_path)
+    _invalidate_vault_stats_cache()
 
     return {
         "status": "success",
@@ -524,10 +842,10 @@ def save_bilingual_reading_card(data: dict) -> dict:
     Save a bilingual reading card (paired English + Chinese sections) into 01_Literature/{category}/02_双语精读笔记.
     Optionally bundles QA interaction records collected during reading.
     """
-    title = data.get("title", "").strip() or "Untitled_Paper"
-    authors = data.get("authors", "").strip() or "Unknown"
+    title = _one_line(data.get("title") or "").strip() or "Untitled_Paper"
+    authors = _one_line(data.get("authors") or "").strip() or "Unknown"
     year = int(data.get("year") or 2024)
-    topic_category = data.get("topic_category", "01_Device_TCAD_器件仿真")
+    topic_category = data.get("topic_category") or "01_Device_TCAD_器件仿真"
     if topic_category not in ALLOWED_TOPIC_CATEGORIES:
         topic_category = "01_Device_TCAD_器件仿真"
 
@@ -550,11 +868,11 @@ def save_bilingual_reading_card(data: dict) -> dict:
     today = datetime.date.today().isoformat()
     lines = [
         "---",
-        f"title: \"{title}\"",
-        f"authors: \"{authors}\"",
+        f"title: \"{_yaml_quoted(title)}\"",
+        f"authors: \"{_yaml_quoted(authors)}\"",
         f"year: {year}",
         f"date: {today}",
-        f"category: \"{topic_category}\"",
+        f"category: \"{_yaml_quoted(topic_category)}\"",
         "tags: [Literature, Bilingual, 双语精读笔记]",
         "status: 精读中",
         "---",
@@ -573,14 +891,32 @@ def save_bilingual_reading_card(data: dict) -> dict:
 
     for sec in sections:
         sec_title = sec.get("title", "未命名章节")
+        trans_html = (sec.get("translation_html") or "").strip()
         trans = (sec.get("translation") or "").strip()
+        orig_html = (sec.get("orig_html") or "").strip()
         orig = (sec.get("text") or "").strip()
         lines.append(f"### {sec_title}\n")
-        if trans:
+        # Translation: prefer pre-rendered HTML (already KaTeX-processed) over
+        # raw markdown. The HTML embeds inline <span class="katex"> + <svg>
+        # blocks for every formula, so Obsidian / Typora / GitHub preview all
+        # show fully-typeset math without any community plugin.
+        if trans_html:
+            lines.append("> [!NOTE] 中文精译 (已 KaTeX 排版)\n")
+            lines.append('<div class="bilingual-trans-cn">\n')
+            lines.append(trans_html)
+            lines.append("\n</div>\n")
+        elif trans:
+            # Fallback when client didn't pre-render (older client / partial load)
             trans_block = "\n".join(f"> {line}" if line.strip() else ">" for line in trans.splitlines())
-            lines.append(f"> [!NOTE] 中文精译\n{trans_block}\n")
-        if orig:
-            lines.append(f"<details>\n<summary><b>展开对应英文原文 (第 {sec.get('page_start', 1)}-{sec.get('page_end', 1)} 页)</b></summary>\n\n{orig}\n\n</details>\n")
+            lines.append(f"> [!NOTE] 中文精译 (LaTeX 源码 — 需 Obsidian 公式插件)\n{trans_block}\n")
+        # English original: same dual-mode treatment. Useful when the source
+        # PDF contains LaTeX (common in microelectronics / physics papers).
+        if orig_html:
+            page_hint = f"(第 {sec.get('page_start', 1)}-{sec.get('page_end', 1)} 页 · KaTeX 已排版)"
+            lines.append(f"<details>\n<summary><b>展开对应英文原文 {page_hint}</b></summary>\n\n<div class=\"bilingual-trans-en\">\n\n{orig_html}\n\n</div>\n\n</details>\n")
+        elif orig:
+            page_hint = f"(第 {sec.get('page_start', 1)}-{sec.get('page_end', 1)} 页)"
+            lines.append(f"<details>\n<summary><b>展开对应英文原文 {page_hint}</b></summary>\n\n{orig}\n\n</details>\n")
         lines.append("---\n")
 
     if qa_records:
@@ -614,7 +950,12 @@ def save_bilingual_reading_card(data: dict) -> dict:
         target_dir = _safe_path(target_dir, safe_sub)
         target_dir.mkdir(parents=True, exist_ok=True)
     file_path = _safe_path(target_dir, filename)
+    # The destination folder may have been removed by the user; create it
+    # instead of failing with a raw "[Errno 2]" 500 that also leaks the
+    # absolute filesystem path to the browser.
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(content, encoding="utf-8")
+    _invalidate_vault_stats_cache()
 
     return {
         "status": "success",
@@ -628,8 +969,8 @@ def save_qa_card(data: dict) -> dict:
     """
     Save an individual text selection Q&A note into 01_Literature/{topic_category}/04_AI划词答疑.
     """
-    title = (data.get("title") or "Untitled_Paper").strip()
-    question = (data.get("question") or "未命名疑问").strip()
+    title = _one_line(data.get("title") or "Untitled_Paper").strip()
+    question = _one_line(data.get("question") or "未命名疑问").strip()
     selection = (data.get("selection") or "").strip()
     answer = (data.get("answer") or "").strip()
     mode = data.get("mode", "explain")
@@ -670,12 +1011,12 @@ def save_qa_card(data: dict) -> dict:
         sel_block = f"## 📌 选中原文 / 上下文\n{sel_lines}\n\n---\n\n"
 
     content = f"""---
-title: "答疑: {question[:60]}"
-paper: "{title}"
-category: "{topic_category}"
+title: "答疑: {_yaml_quoted(question[:60])}"
+paper: "{_yaml_quoted(title)}"
+category: "{_yaml_quoted(topic_category)}"
 date: {today_str}
-mode: "{mode}"
-tags: [Literature, QnA, AI划词答疑, {mode}]
+mode: "{_yaml_quoted(mode)}"
+tags: [Literature, QnA, AI划词答疑, {_yaml_quoted(mode)}]
 status: 已完成
 ---
 
@@ -710,7 +1051,12 @@ status: 已完成
         target_dir = _safe_path(target_dir, safe_sub)
         target_dir.mkdir(parents=True, exist_ok=True)
     file_path = _safe_path(target_dir, filename)
+    # The destination folder may have been removed by the user; create it
+    # instead of failing with a raw "[Errno 2]" 500 that also leaks the
+    # absolute filesystem path to the browser.
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(content, encoding="utf-8")
+    _invalidate_vault_stats_cache()
 
     return {
         "status": "success",

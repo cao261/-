@@ -32,7 +32,7 @@ echo ============================================================
 echo.
 
 rem ------------------------------------------------------------
-echo [1/3] 检查 Python 环境与依赖...
+echo [1/4] 检查 Python 环境与依赖...
 python -c "import fastapi, uvicorn, requests, pydantic, multipart" 2>nul
 if errorlevel 1 goto :INSTALL_DEPS
 echo     依赖就绪。
@@ -63,15 +63,20 @@ echo     依赖安装完成。
 echo.
 
 rem ------------------------------------------------------------
-echo [2/3] 检查服务是否已在运行...
+echo [2/4] 检查服务是否已在运行...
 %PROBE%
 if not errorlevel 1 goto :ALREADY
 
 echo     正在启动本地科研工作台服务 %URL% ...
 rem 服务端单独开一个窗口：日志可见，Ctrl+C 或关闭该窗口即可停止。
-start "MicroBench Server" /D "%APP_DIR%" cmd /k python -m uvicorn microbench.app:app --host 127.0.0.1 --port 5000 --reload
+rem 不加 --reload：生产模式启动更快，也不会留下常驻的 reloader 进程。
+start "MicroBench Server" /D "%APP_DIR%" cmd /k python -m uvicorn microbench.app:app --host 127.0.0.1 --port 5000
 
-echo [3/3] 等待服务就绪...
+rem 顺手把离线阅读版刷新一次，免得平板上拿到的还是旧快照
+if not exist logs mkdir logs
+start "MicroBench Offline" /MIN cmd /c "python microbench\export_offline.py > logs\offline_export.log 2>&1"
+
+echo [3/4] 等待服务就绪...
 set /a TRIES=0
 :WAIT_LOOP
 %SLEEP%

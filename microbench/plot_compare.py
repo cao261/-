@@ -40,6 +40,35 @@ DEFAULT_VAL_THRESHOLD = 230
 # Smaller bucket → stricter clustering (separates close colors); larger → merges.
 DEFAULT_HUE_BUCKET = 32
 
+# Hard ceiling on the image area we are willing to digitise. Pillow only
+# raises DecompressionBombError above ~2x its own limit, so a 4K screenshot
+# (4000x3000 = 12 MP) sails through while the pure-Python pixel loop needs
+# tens of seconds and a 700MB boolean mask. 40 MP keeps the worst case
+# bounded while covering any realistic chart screenshot.
+MAX_IMAGE_PIXELS = 40_000_000
+
+
+def _threshold_mask(img, sat_thresh: int, val_thresh: int):
+    """Return a binary mask (mode "L", 0/255) of "data" pixels.
+
+    The threshold test is `saturation >= sat_thresh AND value <= val_thresh`
+    where saturation = max(R,G,B) - min(R,G,B) and value = max(R,G,B).
+
+    Implemented with Pillow's C-level channel ops (split / lighter / darker /
+    difference / point) instead of a Python loop over every pixel.
+    """
+    from PIL import ImageChops
+
+    r, g, b = img.split()
+    lighter = ImageChops.lighter(ImageChops.lighter(r, g), b)   # per-pixel max
+    darker = ImageChops.darker(ImageChops.darker(r, g), b)       # per-pixel min
+    sat = ImageChops.difference(lighter, darker)                 # max - min
+
+    sat_mask = sat.point(lambda v: 255 if v >= sat_thresh else 0)
+    val_mask = lighter.point(lambda v: 255 if v <= val_thresh else 0)
+    # multiply() on 0/255 values is a logical AND.
+    return ImageChops.multiply(sat_mask, val_mask)
+
 
 def extract_curve_from_image(
     image_bytes: bytes,
@@ -57,34 +86,29 @@ def extract_curve_from_image(
       - total_pixels: how many "data pixels" were detected
       - cluster_color: approximate RGB of the dominant curve (for debug)
       - width / height: image dimensions
+
+    Implementation note: this used to walk every pixel twice in pure Python
+    and keep a `[[False] * width] * height` mask alive, i.e. 89M Python list
+    slots (~700MB) for a 4000x3000 screenshot, and 10-20 seconds of CPU.
+    The threshold now runs in Pillow's C code, the mask is a flat bytes
+    buffer, and — when numpy is importable — the clustering and the
+    per-column median are vectorised. numpy stays an *optional* accelerator;
+    the pure-Pillow fallback keeps the same numbers without it.
     """
-    from PIL import Image  # Pillow; declared as a soft dep
+    from PIL import Image
 
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     width, height = img.size
-    pixels = img.load()  # type: ignore
 
-    # Phase 1: find candidate "data" pixels (saturated, not too dark)
-    candidate_mask = [[False] * width for _ in range(height)]
-    r_sum = 0
-    g_sum = 0
-    b_sum = 0
-    n_cand = 0
-    for y in range(height):
-        row = candidate_mask[y]
-        for x in range(width):
-            r, g, b = pixels[x, y]
-            mx = max(r, g, b)
-            mn = min(r, g, b)
-            sat = mx - mn
-            if sat >= sat_thresh and mx <= val_thresh:
-                row[x] = True
-                r_sum += r
-                g_sum += g
-                b_sum += b
-                n_cand += 1
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"图片过大 ({width}x{height} = {width * height / 1e6:.1f} MP), "
+            f"请裁剪到 {MAX_IMAGE_PIXELS / 1e6:.0f} MP 以内再上传"
+        )
 
-    if n_cand == 0:
+    mask = _threshold_mask(img, sat_thresh, val_thresh)
+    bbox = mask.getbbox()
+    if bbox is None:
         return {
             "points": [],
             "total_pixels": 0,
@@ -94,28 +118,83 @@ def extract_curve_from_image(
             "warning": "未检测到饱和度足够的数据像素。请尝试调整阈值或确认图表是否含彩色曲线。",
         }
 
-    # Phase 2: cluster by quantized RGB
-    cluster_pixels = defaultdict(list)  # color_key -> [(x, y), ...]
-    for y in range(height):
-        row = candidate_mask[y]
-        for x in range(width):
-            if not row[x]:
-                continue
-            r, g, b = pixels[x, y]
-            key = (
-                r // hue_bucket,
-                g // hue_bucket,
-                b // hue_bucket,
-            )
-            cluster_pixels[key].append((x, y))
+    # Crop to the bounding box of the candidate pixels. For a real chart
+    # this typically removes the margins and the legend area, and it keeps
+    # the coordinates we emit in the original image space by adding the
+    # crop offset back at the end.
+    off_x, off_y = bbox[0], bbox[1]
+    mask_c = mask.crop(bbox)
+    img_c = img.crop(bbox)
+    cw, ch = mask_c.size
 
-    # Pick the largest cluster (the "main curve")
-    main_cluster_key, main_cluster = max(cluster_pixels.items(), key=lambda kv: len(kv[1]))
-    cluster_color = [
-        main_cluster_key[0] * hue_bucket + hue_bucket // 2,
-        main_cluster_key[1] * hue_bucket + hue_bucket // 2,
-        main_cluster_key[2] * hue_bucket + hue_bucket // 2,
-    ]
+    cluster_pixels: dict = {}
+    n_clusters = 0
+    main_cluster: list = []
+    main_cluster_key = (0, 0, 0)
+    cluster_color = [0, 0, 0]
+
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    if np is not None:
+        arr = np.asarray(img_c)                      # (h, w, 3) uint8
+        m = np.asarray(mask_c) > 0                   # (h, w) bool
+        ys, xs = np.nonzero(m)
+        if xs.size == 0:
+            rgb = np.empty((0, 3), dtype=np.uint8)
+        else:
+            rgb = arr[ys, xs]
+        if rgb.shape[0]:
+            keys = (rgb.astype(np.int32) // hue_bucket)
+            packed = (keys[:, 0].astype(np.int64) << 40) | \
+                     (keys[:, 1].astype(np.int64) << 20) | \
+                     keys[:, 2].astype(np.int64)
+            uniq, inverse, counts = np.unique(
+                packed, return_inverse=True, return_counts=True
+            )
+            n_clusters = int(uniq.size)
+            best = int(np.argmax(counts))
+            main_cluster_key = (
+                int((int(uniq[best]) >> 40) & 0xFFFFF),
+                int((int(uniq[best]) >> 20) & 0xFFFFF),
+                int(int(uniq[best]) & 0xFFFFF),
+            )
+            sel = inverse == best
+            mx = xs[sel]
+            my = ys[sel]
+            main_cluster = list(zip(mx.tolist(), my.tolist()))
+        cluster_color = [
+            main_cluster_key[0] * hue_bucket + hue_bucket // 2,
+            main_cluster_key[1] * hue_bucket + hue_bucket // 2,
+            main_cluster_key[2] * hue_bucket + hue_bucket // 2,
+        ]
+    else:
+        # Pure-Pillow fallback: one flat pass over the mask bytes.
+        md = mask_c.tobytes()
+        pd = img_c.tobytes()
+        buckets: dict = {}
+        for i, m in enumerate(md):
+            if not m:
+                continue
+            j = i * 3
+            r = pd[j]
+            g = pd[j + 1]
+            b = pd[j + 2]
+            key = (r // hue_bucket, g // hue_bucket, b // hue_bucket)
+            y, x = divmod(i, cw)
+            buckets.setdefault(key, []).append((x, y))
+        n_clusters = len(buckets)
+        if buckets:
+            main_cluster_key, main_cluster = max(
+                buckets.items(), key=lambda kv: len(kv[1])
+            )
+        cluster_color = [
+            main_cluster_key[0] * hue_bucket + hue_bucket // 2,
+            main_cluster_key[1] * hue_bucket + hue_bucket // 2,
+            main_cluster_key[2] * hue_bucket + hue_bucket // 2,
+        ]
 
     # Phase 3: per-column median y
     by_x = defaultdict(list)
@@ -136,7 +215,8 @@ def extract_curve_from_image(
         ys_sorted = sorted(ys)
         mid = len(ys_sorted) // 2
         median_y = ys_sorted[mid] if len(ys_sorted) % 2 else (ys_sorted[mid - 1] + ys_sorted[mid]) / 2
-        points.append([x, median_y])
+        # Re-add the crop offset so the points are in original image space.
+        points.append([x + off_x, median_y + off_y])
 
     return {
         "points": points,
@@ -144,7 +224,7 @@ def extract_curve_from_image(
         "cluster_color": cluster_color,
         "width": width,
         "height": height,
-        "n_clusters": len(cluster_pixels),
+        "n_clusters": n_clusters,
     }
 
 
@@ -334,7 +414,22 @@ def compute_metrics(
         r2 = 0.0
 
     # Verdict
-    if max_rel_pct <= tol["pass_pct"]:
+    #
+    # A relative error is only computable where |paper_y| is non-zero. If the
+    # extracted paper curve is flat-zero (digitisiser failed / wrong column
+    # picked / empty panel), EVERY relative error is None, valid_rel is empty,
+    # and the old code fell through to max_rel_pct = 0.0 <= pass_pct -> "pass".
+    # That reported a total extraction failure as a successful reproduction,
+    # which is the single most misleading thing this module can do. Declare it
+    # inconclusive instead, and make it loud in the response.
+    if not valid_rel:
+        verdict = "inconclusive"
+        verdict_msg = (
+            "⚠️ 无法判定: 论文曲线在重叠区间内全为 0, 相对误差无从计算。"
+            "这通常意味着图表数据提取失败(选错坐标轴/列), 而不是复现通过。"
+            f" 绝对 RMSE={rmse:.4g}, MAE={mae:.4g} 仅作参考。"
+        )
+    elif max_rel_pct <= tol["pass_pct"]:
         verdict = "pass"
         verdict_msg = f"✅ 通过: 最大相对误差 {max_rel_pct:.2f}% ≤ {tol['pass_pct']}%"
     elif max_rel_pct <= tol["warn_pct"]:

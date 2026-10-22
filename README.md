@@ -51,21 +51,104 @@
 
 ### 🤖 模型选择与「直译」参数
 
-| 模型 | 思考模式 | 论文直译实测 |
+实测口径：2015 IEEE 双栏论文**整页**（2627 字符，pdfplumber 抽取），
+走真实 HTTP 接口，统计端到端耗时与译文完整性。
+
+| 模型 | 思考模式 | 整页直译实测 |
 | --- | --- | --- |
-| **MiniMax-M3** | 可开关（`thinking.type` 支持 `adaptive` / `disabled`） | ✅ 整页一次翻译 21.5s 出完整译文，公式/术语保留良好 |
-| MiniMax-M3.1-Flash | **强制 adaptive，不可关闭** | ⚠️ 长文输入容易在推理里打转（思考烧光 `max_tokens` → 正文为空） |
+| **MiniMax-M3** | 可关（`thinking.type=disabled` 支持） | ✅ **10~12s**，译文完整、无思考泄漏、无中英混杂 —— 直译首选 |
+| MiniMax-M3.1-Flash | **强制 adaptive，不可关闭**（传 `disabled` 直接 400） | ⚠️ 45s；推理会把输出预算吃光，预算给小了正文被截断（代码已自动加大预算并检测截断） |
+| MiniMax-M2.7 | 传 `disabled` 会被**静默忽略** | ⚠️ 13~25s，译文完整但 content 里混着思考文本；部分账号已不再提供该模型 |
 | Agnes 3.0 Flash（备用） | 无思考 | ✅ 兜底可用，20 RPM 限速 |
 
-推荐配置（`.env`）：
+> **为什么「慢 + 乱」**：MiniMax 的**思考 token 与正文共用同一个 `max_tokens`
+> 预算池**。预算给小了，推理先吃光，正文就断在半句，而前端仍显示「已翻译」。
+> M3.1-Flash 强制思考，最容易踩这个坑。
+
+推荐配置（`.env`）—— **读论文和做推理解耦**：
 
 ```ini
-LLM_MODEL_NAME=MiniMax-M3
-LLM_TRANSLATION_DISABLE_THINKING=1   # 直译任务关掉思考：更快，且不会在推理里打转
+LLM_BASE_URL=https://api.minimaxi.com/v1  # 国内站；国际站用 api.minimax.io
+LLM_MODEL_NAME=MiniMax-M3                 # 主模型：解读 / 答疑
+LLM_TRANSLATION_MODEL=MiniMax-M3          # 翻译专用：批量直译
+LLM_TRANSLATION_DISABLE_THINKING=1
+LLM_TRANSLATION_DEADLINE=180               # 单次翻译请求的总时限（秒）
 ```
 
-`LLM_TRANSLATION_DISABLE_THINKING=1` 只作用于翻译类请求；问答/解读仍保留模型的
-推理能力。若把主模型换成 M3.1-Flash，代码会自动忽略该参数（模型会拒绝）并降级重试。
+- `LLM_TRANSLATION_MODEL` 留空 = 翻译跟随主模型。
+- `LLM_TRANSLATION_DISABLE_THINKING=1` 只作用于翻译类请求；问答/解读仍保留模型的推理能力。
+- 若把翻译模型换成 M3.1-Flash，代码会自动忽略 `disabled` 参数（模型会拒绝）、
+  自动加大输出预算、并在正文被截断时**报错而不是把残缺译文当成成功**。
+- **总时限**：单次翻译请求最多跑 `LLM_TRANSLATION_DEADLINE` 秒（默认 180，可调 30~900）。
+  这个时限覆盖整条链路——分块之间的等待、模型重试、截断后抬预算重试，都算在里面。
+  超时的行为**不是报错**，而是返回**已经翻完的部分**并标 `partial`，前端会显示
+  「已翻译 N/M 段 · 超出时限」，再点一次翻译可以接着翻。
+- 翻译结果按 (章节, 文本哈希, 模型) 缓存。换模型或改提示词后缓存键会变，
+  不会命中旧结果；但**只改代码不换模型**时，旧译文仍在内存缓存里，
+  重启服务即可清空。
+
+---
+
+## 📱 平板版（iPad / Android 平板）
+
+工作台有**两个**平板入口，取决于平板在不在你的电脑旁边：
+
+| | 实时版（LAN） | 离线阅读版 |
+|---|---|---|
+| **启动方式** | 双击 `start_workbench_lan.bat` | 双击 `start_offline_sync.bat` |
+| **需要电脑开着** | ✅ 必须 | ❌ 不需要 |
+| **需要同一局域网** | ✅ 必须（同一个 Wi-Fi） | ❌ 不需要，文件带在平板上 |
+| **能做什么** | 全功能：抓论文、AI 解读/翻译、建卡、生成复现工程、周报 | 只读：看全部笔记与公式、全文搜索 |
+| **拿到最新内容** | 实时 | 需重新导出（见下） |
+
+### 实时版（电脑在旁边时用）
+
+1. 双击 **`start_workbench_lan.bat`**，窗口里会打印：
+   ```
+   [推荐] 一键配对 (自动填入口令):
+      http://192.168.1.101:5000/?k=XXXXXXXXXXXX
+   ```
+2. 平板连**同一个 Wi-Fi**，用 Safari 打开上面那行带 `?k=` 的地址 → 自动完成配对，浏览器会记住口令，之后直接开 `http://192.168.1.101:5000/` 即可；
+3. **iPad**：分享按钮 → 添加到主屏幕，即可全屏运行（已配置 PWA manifest + standalone 模式）；
+   **Android**：Chrome 菜单 → 添加到主屏幕；
+4. 页面已针对平板适配：触控目标 ≥44pt、安全区避让、竖屏单栏、阅读栏宽限制。
+
+> **关于口令**：工作台开到局域网后，同一个 Wi-Fi 下任何设备只要知道地址就能访问——能读你的全部笔记、写入文件、消耗你的 API 额度。所以这里加了一道**一次性口令**：
+> - 口令由 `logs/lan_token.txt` 持久保存，**重启不变**，平板只需配对一次；
+> - 配对后存进 **HttpOnly + SameSite=Lax** 的 Cookie，页面脚本读不到，跨站请求也不会带上；
+> - 本机（`127.0.0.1`）访问**完全不受影响**，不需要口令，桌面用法与以前一模一样；
+> - 端口不对外时，口令存在也不会有人能连上——两道锁是独立的。
+
+> **连不上怎么办**：99% 是 Windows 防火墙。启动脚本会检测并提示放行命令（需管理员身份）：
+> ```
+> netsh advfirewall firewall add rule name="MicroBench 5000" dir=in action=allow protocol=TCP localport=5000 profile=private
+> ```
+
+### 离线阅读版（没带电脑时用）
+
+把整个 vault 烘焙成**一个自包含的 HTML 文件**（`MicroBench_离线阅读版.html`）：
+
+- **零外部依赖**——KaTeX 公式在导出时就渲染成静态 HTML，字体以 base64 内嵌，没有一个网络请求，飞机上、地铁上、图书馆都能开；
+- 公式渲染规则与在线版**完全一致**（同一套 `$$`/`$` 提取逻辑）；
+- 目录树导航 + 全文搜索 + 深色模式 + 触控适配；
+- 1.3 MB 一个文件，AirDrop / 微信文件传输 / U 盘都能拷。
+
+**保持内容最新**（这是离线版唯一需要操心的点）：
+
+```bash
+# 手动导出一次
+python microbench/export_offline.py
+
+# 或者常驻监视,笔记一改就自动重导 (每 60 秒检查)
+python microbench/export_offline.py --watch
+
+# 输出到云盘目录 —— 平板用云盘 App 直接打开,永远是最新的
+python microbench/export_offline.py "D:/OneDrive/MicroBench.html"
+```
+
+双击 **`start_offline_sync.bat`** 更省事：把一个云盘文件夹拖到它上面，它会先导一次然后常驻监视，之后你只管写笔记。
+
+> **能不能在平板上编辑？** 离线版是只读的。想在平板上**读 + 改**，把整个 vault 放进 OneDrive / 坚果云 / Obsidian Sync，用 iPad 版 Obsidian 打开——Obsidian 原生支持 LaTeX 公式和双链，体验比这个 HTML 还好。代价是需要处理同步冲突。
 
 ---
 
@@ -101,12 +184,22 @@ LLM_TRANSLATION_DISABLE_THINKING=1   # 直译任务关掉思考：更快，且�
 │   └── 05_Troubleshooting_Template.md      # 避坑排错日记模版
 │
 ├── microbench/                 # 本地 Web 工作台源码 (FastAPI + 极简前端)
-│   ├── static/index.html       # 单文件前端（工作台 + PDF 双栏阅读器 + AI 答疑）
-│   └── static/vendor/          # 本地化的 PDF.js / KaTeX（离线可用，见下方说明）
+│   ├── app.py                  # 后端 API + 鉴权/跨站守卫
+│   ├── lan.py                  # 局域网模式: 口令与 IP 解析
+│   ├── export_offline.py       # 导出单文件离线阅读版
+│   ├── static/
+│   │   ├── index.html          # 主界面 (单文件前端: 工作台 + PDF 双栏阅读器 + AI 答疑)
+│   │   ├── pair.html           # 平板配对口令页
+│   │   ├── manifest.webmanifest# PWA 清单
+│   │   └── vendor/             # 本地化的 PDF.js / KaTeX（离线可用，见下方说明）
+│   └── _test_lan.py            # 局域网模式回归测试
 ├── assets/                     # 桌面快捷方式图标 (microbench.ico)
 ├── requirements.txt            # Python 轻量依赖
 ├── .env                        # 模型 API Key 配置（已 gitignore，勿提交）
-└── start_workbench.bat         # Windows 一键启动脚本（桌面快捷方式指向此文件）
+├── start_workbench.bat         # Windows 一键启动脚本 (仅本机，桌面快捷方式指向此文件)
+├── start_workbench_lan.bat     # Windows 一键启动脚本 (平板 / 局域网)
+├── start_offline_sync.bat      # 离线阅读版同步器 (可导出到云盘)
+└── MicroBench_离线阅读版.html   # 离线快照 (单文件, 平板可离线阅读)
 ```
 
 ### 🌐 前端依赖已本地化（无需外网）
@@ -114,8 +207,8 @@ LLM_TRANSLATION_DISABLE_THINKING=1   # 直译任务关掉思考：更快，且�
 PDF 双栏阅读器用的 PDF.js、公式渲染用的 KaTeX 原本从 `cdn.jsdelivr.net` 加载，
 该域名在部分网络环境下不可达，会导致阅读器直接报「PDF.js 未加载」。
 
-现在两者都随仓库分发在 `microbench/static/vendor/`，由 FastAPI 的 `/static`
-挂载提供：
+现在两者都随仓库分发在 `microbench/static/vendor/`，由 FastAPI 的 `/static/vendor`
+挂载提供（只挂 vendor 子树，其余静态文件仍走白名单路由）：
 
 ```text
 microbench/static/vendor/
@@ -123,10 +216,12 @@ microbench/static/vendor/
 └── katex/    katex.min.js / katex.min.css / fonts/ (woff2 + woff + ttf)
 ```
 
-重新生成或升级版本：
+重新生成或升级版本（vendor 文件已随仓库提交，通常无需手动操作）：
 
 ```bash
-python _vendor_assets.py      # 从 npmmirror 拉取官方 npm 包并落地到 vendor/
+npm install katex@0.16.11 pdfjs-dist@3.11.174 --prefix microbench/_vendor --registry=https://registry.npmmirror.com
+# 然后把 node_modules/katex/dist → microbench/static/vendor/katex/
+#      node_modules/pdfjs-dist/build|web → microbench/static/vendor/pdfjs/
 ```
 
 `index.html` 采用「本地优先 + CDN 兜底」：本地文件缺失（全新克隆未执行上述脚本）

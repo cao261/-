@@ -5,8 +5,17 @@ Provides automated extraction of title, authors, year, abstract, BibTeX, and PDF
 
 import re
 import urllib.parse
-import xml.etree.ElementTree as ET
+import ipaddress
+import socket
 import requests
+
+# Use defusedxml to safely parse untrusted XML from external APIs
+# (arXiv Atom feed). Standard xml.etree.ElementTree is vulnerable to
+# XXE / billion-laughs / quadratic blowup attacks on adversarial input.
+try:
+    from defusedxml.ElementTree import fromstring as _et_fromstring  # nosec B314 B405
+except ImportError:  # pragma: no cover - fallback if defusedxml missing
+    from xml.etree.ElementTree import fromstring as _et_fromstring  # nosec B314 B405
 
 HEADERS = {
     "User-Agent": "MicroBench-Academic-Assistant/1.0 (mailto:academic_workbench@xjtu.edu.cn)"
@@ -14,6 +23,97 @@ HEADERS = {
 
 PDF_DOWNLOAD_TIMEOUT = 30  # seconds
 PDF_MAX_SIZE_MB = 50       # hard cap to avoid filling disk
+
+
+# ---------------------------------------------------------------------------
+# SSRF guard
+# ---------------------------------------------------------------------------
+# Lives here (not in paper_text) because paper_fetcher itself fetches URLs
+# whose host is chosen by a third party:
+#   - resolve_doi_landing_url() follows doi.org's redirect to whatever host
+#     the DOI registrant controls;
+#   - _scrape_ieee_abstract() then fetches that landing page.
+# Both are SSRF vectors: a DOI pointing at 127.0.0.1 / 169.254.169.254 /
+# an RFC1918 host would make the server probe the user's own network.
+# The guard is re-exported from paper_text for the user-URL path.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _assert_public_http_url(url: str) -> None:
+    """
+    Reject any URL that is not plain public http(s).
+
+    Blocks: non-http(s) schemes (file://, ftp://, gopher://...), loopback,
+    link-local (incl. the 169.254.169.254 cloud metadata endpoint), and any
+    RFC1918 / CGNAT / reserved address. Raises ValueError with the reason so
+    the caller can report something actionable instead of a generic
+    "could not fetch".
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"只支持 http/https, 收到 {parsed.scheme!r}")
+
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL 缺少主机名")
+
+    # Literal IP? Decide directly. Hostname? Resolve first, then decide every
+    # address it maps to — otherwise "evil.test" -> 127.0.0.1 via DNS rebinding
+    # or a hosts-file entry sails straight through a string check.
+    try:
+        ip = ipaddress.ip_address(host)
+        addrs = [ip]
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except socket.gaierror as e:
+            raise ValueError(f"域名无法解析: {host} ({e})")
+        addrs = []
+        for info in infos:
+            try:
+                addrs.append(ipaddress.ip_address(info[4][0]))
+            except ValueError:
+                continue
+        if not addrs:
+            raise ValueError(f"域名未解析到任何 IP: {host}")
+
+    for ip in addrs:
+        if ip.is_loopback:
+            raise ValueError(f"拒绝访问回环地址 ({ip})")
+        if ip.is_link_local:
+            raise ValueError(f"拒绝访问链路本地地址 ({ip})，其中包括云元数据端点")
+        if ip.is_private or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            raise ValueError(f"拒绝访问内网/保留地址 ({ip})")
+
+
+def _safe_redirect_chain(url: str, method: str = "GET", max_hops: int = 5,
+                         timeout: int = 20) -> str:
+    """Follow redirects manually, validating EVERY hop against the SSRF guard.
+
+    `requests` with allow_redirects=True would happily follow a redirect from
+    a legitimate publisher straight to 169.254.169.254. Doing the walk by
+    hand means each intermediate URL is checked before we send a request to
+    it. Returns the final validated URL.
+    """
+    current = url
+    for _ in range(max_hops + 1):
+        _assert_public_http_url(current)
+        resp = requests.request(
+            method, current, headers=HEADERS, timeout=timeout,
+            allow_redirects=False, stream=(method == "GET"),
+        )
+        try:
+            if resp.status_code in (301, 302, 303, 307, 308):
+                nxt = urllib.parse.urljoin(current, resp.headers.get("Location", ""))
+                if not nxt:
+                    break
+                current = nxt
+                continue
+            return current
+        finally:
+            resp.close()
+    raise ValueError(f"重定向次数超过上限 ({max_hops})")
+
 
 def clean_text(text: str) -> str:
     if not text:
@@ -58,9 +158,8 @@ def fetch_arxiv_metadata(arxiv_id: str) -> dict:
                 f"Semantic Scholar 兜底失败: {s2_err}"
             ) from last_err
 
-    root = ET.fromstring(resp.text)
+    root = _et_fromstring(resp.text)  # nosec B314 - via defusedxml wrapper above
 
-    root = ET.fromstring(resp.text)
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     entry = root.find("atom:entry", ns)
     if entry is None:
@@ -305,14 +404,23 @@ def _scrape_ieee_abstract(landing_url: str) -> str:
     Returns empty string if nothing found.
     """
     try:
+        # The landing URL comes from a doi.org redirect, i.e. its host is
+        # chosen by whoever registered the DOI. Validate it (and every
+        # redirect hop) before fetching, otherwise a DOI pointing at
+        # 127.0.0.1 / 169.254.169.254 makes the server probe the user's
+        # own network.
+        safe_url = _safe_redirect_chain(landing_url, method="GET")
         resp = requests.get(
-            landing_url,
+            safe_url,
             headers={**HEADERS, "Accept": "text/html"},
             timeout=20,
-            allow_redirects=True,
+            allow_redirects=False,
         )
-        resp.raise_for_status()
-        html = resp.text
+        try:
+            resp.raise_for_status()
+            html = resp.text
+        finally:
+            resp.close()
 
         # Skip if it's just an AWS WAF challenge page
         if "awswaf" in html.lower() or len(html) < 5000:
@@ -353,6 +461,10 @@ def _scrape_ieee_abstract(landing_url: str) -> str:
                 pass
     except requests.RequestException:
         pass
+    except ValueError:
+        # Blocked by the SSRF guard — the landing page points somewhere
+        # internal. This scrape is best-effort, so just give up quietly.
+        pass
     return ""
 
 
@@ -361,16 +473,34 @@ def resolve_doi_landing_url(doi: str) -> str:
     Resolve DOI to publisher landing page URL via doi.org redirect.
     Returns the final landing URL (not the PDF directly — most publishers
     require browser JS / login to fetch PDF, so we only expose the link).
+
+    The redirect chain is walked by hand and every hop is validated against
+    the SSRF guard. Letting `requests` follow redirects automatically would
+    allow a DOI registrant to bounce the request to an internal host.
     """
     clean_doi = _normalize_doi(doi)
     resp = requests.head(
         f"https://doi.org/{clean_doi}",
         headers=HEADERS,
         timeout=15,
-        allow_redirects=True,
+        allow_redirects=False,
     )
-    resp.raise_for_status()
-    return resp.url
+    try:
+        if resp.status_code in (301, 302, 303, 307, 308):
+            nxt = urllib.parse.urljoin(
+                f"https://doi.org/{clean_doi}", resp.headers.get("Location", "")
+            )
+            if not nxt:
+                resp.raise_for_status()
+                return f"https://doi.org/{clean_doi}"
+            resp.close()
+            resp = None
+            return _safe_redirect_chain(nxt, method="GET", timeout=15)
+        resp.raise_for_status()
+        return resp.url
+    finally:
+        if resp is not None:
+            resp.close()
 
 # ---------------------------------------------------------------------------
 # BibTeX generation

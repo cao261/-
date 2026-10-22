@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>MicroBench · 配对口令</title>
+<meta name="theme-color" content="#F7F4ED">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="MicroBench">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/pwa/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/pwa/icon-192.png">
+<style>
+  :root {
+    --n-0:#FFFFFF; --n-50:#F7F4ED; --n-100:#F1EDE3; --n-150:#EAE4D6;
+    --n-200:#E1DACA; --n-300:#CFC5B1; --n-500:#8A8071; --n-600:#6C6459;
+    --n-700:#4E483F; --n-800:#332E28; --n-900:#1C1A17;
+    --accent:#A8482C; --accent-hover:#8C3A22; --accent-soft:#F7EDE8;
+    --accent-line:rgba(168,72,44,.28);
+    --ok:#4F6046; --bad:#A8482C;
+    --font-display:'Cormorant Garamond',Garamond,'Songti SC','SimSun',serif;
+    --font-ui:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    --font-cn:"PingFang SC","Microsoft YaHei","Hiragino Sans GB","Noto Sans CJK SC",sans-serif;
+    --font-mono:'JetBrains Mono',ui-monospace,"Cascadia Code",Consolas,monospace;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--n-50);
+    color: var(--n-800);
+    font-family: var(--font-cn);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: calc(24px + env(safe-area-inset-top)) calc(20px + env(safe-area-inset-right))
+             calc(24px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
+    /* Prevent the iOS zoom-on-focus that shrinks the whole page when the
+       16px threshold is crossed. 16px exactly keeps it at 1:1. */
+    -webkit-text-size-adjust: 100%;
+  }
+  .card {
+    width: 100%;
+    max-width: 420px;
+    background: var(--n-0);
+    border: 1px solid var(--n-200);
+    border-radius: 20px;
+    padding: 32px 28px 28px;
+    box-shadow: 0 14px 40px rgba(51,46,40,.09);
+  }
+  .brand {
+    font-family: var(--font-display);
+    font-size: 34px;
+    font-weight: 400;
+    letter-spacing: .01em;
+    color: var(--n-900);
+    margin: 0 0 2px;
+  }
+  .brand em { color: var(--accent); font-style: italic; }
+  .sub {
+    font-family: var(--font-ui);
+    font-size: 12px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--n-500);
+    margin: 0 0 22px;
+  }
+  .notice {
+    display: none;
+    margin: 0 0 18px;
+    padding: 11px 14px;
+    border-radius: 10px;
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-line);
+    color: var(--accent-hover);
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  .notice.show { display: block; }
+  label {
+    display: block;
+    font-family: var(--font-ui);
+    font-size: 11px;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--n-600);
+    margin: 0 0 8px;
+  }
+  input {
+    width: 100%;
+    height: 54px;                    /* 54px > the 44px touch minimum */
+    padding: 0 16px;
+    font-family: var(--font-mono);
+    font-size: 19px;
+    letter-spacing: .12em;
+    color: var(--n-900);
+    background: var(--n-50);
+    border: 1px solid var(--n-200);
+    border-radius: 12px;
+    outline: none;
+    -webkit-appearance: none;
+  }
+  input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  button {
+    width: 100%;
+    height: 54px;
+    margin-top: 14px;
+    border: none;
+    border-radius: 12px;
+    background: var(--accent);
+    color: #fff;
+    font-family: var(--font-cn);
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .18s ease, transform .12s ease;
+  }
+  button:hover { background: var(--accent-hover); }
+  button:active { transform: scale(.98); }
+  button:disabled { opacity: .6; cursor: default; }
+  .meta {
+    margin: 20px 0 0;
+    padding-top: 16px;
+    border-top: 1px solid var(--n-150);
+    font-family: var(--font-ui);
+    font-size: 12.5px;
+    line-height: 1.75;
+    color: var(--n-500);
+  }
+  .meta b { color: var(--n-700); font-weight: 600; }
+  .meta code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: var(--n-50);
+    border: 1px solid var(--n-150);
+    border-radius: 5px;
+    padding: 1px 6px;
+    color: var(--n-700);
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1 class="brand">Micro<em>Bench</em></h1>
+    <p class="sub">Tablet pairing</p>
+
+    <div class="notice" id="notice">{{NOTICE}}</div>
+
+    <form id="form" autocomplete="off">
+      <label for="token">访问口令</label>
+      <input id="token" name="token" type="password" inputmode="text"
+             autocapitalize="off" autocorrect="off" spellcheck="false"
+             placeholder="••••••••••••" required>
+      <button id="submit" type="submit">解锁工作台</button>
+    </form>
+
+    <p class="meta">
+      口令显示在启动工作台的 PC 窗口里（<code>start_workbench_lan.bat</code>）。<br>
+      当前连接的主机：<b id="host">{{HOST}}</b>
+    </p>
+  </main>
+
+<script>
+  const notice = document.getElementById("notice");
+  const form = document.getElementById("form");
+  const input = document.getElementById("token");
+  const submit = document.getElementById("submit");
+
+  function say(msg) {
+    notice.textContent = msg;
+    notice.classList.add("show");
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const token = input.value.trim();
+    if (!token) { say("请输入访问口令"); input.focus(); return; }
+    submit.disabled = true;
+    submit.textContent = "验证中…";
+    try {
+      const res = await fetch("/api/auth/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        // The server set an HttpOnly cookie; reload into the app.
+        location.replace("/");
+        return;
+      }
+      say(data.detail || "口令不正确");
+      submit.disabled = false;
+      submit.textContent = "解锁工作台";
+      input.select();
+    } catch (err) {
+      say("无法连接到工作台：" + err.message);
+      submit.disabled = false;
+      submit.textContent = "解锁工作台";
+    }
+  });
+
+  // Auto-focus on a device with a real keyboard; on touch devices the
+  // keyboard popping up unprompted is annoying, so leave it alone.
+  if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) {
+    input.focus();
+  }
+</script>
+</body>
+</html>

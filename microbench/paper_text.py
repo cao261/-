@@ -41,15 +41,73 @@ common keywords. Returns list of {title, text, page_start, page_end}.
 
 import io
 import re
+import sys
 from typing import Optional
 from pathlib import Path
+
+# Module-level import. The SSRF-hardening patch introduced module-level
+# helpers that call requests.get(), but `requests` was only ever imported
+# as a function-local name inside fetch_full_text() — so the helpers raised
+# `NameError: name 'requests' is not defined` and every DOI → openAccessPdf
+# full-text fetch died with a 502.
+import requests
 
 from .paper_fetcher import (
     _normalize_arxiv_id,
     _normalize_doi,
     HEADERS,
     PDF_MAX_SIZE_MB,
+    # The SSRF guard lives in paper_fetcher (it is needed there too, for the
+    # doi.org redirect chain and the IEEE landing-page scrape). Re-exported
+    # here so the existing `from .paper_text import _assert_public_http_url`
+    # call sites keep working.
+    _assert_public_http_url,
 )
+
+
+# ---------------------------------------------------------------------------
+# SSRF guard for the "user pasted a direct PDF URL" path
+# ---------------------------------------------------------------------------
+# Implementation lives in paper_fetcher._assert_public_http_url — see the
+# comment there for why it must not be duplicated in this module.
+#
+# The implementation now lives in paper_fetcher._assert_public_http_url and
+# is imported above — it is needed there as well (doi.org redirect chain,
+# IEEE landing-page scrape), and duplicating it would let the two copies
+# drift apart.
+
+
+def _download_pdf_bytes(url: str, max_bytes: int, allow_redirects: bool = False) -> bytes:
+    """GET `url` and return the body, refusing to buffer more than `max_bytes`.
+
+    The previous code used `requests.get(..., stream=True)` followed by
+    `.content`, which reads the *entire* body into memory before the size
+    check happens at the call site. A hostile or misconfigured URL could
+    therefore make the server allocate an arbitrary amount of RAM.
+
+    Streaming with a running counter keeps the peak allocation bounded by
+    `max_bytes`, and the response is always closed (the old code never
+    closed the connection, leaving the socket to be reclaimed by the GC).
+    """
+    resp = requests.get(
+        url, headers=HEADERS, timeout=60, stream=True, allow_redirects=allow_redirects
+    )
+    try:
+        resp.raise_for_status()
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    f"PDF 超过 {max_bytes // (1024 * 1024)}MB 上限, 已中止下载"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        resp.close()
 
 
 # Common section keywords (case-insensitive). Order matters for matching priority.
@@ -170,13 +228,55 @@ def extract_page_text_from_path(pdf_path, page_no: int) -> str:
     the server re-extracts the page with the correct word spacing and
     column order instead of trusting the text the browser scraped via
     PDF.js (which loses spaces on fonts without space glyphs).
+
+    The tail is trimmed: a page normally ends with a hyphenated word that
+    continues on the next page ("...in a highly mag-") plus a lone page
+    number. Feeding that to the model makes the translation end on a
+    half-word ("在高度磁——"), which reads as "已翻译但内容是乱的".
     """
     import pdfplumber
     path = Path(pdf_path)
     with pdfplumber.open(str(path)) as pdf:
         if page_no < 1 or page_no > len(pdf.pages):
             return ""
-        return _extract_page_text(pdf.pages[page_no - 1])
+        return _trim_page_tail(_extract_page_text(pdf.pages[page_no - 1]))
+
+
+_PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
+_SENTENCE_END_RE = re.compile(r"[.!?。！？]")
+# 末尾残片最多砍掉这么多字符，防止整页没有句号时把大半页都砍掉。
+_MAX_TAIL_TRIM_CHARS = 1500
+
+
+def _trim_page_tail(text: str) -> str:
+    """去掉页尾的页码行和没写完的末句。
+
+    只用于「按页翻译」这条路径（单页独立成文）。整篇章节翻译不能这么切：
+    章节里各页是拼起来的，页尾的 "mag-" 正是下一页 "netic" 的前半截，
+    切掉反而会拼出一个新词。
+
+    为什么必须切：一页的最后一句往往跨页续写，页尾还常带一个单独的页码
+    行。直接丢给模型翻译，译文就会以半截词收尾（"在高度磁——"），读起来
+    像翻译坏了。按「最后一个句末标点」一刀切掉尾巴，可以同时解决三件事：
+    跨页断词、页码行、没写完的末句。
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+
+    # 1) 末尾孤立的页码行（单独一个数字）
+    while lines and _PAGE_NUMBER_RE.match(lines[-1]):
+        lines.pop()
+    text = "\n".join(lines).rstrip()
+
+    # 2) 砍掉最后一个句末标点之后的残片
+    ends = list(_SENTENCE_END_RE.finditer(text))
+    if ends:
+        cut = ends[-1].end()
+        if cut < len(text) and (len(text) - cut) <= _MAX_TAIL_TRIM_CHARS:
+            text = text[:cut]
+
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -356,8 +456,14 @@ def split_into_sections(pages: list[dict]) -> list[dict]:
     # Build full text with page markers (page_num|sentinel|text)
     full_text_parts = []
     page_boundaries = []  # (char_offset, page_num)
+    # Running offset instead of len("".join(full_text_parts)) per page.
+    # The old form was O(n^2): every page re-joined the whole accumulated
+    # text, so a 1000-page paper spent ~740ms just computing boundaries
+    # (5.4M characters copied 1000 times).
+    running_len = 0
     for p in pages:
-        page_boundaries.append((len("".join(full_text_parts)), p["page"]))
+        page_boundaries.append((running_len, p["page"]))
+        running_len += len(p["text"]) + 1  # +1 for the "\n" marker below
         full_text_parts.append(p["text"])
         full_text_parts.append("\n")
     full_text = "".join(full_text_parts)
@@ -503,6 +609,7 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None) -> dict
     if arxiv_id:
         # We already have download_arxiv_pdf; reuse it
         # Wrap in try/except so arXiv 404 falls through to DOI path
+        tmp_path = None
         try:
             from .paper_fetcher import download_arxiv_pdf
             import tempfile as _tempfile
@@ -512,10 +619,6 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None) -> dict
             info = download_arxiv_pdf(arxiv_id, str(tmp_path))
             with open(tmp_path, "rb") as f:
                 pdf_bytes = f.read()
-            try:
-                tmp_path.unlink()  # cleanup
-            except OSError:
-                pass
             meta = fetch_arxiv_metadata(arxiv_id)
             source = "arXiv"
         except Exception:
@@ -523,6 +626,16 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None) -> dict
             arxiv_id = None
             pdf_bytes = None
             source = None
+        finally:
+            # The temp file used to be unlinked *inside* the try block, so
+            # any failure (network error, 404, disk error) leaked a .pdf
+            # into %TEMP% on every attempt. Repeated failed fetches slowly
+            # filled the temp directory with multi-MB leftovers.
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     # --- Otherwise try DOI ---
     if pdf_bytes is None:
@@ -534,37 +647,52 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None) -> dict
 
         if doi:
             # Try Semantic Scholar's openAccessPdf field
+            data = {}
             try:
-                resp = requests.get(
+                with requests.get(
                     f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
                     headers=HEADERS,
                     params={"fields": "title,authors,year,venue,openAccessPdf"},
                     timeout=20,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    oa = data.get("openAccessPdf") or {}
-                    pdf_url = oa.get("url") if isinstance(oa, dict) else None
-                    if pdf_url:
-                        pdf_resp = requests.get(
-                            pdf_url,
-                            headers=HEADERS,
-                            timeout=60,
-                            stream=True,
+                ) as resp:
+                    if resp.status_code == 200:
+                        data = resp.json()
+                    else:
+                        # The unauthenticated Graph API rate-limits hard
+                        # (HTTP 429 is routine). Falling through with an
+                        # empty dict keeps the Crossref metadata path alive
+                        # instead of blowing up with an UnboundLocalError.
+                        print(
+                            f"[MicroBench] Semantic Scholar OA 查询返回 HTTP "
+                            f"{resp.status_code} (DOI: {doi})",
+                            file=sys.stderr,
                         )
-                        pdf_resp.raise_for_status()
-                        if "pdf" in pdf_resp.headers.get("Content-Type", "").lower():
-                            pdf_bytes = pdf_resp.content
-                            source = "OpenAccess"
-                            meta = {
-                                "title": data.get("title", ""),
-                                "authors": ", ".join(
-                                    a.get("name", "") for a in (data.get("authors") or [])
-                                ),
-                                "year": data.get("year", ""),
-                                "venue": data.get("venue", ""),
-                            }
+                oa = data.get("openAccessPdf") or {}
+                pdf_url = oa.get("url") if isinstance(oa, dict) else None
+                if pdf_url:
+                    # The OA URL comes from an upstream API, not from the
+                    # user — but it is still an arbitrary URL, so it gets the
+                    # same SSRF treatment as a user-supplied one. Without
+                    # this, a crafted DOI whose metadata points at
+                    # 127.0.0.1 would make the server probe the LAN.
+                    _assert_public_http_url(pdf_url)
+                    pdf_bytes = _download_pdf_bytes(
+                        pdf_url, PDF_MAX_SIZE_MB * 1024 * 1024
+                    )
+                    if pdf_bytes:
+                        source = "OpenAccess"
+                        meta = {
+                            "title": data.get("title", ""),
+                            "authors": ", ".join(
+                                a.get("name", "") for a in (data.get("authors") or [])
+                            ),
+                            "year": data.get("year", ""),
+                            "venue": data.get("venue", ""),
+                        }
             except requests.RequestException:
+                pass
+            except ValueError:
+                # Blocked by the SSRF guard, or over the size cap.
                 pass
 
             # Fall back to Crossref for metadata even if no PDF
@@ -576,16 +704,72 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None) -> dict
                     pass
 
     # --- Otherwise try direct URL ---
+    # SSRF guard: this path fetches an operator-supplied URL with no host
+    # allowlist and with redirects followed, so anything the machine can
+    # reach (localhost services, 169.254.169.254 metadata, LAN routers) is
+    # reachable too. MicroBench is a local single-user app, so this is not a
+    # remote attack surface, but a mistyped/hostile link (or a redirect from
+    # an otherwise-legitimate publisher link) should not silently probe the
+    # local network. Reject loopback / link-local / private / non-http(s)
+    # targets, and re-check after redirects by disabling redirect-following.
     if pdf_bytes is None and identifier.startswith("http"):
         try:
-            resp = requests.get(identifier, headers=HEADERS, timeout=60, stream=True,
-                                allow_redirects=True)
-            resp.raise_for_status()
-            if "pdf" in resp.headers.get("Content-Type", "").lower():
-                pdf_bytes = resp.content
+            _assert_public_http_url(identifier)
+            current = identifier
+            hops = 0
+            body = None
+            # Follow up to 3 redirects manually, re-validating each hop.
+            while True:
+                resp = requests.get(
+                    current, headers=HEADERS, timeout=60, stream=True,
+                    allow_redirects=False,
+                )
+                try:
+                    if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                        if hops >= 3:
+                            break
+                        nxt = requests.compat.urljoin(
+                            current, resp.headers.get("Location", "")
+                        )
+                        if not nxt:
+                            break
+                        _assert_public_http_url(nxt)
+                        current = nxt
+                        hops += 1
+                        continue
+                    resp.raise_for_status()
+                    ctype = resp.headers.get("Content-Type", "").lower()
+                    if "pdf" in ctype:
+                        # Stream with a running cap instead of `.content`,
+                        # which would buffer an unbounded body before the
+                        # size limit could be enforced.
+                        chunks = []
+                        total = 0
+                        limit = PDF_MAX_SIZE_MB * 1024 * 1024
+                        for chunk in resp.iter_content(chunk_size=64 * 1024):
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > limit:
+                                raise ValueError(
+                                    f"PDF 超过 {PDF_MAX_SIZE_MB}MB 上限, 已中止下载"
+                                )
+                            chunks.append(chunk)
+                        body = b"".join(chunks)
+                    break
+                finally:
+                    resp.close()
+            if body:
+                pdf_bytes = body
                 source = "URL"
         except requests.RequestException:
             pass
+        except ValueError as e:
+            # Blocked by the SSRF guard — surface it instead of silently
+            # falling through to the generic "could not fetch" advice, which
+            # would send the user hunting for a permissions problem that
+            # isn't the cause.
+            raise ValueError(f"出于安全考虑拒绝抓取该 URL: {e}")
 
     if pdf_bytes is None:
         raise ValueError(
