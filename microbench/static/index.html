@@ -6189,8 +6189,11 @@
       { id: "push_snapshots",  name: "推送 · 译文快照", kind: "snapshots",  dir: "push" },
       { id: "push_annotations", name: "批注（写入即同步）", kind: "annotations", dir: "push" },
       { id: "push_progress",  name: "推送 · 阅读进度", kind: "progress",  dir: "push" },
+      { id: "push_files",      name: "推送 · 论文 PDF（增量）", kind: "files", dir: "push" },
       { id: "pull_snapshots",  name: "拉取 · 译文快照", kind: "snapshots",  dir: "pull" },
-      { id: "pull_annotations", name: "拉取 · 批注（高亮+笔记）", kind: "annotations", dir: "pull" },      { id: "pull_progress",  name: "拉取 · 阅读进度", kind: "progress",  dir: "pull" },
+      { id: "pull_annotations", name: "拉取 · 批注（高亮+笔记）", kind: "annotations", dir: "pull" },
+      { id: "pull_progress",   name: "拉取 · 阅读进度", kind: "progress",  dir: "pull" },
+      { id: "pull_files",      name: "拉取 · 论文 PDF（自动补齐）", kind: "files", dir: "pull" },
     ];
 
     function _syncStep(id, state, detail) {
@@ -6213,6 +6216,50 @@
     function reloadAfterSync() {
       closeSyncModal();
       location.reload();
+    }
+
+    // 论文 PDF 通道：空间信息 + 释放云端实体
+    async function refreshSyncFilesInfo() {
+      const el = document.getElementById("sync-files-info");
+      if (!el) return;
+      try {
+        const r = await fetch("/api/sync/status");
+        if (!r.ok) return;
+        const d = await r.json();
+        const f = d.files || {};
+        const items = f.items || [];
+        const mb = ((f.total_bytes || 0) / 1048576).toFixed(1);
+        const local = items.filter(x => x.local).length;
+        const tombs = items.filter(x => x.deleted).length;
+        const released = items.filter(x => x.blob === false && !x.deleted).length;
+        let txt = `论文 PDF：云端 ${f.count || 0} 篇 / ${mb} MB · 本机已有 ${local} 篇`;
+        if (released) txt += ` · ${released} 篇已释放`;
+        if (tombs) txt += ` · ${tombs} 篇标记删除`;
+        el.textContent = txt;
+      } catch (e) { /* 统计失败不影响同步 */ }
+    }
+
+    async function releaseCloudPdfs() {
+      const ok = confirm(
+        "释放云端保存的 PDF 实体？\n\n" +
+        "· 云端 PDF 会被删除，腾出坚果云空间\n" +
+        "· 批注、译文快照、阅读进度全部保留\n" +
+        "· 本机的 PDF 不受影响\n\n" +
+        "（PDF 内容没变的话，以后同步也不会再自动传回去）");
+      if (!ok) return;
+      try {
+        const r = await fetch("/api/sync/files/release", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ all: true }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+        showToast(`已释放 ${d.released} 篇云端 PDF，腾出 ${((d.freed_bytes || 0) / 1048576).toFixed(1)} MB`);
+        await refreshSyncFilesInfo();
+      } catch (e) {
+        showToast("释放失败: " + (e.message || e), true);
+      }
     }
 
     async function syncNow() {
@@ -6253,6 +6300,43 @@
         SYNC_STEPS.forEach(s => {
           const bucket = (s.dir === "push" ? d.pushed : d.pulled) || {};
           const list = bucket[s.kind] || [];
+
+          // PDF 通道单独渲染：它的语义和「文件列表」不一样
+          if (s.kind === "files") {
+            const rep = ((d.files || {})[s.dir]) || {};
+            if (s.dir === "push") {
+              const pub = (rep.published || []).length;
+              const upd = (rep.updated || []).length;
+              const del = (rep.deleted || []).length;
+              if (pub || upd || del) {
+                const bits = [];
+                if (pub) bits.push(`新增 ${pub} 篇`);
+                if (upd) bits.push(`更新 ${upd} 篇`);
+                if (del) bits.push(`标记删除 ${del} 篇`);
+                _syncStep(s.id, "done", bits.join(" · "));
+              } else {
+                _syncStep(s.id, "skip", `无需上传（${rep.unchanged || 0} 篇未变）`);
+              }
+            } else {
+              const rest = (rep.restored || []).length;
+              const conf = (rep.conflicts || []).length;
+              const rem = (rep.removed || []).length;
+              const keep = (rep.retained || []).length;
+              if (rest || rem) {
+                const bits = [];
+                if (rest) bits.push(`补齐 ${rest} 篇`);
+                if (rem) bits.push(`删除 ${rem} 篇`);
+                if (keep) bits.push(`${keep} 篇按设置保留在本机`);
+                _syncStep(s.id, "done", bits.join(" · "));
+              } else if (conf) {
+                _syncStep(s.id, "fail", `${conf} 篇版本冲突，未覆盖`);
+              } else {
+                _syncStep(s.id, "skip", "本机已齐全");
+              }
+            }
+            return;
+          }
+
           if (!list.length) {
             _syncStep(s.id, "skip", s.dir === "push" ? "无需推送" : "没有新内容");
             return;
@@ -6271,6 +6355,12 @@
         const pulledAnno = ((d.pulled || {}).annotations || []).length;
         if (pulledAnno) bits.push(`更新了 ${pulledAnno} 条批注`);
         if (d.progress && d.progress.page) bits.push(`阅读进度：第 ${d.progress.page} 页`);
+        const fPush = ((d.files || {}).push) || {};
+        const fPull = ((d.files || {}).pull) || {};
+        if ((fPush.published || []).length) bits.push(`上传 ${fPush.published.length} 篇 PDF`);
+        if ((fPull.restored || []).length) bits.push(`补齐 ${fPull.restored.length} 篇 PDF`);
+        if ((fPull.conflicts || []).length) bits.push(`${fPull.conflicts.length} 篇 PDF 冲突`);
+        refreshSyncFilesInfo();
 
         if (d.snapshot_updated) {
           // 拉到了新译文：结果留在面板上（别一闪而过），给用户看清再刷新
@@ -7925,11 +8015,13 @@
             <button class="btn-zoom-toggle" onclick="closeSyncModal()" title="关闭" aria-label="关闭">×</button>
           </div>
           <div class="sync-modal-dir" id="sync-modal-dir">同步目录：检测中…</div>
+          <div class="sync-modal-dir" id="sync-files-info">论文 PDF：统计中…</div>
           <div class="sync-steps" id="sync-steps"></div>
           <div class="sync-modal-foot">
             <span class="sync-modal-note" id="sync-modal-note"></span>
             <div class="row gap-1">
               <button class="btn-pill-outline" id="sync-reload-btn" onclick="reloadAfterSync()" style="display:none;">↻ 用新译文刷新</button>
+              <button class="btn-pill-outline" onclick="releaseCloudPdfs()" title="删除云端保存的 PDF，腾出坚果云空间；批注和译文快照全部保留">🧹 释放云端 PDF</button>
               <button class="btn-pill-outline" onclick="syncNow()">再同步一次</button>
               <button class="btn-pill" onclick="closeSyncModal()">完成</button>
             </div>

@@ -13,7 +13,9 @@ import os
 import json
 import re
 import hmac
+import hashlib
 import ipaddress
+import uuid
 import asyncio
 import shutil
 import time
@@ -3363,6 +3365,303 @@ def _safe_paper_key(paper_id: str) -> str:
     return "".join(c for c in (paper_id or "") if c.isalnum() or c in "_-")[:128] or "progress"
 
 
+# ---------------------------------------------------------------------------
+# 论文 PDF 实体通道（files/）
+#
+# 用户要的是「全部直接同步」：PDF 本体也不用手工拷，点一次同步就增量对齐。
+# 共享目录里每个 PDF 存两份东西：
+#   files/<safePaperId>.pdf   PDF 实体（坚果云负责传到另一台设备）
+#   files/<safePaperId>.json  清单：relative_path / size / mtime / sha256
+#                              / deleted（墓碑）/ propagate（墓碑是否传播）/ blob
+#
+# 增量靠 (size, mtime)：两者都没变 → 零传输；变了才算 sha256；
+# sha256 相同说明内容其实没变（只更新清单），不同才真的重传。
+#
+# 删除用墓碑：一方删了本地 PDF → 清单标 deleted。
+#   propagate=false（默认）→ 对方只从云端释放实体，本地文件保留（安全）
+#   propagate=true          → 对方也删本地 PDF（联动删除）
+#
+# 空间管理：释放云端实体但保留清单；批注/译文快照/进度一律不动
+# （批注和译文比 PDF 值钱，PDF 随时能重新下）。
+# ---------------------------------------------------------------------------
+
+SYNC_FILE_SUBDIR = "files"
+PDF_MAX_BYTES = 256 * 1024 * 1024
+_JS_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _js_base36(n: int) -> str:
+    """JS 的 Number.prototype.toString(36)。"""
+    if n == 0:
+        return "0"
+    out = []
+    while n:
+        out.append(_JS_BASE36[n % 36])
+        n //= 36
+    return "".join(reversed(out))
+
+
+def _paper_id_for(relative_path: str) -> str:
+    """复刻前端 index.html 的 paperId 生成：base + djb2(完整相对路径)。
+
+    必须逐字复刻 —— 两台设备算出的 paper_id 不一致，批注/快照/进度就全对不上。
+    任何一边改了这条规则，另一边都得同步改。
+    """
+    path = (relative_path or "").replace("\\", "/")
+    base = path.split("/")[-1]
+    if base.lower().endswith(".pdf"):
+        base = base[:-4]
+    base = base[:70] or "paper"
+    h = 5381
+    for ch in path:
+        # JS: h = ((h << 5) + h + s.charCodeAt(i)) | 0
+        h = ((h << 5) + h + ord(ch)) & 0xFFFFFFFF
+    return f"{base}_{_js_base36(h)}"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _files_dir() -> Path:
+    d = _sync_root() / SYNC_FILE_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _file_meta_path(safe: str) -> Path:
+    return _files_dir() / f"{safe}.json"
+
+
+def _file_blob_path(safe: str) -> Path:
+    return _files_dir() / f"{safe}.pdf"
+
+
+def _safe_local_pdf(relative_path: str):
+    """相对路径 → vault 内的绝对路径；越界返回 None。"""
+    if not relative_path:
+        return None
+    try:
+        from .generator import _safe_path
+        return _safe_path(BASE_DIR, relative_path)
+    except Exception:
+        return None
+
+
+def _vault_pdfs() -> list:
+    """vault 里所有 PDF：[(相对路径, 绝对路径)]。"""
+    out = []
+    try:
+        for pdf in sorted(BASE_DIR.rglob("*.pdf")):
+            if pdf.is_file():
+                out.append((str(pdf.relative_to(BASE_DIR)).replace("\\", "/"), pdf))
+    except OSError:
+        pass
+    return out
+
+
+def _write_file_meta(safe: str, meta: dict) -> None:
+    meta["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+    _file_meta_path(safe).write_text(
+        json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _device_id() -> str:
+    """本机稳定标识：用来区分「这篇是我发布的」还是「对方发布的」。
+
+    没有它就会出这种事故：A 设备有 1、2 篇，B 设备有 2、3 篇。
+    B 同步时看到 1 不在自己机器上 → 误判成「B 把 1 删了」→ 打上墓碑
+    → A 下次同步时把自己的 1 删掉。发布者标记让墓碑只对「自己删的」生效。
+    """
+    p = BASE_DIR / "logs" / "_device_id.json"
+    try:
+        data = _safe_read_json(p) or {}
+        did = (data.get("device_id") or "").strip()
+        if did:
+            return did
+    except OSError:
+        pass
+    did = uuid.uuid4().hex[:12]
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(
+            {"device_id": did,
+             "created_at": _dt.datetime.now().isoformat(timespec="seconds")},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    return did
+
+
+def _sync_push_files() -> dict:
+    """把 vault 里的 PDF 增量发布到共享目录。
+
+    返回 {"published", "updated", "unchanged", "deleted", "skipped", "errors"}。
+    """
+    res = {"published": [], "updated": [], "unchanged": 0,
+           "deleted": [], "skipped": [], "errors": []}
+    files_dir = _files_dir()
+    seen = set()
+    my_id = _device_id()
+
+    for rel, pdf in _vault_pdfs():
+        try:
+            st = pdf.stat()
+        except OSError:
+            continue
+        if st.st_size > PDF_MAX_BYTES:
+            res["skipped"].append({"name": rel, "reason": "文件过大"})
+            continue
+        pid = _paper_id_for(rel)
+        safe = _safe_paper_key(pid)
+        seen.add(safe)
+        old = _safe_read_json(_file_meta_path(safe)) or {}
+        blob = _file_blob_path(safe)
+
+        # 快速判定：大小和修改时间都没变 → 零传输
+        # （blob 已释放也算"没变" —— 尊重用户的释放操作，不偷偷传回去）
+        if (old.get("size") == st.st_size
+                and abs(float(old.get("mtime") or 0) - st.st_mtime) < 1e-6
+                and (blob.exists() or old.get("blob") is False)):
+            if not old.get("owner"):
+                # 旧清单没有 owner：本机确实持有这份 PDF → 补上归属
+                old["owner"] = my_id
+                _write_file_meta(safe, old)
+            res["unchanged"] += 1
+            continue
+
+        try:
+            digest = _sha256_file(pdf)
+        except OSError as e:
+            res["errors"].append({"name": rel, "reason": str(e)})
+            continue
+
+        if old.get("sha256") == digest:
+            # 内容其实没变（只是 mtime 动了，比如被 touch 过）→ 只更新清单
+            old.update({"size": st.st_size, "mtime": st.st_mtime})
+            if not old.get("owner"):
+                old["owner"] = my_id
+            _write_file_meta(safe, old)
+            res["unchanged"] += 1
+            continue
+
+        # 真的变了 → 传实体 + 更新清单
+        try:
+            tmp = files_dir / f"{safe}.pdf.tmp"
+            shutil.copyfile(pdf, tmp)
+            os.replace(tmp, blob)
+        except OSError as e:
+            res["errors"].append({"name": rel, "reason": str(e)})
+            continue
+        now = _dt.datetime.now().isoformat(timespec="seconds")
+        meta = {
+            "paper_id": pid,
+            "relative_path": rel,
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "sha256": digest,
+            "blob": True,
+            "deleted": False,
+            "propagate": False,
+            "owner": my_id,                     # 谁发布的（墓碑只对发布者生效）
+            "published_at": old.get("published_at") or now,
+            "updated_at": now,
+        }
+        _write_file_meta(safe, meta)
+        (res["published"] if not old else res["updated"]).append(rel)
+
+    # 本地已经没有、但清单还在 → 墓碑
+    # ⚠️ 只处理「本机自己发布的」：对方发布的论文本机没下，那不是"被删了"，
+    #    那是"还没拿过来"。误标墓碑会让对方把自己的论文删掉。
+    for fp in sorted(files_dir.glob("*.json")):
+        safe = fp.stem
+        if safe in seen:
+            continue
+        meta = _safe_read_json(fp) or {}
+        if meta.get("deleted"):
+            continue
+        if (meta.get("owner") or "") != my_id:
+            continue
+        rel = meta.get("relative_path") or ""
+        local = _safe_local_pdf(rel) if rel else None
+        if local is not None and local.exists():
+            continue        # 本机其实还有（可能只是路径挪了）→ 不标墓碑
+        meta["deleted"] = True
+        meta["deleted_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+        _write_file_meta(safe, meta)
+        res["deleted"].append(rel or safe)
+
+    return res
+
+
+def _sync_pull_files() -> dict:
+    """把共享目录里的 PDF 还原到本机 vault。
+
+    返回 {"restored", "conflicts", "removed", "retained", "skipped"}。
+    """
+    res = {"restored": [], "conflicts": [], "removed": [],
+           "retained": [], "skipped": []}
+    files_dir = _files_dir()
+
+    for fp in sorted(files_dir.glob("*.json")):
+        safe = fp.stem
+        meta = _safe_read_json(fp) or {}
+        rel = meta.get("relative_path") or ""
+        if not rel:
+            continue
+        blob = _file_blob_path(safe)
+
+        if meta.get("deleted"):
+            local = _safe_local_pdf(rel)
+            if meta.get("propagate"):
+                # 联动删除：对方也把本地 PDF 删掉
+                if local is not None and local.exists():
+                    try:
+                        local.unlink()
+                        res["removed"].append(rel)
+                    except OSError as e:
+                        res["skipped"].append({"name": rel, "reason": str(e)})
+            else:
+                res["retained"].append(rel)     # 默认：本机保留
+            if blob.exists():
+                try:
+                    blob.unlink()                # 释放云端空间
+                except OSError:
+                    pass
+            continue
+
+        if not blob.exists():
+            res["skipped"].append({"name": rel, "reason": "云端已释放实体"})
+            continue
+
+        local = _safe_local_pdf(rel)
+        if local is None:
+            res["skipped"].append({"name": rel, "reason": "路径越界"})
+            continue
+        if local.exists():
+            try:
+                if local.stat().st_size == blob.stat().st_size:
+                    res["skipped"].append({"name": rel, "reason": "本机已有"})
+                    continue
+            except OSError:
+                pass
+            # 本机有但内容不同 → 不覆盖，交给用户决定（论文被改过不能默默替换）
+            res["conflicts"].append({"name": rel, "reason": "本机版本不同，未覆盖"})
+            continue
+        try:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(blob, local)
+            res["restored"].append(rel)
+        except OSError as e:
+            res["skipped"].append({"name": rel, "reason": str(e)})
+
+    return res
+
+
 def _local_progress_path() -> Path:
     return BASE_DIR / "logs" / "_reading_state.json"
 
@@ -3410,6 +3709,8 @@ class SyncRequest(BaseModel):
                                       description="本机的阅读进度（页码/缩放/滚动位置）")
     push_only: bool = Field(default=False)
     pull_only: bool = Field(default=False)
+    include_files: bool = Field(default=True,
+                                description="是否连同 PDF 本体一起同步（增量）")
 
 
 @app.post("/api/sync")
@@ -3423,6 +3724,9 @@ async def api_sync(req: SyncRequest):
     root.mkdir(parents=True, exist_ok=True)
     pushed: dict = {k: [] for k in SYNC_KINDS}
     pulled: dict = {k: [] for k in SYNC_KINDS}
+    pushed["files"] = []
+    pulled["files"] = []
+    files_report: dict = {"push": {}, "pull": {}}
     snapshot_updated = False
 
     # ---------- 推送：翻译快照 ----------
@@ -3483,6 +3787,12 @@ async def api_sync(req: SyncRequest):
                 json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
             pushed["progress"].append(safe + ".json")
 
+    # ---------- 推送：论文 PDF 本体（增量，只传变化过的） ----------
+    if req.include_files and not req.pull_only:
+        rep = _sync_push_files()
+        files_report["push"] = rep
+        pushed["files"] = list(rep.get("published", [])) + list(rep.get("updated", []))
+
     # ---------- 拉取：翻译快照（共享 → 本机） ----------
     if not req.push_only:
         src_dir = _sync_dir("snapshots")
@@ -3537,6 +3847,12 @@ async def api_sync(req: SyncRequest):
         except OSError:
             pass
 
+        # ---------- 拉取：论文 PDF 本体（还原到 vault 原来的相对路径） ----------
+        if req.include_files and not req.push_only:
+            rep = _sync_pull_files()
+            files_report["pull"] = rep
+            pulled["files"] = list(rep.get("restored", []))
+
     return {
         "status": "success",
         "root": str(root),
@@ -3545,11 +3861,118 @@ async def api_sync(req: SyncRequest):
         "pushed_total": sum(len(v) for v in pushed.values()),
         "pulled_total": sum(len(v) for v in pulled.values()),
         "snapshot_updated": snapshot_updated,
+        "files": files_report,
         "elapsed_ms": int((time.monotonic() - _t0) * 1000) if _t0 else 0,
         "progress": (
             prog.get(_safe_paper_key(req.paper_id)) if req.paper_id else None
         ) if not req.push_only else None,
     }
+
+
+class FileReleaseRequest(BaseModel):
+    """释放云端 PDF 实体（清单和批注保留）。"""
+    paper_id: Optional[str] = Field(default=None, max_length=300,
+                                    description="要释放的论文 id；留空则配合 all=True")
+    all: bool = Field(default=False, description="释放全部 PDF 实体")
+
+
+@app.post("/api/sync/files/release")
+async def api_sync_files_release(req: FileReleaseRequest):
+    """释放云端 PDF 实体，腾出坚果云空间。
+
+    只删 files/*.pdf 实体，保留清单（files/*.json）以及批注、译文快照、阅读进度
+    —— 那些是真正攒下来的东西，PDF 随时能重新下。
+    """
+    files_dir = _files_dir()
+    targets = []
+    if req.all:
+        targets = sorted(files_dir.glob("*.json"))
+    elif req.paper_id:
+        safe = _safe_paper_key(req.paper_id)
+        p = _file_meta_path(safe)
+        if p.exists():
+            targets = [p]
+    else:
+        raise HTTPException(status_code=400, detail="缺少 paper_id")
+
+    freed = 0
+    released = []
+    for fp in targets:
+        safe = fp.stem
+        blob = _file_blob_path(safe)
+        if blob.exists():
+            try:
+                freed += blob.stat().st_size
+                blob.unlink()
+            except OSError:
+                continue
+        meta = _safe_read_json(fp) or {}
+        meta["blob"] = False
+        meta["released_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+        _write_file_meta(safe, meta)
+        released.append(meta.get("relative_path") or safe)
+
+    return {
+        "status": "success",
+        "released": len(released),
+        "freed_bytes": freed,
+        "items": released,
+    }
+
+
+@app.post("/api/sync/files/propagate_delete")
+async def api_sync_files_propagate_delete(paper_id: str = Query(..., min_length=3,
+                                                                max_length=300)):
+    """把某篇论文标成「联动删除」：对方下次同步时也删掉本地 PDF。
+
+    不勾这个开关时，对方只会从云端释放实体，本地 PDF 保留（默认，安全）。
+    """
+    safe = _safe_paper_key(paper_id)
+    p = _file_meta_path(safe)
+    meta = _safe_read_json(p) or {}
+    if not meta:
+        raise HTTPException(status_code=404, detail="共享目录里没有这篇论文")
+    meta["propagate"] = True
+    meta["deleted"] = True
+    meta["deleted_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+    _write_file_meta(safe, meta)
+    return {"status": "success", "paper_id": paper_id,
+            "relative_path": meta.get("relative_path", "")}
+
+
+def _sync_files_status() -> dict:
+    """files/ 通道的状态：云端存了多少 PDF、本机有几篇、哪些是墓碑。"""
+    fdir = _sync_root() / SYNC_FILE_SUBDIR
+    items = []
+    total = 0
+    count = 0
+    if fdir.is_dir():
+        for fp in sorted(fdir.glob("*.json")):
+            meta = _safe_read_json(fp) or {}
+            rel = meta.get("relative_path") or ""
+            safe = fp.stem
+            blob = fdir / f"{safe}.pdf"
+            blob_exists = blob.exists()
+            size = 0
+            if blob_exists:
+                try:
+                    size = blob.stat().st_size
+                except OSError:
+                    size = 0
+                total += size
+                count += 1
+            local = _safe_local_pdf(rel) if rel else None
+            items.append({
+                "paper_id": meta.get("paper_id", safe),
+                "relative_path": rel,
+                "size": meta.get("size", size),
+                "blob": blob_exists,
+                "deleted": bool(meta.get("deleted")),
+                "propagate": bool(meta.get("propagate")),
+                "local": bool(local and local.exists()),
+                "sha256": (meta.get("sha256") or "")[:12],
+            })
+    return {"count": count, "total_bytes": total, "items": items}
 
 
 @app.get("/api/sync/status")
@@ -3569,6 +3992,7 @@ async def api_sync_status():
                 except OSError:
                     continue
         out["kinds"][kind] = files
+    out["files"] = _sync_files_status()
     return out
 
 
