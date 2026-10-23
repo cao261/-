@@ -61,13 +61,23 @@ ALLOWED_PROJECT_TYPES = ("TCAD", "EDA")
 
 def _safe_path(base_dir: Path, *parts) -> Path:
     """
-    Resolve *parts under base_dir and ensure the resulting absolute path is inside base_dir.
+    把 *parts 拼到 base_dir 下，并确保结果仍在 base_dir 内。
     Raises ValueError on path-traversal attempts (e.g. parts containing '..' or absolute paths).
+
+    ⚠️ 包含性检查用 **逻辑路径**（os.path.abspath），**不**用 resolve()：
+    vault 的数据目录（01_Literature 等）现在是 junction，指向坚果云的
+    「我的坚果云\MicroBench工作台」。resolve() 会穿透 junction，把结果变成
+    C 盘的真实路径 → 相对 E 盘的 base 就成了"越界" → 所有 PDF 报 400、
+    vault 列表 500。junction 对用户是透明的，不该被判成越界。
+
+    abspath 同样会把 `..` 归一化，所以遍历攻击照样被拦；绝对路径/换盘符
+    也拦得住。唯一放宽的是"指向 vault 外的符号链接/junction"能被读到 ——
+    但建 junction 需要对 vault 目录有写权限，那已在可信边界内。
     """
-    base_resolved = base_dir.resolve()
+    base_logical = os.path.abspath(str(base_dir))
     # Reject dot-only components outright. Containment alone is NOT enough:
-    # base/"02_Reproduction"/".." resolves to base_resolved itself, which passes
-    # the relative_to() check below while silently meaning "the parent dir".
+    # base/"02_Reproduction"/".." 归一化之后就是 base 的父目录，会悄悄
+    # 指到 vault 外面去。
     for p in parts:
         if p is None:
             continue
@@ -76,16 +86,15 @@ def _safe_path(base_dir: Path, *parts) -> Path:
             raise ValueError(
                 f"非法路径分量: '{text!r}' 解析为目录本身/父目录 (拒绝遍历攻击)"
             )
-    # First join as-is to detect early traversal in raw parts
-    joined = base_dir.joinpath(*parts)
-    resolved = joined.resolve()
-    try:
-        resolved.relative_to(base_resolved)
-    except ValueError:
+        if os.path.isabs(text) or (len(text) > 1 and text[1] == ":"):
+            raise ValueError(f"非法路径分量: '{text!r}' 是绝对路径 (拒绝越界)")
+    # 逻辑路径检查（不 resolve）—— abspath 会把 .. 归一化
+    joined = os.path.abspath(str(base_dir.joinpath(*parts)))
+    if not (joined == base_logical or joined.startswith(base_logical + os.sep)):
         raise ValueError(
             f"非法路径: '{parts}' 解析后位于 base 目录之外 (拒绝遍历攻击)"
         )
-    return resolved
+    return Path(joined)
 
 def sanitize_filename(name: str) -> str:
     """Make string safe for Windows filesystem while preserving meaning."""
