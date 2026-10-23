@@ -3245,27 +3245,99 @@ SYNC_KINDS = ("snapshots", "annotations", "progress")
 SYNC_MAX_FILE_BYTES = 8 * 1024 * 1024
 # 坚果云同步空间里的目录名（两台设备必须用同一个名字才能对上）
 NUTSTORE_SUBDIR = "MicroBench同步"
+# 坚果云客户端自带的云端沙箱名（每台设备都有，名字固定）
+NUTSTORE_CLOUD_NAMES = ("我的坚果云", "My Nutstore")
+# 客户端自己的缓存目录 —— 不是用户空间，放东西不会上云
+NUTSTORE_CACHE_PREFIXES = ("dlcache", "sigs", "tmp")
+
+
+def _nutstore_users_map() -> dict:
+    """读坚果云客户端的 UsersMap.json → {"用户邮箱": "镜像id"}。
+
+    镜像 id 就是同步目录名：Nutstore\\<id>\\ 才是真正的同步空间。
+    """
+    appdata = os.environ.get("APPDATA") or ""
+    if not appdata:
+        return {}
+    p = Path(appdata) / "Nutstore" / "config" / "UsersMap.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _nutstore_dir():
-    """自动探测坚果云同步空间（%USERPROFILE%\\Nutstore）。
+    """自动探测坚果云里「真正会上云」的目录。
 
-    有了它，"另一台设备克隆下来就能用"：不用改 .env，只要装了坚果云客户端
-    并登录同一账号，同步目录就自动落在它里面。
+    两个实测踩出来的坑（另一台设备先踩出来的，本机已复现）：
+
+    1. %USERPROFILE%\\Nutstore 本身是**客户端工作目录**，东西放这儿不上云。
+       真正的同步空间在 Nutstore\\<镜像id>\\ 里面。
+    2. Nutstore\\<镜像id>\\ 下新建顶层文件夹也会被坚果云忽略
+       （本地库记 sync_errors reason=7、traffic_history.totalUploadSize 恒为 0），
+       必须放进已存在的云端沙箱「我的坚果云」。
+
+    所以探测顺序：
+      1. Nutstore\\<镜像id>\\我的坚果云      ← 官方沙箱，两台设备都有
+      2. Nutstore\\<镜像id>\\ 下唯一的非缓存目录（用户自建的名字）
+      3. 退回 Nutstore 根（老行为，不保证上云）
+
+    有了它，"另一台设备克隆下来就能用"是真的：不用改 .env，只要装了坚果云
+    客户端并登录同一账号，同步目录就自动落在真正会同步的地方。
     """
-    home = os.path.expanduser("~")
+    home = Path(os.path.expanduser("~"))
+    roots = []
     for name in ("Nutstore", "坚果云", "Nutstore 同步空间"):
-        p = Path(home) / name
+        p = home / name
         if p.is_dir():
-            return p
-    return None
+            roots.append(p)
+    if not roots:
+        return None
+
+    um = _nutstore_users_map()
+    active = str(um.get("activeUser") or "").strip()
+    uid = str((um.get("users") or {}).get(active) or "").strip()
+
+    for root in roots:
+        # 镜像 id 目录：优先用 UsersMap.json 里查到的 id
+        id_dirs = []
+        if uid:
+            id_dirs.append(root / uid)
+        try:
+            for d in sorted(root.iterdir()):
+                if d.is_dir() and d.name.isdigit() and d not in id_dirs:
+                    id_dirs.append(d)
+        except OSError:
+            pass
+
+        for id_dir in id_dirs:
+            if not id_dir.is_dir():
+                continue
+            # 1) 官方云端沙箱「我的坚果云」
+            for cn in NUTSTORE_CLOUD_NAMES:
+                cloud = id_dir / cn
+                if cloud.is_dir():
+                    return cloud
+            # 2) 沙箱被改名了：id_dir 下恰好只有一个非缓存目录
+            try:
+                subs = [d for d in sorted(id_dir.iterdir())
+                        if d.is_dir()
+                        and not d.name.lower().startswith(NUTSTORE_CACHE_PREFIXES)]
+            except OSError:
+                subs = []
+            if len(subs) == 1:
+                return subs[0]
+
+    # 3) 退回 Nutstore 根（老行为：这是客户端工作目录，不保证上云）
+    return roots[0]
 
 
 def _sync_root() -> Path:
     """同步根目录。优先级：
 
     1. .env 的 ANNOTATIONS_DIR（显式指定）
-    2. 坚果云同步空间里的 MicroBench同步（自动探测 → 跨设备零配置）
+    2. 坚果云**云端沙箱**里的 MicroBench同步（自动探测 → 跨设备零配置）
     3. vault 内的 01_Literature/_同步（跟着 vault 自己的同步走）
     """
     raw = (os.getenv("ANNOTATIONS_DIR") or "").strip()
