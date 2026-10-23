@@ -356,6 +356,11 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 `sndconfig*.localAbsPath` 是同步根、`sndobject*` 表是已登记的同步对象清单、
 `sync_errors` 表应为 0 行。这比看文件存在与否可靠。
 
+> `traffic_history` **不是一张独立的表**，是 `config` 表里的一个 key，值是 JSON：
+> `select key, value from config where key = 'traffic_history';`
+> 里面有 `totalUploadSize` / `totalDownloadSize` / `latest_upload_file_date`。
+> （在 nutstore.db / event.db / db_backup 里按表名找是找不到的，别浪费时间。）
+
 ### 4.9 环境类
 
 - **PS 5.1 读 UTF-8 脚本乱码** → §2.1
@@ -416,6 +421,8 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 | PowerShell 脚本报「字符串缺少终止符」 | 脚本编码 | PS 5.1 读 UTF-8（§2.1） |
 | 中文脚本在 cmd 里乱码 | `chcp` / 编码 | 同上 |
 | 批注点了没反应 / 批注丢了 | mouseup 是否落在气泡上 | 点浮层按钮会触发浮层容器的 mouseup 采集（→ return） |
+| 全量测试绿、单跑某个文件却红 | `.env` 的部署开关是否漏进 pytest 进程 | `llm.py` import 时 `load_dotenv(override=False)`；测试进程要隔离 `.env`（`tests/conftest.py` 已钉死） |
+| 某个 `@slow`/`@llm` 测试偶发红 | 单跑是否通过 | 真打 MiniMax API，偶发；不是代码问题。pre-commit 钩子用 `-m "not slow"` 已排除 |
 
 ---
 
