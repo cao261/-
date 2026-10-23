@@ -6,6 +6,12 @@
 > 另有两份技术契约，改代码前必读：
 > - [`docs/READER_CONTRACT.md`](docs/READER_CONTRACT.md) —— 阅读器：页内顺序、公式、批注
 > - [`docs/SYNC_CONTRACT.md`](docs/SYNC_CONTRACT.md) —— 跨设备同步：红线清单，改动即破坏
+>
+> **另一台设备上的 agent 先看这个**：
+> [`docs/HANDOFF_2026-10-23.md`](docs/HANDOFF_2026-10-23.md) —— 跨设备交接记录。
+> 两台设备（25353 / 30461）之间**没有会话通道**（`session send` 只能投本机会话），
+> 交接一律走仓库：对方 `git pull` 就能拿到本文件。
+> ⚠️ 它是**某个时点的快照**，不是长期状态 —— 以 §4.4 和各机实测为准。
 
 ---
 
