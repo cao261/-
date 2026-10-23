@@ -3459,6 +3459,12 @@
     // bfcache 恢复），只挂监听器会永远等不到 —— 用 readyState 兜底，
     // 否则整个初始化（含看板统计）一次都不会跑。
     const _bootDashboard = () => {
+      // 文献流先发请求：放在 openVaultPdf 之前，避免后面的 PDF 直开流程
+      // 把它连同页面状态一起打断（那样 feed 会一直停在初始占位）。
+      try {
+        const fn = window.loadRecentFeed || loadRecentFeed;
+        if (typeof fn === "function") fn();
+      } catch (e) { console.warn("加载文献 feed 失败", e); }
       _applyTheme(document.documentElement.getAttribute("data-theme") || "light");
       _initHeaderScrollState();
       loadStats();
