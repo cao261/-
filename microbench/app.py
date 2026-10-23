@@ -3370,25 +3370,34 @@ async def api_sync(req: SyncRequest):
             except OSError:
                 continue
 
-    # ---------- 推送：批注（本机 → 共享） ----------
-    ann_local_dir = BASE_DIR / "logs" / "_pdf_snapshots" / "annotations"
-    if not req.pull_only and ann_local_dir.is_dir():
-        dst_dir = _sync_dir("annotations")
-        for fp in ann_local_dir.glob("*.json"):
-            try:
-                dst = dst_dir / fp.name
-                cur = _safe_read_json(dst) or {}
-                new = _safe_read_json(fp) or {}
-                items = _merge_annotation_lists(
-                    cur.get("annotations") or [], new.get("annotations") or [], [])
-                payload = {"paper_id": new.get("paper_id", fp.stem),
-                           "updated_at": _dt.datetime.now().isoformat(timespec="seconds"),
-                           "schema_version": 2, "annotations": items}
-                dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
-                               encoding="utf-8")
+    # ---------- 推送：批注 ----------
+    # 批注现在是"写入即同步"（直接落在共享目录里），所以这里不再从本机
+    # logs/ 复制，而是把共享目录里已有的批注列出来，让面板显示真实状态。
+    ann_shared_dir = _annotations_dir()
+    if not req.pull_only:
+        if ann_shared_dir.is_dir():
+            for fp in sorted(ann_shared_dir.glob("*.json")):
                 pushed["annotations"].append(fp.name)
-            except OSError:
-                continue
+        # 兼容：旧版本把批注存在本机 logs/ 下
+        ann_local_dir = BASE_DIR / "logs" / "_pdf_snapshots" / "annotations"
+        if ann_local_dir.is_dir():
+            for fp in ann_local_dir.glob("*.json"):
+                try:
+                    dst = ann_shared_dir / fp.name
+                    cur = _safe_read_json(dst) or {}
+                    new = _safe_read_json(fp) or {}
+                    items = _merge_annotation_lists(
+                        cur.get("annotations") or [], new.get("annotations") or [], [])
+                    payload = {"paper_id": new.get("paper_id", fp.stem),
+                               "updated_at": _dt.datetime.now().isoformat(timespec="seconds"),
+                               "schema_version": 2, "annotations": items}
+                    ann_shared_dir.mkdir(parents=True, exist_ok=True)
+                    dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                                   encoding="utf-8")
+                    if fp.name not in pushed["annotations"]:
+                        pushed["annotations"].append(fp.name)
+                except OSError:
+                    continue
 
     # ---------- 推送：阅读进度 ----------
     if not req.pull_only and req.progress:
@@ -3501,6 +3510,9 @@ class AnnotationItem(BaseModel):
                        description="被划选的原文片段")
     note: str = Field(default="", max_length=8000, description="用户自己写的笔记")
     color: str = Field(default="yellow", max_length=16)
+    rects: list = Field(default_factory=list, max_length=200,
+                        description="原文侧高亮矩形（归一化 0~1：x/y/w/h），"
+                                    "只在 PDF 原文划选时才有")
     created_at: str = Field(default="", max_length=40)
     updated_at: str = Field(default="", max_length=40)
 

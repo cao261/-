@@ -15,28 +15,38 @@ requests 的 `merge_environment_settings` 用 setdefault，键已存在就不会
 的 monkeypatch 仍然有效（换成 Session 会让打桩失效，测试会真的发网请求）。
 """
 import sys
+import time
 
-_state = {"bypassed": False}
+# 直连兜底的持续时间。代理客户端可能只是临时退出/重启，过一会儿又好了 ——
+# 所以不能永久标记"代理已死"，否则用户把代理开回来后请求仍然直连，
+# 而 arxiv 这类站点直连会 SSL 证书校验失败（平时靠代理做 TLS 拦截）。
+BYPASS_TTL_SECONDS = 300
+
+_state = {"bypassed_until": 0.0}
 
 
 def proxy_bypassed() -> bool:
-    """环境代理是否已判定为不可用（True = 之后一律直连）。"""
-    return _state["bypassed"]
+    """环境代理是否已判定为不可用（True = 之后一律直连）。
+
+    限时生效：超过 BYPASS_TTL_SECONDS 自动失效，下次请求重新走代理
+    （代理客户端恢复后无需重启服务）。
+    """
+    return time.time() < _state["bypassed_until"]
 
 
 def mark_proxy_dead(err: Exception) -> None:
-    """记下「环境代理是死的」，只提示一次。"""
-    if _state["bypassed"]:
+    """记下「环境代理暂时不可用」，只提示一次。"""
+    if proxy_bypassed():
         return
-    _state["bypassed"] = True
+    _state["bypassed_until"] = time.time() + BYPASS_TTL_SECONDS
     print(
-        f"[MicroBench] 本地代理不可用 ({err})，后续请求改为直连",
+        f"[MicroBench] 本地代理不可用 ({err})，接下来 {BYPASS_TTL_SECONDS // 60} 分钟内改直连",
         file=sys.stderr,
     )
 
 
 def direct_kwargs() -> dict:
     """代理已死时附加的 kwargs（让 requests 忽略环境代理）。"""
-    if _state["bypassed"]:
+    if proxy_bypassed():
         return {"proxies": {"http": None, "https": None}}
     return {}
