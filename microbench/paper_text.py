@@ -441,6 +441,29 @@ def _mark_broken_formulas(text: str) -> str:
     return "\n".join(out)
 
 
+def _find_vertical_split(words, width, height):
+    """找到双栏正文开始的 y（整宽标题区结束的位置）；找不到返回 0。
+
+    抽成独立函数，生产代码和测试共用同一套判定，免得两边算出不同的
+    y_split，测试就成了自说自话。
+    """
+    for band in range(_Y_BANDS):
+        y0 = height * band / _Y_BANDS
+        y1 = height * (band + 1) / _Y_BANDS
+        band_words = [w for w in words if y0 <= w["top"] < y1]
+        if len(band_words) < 6:
+            continue
+        cover = _x_cover(band_words, width, _X_BINS)
+        a, ln = _longest_gap(cover, int(_X_BINS * 0.15), int(_X_BINS * 0.85))
+        if a is None or ln < 2:
+            continue
+        left_n = sum(1 for w in band_words if w["x1"] <= width * a / _X_BINS)
+        right_n = sum(1 for w in band_words if w["x0"] >= width * (a + ln) / _X_BINS)
+        if left_n >= 4 and right_n >= 4:
+            return y0
+    return 0.0
+
+
 def _extract_page_text_raw(page) -> str:
     plain = ""
     try:
@@ -460,22 +483,7 @@ def _extract_page_text_raw(page) -> str:
         return plain
 
     # 1) 垂直方向：找到双栏开始的 y（整宽标题区结束的位置）
-    y_split = 0.0
-    for band in range(_Y_BANDS):
-        y0 = height * band / _Y_BANDS
-        y1 = height * (band + 1) / _Y_BANDS
-        band_words = [w for w in words if y0 <= w["top"] < y1]
-        if len(band_words) < 6:
-            continue
-        cover = _x_cover(band_words, width, _X_BINS)
-        a, ln = _longest_gap(cover, int(_X_BINS * 0.15), int(_X_BINS * 0.85))
-        if a is None or ln < 2:
-            continue
-        left_n = sum(1 for w in band_words if w["x1"] <= width * a / _X_BINS)
-        right_n = sum(1 for w in band_words if w["x0"] >= width * (a + ln) / _X_BINS)
-        if left_n >= 4 and right_n >= 4:
-            y_split = y0
-            break
+    y_split = _find_vertical_split(words, width, height)
 
     below = [w for w in words if w["top"] >= y_split]
     if len(below) < 30:
@@ -499,70 +507,56 @@ def _extract_page_text_raw(page) -> str:
         #     全局最长零覆盖段就找不到栏缝了 —— 于是退回 plain，
         #     两栏正文互相交错，公式被拆散（实测 JACERS 综述第 2 页）。
         #     这里改成「逐带投票」：每个水平带单独找栏缝，对中点投票，
-        #     取众数当栏缝；再按垂直顺序把双栏块和跨栏块拼回去。
-        split = _extract_by_band_voting(page, words, width, height, y_split)
-        if split:
-            return split
-        return plain
+        #     取众数当栏缝。
+        x_mid = _vote_column_gap(words, width, height, y_split)
+        if x_mid is None:
+            return plain
+    else:
+        x_mid = (x_gap0 + x_gap1) / 2.0
 
-    # 3) 分区抽取
-    parts = []
-    try:
-        if y_split > 0:
+    # 3) 按带分组切页 → 左栏正文 / 右栏正文 / 整宽块
+    top_txt = ""
+    if y_split > 0:
+        try:
             top_txt = page.crop((0, 0, width, y_split)).extract_text(
                 x_tolerance=PDF_X_TOLERANCE
             ) or ""
-            if top_txt.strip():
-                parts.append(top_txt.strip())
-        left_txt = page.crop((0, y_split, x_gap0, height)).extract_text(
-            x_tolerance=PDF_X_TOLERANCE
-        ) or ""
-        right_txt = page.crop((x_gap1, y_split, width, height)).extract_text(
-            x_tolerance=PDF_X_TOLERANCE
-        ) or ""
-        if left_txt.strip():
-            parts.append(left_txt.strip())
-        if right_txt.strip():
-            parts.append(right_txt.strip())
-    except Exception:
+        except Exception:
+            top_txt = ""
+    left_parts, right_parts, span_units = _extract_by_bands(
+        page, words, width, height, y_split, x_mid)
+    if not left_parts and not right_parts and not span_units:
         return plain
+    return _join_reading_order(left_parts, right_parts, span_units, top_txt)
 
-    if not parts:
-        return plain
+
+def _join_reading_order(left_parts, right_parts, span_units, top_txt="") -> str:
+    """页内阅读顺序：左栏正文 → 右栏正文 → 跨栏块（页眉/图注/整宽表格）。
+
+    用户诉求："一页中就是从左到右翻译，一直都是从左到右"。
+
+    之前的两种做法都会碍事：
+    - 整栏裁剪：跨栏表格被栏缝劈成两半，一半塞进左栏、一半塞进右栏，
+      表格碎片夹在正文中间，译文读起来完全对不上；
+    - 逐带交替拼接：左1→右1→左2→右2，译文左右横跳。
+
+    现在：两栏正文各自成段（先左后右），跨栏的表格/图注**整块保留**
+    并排在正文之后 —— 放最前面会让读者一进页面就撞上一页眉+表格，
+    正文得先滚过去才看得到（用户原话："老是先翻译最上面的那一栏，
+    给我的阅读造成阻碍"）。
+    """
+    parts = []
+    if top_txt and top_txt.strip():
+        parts.append(top_txt.strip())
+    parts.extend(p for p in left_parts if p.strip())
+    parts.extend(p for p in right_parts if p.strip())
+    for unit in span_units or []:
+        parts.extend(p for p in unit if p.strip())
     return "\n\n".join(parts)
 
 
-def _band_column_gap(band_words, width):
-    """在一个水平带里找栏缝，返回栏缝中点（页面坐标）或 None。"""
-    if len(band_words) < 6:
-        return None
-    cover = _x_cover(band_words, width, _X_BINS)
-    a, ln = _longest_gap(cover, int(_X_BINS * 0.15), int(_X_BINS * 0.85))
-    if a is None or ln < 2:
-        return None
-    mid = width * (a + ln / 2.0) / _X_BINS
-    left_n = sum(1 for w in band_words if w["x1"] <= mid)
-    right_n = sum(1 for w in band_words if w["x0"] >= mid)
-    if left_n < 3 or right_n < 3:
-        return None
-    return mid
-
-
-def _has_gap_near(cover, center_bin, tol_bins=3):
-    """cover 在 center_bin 附近是否有空隙（这一带是不是双栏排版）。"""
-    lo = max(0, center_bin - tol_bins)
-    hi = min(len(cover), center_bin + tol_bins + 1)
-    for i in range(lo, hi):
-        if cover[i] <= 0.5:
-            return True
-    return False
-
-
-def _extract_by_band_voting(page, words, width, height, y_split):
-    """整宽元素挡住宿缝时的兜底抽取：逐带投票找栏缝，按块拼回阅读顺序。
-
-    返回 None 表示这条路也不可靠，调用方退回 pdfplumber 的原始抽取。
-    """
+def _vote_column_gap(words, width, height, y_split):
+    """逐带投票找栏缝，返回栏缝中点（页面坐标）；找不到返回 None。"""
     band_h = max(8.0, height / 40.0)
     bands = []
     y = y_split
@@ -590,52 +584,99 @@ def _extract_by_band_voting(page, words, width, height, y_split):
     right_n = sum(1 for w in words if w["x0"] >= x_mid - 1)
     if left_n < 8 or right_n < 8:
         return None
+    return x_mid
 
-    # 按垂直顺序分块：
-    #   双栏带（这一带在栏缝位置有空隙）→ 左右各裁一段
-    #   跨栏带（整宽表格/图注，栏缝位置被填满）→ 整宽裁一段
-    # 判据是"栏缝位置有没有空隙"，不是"最长空隙在哪"—— 后者会被图注、
-    # 缩进段落带偏，导致整页又按整宽裁回去（两栏正文重新交错）。
+
+def _extract_by_bands(page, words, width, height, y_split, x_mid):
+    """按水平带分组切页。
+
+    返回 (正文左栏段, 正文右栏段, 整宽单元列表)。
+
+    整宽单元 = 跨栏的表格/图注 + 它紧邻的表体，按「标题 → 左半 → 右半」
+    整块保留。跨栏表格被栏缝劈成两半、碎片夹在正文中间，读起来完全对不上
+    （实测 JACERS 第 2 页：Table I 的标题被甩到最后，表体却散在两栏里）。
+
+    分组判据是"栏缝位置有没有空隙"，不是"最长空隙在哪" —— 后者会被图注、
+    缩进段落带偏，导致整页又按整宽裁回去（两栏正文重新交错）。
+    """
+    band_h = max(8.0, height / 40.0)
+    x_bin = int(round(x_mid / width * _X_BINS))
     groups = []   # [kind, y0, y1]
-    for y0, y1, bw in bands:
-        if not bw:
-            continue
-        cover = _x_cover(bw, width, _X_BINS)
-        kind = "split" if _has_gap_near(cover, x_bin) else "span"
-        if groups and groups[-1][0] == kind:
-            groups[-1][2] = y1
-        else:
-            groups.append([kind, y0, y1])
-
-    parts = []
-    try:
-        if y_split > 0:
-            top_txt = page.crop((0, 0, width, y_split)).extract_text(
-                x_tolerance=PDF_X_TOLERANCE
-            ) or ""
-            if top_txt.strip():
-                parts.append(top_txt.strip())
-        for kind, gy0, gy1 in groups:
-            if kind == "split":
-                lt = page.crop((0, gy0, x_mid, gy1)).extract_text(
-                    x_tolerance=PDF_X_TOLERANCE) or ""
-                rt = page.crop((x_mid, gy0, width, gy1)).extract_text(
-                    x_tolerance=PDF_X_TOLERANCE) or ""
-                if lt.strip():
-                    parts.append(lt.strip())
-                if rt.strip():
-                    parts.append(rt.strip())
+    y = y_split
+    while y < height:
+        bw = [w for w in words if y <= w["top"] < y + band_h]
+        y1 = y + band_h
+        if bw:
+            cover = _x_cover(bw, width, _X_BINS)
+            kind = "split" if _has_gap_near(cover, x_bin) else "span"
+            if groups and groups[-1][0] == kind:
+                groups[-1][2] = y1
             else:
+                groups.append([kind, y, y1])
+        y = y1
+
+    left_parts: list[str] = []
+    right_parts: list[str] = []
+    units: list[list[str]] = []
+    pending: list[str] = []
+    try:
+        for kind, gy0, gy1 in groups:
+            if kind == "span":
                 st = page.crop((0, gy0, width, gy1)).extract_text(
                     x_tolerance=PDF_X_TOLERANCE) or ""
                 if st.strip():
-                    parts.append(st.strip())
+                    pending.append(st.strip())
+                continue
+            lt = page.crop((0, gy0, x_mid, gy1)).extract_text(
+                x_tolerance=PDF_X_TOLERANCE) or ""
+            rt = page.crop((x_mid, gy0, width, gy1)).extract_text(
+                x_tolerance=PDF_X_TOLERANCE) or ""
+            if pending:
+                # 上面紧挨着跨栏块 → 这一组是表格的表体，整块保留
+                unit = list(pending)
+                pending = []
+                if lt.strip():
+                    unit.append(lt.strip())
+                if rt.strip():
+                    unit.append(rt.strip())
+                units.append(unit)
+            else:
+                # 纯正文：两栏各自成段（后面再按「左栏读完再右栏」合并）
+                if lt.strip():
+                    left_parts.append(lt.strip())
+                if rt.strip():
+                    right_parts.append(rt.strip())
     except Exception:
-        return None
+        return [], [], []
+    if pending:
+        units.append(pending)
+    return left_parts, right_parts, units
 
-    if not parts:
+
+def _band_column_gap(band_words, width):
+    """在一个水平带里找栏缝，返回栏缝中点（页面坐标）或 None。"""
+    if len(band_words) < 6:
         return None
-    return "\n\n".join(parts)
+    cover = _x_cover(band_words, width, _X_BINS)
+    a, ln = _longest_gap(cover, int(_X_BINS * 0.15), int(_X_BINS * 0.85))
+    if a is None or ln < 2:
+        return None
+    mid = width * (a + ln / 2.0) / _X_BINS
+    left_n = sum(1 for w in band_words if w["x1"] <= mid)
+    right_n = sum(1 for w in band_words if w["x0"] >= mid)
+    if left_n < 3 or right_n < 3:
+        return None
+    return mid
+
+
+def _has_gap_near(cover, center_bin, tol_bins=3):
+    """cover 在 center_bin 附近是否有空隙（这一带是不是双栏排版）。"""
+    lo = max(0, center_bin - tol_bins)
+    hi = min(len(cover), center_bin + tol_bins + 1)
+    for i in range(lo, hi):
+        if cover[i] <= 0.5:
+            return True
+    return False
 
 
 def split_into_sections(pages: list[dict]) -> list[dict]:

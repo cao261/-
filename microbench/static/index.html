@@ -3438,7 +3438,6 @@
       initReaderQAPanelDrag();
       initAnnotationFeatures();
       loadTranslationModelChoices();
-      try { _setupPdfScrollSync(); } catch (e) { /* 忽略 */ }
       // 调试/自动化入口：?sync_now=1 直接触发一次同步（不用点按钮）
       try {
         if (new URLSearchParams(location.search).get("sync_now") === "1") {
@@ -3650,8 +3649,6 @@
 
     async function loadPdfDualColumn(opts = {}) {
       const { keepTranslations = false, generation = null, restoreSnapshot = null } = opts;
-      // 左右两栏滚动联动（PDF 视图一出现就绑上）
-      try { _setupPdfScrollSync(); } catch (e) { /* 忽略 */ }
       const title = _readerState.title || "";
       const placeholder = document.getElementById("pdf-viewer-placeholder");
       const listEl = document.getElementById("pdf-pages-list");
@@ -5981,53 +5978,19 @@
     }
 
     // ===========================================================================
-    // 左右两栏滚动联动
+    // 左右两栏滚动联动 —— 已移除
     // ===========================================================================
-    // 用户反馈："他应该先翻译左边的呀" —— 真实原因不是翻译错乱，而是
-    // **左右两栏各自独立滚动**：左边滚到第 2 页，右边还停在第 1 页，
-    // 看上去就永远"对不上"。
+    // 曾经按"页"把两栏对齐（左栏滚到第 N 页 → 右栏跟到第 N 页的译文）。
+    // 用户反馈："它不是译文滚动原文滚动同时进行，但是这个页码却有一些错位，
+    // 我感觉不是很需要这个功能" —— 联动是治标：译文是**流式**的（整页一次
+    // 翻译、按段落铺开），跟 PDF 的整页版面本来就不可能逐像素对齐，强行联动
+    // 反而制造错位跳动。
     //
-    // 这里把两栏按"页"对齐：左栏滚到第 N 页 → 右栏跟着滚到第 N 页的译文
-    // （反之亦然）。用时间戳做锁，避免两栏互相触发形成回弹。
-    const _pdfScrollSync = { lockUntil: 0, timer: null };
-
-    function _setupPdfScrollSync() {
-      const left = document.getElementById("pdf-viewer-container");
-      const right = document.getElementById("pdf-translations-container");
-      if (!left || !right || left.dataset.scrollSync === "1") return;
-      left.dataset.scrollSync = "1";
-      right.dataset.scrollSync = "1";
-
-      const sync = (from, to, pageSel, targetPrefix) => {
-        if (Date.now() < _pdfScrollSync.lockUntil) return;   // 刚被别人同步过 → 忽略
-        const fromTop = from.getBoundingClientRect().top;
-        let pageBlock = null;
-        from.querySelectorAll(pageSel).forEach(b => {
-          if (!pageBlock && b.getBoundingClientRect().bottom > fromTop + 8) pageBlock = b;
-        });
-        if (!pageBlock) return;
-        const m = pageBlock.id.match(/(\d+)$/);
-        if (!m) return;
-        const target = document.getElementById(targetPrefix + m[1]);
-        if (!target) return;
-        const delta = target.getBoundingClientRect().top - pageBlock.getBoundingClientRect().top;
-        if (Math.abs(delta) < 2) return;
-        _pdfScrollSync.lockUntil = Date.now() + 350;
-        to.scrollTop += delta;
-      };
-
-      const bind = (from, to, pageSel, prefix) => {
-        from.addEventListener("scroll", () => {
-          if (_pdfScrollSync.timer) return;
-          _pdfScrollSync.timer = setTimeout(() => {
-            _pdfScrollSync.timer = null;
-            sync(from, to, pageSel, prefix);
-          }, 90);
-        }, { passive: true });
-      };
-      bind(left, right, ".pdf-page-block", "pdf-trans-block-");
-      bind(right, left, ".pdf-translation-block", "pdf-page-block-");
-    }
+    // 真正让两栏"对得上"的是**页内文本顺序**：双栏页现在按「左栏整段读完 →
+    // 再读右栏」抽取和翻译（见 microbench/paper_text.py），右栏译文一出现
+    // 就是连贯的一整段，读起来不再左右横跳。
+    //
+    // 两栏现在各自独立滚动，互不打扰。
 
     // 取当前划选在 PDF 原文侧的高亮矩形（归一化 0~1，随缩放还原）。
     // PDF.js 文本层是绝对定位的 span，不能往里插标记（会挤坏版面），
