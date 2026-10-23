@@ -248,6 +248,43 @@ _SENTENCE_END_RE = re.compile(r"[.!?。！？]")
 _MAX_TAIL_TRIM_CHARS = 1500
 
 
+def render_page_png(pdf_path, page_no: int, zoom: float = 2.0,
+                    max_pixels: int = 1_600_000) -> bytes:
+    """把 PDF 的一页渲染成 PNG（多模态答疑用）。
+
+    为什么需要它：表格和曲线图「不好文字化」—— pdfplumber 抽出来的只是
+    碎片（"2 4 3" 这种上下标），模型看到的是一堆没有意义的字符。
+    MiniMax-M3 是多模态模型，直接把这一页的截图喂给它，它就能自己看图
+    读出数值和趋势（实测 image_url 输入 HTTP 200 且模型能正确读出图里的
+    数值）。
+
+    zoom=2.0 → 约 144 DPI，够看清坐标轴刻度。
+    max_pixels 限制总像素数，避免超大页面把请求撑爆。
+    返回 PNG 字节；渲染失败时抛异常由调用方兜底。
+    """
+    import io as _io
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:  # pragma: no cover - env dependent
+        raise RuntimeError(
+            "PDF 页面截图需要 PyMuPDF (fitz), 请先 pip install pymupdf"
+        ) from exc
+
+    path = Path(pdf_path)
+    with fitz.open(str(path)) as doc:
+        if page_no < 1 or page_no > doc.page_count:
+            raise ValueError(f"页码越界: {page_no} (共 {doc.page_count} 页)")
+        page = doc.load_page(page_no - 1)
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        # 像素总量保护：超出就按比例降一档 zoom
+        if pix.width * pix.height > max_pixels:
+            scale = (max_pixels / float(pix.width * pix.height)) ** 0.5
+            mat = fitz.Matrix(zoom * scale, zoom * scale)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+        return pix.tobytes("png")
+
+
 def _trim_page_tail(text: str) -> str:
     """去掉页尾的页码行和没写完的末句。
 
@@ -515,19 +552,89 @@ def _extract_page_text_raw(page) -> str:
         x_mid = (x_gap0 + x_gap1) / 2.0
 
     # 3) 按带分组切页 → 左栏正文 / 右栏正文 / 整宽块
-    top_txt = ""
-    if y_split > 0:
-        try:
-            top_txt = page.crop((0, 0, width, y_split)).extract_text(
-                x_tolerance=PDF_X_TOLERANCE
-            ) or ""
-        except Exception:
-            top_txt = ""
     left_parts, right_parts, span_units = _extract_by_bands(
         page, words, width, height, y_split, x_mid)
-    if not left_parts and not right_parts and not span_units:
+
+    # 3b) 双栏正文起点以上的区域也要分栏 —— 见 _extract_top_region 的说明。
+    #     这一步是「先翻译右边的了」那个 bug 的真正修复点。
+    front, top_left, top_right = _extract_top_region(
+        page, words, width, height, y_split, x_mid)
+    left_parts = top_left + left_parts
+    right_parts = top_right + right_parts
+
+    if not left_parts and not right_parts and not span_units and not front:
         return plain
-    return _join_reading_order(left_parts, right_parts, span_units, top_txt)
+    return _join_reading_order(left_parts, right_parts, span_units, "\n\n".join(front))
+
+
+def _extract_top_region(page, words, width, height, y_split, x_mid):
+    """把「双栏正文起点以上」的区域按栏拆开。
+
+    返回 (整宽块, 左栏段, 右栏段)。
+
+    为什么必须拆（这是用户反馈「先翻译右边的了」的根因）:
+      旧做法把 y_split 以上的区域**整宽裁一刀**当页眉，然后排在最前面。
+      很多期刊页顶部并不是「整宽标题区」，而是**左右两栏各自从不同高度
+      开始**（页顶被一张大图占住，只有另一栏先有文字）。实测 JACERS 综述
+      第 3 页：右栏图注从 y=227 就开始，左栏正文要到 y=450 才开始 ——
+      整宽裁一刀就把右栏正文整块抢到了最前面，左栏正文反而排在后面，
+      译文读起来完全是乱的。
+
+      所以这里用同一套「按带找栏缝」的判据把顶部区域也分栏:
+        - 真的双栏的带 → 左右分开，��左归左、右归右；
+        - 整宽的带（页眉/标题/整宽图注）→ 单独成块，仍排最前；
+        - 只有一栏有字的带 → 归那一栏。
+    """
+    front: list[str] = []
+    left_parts: list[str] = []
+    right_parts: list[str] = []
+    if y_split <= 0:
+        return front, left_parts, right_parts
+
+    band_h = max(8.0, height / 40.0)
+    x_bin = int(round(x_mid / width * _X_BINS))
+    y = 0.0
+    while y < y_split - 0.01:
+        y1 = min(y + band_h, y_split)
+        bw = [w for w in words if y <= w["top"] < y1]
+        if bw:
+            cover = _x_cover(bw, width, _X_BINS)
+            left_n = sum(1 for w in bw if w["x1"] <= x_mid)
+            right_n = sum(1 for w in bw if w["x0"] >= x_mid)
+            # 真正的双栏带：栏缝干净 + 两边都够多字
+            is_split = (
+                _has_gap_near(cover, x_bin)
+                and left_n >= 4
+                and right_n >= 4
+            )
+            if not is_split:
+                # 不是双栏 → 判断是「整宽块」还是「单栏块」
+                xs = min(w["x0"] for w in bw)
+                xe = max(w["x1"] for w in bw)
+                wide = (xe - xs) >= width * 0.5
+                cross = any(
+                    w["x0"] < x_mid - 2 and w["x1"] > x_mid + 2 for w in bw
+                )
+                is_split = not (wide or cross)
+            try:
+                if is_split:
+                    lt = page.crop((0, y, x_mid, y1)).extract_text(
+                        x_tolerance=PDF_X_TOLERANCE) or ""
+                    rt = page.crop((x_mid, y, width, y1)).extract_text(
+                        x_tolerance=PDF_X_TOLERANCE) or ""
+                    if lt.strip():
+                        left_parts.append(lt.strip())
+                    if rt.strip():
+                        right_parts.append(rt.strip())
+                else:
+                    st = page.crop((0, y, width, y1)).extract_text(
+                        x_tolerance=PDF_X_TOLERANCE) or ""
+                    if st.strip():
+                        front.append(st.strip())
+            except Exception:
+                pass
+        y = y1
+    return front, left_parts, right_parts
 
 
 def _join_reading_order(left_parts, right_parts, span_units, top_txt="") -> str:

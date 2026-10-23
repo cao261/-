@@ -1526,12 +1526,25 @@ async def _stream_model(
     temperature: float,
     timeout: int,
     cancel_event: Optional[asyncio.Event] = None,
+    disable_thinking: bool = False,
 ) -> AsyncIterator[str]:
     """Yield content chunks from a single model via httpx streaming.
 
     Yields the `content` field from each SSE `data: {...}` line.
     Raises LLMError on non-200 status, asyncio.CancelledError on cancel.
     Does NOT retry — callers wrap this in their own retry logic if needed.
+
+    disable_thinking=True: send thinking={"type":"disabled"} so the model
+    answers directly instead of reasoning first. This is the key fix for
+    "the Q&A panel never produces an answer" (see chat_stream_async):
+    M3 thinks by default and reasoning tokens share the same max_tokens
+    budget as the visible answer. Measured with 20K chars of context and
+    max_tokens=4000, the reasoning burned the whole budget and the visible
+    body was 2 characters - the user saw a spinner and then nothing.
+
+    Models that reject the parameter (M3.1-Flash forces adaptive thinking)
+    get a 400; we drop the parameter and retry once, and remember the model
+    in _THINKING_DISABLE_UNSUPPORTED so we stop sending it.
     """
     if httpx is None:
         raise LLMError("httpx 包未安装, 请先 pip install httpx")
@@ -1544,6 +1557,8 @@ async def _stream_model(
         "temperature": temperature,
         "stream": True,  # request SSE
     }
+    if disable_thinking and cfg["model"] not in _THINKING_DISABLE_UNSUPPORTED:
+        payload["thinking"] = {"type": "disabled"}
 
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
@@ -1590,6 +1605,7 @@ async def _stream_model(
                 err.status_code = resp.status_code
                 raise err
 
+            body_visible_chars = 0
             async for line in resp.aiter_lines():
                 if cancel_event is not None and cancel_event.is_set():
                     raise asyncio.CancelledError("client disconnected mid-stream")
@@ -1599,6 +1615,7 @@ async def _stream_model(
                 if data == "[DONE]":
                     # Flush any tail that arrived after the last </think>.
                     if not in_think and think_buf:
+                        body_visible_chars += len(think_buf.strip())
                         yield think_buf
                     return
                 try:
@@ -1612,12 +1629,14 @@ async def _stream_model(
                             in_think = False
                             think_buf = think_buf.split("</think>", 1)[1]
                             if think_buf:
+                                body_visible_chars += len(think_buf.strip())
                                 yield think_buf
                                 think_buf = ""
                         continue
                     if "<think>" in delta:
                         before, _, rest = delta.partition("<think>")
                         if before:
+                            body_visible_chars += len(before.strip())
                             yield before
                         in_think = True
                         think_buf = rest
@@ -1625,13 +1644,28 @@ async def _stream_model(
                             in_think = False
                             think_buf = think_buf.split("</think>", 1)[1]
                             if think_buf:
+                                body_visible_chars += len(think_buf.strip())
                                 yield think_buf
                                 think_buf = ""
                         continue
+                    body_visible_chars += len(delta.strip())
                     yield delta
                 except (json.JSONDecodeError, KeyError, IndexError):
                     # Skip malformed lines (heartbeats, comments)
                     continue
+
+            # The loop ended without a "[DONE]" sentinel. Measured against the
+            # real API: when the reasoning eats the whole max_tokens budget,
+            # the upstream emits finish_reason="length" and then just closes
+            # the connection. That path produced an empty body which the
+            # frontend rendered as a blank answer box - the user saw
+            # "no answer at all" with no error and no clue why.
+            if body_visible_chars == 0:
+                raise LLMError(
+                    f"{TRUNCATED_MARKER}: {TRUNCATED_NO_BODY}"
+                    f"(stream ended with no visible content, "
+                    f"max_tokens={max_tokens})"
+                )
     except asyncio.CancelledError:
         raise
     except httpx.ConnectError as e:
@@ -1660,6 +1694,7 @@ async def chat_stream_async(
     temperature: float = DEFAULT_TEMPERATURE,
     timeout: int = DEFAULT_TIMEOUT,
     cancel_event: Optional[asyncio.Event] = None,
+    disable_thinking: bool = False,
 ) -> AsyncIterator[str]:
     """Streaming version of chat() with cancellation support.
 
@@ -1672,6 +1707,17 @@ async def chat_stream_async(
     Cancellation:
       - cancel_event checked before each chunk (mid-stream close)
       - Pre-stream check saves an HTTP call when cancel fires very early
+
+    Empty-body recovery (the "no answer" bug):
+      MiniMax-M3 reasons by default, and the reasoning tokens share the same
+      max_tokens budget as the visible answer. With a large context the
+      reasoning can consume the entire budget, leaving a 2-character body.
+      When that happens this function retries the call once with thinking
+      disabled, so the user always gets an answer. Nothing was streamed at
+      that point, so the retry is seamless.
+
+    disable_thinking=True skips the reasoning phase from the start (used by
+    the translation path, where reasoning only wastes latency).
 
     Usage (in FastAPI endpoint):
         async def event_gen():
@@ -1719,12 +1765,18 @@ async def chat_stream_async(
         # see the primary's half-answer glued onto the fallback's complete
         # answer ("PART-A PART-B FALLBACK-1 FALLBACK-2"), which reads as one
         # confident nonsense answer.
+        # "emitted" must mean "the user can see real content", not "some
+        # bytes were emitted". The upstream's empty body is exactly two
+        # newlines; counting those as output made the recovery branch below
+        # bail out with "already streamed" and the user got a blank answer.
         emitted = False
         try:
             async for chunk in _stream_model(
                 primary, messages, max_tokens, temperature, timeout, cancel_event,
+                disable_thinking=disable_thinking,
             ):
-                emitted = True
+                if chunk.strip():
+                    emitted = True
                 yield chunk
             return
         except asyncio.CancelledError:
@@ -1735,6 +1787,23 @@ async def chat_stream_async(
                 # Already streamed partial content — fail fast, keep the
                 # partial output the user already has.
                 raise
+            # Empty body: the model burned the whole max_tokens budget on
+            # reasoning and never produced a visible answer. Retrying with
+            # thinking disabled makes it answer directly (measured: same
+            # 20K context, max_tokens=4000 -> 14398 chars of reasoning and a
+            # 2-char body with thinking on, vs a clean answer with it off).
+            # Nothing was streamed yet, so the retry is seamless.
+            if (
+                not disable_thinking
+                and TRUNCATED_MARKER in err_msg
+                and TRUNCATED_NO_BODY in err_msg
+            ):
+                async for chunk in _stream_model(
+                    primary, messages, max_tokens, temperature, timeout,
+                    cancel_event, disable_thinking=True,
+                ):
+                    yield chunk
+                return
             status = getattr(e, "status_code", None)
             quota_hit = (
                 model_manager.is_quota_exhausted_error(status, err_msg)
@@ -1751,6 +1820,7 @@ async def chat_stream_async(
         # it is not repeated here.
         async for chunk in _stream_model(
             fallback, messages, max_tokens, temperature, timeout, cancel_event,
+            disable_thinking=disable_thinking,
         ):
             yield chunk
         return

@@ -717,6 +717,14 @@ class ExplainSelectionRequest(BaseModel):
                                                     "(term=2K / mid=8K / wide=20K / full=50K 字符), "
                                                     "防止客户端或路由器的预算失控。"
                                                     "留空则按 mid 的上限处理。")
+    page_image: Optional[str] = Field(default=None, max_length=4_000_000,
+                                       description="所选片段所在页面的 PNG 截图 (base64, 不含 data URL 前缀)。"
+                                                   "表格/曲线图这类「不好文字化」的内容, 抽出来的文本只是碎片 "
+                                                   "(上下标/坐标轴标签), 模型看到的是一堆没意义的字符。"
+                                                   "MiniMax-M3 是多模态模型, 把截图一起给它, 它就能自己看图读出数值。")
+    pdf_relative_path: Optional[str] = Field(default=None, max_length=500,
+                                              description="PDF 在 vault 中的相对路径。提供 page_image 时用于"
+                                                          "校验图片来源 (只允许 vault 内的 PDF)。")
 
 
 class TranslatePageRequest(BaseModel):
@@ -2721,6 +2729,31 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
     user_msg_parts.append(f"【用户的问题】:\n{req.question.strip()}")
     user_msg = "\n\n".join(user_msg_parts)
 
+    # --- 多模态兜底: 表格/曲线图不好文字化时, 把页面截图一起给模型 -----
+    # 用户原话: "minimaxm3 是多模态模型, 如果表或者图不好文字化给他的话,
+    # 完全可以截图给它, 让它回答问题"。
+    #
+    # 抽取层对表格/图注只能拿到碎片 ("2 4 3" 这种上下标、坐标轴刻度),
+    # 模型看到的是一堆没有意义的字符 —— 这正是「这个表需要注意什么」
+    # 问不出答案的原因。截图走 OpenAI 兼容的 image_url (data URL)。
+    image_b64 = (req.page_image or "").strip()
+    if image_b64.startswith("data:"):
+        image_b64 = image_b64.split(",", 1)[-1]
+    image_b64 = "".join(image_b64.split())
+    if image_b64:
+        user_content = [
+            {"type": "text", "text": user_msg},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{image_b64}",
+                },
+            },
+        ]
+        user_msg = user_content
+    else:
+        user_content = user_msg
+
     async def event_gen():
         try:
             st = llm.get_llm_status()
@@ -2728,7 +2761,7 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
             chunk_iter = llm.chat_stream_async(
                 messages=[
                     {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
+                    {"role": "user", "content": user_content},
                 ],
                 max_tokens=4000,
                 temperature=0.3,

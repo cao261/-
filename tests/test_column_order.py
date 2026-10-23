@@ -120,3 +120,93 @@ def test_no_horizontal_interleaving_in_final_text():
                     continue
                 assert li > ri, (
                     f"左栏词 {lw!r} 出现在右栏词 {rw!r} 之前 —— 左右交替了")
+
+
+# ---------------------------------------------------------------------------
+# 不对称双栏页（第 3 页）：左右两栏的起始高度不同
+# ---------------------------------------------------------------------------
+#
+# JACERS 第 3 页的版面：页顶被 Fig.2 的显微照片和 Fig.3 的曲线图占住，
+# 右栏的图注从 y≈227 就开始，左栏正文要到 y≈450 才开始。
+#
+# 旧实现把「双栏正文起点以上」整宽裁一刀当页眉 → 右栏那半张页面
+# （Fig.3 图注 + 右栏开头两段）被抢到最前面，左栏正文反而排后面。
+# 用户看到的现象正是「先翻译右边的了」。
+#
+# 现在顶部区域也按栏拆开，所以左栏必须整体早于右栏。
+
+_ASYM_PAGE = 3
+
+
+def _page_text(page_no):
+    import pdfplumber
+    from microbench import paper_text as pt
+    with pdfplumber.open(str(JACERS)) as pdf:
+        return pt._extract_page_text_raw(pdf.pages[page_no - 1])
+
+
+def test_asymmetric_page_left_column_precedes_right_column():
+    """左右栏起始高度不同的页面：左栏整段仍必须早于右栏整段。"""
+    text = _page_text(_ASYM_PAGE)
+
+    left_fig = "Fig.2. (a) An optical"
+    left_body = "where n is the volume fraction"
+    right_fig = "Fig.3. Transverse magnetoelectric"
+    right_body = "NiFe O and PZT. These data show"
+
+    li = text.find(left_fig)
+    assert li >= 0, "第 3 页没抽到左栏的 Fig.2 图注"
+    ri = text.find(right_fig)
+    assert ri >= 0, "第 3 页没抽到右栏的 Fig.3 图注"
+
+    assert li < ri, "右栏内容被排到了左栏前面（先翻译右边的了）"
+
+    # 左栏正文也要早于右栏正文
+    lb = text.find(left_body)
+    rb = text.find(right_body)
+    if lb >= 0 and rb >= 0:
+        assert lb < rb, "左栏正文没有整体排在右栏正文之前"
+
+
+def test_asymmetric_page_right_column_is_not_front_loaded():
+    """右栏不得被当成「页眉」抢在最前面。"""
+    text = _page_text(_ASYM_PAGE)
+    right_fig = "Fig.3. Transverse magnetoelectric"
+    right_body = "NiFe O and PZT. These data show"
+    left_fig = "Fig.2. (a) An optical"
+
+    ri = text.find(right_fig)
+    li = text.find(left_fig)
+    assert ri > li, "右栏图注出现在左栏图注之前 —— 右栏被抢到最前面了"
+
+    # 页眉（页码行）可以排在最前，但正文不该
+    header_idx = text.find("February 2008")
+    if header_idx >= 0 and ri >= 0:
+        assert header_idx < ri, "页眉应该在正文之前"
+
+
+def test_top_region_is_split_by_column():
+    """顶部区域必须被拆成左/右两栏，而不是整宽一刀。"""
+    import pdfplumber
+    from microbench import paper_text as pt
+    with pdfplumber.open(str(JACERS)) as pdf:
+        page = pdf.pages[_ASYM_PAGE - 1]
+        width, height = float(page.width), float(page.height)
+        words = page.extract_words(x_tolerance=pt.PDF_X_TOLERANCE,
+                                   use_text_flow=False, keep_blank_chars=False)
+        y_split = pt._find_vertical_split(words, width, height)
+        x_mid = pt._vote_column_gap(words, width, height, y_split)
+        assert x_mid is not None
+        front, left_top, right_top = pt._extract_top_region(
+            page, words, width, height, y_split, x_mid)
+
+    # 右栏顶部（Fig.3 图注那块）必须落在 right_top，而不是 front
+    assert any("Fig.3" in p for p in right_top), \
+        "顶部区域的右栏内容没有归到右栏"
+    assert not any("Fig.3" in p for p in front), \
+        "右栏的 Fig.3 图注被当成整宽块抢到了最前面"
+    # 左栏在这一页顶部是显微照片（没有文字），所以左栏顶部可以为空；
+    # 但只要有内容，就必须归到 left_top 而不是 front。
+    assert not any("Fig.3" in p for p in left_top), \
+        "右栏内容混进了左栏"
+    assert left_top == [] or all("Fig.3" not in p for p in left_top)

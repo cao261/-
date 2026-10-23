@@ -1350,8 +1350,51 @@
       from { opacity: 0; transform: translateY(20px) scale(0.98); }
       to   { opacity: 1; transform: translateY(0) scale(1); }
     }
-    .reader-qa-panel.minimized { height: 46px !important; }
-    .reader-qa-panel.minimized .qa-body { display: none !important; }
+    /* ---------- QA panel: 最小化 = 收成侧边栏 ----------
+       用户原话（2026-10-23）："划线解答有点问题，最好点最小化能够缩小至
+       侧边栏"。
+
+       旧实现只是把高度压到 46px，面板仍然是 460px 宽 —— 屏幕上还是占着
+       一大块，挡着 PDF 原文。现在最小化 = 收成一条贴右边��的窄竖条
+       （宽 44px），标题竖排显示，点一下就展开。
+
+       关键点：收起的条必须**跟随面板的位置**（面板被拖到左边时，条也要
+       在左边），所以这里不写死 right，而是用 JS 在 toggle 时补上
+       left/top 定位；同时用 .qa-collapsed 类而不是 .minimized，避免和
+       旧的 height 覆盖规则打架。 */
+    .reader-qa-panel.qa-collapsed {
+      width: 44px !important;
+      min-width: 44px !important;
+      height: auto !important;
+      min-height: 0 !important;
+      max-height: calc(var(--app-vh) - 120px);
+      right: auto !important;
+      bottom: auto !important;
+      overflow: hidden;
+      border-radius: var(--r-lg) 0 0 var(--r-lg);
+      box-shadow: var(--sh-3);
+    }
+    .reader-qa-panel.qa-collapsed .qa-body,
+    .reader-qa-panel.qa-collapsed .qa-resize-tip { display: none !important; }
+    .reader-qa-panel.qa-collapsed .qa-panel-head {
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 4px;
+      cursor: pointer;
+      height: 100%;
+    }
+    .reader-qa-panel.qa-collapsed .qa-panel-title {
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+      letter-spacing: 2px;
+      font-size: 0.8125rem;
+      white-space: nowrap;
+    }
+    .reader-qa-panel.qa-collapsed .qa-panel-sub,
+    .reader-qa-panel.qa-collapsed #qa-panel-model-pill { display: none !important; }
+    .reader-qa-panel.qa-collapsed .qa-panel-head .row { flex-direction: column; }
 
     /* ---------- QA panel: 可拖动 + 可缩放 ----------
        用户在 27 寸屏上嫌它"只在角落里一小块、只能看一部分"：
@@ -5990,7 +6033,48 @@
 
     function minimizeReaderQAPanel() {
       const panel = document.getElementById("reader-qa-panel");
-      if (panel) panel.classList.toggle("minimized");
+      if (!panel) return;
+      const collapsed = panel.classList.toggle("qa-collapsed");
+      if (collapsed) {
+        // 收起时先记住当前位置/尺寸（展开时还原），并把面板移到当前所在
+        // 那一侧的边缘 —— 拖到左边就贴左边，不要永远贴右边。
+        const r = panel.getBoundingClientRect();
+        panel.dataset.restoreLeft = String(Math.round(r.left));
+        panel.dataset.restoreTop = String(Math.round(r.top));
+        panel.dataset.restoreWidth = String(Math.round(r.width));
+        panel.dataset.restoreHeight = String(Math.round(r.height));
+
+        const railH = Math.min(r.height, window.innerHeight - 120);
+        panel.style.left = Math.max(0, Math.min(r.left, window.innerWidth - 44)) + "px";
+        panel.style.top = Math.max(0, Math.min(r.top, window.innerHeight - railH)) + "px";
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+        // 贴着窗口边缘：靠右就 right=0，靠左就 left=0
+        if (r.left + r.width > window.innerWidth - 60) {
+          panel.style.left = "auto";
+          panel.style.right = "0px";
+        }
+      } else {
+        // 展开：还原之前的位置与尺寸
+        const lw = parseInt(panel.dataset.restoreWidth || "", 10);
+        const lh = parseInt(panel.dataset.restoreHeight || "", 10);
+        if (lw) panel.style.width = lw + "px";
+        if (lh) panel.style.height = lh + "px";
+        const ll = parseInt(panel.dataset.restoreLeft || "", 10);
+        const lt = parseInt(panel.dataset.restoreTop || "", 10);
+        if (!isNaN(ll)) panel.style.left = ll + "px";
+        if (!isNaN(lt)) panel.style.top = lt + "px";
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      }
+    }
+
+    // 收起状态下点标题栏也能展开（竖条上不方便够到小按钮）
+    function _qaCollapsedHeadClick(e) {
+      const panel = document.getElementById("reader-qa-panel");
+      if (!panel || !panel.classList.contains("qa-collapsed")) return;
+      if (e.target.closest("button")) return;
+      minimizeReaderQAPanel();
     }
 
     function openReaderQAPanel(presetQ = null) {
@@ -5998,6 +6082,7 @@
       if (!panel) return;
       panel.style.display = "flex";
       panel.classList.remove("minimized");
+      panel.classList.remove("qa-collapsed");
 
       // Hide bubble if showing
       const bubble = document.getElementById("reader-selection-bubble");
@@ -7394,6 +7479,84 @@
       }
     }
 
+    // -------------------------------------------------------------------
+    // 截取「所选片段所在页面」的图片 —— 多模态答疑兜底
+    // -------------------------------------------------------------------
+    // 用户原话（2026-10-23）："minimaxm3 是多模态模型，如果表或者图不好
+    // 文字化给他的话，完全可以截图给它，让它回答问题"。
+    //
+    // 为什么需要：表格和曲线图被 pdfplumber 抽出来只是碎片（"2 4 3" 这种
+    // 上下标、坐标轴刻度），模型看到一堆没意义的字符，自然答不上来。
+    //
+    // 实现：直接用已经渲染好的 PDF.js 画布裁剪 —— 不额外请求服务端，
+    // 也没有编码/分辨率的往返损耗。选区矩形 (_readerSelState.rects) 是
+    // 相对页面画布的归一化坐标，直接换算成像素即可。
+    function _captureSelectionPageImage() {
+      try {
+        const pageNum = _readerSelState.pageNum;
+        if (!pageNum) return null;
+        const block = document.getElementById(`pdf-page-block-${pageNum}`);
+        if (!block) return null;
+        const canvas = block.querySelector("canvas.pdf-page-canvas");
+        if (!canvas || !canvas.width || !canvas.height) return null;
+
+        // 选区矩形（归一化）→ 包围盒；没有选区就发整页
+        let box = null;
+        const rects = (_readerSelState.rects || []).filter(
+          r => r && r.w > 0 && r.h > 0
+        );
+        if (rects.length) {
+          let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+          rects.forEach(r => {
+            x0 = Math.min(x0, r.x);
+            y0 = Math.min(y0, r.y);
+            x1 = Math.max(x1, r.x + r.w);
+            y1 = Math.max(y1, r.y + r.h);
+          });
+          // 往外扩一点：表格/图注常常比划选范围大
+          const padX = Math.max(0.02, (x1 - x0) * 0.12);
+          const padY = Math.max(0.02, (y1 - y0) * 0.12);
+          x0 = Math.max(0, x0 - padX);
+          y0 = Math.max(0, y0 - padY);
+          x1 = Math.min(1, x1 + padX);
+          y1 = Math.min(1, y1 + padY);
+          box = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        }
+
+        // 输出尺寸上限：太长 base64 会把请求撑爆，缩到 ~1400px 宽足够看清
+        const MAX_W = 1400;
+        const sw = box ? box.w * canvas.width : canvas.width;
+        const sh = box ? box.h * canvas.height : canvas.height;
+        const scale = Math.min(1, MAX_W / Math.max(1, sw));
+        const ow = Math.max(1, Math.round(sw * scale));
+        const oh = Math.max(1, Math.round(sh * scale));
+
+        const out = document.createElement("canvas");
+        out.width = ow;
+        out.height = oh;
+        const ctx = out.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, ow, oh);
+        if (box) {
+          ctx.drawImage(
+            canvas,
+            Math.round(box.x * canvas.width),
+            Math.round(box.y * canvas.height),
+            Math.round(box.w * canvas.width),
+            Math.round(box.h * canvas.height),
+            0, 0, ow, oh
+          );
+        } else {
+          ctx.drawImage(canvas, 0, 0, ow, oh);
+        }
+        const dataUrl = out.toDataURL("image/png");
+        if (!dataUrl || dataUrl.length < 200) return null;
+        return dataUrl;   // "data:image/png;base64,...."
+      } catch (e) {
+        return null;   // 截图失败不该挡住答疑
+      }
+    }
+
     async function submitReaderQA() {
       const qInput = document.getElementById("qa-question-input");
       const question = (qInput ? qInput.value.trim() : "");
@@ -7452,6 +7615,13 @@
           `换 preset 可强制覆盖路由结果`;
       }
 
+      // 多模态兜底：把所选页面截图一起发给模型（表格/曲线图不好文字化时，
+      // 光靠抽出来的碎片文本是答不出来的）。截图失败不影响正常答疑。
+      let pageImage = null;
+      if (_readerSelState.source === "pdf") {
+        pageImage = _captureSelectionPageImage();
+      }
+
       const payload = {
         // Backend caps: selected_text 15000 / question 1000 / paper_title 300.
         selected_text: (_readerSelState.text || "(用户未划选特定片段,提问全篇整体背景)").slice(0, 15000),
@@ -7459,6 +7629,8 @@
         paper_title: (_readerState.title || "").slice(0, 300),
         surrounding_context: surroundingContext,
         source_type: _readerSelState.source || "general",
+        page_image: pageImage,
+        pdf_relative_path: (_pdfState && _pdfState.relativePath) || null,
         // Tell the server which scope we used. Without it the backend
         // falls back to the mid cap (8000) and silently truncates the
         // wide (20K) / full (50K) contexts.
@@ -7928,7 +8100,7 @@
       </button>
 
       <div id="reader-qa-panel" class="reader-qa-panel">
-        <div class="qa-panel-head">
+        <div class="qa-panel-head" onclick="_qaCollapsedHeadClick(event)">
           <div>
             <div class="qa-panel-title">划词答疑 · AI 学术助手</div>
             <div class="qa-panel-sub">针对所选片段深度解答与推导</div>
