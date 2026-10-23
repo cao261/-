@@ -2026,21 +2026,21 @@
       </div>
 
       <div class="hero-metrics">
-        <div class="metric-item">
-          <div class="metric-val" id="stat-lit">0</div>
-          <div class="metric-label">文献典藏</div>
+        <div class="metric-item" id="stat-pdf-item" title="vault 里的论文原文（PDF）数">
+          <div class="metric-val" id="stat-pdf">0</div>
+          <div class="metric-label">论文典藏</div>
         </div>
-        <div class="metric-item">
+        <div class="metric-item" id="stat-pages-item" title="已经翻译好的页数（跨设备共享）">
+          <div class="metric-val" id="stat-pages">0</div>
+          <div class="metric-label">精读译文</div>
+        </div>
+        <div class="metric-item" id="stat-anno-item" title="划词标注 + 手写笔记的条数（跨设备共享）">
+          <div class="metric-val" id="stat-anno">0</div>
+          <div class="metric-label">划词批注</div>
+        </div>
+        <div class="metric-item" id="stat-repro-item" title="02_Reproduction 下的复现工程数">
           <div class="metric-val" id="stat-repro">0</div>
           <div class="metric-label">复现工程</div>
-        </div>
-        <div class="metric-item">
-          <div class="metric-val" id="stat-trouble">0</div>
-          <div class="metric-label">避坑沉淀</div>
-        </div>
-        <div class="metric-item">
-          <div class="metric-val" id="stat-weekly">0</div>
-          <div class="metric-label">周报归档</div>
         </div>
       </div>
     </section>
@@ -2584,7 +2584,11 @@
       }
       async function loadRecentFeed(append = false) {
         const includeQA = document.getElementById("feed-include-qa")?.checked || false;
-        const state = window._feedState;
+        // 状态对象可能还没建（初始化顺序问题）——就地补一个，别让这里抛出去
+        const state = window._feedState || (window._feedState = {
+          items: [], filteredTotal: 0, shownCount: 0, pageSize: 5,
+          offset: 0, hasMore: false,
+        });
         const PAGE = 50; // server page size; client-side paginates within a page
         // A fresh load (or a filter change) always restarts at offset 0.
         if (!append) state.offset = 0;
@@ -2932,19 +2936,44 @@
      * vault switch down with it.
      */
     async function loadStats() {
-      updateObsidianStatus();
-      await loadRecentFeed();
+      // 统计数字是看板的本体，必须先拿到手。
+      // feed 和 Obsidian 状态都是附属品：它们失败（甚至抛 ReferenceError）
+      // 都不能把数字带走 —— 之前这里是 `await loadRecentFeed()` 排在前面，
+      // 它一抛错，数字就永远停在初始的 0（用户看到的「看板全是零」）。
       try {
         const res = await fetch("/api/stats");
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
-        document.getElementById("stat-lit").innerText = data.literature_total;
-        document.getElementById("stat-repro").innerText = data.reproduction_total;
-        document.getElementById("stat-trouble").innerText = data.troubleshoot_count;
-        document.getElementById("stat-weekly").innerText = data.weekly_count;
+        // 看板显示「真实产出」：论文原文数 / 已译页数 / 划词批注数 / 复现工程数。
+        // 之前这里只数 .md 笔记卡片等工具产物，而实际主线（翻论文、翻译、
+        // 划词、批注）的产出没被计入 —— 看板永远是 0，看着像坏了。
+        document.getElementById("stat-pdf").innerText = data.pdf_total ?? 0;
+        document.getElementById("stat-pages").innerText = data.translated_pages ?? 0;
+        document.getElementById("stat-anno").innerText = data.annotation_count ?? 0;
+        document.getElementById("stat-repro").innerText = data.reproduction_total ?? 0;
+        // 其余计数不占展示位，悬停提示里能看到
+        const litItem = document.getElementById("stat-pdf-item");
+        if (litItem) {
+          litItem.title =
+            `论文原文 ${data.pdf_total ?? 0} 篇 · 文献笔记 ${data.note_total ?? 0} 张\n` +
+            `避坑沉淀 ${data.troubleshoot_count ?? 0} 条 · 周报归档 ${data.weekly_count ?? 0} 篇`;
+        }
+        console.log("[stats] 看板统计已更新", {
+          pdf: data.pdf_total, pages: data.translated_pages,
+          anno: data.annotation_count, repro: data.reproduction_total,
+        });
       } catch (err) {
         console.error("加载统计数据失败", err);
       }
+      // 附属品：失败也不影响上面的数字
+      try {
+        const fn = window.updateObsidianStatus || updateObsidianStatus;
+        if (typeof fn === "function") fn();
+      } catch (e) { console.warn("更新 Obsidian 状态失败", e); }
+      try {
+        const fn = window.loadRecentFeed || loadRecentFeed;
+        if (typeof fn === "function") await fn();
+      } catch (e) { console.warn("加载文献 feed 失败", e); }
     }
 
     async function handleFetchPaper() {
@@ -3426,7 +3455,10 @@
       }
     }
 
-    window.addEventListener("DOMContentLoaded", () => {
+    // DOMContentLoaded 可能早就触发过了（脚本在 body 末尾、或页面从
+    // bfcache 恢复），只挂监听器会永远等不到 —— 用 readyState 兜底，
+    // 否则整个初始化（含看板统计）一次都不会跑。
+    const _bootDashboard = () => {
       _applyTheme(document.documentElement.getAttribute("data-theme") || "light");
       _initHeaderScrollState();
       loadStats();
@@ -3455,7 +3487,12 @@
         }
         if (p) openVaultPdf(p);
       } catch (e) { showToast("打开失败: " + e.message, true); }
-    });
+    };
+    if (document.readyState === "loading") {
+      window.addEventListener("DOMContentLoaded", _bootDashboard);
+    } else {
+      _bootDashboard();
+    }
 
     // ----- Paper Full-Text Reader (V1.4) -----
     async function handlePasteTextFallback() {

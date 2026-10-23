@@ -921,6 +921,69 @@ async def serve_pwa_asset(filename: str):
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": "max-age=86400"})
 
 
+# ---------------------------------------------------------------------------
+# 看板「真实产出」统计
+# ---------------------------------------------------------------------------
+# 看板原来只数「用工具生成的结构化产物」：.md 笔记卡片、复现工程目录、
+# 踩坑日记、周报。但用户实际的主线是「翻论文 → 翻译 → 划词 → 批注」——
+# 这条线上的产出（论文原文、已译页数、批注）一个都没被计入，于是看板永远
+# 是 0，看着像坏了。下面把真实产出也统计出来。
+#
+# 译文/批注住在同步目录（坚果云），所以两台设备看到的是同一份数字。
+
+_REAL_STATS_CACHE: dict = {}
+_REAL_STATS_TS: float = 0.0
+_REAL_STATS_TTL = 15.0   # 秒
+
+
+def _real_output_stats() -> dict:
+    """论文原文数 / 笔记数 / 已译页数 / 批注条数。"""
+    global _REAL_STATS_CACHE, _REAL_STATS_TS
+    now = time.monotonic()
+    if _REAL_STATS_CACHE and (now - _REAL_STATS_TS) < _REAL_STATS_TTL:
+        return dict(_REAL_STATS_CACHE)
+
+    pdf_total = note_total = 0
+    lit = BASE_DIR / "01_Literature"
+    if lit.is_dir():
+        for p in lit.rglob("*"):
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            suf = p.suffix.lower()
+            if suf == ".pdf":
+                pdf_total += 1
+            elif suf in (".md", ".markdown"):
+                note_total += 1
+
+    translated_pages = 0
+    snap_dir = _sync_root() / "snapshots"
+    if snap_dir.is_dir():
+        for fp in snap_dir.glob("*.json"):
+            data = _safe_read_json(fp) or {}
+            pages = data.get("pages")
+            if isinstance(pages, list):
+                translated_pages += len(pages)
+
+    annotation_count = 0
+    ann_dir = _sync_root() / "annotations"
+    if ann_dir.is_dir():
+        for fp in ann_dir.glob("*.json"):
+            data = _safe_read_json(fp) or {}
+            items = data.get("annotations")
+            if isinstance(items, list):
+                annotation_count += len(items)
+
+    out = {
+        "pdf_total": pdf_total,
+        "note_total": note_total,
+        "translated_pages": translated_pages,
+        "annotation_count": annotation_count,
+    }
+    _REAL_STATS_CACHE = out
+    _REAL_STATS_TS = now
+    return dict(out)
+
+
 @app.get("/api/stats")
 def api_stats():
     """Vault counters for the dashboard.
@@ -934,11 +997,15 @@ def api_stats():
     """
     try:
         stats = get_vault_stats()
+        real = _real_output_stats()
         return {
+            # 旧字段（工具产出的结构化产物）保留，别的地方还在用
             "literature_total": stats.get("literature_total", 0),
             "reproduction_total": stats.get("reproduction_total", 0),
             "troubleshoot_count": stats.get("troubleshoot_count", 0),
             "weekly_count": stats.get("weekly_count", 0),
+            # 真实产出：看板现在显示的是这几个
+            **real,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"读取 vault 统计失败: {str(e)}")
