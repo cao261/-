@@ -24,6 +24,20 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# ---------------------------------------------------------------------------
+# 在任何 microbench 模块被 import 之前，先占住部署开关。
+#
+# `microbench.llm` 在 import 时 `load_dotenv(..., override=False)`，会把 .env
+# 的值灌进 os.environ。而 .env 是**部署配置**（这台机器要 SYNC_PDF_BODY=0，
+# 因为 vault 整体搬进了坚果云），pytest 跑在同一进程里也会吃到 → files 通道
+# 的 11 个测试因为「通道被关」集体变红，看着像代码坏了，其实是环境泄漏。
+#
+# load_dotenv 是 override=False：**已存在的环境变量不会被覆盖** → 这里先占位，
+# .env 就进不了测试进程。setdefault 而非硬赋值：想显式用别的值跑测试时，
+# `SYNC_PDF_BODY=0 pytest` 仍然有效。
+# ---------------------------------------------------------------------------
+os.environ.setdefault("SYNC_PDF_BODY", "1")
+
 
 @pytest.fixture(scope="session")
 def project_root() -> Path:
@@ -34,6 +48,26 @@ def project_root() -> Path:
 def real_vault() -> Path:
     """The real project root (= the Obsidian vault)."""
     return PROJECT_ROOT
+
+
+@pytest.fixture(autouse=True)
+def _pin_sync_pdf_body(monkeypatch):
+    """测试不依赖本机 .env 里的部署开关。
+
+    `microbench.llm` 在 import 时 `load_dotenv(..., override=False)`，会把 .env
+    的 SYNC_PDF_BODY 注进 os.environ。而部署方一旦把 vault 整体搬进坚果云，
+    就必须设 `SYNC_PDF_BODY=0`（PDF 直接由坚果云共享，files 通道不再传第二份），
+    于是 files 通道的 11 个测试会因为「通道被关」全红 —— 这是环境泄漏，不是
+    代码坏了。
+
+    测试套件固定跑**默认行为（通道开启）**；关闭模式由
+    `test_pdf_body_can_be_disabled` 显式 monkeypatch 覆盖。
+
+    上面模块级那句 `os.environ.setdefault(...)` 是第一道防线（不让 .env 进进程），
+    这个 fixture 是第二道（每个测试都保证，monkeypatch 结束后自动还原）。
+    两道都要：fixture 只在测试执行期生效，模块级那道才挡得住 import 期泄漏。
+    """
+    monkeypatch.setenv("SYNC_PDF_BODY", "1")
 
 
 @pytest.fixture()
