@@ -234,6 +234,54 @@ vault 目录有写权限，那已在可信边界内。
 > 搬完 vault 后，坚果云里 files/*.pdf 记得用 `POST /api/sync/files/release {"all":true}`
 > 清掉（保留清单），否则会留一份 76MB 的冗余副本。
 
+#### 搬 vault 到坚果云：三步的正确顺序（2026-10-23 两台设备实测）
+
+`move_vault_to_cloud.py --apply` 的逻辑是「**目标已存在 → 跳过**」。
+所以只要云端已经有同名目录，它就**不会建 junction** —— 那台设备的 vault
+仍然是本地独立副本，两边各传各的，永远不会合并。
+
+正确顺序：
+
+1. **先合并**：把本地 vault 里云端没有的文件复制进云端目标目录，逐文件 sha256 校验。
+   实测对方设备先搬过一次，云端 `01_Literature` 只有 24 个 PDF，**缺全部 24 个笔记 .md**
+   （精读笔记 / 文献速览卡片 / 划词答疑 —— 用户真正的产出），`_Templates` 也是旧版。
+   直接 `--apply` 会跳过 `01_Literature` → 那 24 篇笔记永远上不了云。
+2. **再搬**：`--apply` 只处理云端还没有的目录
+   （`00_Dashboard` / `02_Reproduction` / `03_Knowledge` / `04_Weekly_Reports` / `.obsidian`）。
+3. **最后换 junction**：把 8 个本地目录改名到备份区（同盘 rename，秒级、不复制数据），
+   再 `mklink /J` 指向云端副本。校验 realpath 对得上 + 文件数一致；
+   回滚 = 删 junction + 改名回去。
+
+> ⚠️ 跨盘 move 是 copy+delete：文件被占用会在 delete 阶段失败、留下两份。
+> 搬之前先停服务，Obsidian 也要关（它锁 `.obsidian`）。
+> 两台设备必须各自都做这三步，且云端路径一致 —— 否则就是两份互不相干的 vault。
+
+#### 模板冲突：vault 的 `_Templates` 是用户地盘
+
+vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
+`microbench/templates/` 是随代码走的兜底副本（`ensure_vault_templates()` 只在缺失时补，
+**绝不覆盖**）。两台设备各改各的 → 合并时同名文件必冲突。
+→ 判据：和 `microbench/templates/` 一致的是「标准骨架」，
+带用户上下文（学校 / 课题组 / 在研方向）的那份才是「个人版」→ **个人版优先**，
+标准版留档。
+
+#### `.obsidian` 的取舍：界面状态不要跨设备共享
+
+`workspace.json` 是 Obsidian 的**界面状态**（开了哪些面板、编辑器布局），
+两台都装 Obsidian 时会互相覆盖（谁后打开谁赢），布局也会串。
+→ **各留各的**：搬 vault 时 `.obsidian` 可以带进云端（"换位置设置也跟着走"），
+但**另一台设备不要给它建 junction**，让它用自己的本地目录。
+（2026-10-23 实测：30461 这台共享 `.obsidian`，25353 那台不共享。）
+
+#### `.env` 的部署开关会漏进测试进程
+
+`microbench/llm.py` 在 import 时 `load_dotenv(..., override=False)` →
+`.env` 里的 `SYNC_PDF_BODY=0` 会进 `os.environ` → files 通道的 11 个测试全红
+（报「通道被关」，看着像代码坏了，其实是环境泄漏）。
+→ `tests/conftest.py` 用 autouse fixture 把 `SYNC_PDF_BODY` 钉成 `1`，
+测试固定跑默认行为；关闭模式由 `test_pdf_body_can_be_disabled` 显式 monkeypatch。
+**任何按部署需要写进 `.env` 的开关，都要在这里钉住。**
+
 ### 4.5 抽取层：双栏顺序（详见 READER_CONTRACT）
 
 两种直觉做法**都错**：
