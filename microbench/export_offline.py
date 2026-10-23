@@ -35,6 +35,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import os
 import re
 import subprocess
 import sys
@@ -256,7 +257,11 @@ def build_katex_css() -> str:
         return f'url(data:font/woff2;base64,{cache[fname]}) format("woff2")'
 
     css = re.sub(r'url\(fonts/([A-Za-z0-9_.-]+\.woff2)\)\s*format\("woff2"\)', repl, css)
-    css = re.sub(r',\s*url\(fonts/[A-Za-z0-9_.-]+\.woff\)\s*format\("woff"\)', "", css)
+    # 清掉所有非 woff2 的字体回退 (.woff / .ttf)。留着它们浏览器会
+    # 去请求 fonts/KaTeX_xxx.ttf —— 单文件产物里没有这个文件，离线时
+    # 会留下 404 噪音，字体也可能回退到系统衬线体。
+    css = re.sub(r',\s*url\(fonts/[A-Za-z0-9_.-]+\.(?:woff|ttf)\)\s*format\("(?:woff|truetype)"\)',
+                 "", css)
     return css
 
 
@@ -776,17 +781,143 @@ def export_once(out_path: Path, quiet: bool = False) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# 6. 平板工作台（可写 + 可同步 + 可用 AI）
+# ---------------------------------------------------------------------------
+
+TABLET_DIR = HERE / "static" / "tablet"
+
+
+def detect_cloud_dir() -> Path | None:
+    """找出一个「写进去就会上云」的目录。
+
+    坚果云客户端的同步根不是 %USERPROFILE%\\Nutstore，而是
+    <镜像根>\\<mirrorId>，镜像 id 从
+
+        %APPDATA%\\Nutstore\\config\\UsersMap.json
+
+    里读。而且 **在镜像根下新建顶层文件夹不会上云** —— 必须放进坚果云
+    自带的「我的坚果云」里面（那是真正的云端沙箱），否则客户端会记
+    sync_errors(reason=7)，上传量一直是 0。
+
+    找不到就返回 None，让调用方退回工作台根目录。
+    """
+    import json as _json
+
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        cfg = Path(appdata) / "Nutstore" / "config" / "UsersMap.json"
+        try:
+            data = _json.loads(cfg.read_text(encoding="utf-8"))
+            cache = Path(data.get("cachePath", ""))
+            mirror = (data.get("users") or {}).get(data.get("activeUser", ""), "")
+            if cache and mirror:
+                root = cache / str(mirror)
+                for name in ("我的坚果云", "Nutstore"):
+                    cand = root / name
+                    if cand.is_dir():
+                        return cand
+                if root.is_dir():
+                    return root
+        except (OSError, ValueError, _json.JSONDecodeError):
+            pass
+
+    # 其它常见云盘
+    home = Path.home()
+    for cand in (home / "OneDrive", home / "BaiduNetdiskDownload",
+                 home / "iCloudDrive"):
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def build_tablet_html(notes: list[Note], katex_css: str) -> str:
+    """把平板工作台打包成一个自包含的 HTML 文件。
+
+    与只读版的关键差别：
+
+      * 携带 **Markdown 源码**而不是烘焙好的 HTML —— 平板上编辑后要能
+        立刻重新渲染（含公式），所以渲染器必须跟着走。
+      * 内联 KaTeX 的 JS 运行时 —— 只读版把公式烘焙进 HTML 就不需要它；
+        可写版不行：用户在平板上敲的公式没人替它渲染。
+      * 内联 app.js / styles.css —— 平板工作台的逻辑有上千行，藏在
+        Python 的字符串模板里没法维护。
+    """
+    index = (TABLET_DIR / "index.html").read_text(encoding="utf-8")
+    app_css = (TABLET_DIR / "styles.css").read_text(encoding="utf-8")
+    app_js = (TABLET_DIR / "app.js").read_text(encoding="utf-8")
+
+    katex_js_path = KATEX_DIST / "katex.min.js"
+    katex_js = katex_js_path.read_text(encoding="utf-8") if katex_js_path.exists() else ""
+
+    # 图标内联，保持单文件
+    icon_path = HERE / "static" / "apple-touch-icon.png"
+    icon_uri = ""
+    if icon_path.exists():
+        icon_uri = "data:image/png;base64," + base64.b64encode(
+            icon_path.read_bytes()).decode("ascii")
+
+    payload = []
+    for n in notes:
+        payload.append({
+            "id": n.rel,
+            "title": n.title,
+            "rel": n.rel,
+            "group": n.folder,
+            "body": n.body,
+            "mtime": 0,
+        })
+    data_json = json.dumps({"notes": payload}, ensure_ascii=False)
+    data_json = data_json.replace("</", "<\\/")
+
+    out = index
+    out = out.replace("__ICON__", icon_uri)
+    out = out.replace("<!--INLINE_KATEX_CSS-->", "<style>\n" + katex_css + "\n</style>")
+    out = out.replace("<!--INLINE_APP_CSS-->", "<style>\n" + app_css + "\n</style>")
+    out = out.replace("<!--INLINE_KATEX_JS-->",
+                      "<script>\n" + katex_js + "\n</script>")
+    out = out.replace("<!--INLINE_APP_JS-->",
+                      "<script>\n" + app_js + "\n</script>")
+    out = out.replace("__DATA__", data_json)
+    return out
+
+
+def export_tablet(out_path: Path, quiet: bool = False) -> bool:
+    def say(*a):
+        if not quiet:
+            print(*a)
+
+    say("[tablet] 扫描 vault ...")
+    notes = collect_notes()
+    if not notes:
+        print("没有找到任何笔记", file=sys.stderr)
+        return False
+    say(f"[tablet] {len(notes)} 篇笔记")
+
+    say("[tablet] 内联 KaTeX 运行时与字体 ...")
+    katex_css = build_katex_css()
+
+    say("[tablet] 组装单文件 ...")
+    doc = build_tablet_html(notes, katex_css)
+    out_path.write_text(doc, encoding="utf-8")
+    say(f"[tablet] 完成: {out_path}  ({out_path.stat().st_size/1024:.0f} KB)")
+    return True
+
+
 def main() -> int:
     import argparse
     import time
 
     ap = argparse.ArgumentParser(
-        description="把 vault 导出成单文件离线阅读版 (平板可用, 零外部依赖)",
+        description="把 vault 导出成单文件离线版 (平板可用, 零外部依赖)",
     )
     ap.add_argument("output", nargs="?", default=None,
                     help="输出 HTML 路径 (默认: 工作台根目录/MicroBench_离线阅读版.html)")
     ap.add_argument("--watch", nargs="?", const=60, type=int, metavar="SECONDS",
                     help="常驻监视 vault, 有改动就重新导出 (默认每 60 秒检查一次)")
+    ap.add_argument("--tablet", action="store_true",
+                    help="导出「平板工作台」: 可编辑 + 可同步 + 可用 AI "
+                         "(默认输出 MicroBench_平板工作台.html)")
     ap.add_argument("--quiet", action="store_true", help="不打印进度")
     args = ap.parse_args()
 
@@ -803,17 +934,29 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass
 
-    out_path = Path(args.output) if args.output else (REPO / "MicroBench_离线阅读版.html")
+    if args.tablet:
+        default_out = REPO / "MicroBench_平板工作台.html"
+    else:
+        default_out = REPO / "MicroBench_离线阅读版.html"
+    out_path = Path(args.output) if args.output else default_out
     out_path = out_path.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    export = export_tablet if args.tablet else export_once
+
     if not args.watch:
-        ok = export_once(out_path, quiet=args.quiet)
+        ok = export(out_path, quiet=args.quiet)
         if ok and not args.quiet:
-            print("\n  用法: 把这个文件拷到平板 (AirDrop / 微信文件传输 / U 盘),")
-            print("        在 iPad 上用 Safari 打开,或存到 '文件' App 后点开。")
-            print("  想让平板永远拿到最新内容: 把输出目录设成云盘目录,")
-            print("        平板直接用云盘 App 打开这个 HTML 即可。")
+            if args.tablet:
+                print("\n  用法: 把这个文件放到平板上打开 (AirDrop / 微信 / 拷进云盘目录)。")
+                print("        打开后在设置里「连接文件夹」,选中云盘里的 vault 目录,")
+                print("        平板就能直接读写那个文件夹 (安卓 Chrome 支持真双向)。")
+                print("        再在设置里填上 MiniMax API Key,AI 解读/翻译就能用了。")
+            else:
+                print("\n  用法: 把这个文件拷到平板 (AirDrop / 微信文件传输 / U 盘),")
+                print("        在 iPad 上用 Safari 打开,或存到 '文件' App 后点开。")
+                print("  想让平板永远拿到最新内容: 把输出目录设成云盘目录,")
+                print("        平板直接用云盘 App 打开这个 HTML 即可。")
         return 0 if ok else 1
 
     # ---- watch mode --------------------------------------------------
@@ -828,7 +971,7 @@ def main() -> int:
                 last = fp
                 ts = __import__("datetime").datetime.now().strftime("%H:%M:%S")
                 print(f"[watch {ts}] 检测到变化,重新导出 ...")
-                export_once(out_path, quiet=True)
+                export(out_path, quiet=True)
                 print(f"[watch {ts}] 完成 "
                       f"({out_path.stat().st_size/1024:.0f} KB)")
             time.sleep(args.watch)

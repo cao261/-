@@ -229,26 +229,69 @@ ANNOTATIONS_DIR=C:/Users/<你的用户名>/Nutstore/MicroBench批注
 
 ---
 
-## 📱 平板版（iPad / Android 平板）
+## 📱 平板版（Android 平板 / iPad）
 
-工作台有**两个**平板入口，取决于平板在不在你的电脑旁边：
+工作台有**三个**平板入口，按「电脑在不在手边」和「要不要能写」来选：
 
-| | 实时版（LAN） | 离线阅读版 |
-|---|---|---|
-| **启动方式** | 双击 `start_workbench_lan.bat` | 双击 `start_offline_sync.bat` |
-| **需要电脑开着** | ✅ 必须 | ❌ 不需要 |
-| **需要同一局域网** | ✅ 必须（同一个 Wi-Fi） | ❌ 不需要，文件带在平板上 |
-| **能做什么** | 全功能：抓论文、AI 解读/翻译、建卡、生成复现工程、周报 | 只读：看全部笔记与公式、全文搜索 |
-| **拿到最新内容** | 实时 | 需重新导出（见下） |
+| | **实时版（LAN）** | **平板工作台** ⭐ | **离线阅读版** |
+|---|---|---|---|
+| **启动方式** | `start_workbench_lan.bat` | `start_tablet_sync.bat` | `start_offline_sync.bat` |
+| **需要电脑开着** | ✅ 必须 | ❌ 不需要 | ❌ 不需要 |
+| **需要同一局域网** | ✅ 必须 | ❌ 不需要 | ❌ 不需要 |
+| **能写吗** | ✅ 全功能 | ✅ 能写能改 | ❌ 只读 |
+| **能用 AI 吗** | ✅ | ✅ 平板直连 API | ❌ |
+| **内容新鲜度** | 实时 | 实时（云盘同步） | 需重新导出 |
 
-### 实时版（电脑在旁边时用）
+### ⭐ 平板工作台（推荐：能写 + 同步 + AI）
+
+一个**单文件 HTML**（约 1 MB，零外部依赖），拷到平板上用 Chrome 打开即可：
+
+- **能写**：编辑现有笔记、新建笔记、速记；改动先存在平板本地（IndexedDB），离线也能写；
+- **能同步**：两种方式
+  - **目录直连**（安卓 Chrome）：设置 → 连接文件夹 → 选云盘里的 vault 目录，之后**真·原地双向读写**，云盘客户端负责上传下载；
+  - **变更包**（任何浏览器）：设置 → 导出变更包 → 把 json 放进 PC 的同步目录，PC 端自动合并回 vault；
+- **能用 AI**：设置里填一次 MiniMax API Key，**平板直连**（已实测 MiniMax 允许浏览器跨域），解读选中 / 翻译选中 / 摘要全文 / 自由提问，流式输出；
+- **公式正确渲染**：KaTeX 运行时和字体全部内嵌，离线也能渲染 `$...$` / `$$...$$`；
+- **安全**：密钥只存平板本地，不随笔记同步；笔记里的外来 HTML 过白名单消毒（`<script>`、`on*`、`javascript:` 全部拦掉）。
+
+#### 部署（推荐做法：让云盘接管 vault）
+
+```bash
+# 1) 先看看会搬什么（不动任何文件）
+python microbench/move_vault_to_cloud.py
+
+# 2) 确认后执行：vault 搬进「我的坚果云」，原路径留一个 junction
+python microbench/move_vault_to_cloud.py --apply
+```
+
+这样：
+
+```
+坚果云/我的坚果云/MicroBench工作台/   <- 真实文件在这里，云盘自动同步
+D:\...\个人工作台                    <- junction 指过去，路径完全不变
+```
+
+之后：
+
+1. 平板装坚果云 App，等它把目录同步下来；
+2. Chrome 打开 `MicroBench_平板工作台.html`（也在那个目录里）；
+3. 设置 → 连接文件夹 → 选「我的坚果云\MicroBench工作台」；
+4. **之后完全自动**：平板改的 .md 直接上云，PC 改的也直接下来，**电脑不用开着**。
+
+不想搬 vault 也能用：跳过第 1–2 步，直接双击 `start_tablet_sync.bat`，用「变更包」把改动回流。
+
+> **坚果云的一个坑**（实测）：同步根不是 `%USERPROFILE%\Nutstore`，而是 `<镜像根>\<mirrorId>`，镜像 id 在
+> `%APPDATA%\Nutstore\config\UsersMap.json` 里。而且**在镜像根下新建顶层文件夹不会上云**——
+> 必须放进坚果云自带的「我的坚果云」里面。`move_vault_to_cloud.py` 已经处理好了。
+
+### 实时版（电脑在旁边，想用全功能时）
 
 1. 双击 **`start_workbench_lan.bat`**，窗口里会打印：
    ```
    [推荐] 一键配对 (自动填入口令):
       http://192.168.1.101:5000/?k=XXXXXXXXXXXX
    ```
-2. 平板连**同一个 Wi-Fi**，用 Safari 打开上面那行带 `?k=` 的地址 → 自动完成配对，浏览器会记住口令，之后直接开 `http://192.168.1.101:5000/` 即可；
+2. 平板连**同一个 Wi-Fi**，用 Safari / Chrome 打开上面那行带 `?k=` 的地址 → 自动完成配对，之后直接开 `http://192.168.1.101:5000/` 即可；
 3. **iPad**：分享按钮 → 添加到主屏幕，即可全屏运行（已配置 PWA manifest + standalone 模式）；
    **Android**：Chrome 菜单 → 添加到主屏幕；
 4. 页面已针对平板适配：触控目标 ≥44pt、安全区避让、竖屏单栏、阅读栏宽限制。
@@ -264,7 +307,7 @@ ANNOTATIONS_DIR=C:/Users/<你的用户名>/Nutstore/MicroBench批注
 > netsh advfirewall firewall add rule name="MicroBench 5000" dir=in action=allow protocol=TCP localport=5000 profile=private
 > ```
 
-### 离线阅读版（没带电脑时用）
+### 离线阅读版（只想看，零依赖）
 
 把整个 vault 烘焙成**一个自包含的 HTML 文件**（`MicroBench_离线阅读版.html`）：
 
@@ -273,22 +316,18 @@ ANNOTATIONS_DIR=C:/Users/<你的用户名>/Nutstore/MicroBench批注
 - 目录树导航 + 全文搜索 + 深色模式 + 触控适配；
 - 1.3 MB 一个文件，AirDrop / 微信文件传输 / U 盘都能拷。
 
-**保持内容最新**（这是离线版唯一需要操心的点）：
+**保持内容最新**：
 
 ```bash
 # 手动导出一次
 python microbench/export_offline.py
 
-# 或者常驻监视,笔记一改就自动重导 (每 60 秒检查)
+# 或者常驻监视,笔记一改就自动重导 (每 60 秒检查一次)
 python microbench/export_offline.py --watch
 
 # 输出到云盘目录 —— 平板用云盘 App 直接打开,永远是最新的
 python microbench/export_offline.py "D:/OneDrive/MicroBench.html"
 ```
-
-双击 **`start_offline_sync.bat`** 更省事：把一个云盘文件夹拖到它上面，它会先导一次然后常驻监视，之后你只管写笔记。
-
-> **能不能在平板上编辑？** 离线版是只读的。想在平板上**读 + 改**，把整个 vault 放进 OneDrive / 坚果云 / Obsidian Sync，用 iPad 版 Obsidian 打开——Obsidian 原生支持 LaTeX 公式和双链，体验比这个 HTML 还好。代价是需要处理同步冲突。
 
 ---
 

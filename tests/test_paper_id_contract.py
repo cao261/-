@@ -107,7 +107,8 @@ def _run_frontend(paths: list) -> dict:
         js_path.write_text(js, encoding="utf-8")
         json_path.write_text(json.dumps(paths, ensure_ascii=False), encoding="utf-8")
         proc = subprocess.run([node, str(js_path), str(json_path)],
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, encoding="utf-8",
+                              timeout=60)
     assert proc.returncode == 0, f"node 执行失败:\n{proc.stderr}"
     return json.loads(proc.stdout)
 

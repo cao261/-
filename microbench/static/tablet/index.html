@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>MicroBench · 平板工作台</title>
+<meta name="theme-color" content="#F7F4ED">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="MicroBench">
+<meta name="apple-touch-icon" href="__ICON__">
+<!--INLINE_KATEX_CSS-->
+<!--INLINE_APP_CSS-->
+</head>
+<body>
+
+<!-- ===================== 顶栏 ===================== -->
+<header class="tb-top">
+  <button class="tb-icon tb-only-narrow" id="btn-menu" aria-label="目录">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+  </button>
+  <div class="tb-brand">Micro<em>Bench</em><span class="tb-brand-sub">平板工作台</span></div>
+  <div class="tb-spacer"></div>
+  <div class="tb-search-wrap">
+    <input class="tb-search" id="search" type="search" placeholder="搜索笔记…" autocomplete="off"
+           autocapitalize="off" autocorrect="off" spellcheck="false">
+  </div>
+  <button class="tb-icon" id="btn-sync" aria-label="同步" title="同步">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-8-4.8"/><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 8 4.8"/><path d="M21 4v5h-5"/><path d="M3 20v-5h5"/></svg>
+    <span class="tb-dot" id="sync-dot"></span>
+  </button>
+  <button class="tb-icon" id="btn-settings" aria-label="设置" title="设置">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+  </button>
+</header>
+
+<!-- ===================== 主区 ===================== -->
+<div class="tb-shell">
+
+  <!-- 目录 -->
+  <nav class="tb-nav" id="nav">
+    <div class="tb-nav-head">
+      <button class="tb-btn tb-btn-primary tb-block" id="btn-new">+ 新建笔记</button>
+      <button class="tb-btn tb-block" id="btn-quick">速记</button>
+    </div>
+    <div class="tb-nav-list" id="nav-list"></div>
+    <div class="tb-nav-foot">
+      <span id="sync-status">本地模式</span>
+    </div>
+  </nav>
+
+  <!-- 正文 -->
+  <main class="tb-main" id="main">
+    <div class="tb-doc-head">
+      <div class="tb-crumb" id="crumb"></div>
+      <div class="tb-doc-actions">
+        <button class="tb-btn tb-sm" id="btn-edit">编辑</button>
+        <button class="tb-btn tb-sm" id="btn-ai">AI</button>
+        <span class="tb-dirty" id="dirty-flag" hidden>未同步</span>
+      </div>
+    </div>
+    <article class="tb-doc" id="doc"></article>
+  </main>
+
+  <!-- 右栏: 编辑 / AI -->
+  <aside class="tb-side" id="side">
+    <div class="tb-side-tabs">
+      <button class="tb-tab is-active" data-pane="edit">编辑</button>
+      <button class="tb-tab" data-pane="ai">AI</button>
+      <button class="tb-side-close" id="btn-side-close" aria-label="关闭">×</button>
+    </div>
+
+    <div class="tb-pane is-active" id="pane-edit">
+      <textarea class="tb-editor" id="editor" spellcheck="false"
+                placeholder="在此编辑 Markdown 源码。$...$ 是行内公式，$$...$$ 是块级公式。"></textarea>
+      <div class="tb-side-foot">
+        <span class="tb-hint" id="edit-hint"></span>
+        <button class="tb-btn tb-btn-primary tb-sm" id="btn-save">保存</button>
+      </div>
+    </div>
+
+    <div class="tb-pane" id="pane-ai">
+      <div class="tb-ai-actions" id="ai-actions">
+        <button class="tb-btn tb-sm" data-ai="explain">解读选中</button>
+        <button class="tb-btn tb-sm" data-ai="translate">翻译选中</button>
+        <button class="tb-btn tb-sm" data-ai="summarize">摘要全文</button>
+        <button class="tb-btn tb-sm" data-ai="ask">自由提问</button>
+      </div>
+      <div class="tb-ai-input">
+        <textarea id="ai-question" rows="2" placeholder="问点什么…（选中文字后点「解读选中」会带上原文）"></textarea>
+      </div>
+      <div class="tb-ai-output" id="ai-output"></div>
+    </div>
+  </aside>
+
+  <div class="tb-scrim" id="scrim"></div>
+</div>
+
+<!-- ===================== 底部标签栏 (窄屏) ===================== -->
+<nav class="tb-tabs" id="tabbar">
+  <button class="tb-tabbar-btn is-active" data-pane="nav">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+    <span>目录</span>
+  </button>
+  <button class="tb-tabbar-btn" data-pane="doc">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg>
+    <span>阅读</span>
+  </button>
+  <button class="tb-tabbar-btn" data-pane="edit">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+    <span>编辑</span>
+  </button>
+  <button class="tb-tabbar-btn" data-pane="ai">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 3l1.9 4.6L18.5 9l-4.6 1.9L12 15.5l-1.9-4.6L5.5 9l4.6-1.4z"/><path d="M18.5 15.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg>
+    <span>AI</span>
+  </button>
+</nav>
+
+<!-- ===================== 设置面板 ===================== -->
+<div class="tb-modal" id="modal-settings" hidden>
+  <div class="tb-modal-card">
+    <div class="tb-modal-head">
+      <span>设置</span>
+      <button class="tb-modal-x" data-close>×</button>
+    </div>
+
+    <div class="tb-modal-body">
+      <h4>AI 模型</h4>
+      <p class="tb-note">密钥只存在这台平板的本地存储里，不会随笔记同步出去。</p>
+      <label class="tb-field">
+        <span>接口地址</span>
+        <input id="cfg-base" type="url" placeholder="https://api.minimaxi.com/v1" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </label>
+      <label class="tb-field">
+        <span>API Key</span>
+        <input id="cfg-key" type="password" placeholder="sk-..." autocapitalize="off" autocorrect="off" spellcheck="false">
+      </label>
+      <label class="tb-field">
+        <span>模型（解读 / 推理）</span>
+        <input id="cfg-model" type="text" placeholder="MiniMax-M3.1-Flash" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </label>
+      <label class="tb-field">
+        <span>模型（翻译）</span>
+        <input id="cfg-model-t" type="text" placeholder="MiniMax-M3" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </label>
+      <div class="tb-row">
+        <button class="tb-btn tb-btn-primary tb-sm" id="btn-test-llm">测试连接</button>
+        <span class="tb-hint" id="llm-hint"></span>
+      </div>
+
+      <h4>同步</h4>
+      <p class="tb-note">
+        当前模式：<b id="sync-mode">仅本机</b>
+      </p>
+      <div class="tb-row tb-row-wrap">
+        <button class="tb-btn tb-sm" id="btn-connect-dir">连接文件夹（真双向）</button>
+        <button class="tb-btn tb-sm" id="btn-import-pack">载入 vault 包</button>
+        <button class="tb-btn tb-sm" id="btn-export-pack">导出变更包</button>
+      </div>
+      <p class="tb-note" id="sync-detail"></p>
+
+      <h4>外观</h4>
+      <div class="tb-row">
+        <button class="tb-btn tb-sm" id="btn-theme">切换深色 / 浅色</button>
+        <button class="tb-btn tb-sm tb-danger" id="btn-reset">清空本地数据</button>
+      </div>
+
+      <h4>关于</h4>
+      <p class="tb-note" id="about-note"></p>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== 新建 / 速记弹窗 ===================== -->
+<div class="tb-modal" id="modal-new" hidden>
+  <div class="tb-modal-card tb-modal-narrow">
+    <div class="tb-modal-head">
+      <span id="new-title">新建笔记</span>
+      <button class="tb-modal-x" data-close>×</button>
+    </div>
+    <div class="tb-modal-body">
+      <label class="tb-field">
+        <span>标题</span>
+        <input id="new-name" type="text" placeholder="笔记标题">
+      </label>
+      <label class="tb-field">
+        <span>存放位置</span>
+        <select id="new-folder"></select>
+      </label>
+      <label class="tb-field" id="new-body-field">
+        <span>内容</span>
+        <textarea id="new-body" rows="5" placeholder="正文（可留空，之后再写）"></textarea>
+      </label>
+      <div class="tb-row tb-row-end">
+        <button class="tb-btn tb-btn-primary tb-sm" id="btn-create">创建</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="file-pack" accept="application/json,.json" hidden>
+<input type="file" id="file-dir" webkitdirectory directory multiple hidden>
+
+<script type="application/json" id="mb-data">__DATA__</script>
+<!--INLINE_KATEX_JS-->
+<!--INLINE_APP_JS-->
+</body>
+</html>
