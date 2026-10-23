@@ -234,6 +234,28 @@ vault 目录有写权限，那已在可信边界内。
 > 搬完 vault 后，坚果云里 files/*.pdf 记得用 `POST /api/sync/files/release {"all":true}`
 > 清掉（保留清单），否则会留一份 76MB 的冗余副本。
 
+#### junction 要建哪几个目录
+
+vault 搬进坚果云后，**两台设备各自**在原路径建 junction，指向
+`<Nutstore>\<id>\我的坚果云\MicroBench工作台\<同名目录>`。
+
+**要共享的（笔记 / 工程 / 数据）**：
+
+```
+00_Dashboard   01_Literature   02_Reproduction   03_Knowledge
+04_Weekly_Reports   _Templates   assets
+```
+
+`.obsidian`：**两台都装 Obsidian 就共享**（同一套配置，插件和外观不用各配一遍）。
+代价只有 `workspace.json`（窗口布局）谁后打开谁赢 —— 比各留各的省事。
+
+> ⚠️ **两台建的目录名必须一致** —— 不一致的话坚果云会各传各的，不会合并。
+> 实测：两台各自建好同名 junction 后，写一边 → 另一边 1 秒内可见（同一份物理文件，
+> 不是两份各同步各的）；删一边 → 另一边一起消失。
+
+> ⚠️ **搬之前先停服务**：文件被占用时跨盘移动会在 delete 阶段失败
+> （copy 成功 delete 失败 → 留下两份）。真遇到了跑 `move_vault_to_cloud.py --undo` 还原。
+
 #### 搬 vault 到坚果云：三步的正确顺序（2026-10-23 两台设备实测）
 
 `move_vault_to_cloud.py --apply` 的逻辑是「**目标已存在 → 跳过**」。
@@ -414,19 +436,17 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 
 ---
 
-## 8. MiniMax Code 的「云端项目」机制（2026-10-23 查明）
+## 8. 已排除的方案：把项目「转成 MiniMax Code 云端项目」（查清后 pass）
 
-桌面端有「本地 / **云端**」两个 tab。云端项目**不是**本地项目表的一个 kind
-（`project_kind IN ('default','workspace')` 是写死的约束），它是**云端会话**：
+MiniMax Code 侧边栏有「本地 / **云端**」两个 tab，但**云端不是文件夹同步**，
+不要再往这个方向想：
 
-- 触发：在会话里输入 **`/cloud`**（`sendIntent: "cloud-handoff"`）
-- 流程：弹窗列文件 → 「确认并上传」→ 「正在上传到云端」→「**云端 Session 已就绪**」
-- 限制：单文件 ≤ 500MB、总体积 ≤ 500MB、最多 15,000 文件
-- **只收工作区内的文件**（`realpath` 必须落在 `workspaceRoot` 内）→ junction 里的文件会被拒
-- 本机 entitlement 检查：`allowed: true`（有云端项目配额）
-- 相关 API：`/minimax-cloud/api/v1/drive/file`、`/uploads/prepare`、`/session-shares`
-- 工作区索引（`workspace-indexing-enabled=true`）会在每轮对话后抓新修订并上传 OSS；
-  网络不通时会 `remote_state='failed_terminal'`（重试 8 次后停），网络恢复后 preflight 通过
+- `project_kind` 的数据库约束写死只有 `'default'` / `'workspace'`，**没有"云端项目"这个类型**
+- 云端 tab 里放的是**云端会话**（Cloud Session），由会话里的 `/cloud` 交接产生：
+  把对话历史 + 你勾选的文件传到 MiniMax 云盘，让**云端 agent 接着跑**
+- 它是「把重活委派给云端」的功能，**不是共享工作区**
+- 限制：单文件 ≤500MB、总体积 ≤500MB、≤15,000 文件、**只收工作目录内的文件**
+  → vault 搬进坚果云（junction）后，里面的文件会被判 `outside_workspace` 而拒传
 
-**用法**：一台设备 `/cloud` 上传 → 另一台设备在「云端」tab 打开同一个项目 →
-改一遍两边都有（这才是真正的「只改一遍」）。
+**结论：两台设备共享工作区的正确做法是「vault 整体进坚果云 + junction」**
+（见 §4.4 部署配置），不是 `/cloud`。这条路已 pass，别再反复折腾。
