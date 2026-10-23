@@ -217,6 +217,23 @@ vault 目录有写权限，那已在可信边界内。
 > 会被判 `outside_workspace` 而**拒绝上传云端**。
 > 所以「vault 搬坚果云」与「转成 MiniMax Code 云端项目」**互斥**。
 
+#### 部署配置：两台设备怎么配
+
+| `.env` 键 | 值 | 含义 |
+|---|---|---|
+| `ANNOTATIONS_DIR` | `<Nutstore>\<id>\我的坚果云\MicroBench同步` | 同步根（两台必须一致） |
+| `SYNC_PDF_BODY` | `1` / `0` | 是否经同步通道传 PDF 本体 |
+
+- **`SYNC_PDF_BODY=1`（默认）**：PDF 走 files 通道（增量 + 墓碑 + 自动补齐）。
+  适用于「vault 留在本地、只同步数据」。
+- **`SYNC_PDF_BODY=0`**：files 通道跳过 PDF 发布/还原/墓碑。
+  适用于「vault 整体搬进坚果云 + junction」——那时两台读的是**同一份**物理文件，
+  再传一份只会让坚果云多占一倍空间（76MB → 152MB）。
+  关闭时**连墓碑也不发**：同一份文件被删，两台天然都看不到。
+
+> 搬完 vault 后，坚果云里 files/*.pdf 记得用 `POST /api/sync/files/release {"all":true}`
+> 清掉（保留清单），否则会留一份 76MB 的冗余副本。
+
 ### 4.5 抽取层：双栏顺序（详见 READER_CONTRACT）
 
 两种直觉做法**都错**：

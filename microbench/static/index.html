@@ -6395,6 +6395,10 @@
           // PDF 通道单独渲染：它的语义和「文件列表」不一样
           if (s.kind === "files") {
             const rep = ((d.files || {})[s.dir]) || {};
+            if (rep.disabled) {
+              _syncStep(s.id, "skip", "PDF 本体由坚果云 vault 直接共享，不经此通道传输");
+              return;
+            }
             if (s.dir === "push") {
               const pub = (rep.published || []).length;
               const upd = (rep.updated || []).length;

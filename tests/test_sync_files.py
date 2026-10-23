@@ -39,6 +39,30 @@ def test_paper_id_matches_frontend_algorithm():
     assert app._paper_id_for(other) != app._paper_id_for(rel)
 
 
+def test_pdf_body_can_be_disabled(env, monkeypatch):
+    """关掉 PDF 本体传输：vault 整体搬进坚果云后两台共享同一份文件，不该再传一份。
+
+    适用场景：01_Literature 等数据目录是 junction（指向坚果云），两台设备
+    读的是同一份物理文件 → 再传一份只会让坚果云多占一倍空间。
+    """
+    app, vault, sync = env
+    _make_pdf(vault, "a.pdf", b"a" * 100)
+    monkeypatch.setenv("SYNC_PDF_BODY", "0")
+
+    push = app._sync_push_files()
+    assert push.get("disabled") is True
+    assert push["published"] == []
+    assert not list((sync / "files").glob("*.pdf"))
+
+    pull = app._sync_pull_files()
+    assert pull.get("disabled") is True
+    assert pull["restored"] == []
+
+    # 开关打开时恢复正常行为
+    monkeypatch.setenv("SYNC_PDF_BODY", "1")
+    assert app._sync_push_files().get("disabled") is None
+
+
 def test_push_publishes_then_is_incremental(env):
     app, vault, sync = env
     _make_pdf(vault, "a.pdf", b"a" * 100)

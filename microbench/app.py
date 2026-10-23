@@ -3597,6 +3597,20 @@ def _device_id() -> str:
     return did
 
 
+def _pdf_body_enabled() -> bool:
+    """是否通过同步通道传输论文 PDF 本体。
+
+    关掉（.env 里 ``SYNC_PDF_BODY=0``）适用于「vault 整体搬进坚果云 + junction」
+    的部署：那时两台设备读的是**同一份**物理文件，PDF 根本不需要再传一份 ——
+    传了只会让坚果云多占一倍空间（76MB → 152MB）。
+
+    关闭时 files 通道整体跳过 PDF 相关操作（发布 / 还原 / 墓碑）：
+    同一份文件被删，两台天然都看不到，不需要墓碑再通知一次。
+    """
+    raw = (os.getenv("SYNC_PDF_BODY") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def _sync_push_files() -> dict:
     """把 vault 里的 PDF 增量发布到共享目录。
 
@@ -3604,6 +3618,9 @@ def _sync_push_files() -> dict:
     """
     res = {"published": [], "updated": [], "unchanged": 0,
            "deleted": [], "skipped": [], "errors": []}
+    if not _pdf_body_enabled():
+        res["disabled"] = True
+        return res
     files_dir = _files_dir()
     seen = set()
     my_id = _device_id()
@@ -3705,6 +3722,9 @@ def _sync_pull_files() -> dict:
     """
     res = {"restored": [], "conflicts": [], "removed": [],
            "retained": [], "skipped": []}
+    if not _pdf_body_enabled():
+        res["disabled"] = True
+        return res
     files_dir = _files_dir()
 
     for fp in sorted(files_dir.glob("*.json")):
@@ -4093,6 +4113,7 @@ async def api_sync_status():
                     continue
         out["kinds"][kind] = files
     out["files"] = _sync_files_status()
+    out["pdf_body_enabled"] = _pdf_body_enabled()
     return out
 
 
