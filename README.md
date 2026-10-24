@@ -282,35 +282,35 @@ ANNOTATIONS_DIR=C:/Users/<你的用户名>/Nutstore/MicroBench批注
 密钥只存平板本地；笔记里的外来 HTML 过白名单消毒（`<script>`、`on*`、`javascript:` 全拦，
 但保留双语精读笔记里存着的原始 HTML 块）。
 
-#### 部署（推荐做法：让云盘接管 vault）
+#### 部署（vault 已经在坚果云里了，不用再搬）
 
-```bash
-# 1) 先看看会搬什么（不动任何文件）
-python microbench/move_vault_to_cloud.py
+> ✅ **2026-10-23 已完成**：vault 整体搬进了坚果云，8 个目录全部是 junction，
+> 指向 `我的坚果云\MicroBench工作台`（78 个文件 / 82 MB，`sync_errors = 0`）。
+> 两台电脑读的是**同一份物理文件**，PDF 也不再经同步通道传第二份
+> （`SYNC_PDF_BODY=0`）。**所以平板端不需要任何搬迁操作。**
 
-# 2) 确认后执行：vault 搬进「我的坚果云」，原路径留一个 junction
-python microbench/move_vault_to_cloud.py --apply
-```
+安卓平板上的步骤：
 
-这样：
+1. 平板装**坚果云 App**，登录同一账号，等它把
+   `我的坚果云\MicroBench工作台` 目录同步下来（78 个文件 / 82 MB，
+   首次同步要一会儿，之后是增量的）；
+2. 用 **Chrome** 打开 `MicroBench_平板工作台.html`
+   （也可以把这个 HTML 本身放进坚果云目录一起同步）；
+3. 打开后 → 设置 → **连接文件夹** → 选坚果云同步下来的
+   **`MicroBench工作台`** 目录；
+4. **之后完全自动**：平板改的 .md 直接上云，PC 改的也直接下来，
+   **电脑不用开着**；PDF 原文直接从那个目录读。
 
-```
-坚果云/我的坚果云/MicroBench工作台/   <- 真实文件在这里，云盘自动同步
-D:\...\个人工作台                    <- junction 指过去，路径完全不变
-```
+> **不想开坚果云 App？** 那就走「变更包」：平板设置里点「导出变更包」，
+> 把 json 用微信/AirDrop 发回 PC，`start_tablet_sync.bat` 会自动合并回 vault。
+> 但这样**读不了原文 PDF**（PDF 太大不会进包），只适合看笔记。
 
-之后：
+<details>
+<summary>（已归档）旧的搬迁脚本 <code>move_vault_to_cloud.py</code></summary>
 
-1. 平板装坚果云 App，等它把目录同步下来；
-2. Chrome 打开 `MicroBench_平板工作台.html`（也在那个目录里）；
-3. 设置 → 连接文件夹 → 选「我的坚果云\MicroBench工作台」；
-4. **之后完全自动**：平板改的 .md 直接上云，PC 改的也直接下来，**电脑不用开着**。
-
-不想搬 vault 也能用：跳过第 1–2 步，直接双击 `start_tablet_sync.bat`，用「变更包」把改动回流。
-
-> **坚果云的一个坑**（实测）：同步根不是 `%USERPROFILE%\Nutstore`，而是 `<镜像根>\<mirrorId>`，镜像 id 在
-> `%APPDATA%\Nutstore\config\UsersMap.json` 里。而且**在镜像根下新建顶层文件夹不会上云**——
-> 必须放进坚果云自带的「我的坚果云」里面。`move_vault_to_cloud.py` 已经处理好了。
+搬迁已于 2026-10-23 由另一条流程完成（见 `docs/HANDOFF_2026-10-23.md`），
+本脚本保留作为**参考与回滚工具**，日常不要再跑。
+</details>
 
 ### 实时版（电脑在旁边，想用全功能时）
 

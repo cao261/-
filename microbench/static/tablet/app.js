@@ -1086,7 +1086,8 @@
     pdfStatus("正在打开…");
 
     if (!state.dirHandle) {
-      pdfStatus("还没连接文件夹 —— PDF 原文在云盘的 vault 目录里，先在设置里「连接文件夹」");
+      pdfStatus("还没连接文件夹 —— PDF 原文在云盘的 vault 目录里。" +
+                "安卓平板上请选坚果云同步下来的「我的坚果云\\MicroBench工作台」");
       return;
     }
     const file = await getVaultFile(pdfId);
@@ -1323,7 +1324,8 @@
     }
     note.textContent = state.dirHandle
       ? `共 ${ids.length} 篇原文。PDF 直接从已连接的云盘目录读取。`
-      : `共 ${ids.length} 篇原文。⚠ 还没连接文件夹 —— 点开会提示你先连接云盘里的 vault 目录。`;
+      : `共 ${ids.length} 篇原文。⚠ 还没连接文件夹 —— 点开会提示你先连接云盘里的 vault 目录。` +
+        `（在安卓平板上就是坚果云同步下来的「我的坚果云\\MicroBench工作台」那个文件夹）`;
 
     // 反查：PDF -> 关联笔记
     const byPdf = {};

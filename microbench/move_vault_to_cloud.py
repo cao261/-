@@ -3,21 +3,23 @@
 """
 Move the vault into a cloud-synced folder, keeping the old path working.
 
-Why
----
-The tablet edits notes directly inside the synced folder. For those edits
-to reach the PC without the PC running a merge watcher, the folder the
-tablet writes to and the folder the PC reads from have to be the *same*
-folder on the *same* cloud. The cheapest way to get there is to let the
-cloud client own the vault:
+⚠️ 已归档 —— 不要再日常运行。
+   2026-10-23，vault 搬迁已由另一条流程完成（见 docs/HANDOFF_2026-10-23.md）：
+   8 个顶层目录全部建成了 junction，指向「我的坚果云\MicroBench工作台」。
+   本脚本保留作为**参考与回滚工具**（真正的回滚入口是
+   `tools\_swap_to_junction.py --rollback`）。
+
+为什么当初需要这个脚本
+--------------------
+平板要直接读写笔记和原文 PDF，就必须让「平板读的目录」和「电脑读的目录」
+是**同一个云端文件夹**。最省事的做法是让云盘客户端接管 vault：
 
     坚果云/我的坚果云/MicroBench工作台/     <- 真正的文件在这里
     D:\\...\\个人工作台                     <- junction 指过去（路径不变）
 
-A Windows junction is used rather than a copy or a symlink because it is
-transparent to every tool: Obsidian, the FastAPI server, git, and every
-relative path in the project keep working unchanged. Symlinks need
-developer mode or admin rights; junctions need neither.
+用 Windows junction 而不是复制或软链接，是因为它对所有工具都是透明的：
+Obsidian、FastAPI 服务、git、以及项目里每一处相对路径都不用改。
+软链接需要开发者模式或管理员权限，junction 两者都不需要。
 
 Reversible: `--undo` moves everything back and removes the junction.
 
