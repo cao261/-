@@ -89,7 +89,7 @@ public class SettingsActivity extends Activity {
         row.setGravity(Gravity.CENTER_VERTICAL);
 
         Button test = new Button(this);
-        test.setText("测试连接");
+        test.setText("测试并保存");
         test.setOnClickListener(new TestClick(this));
         row.addView(test, new LinearLayout.LayoutParams(0, dp(48), 1f));
 
@@ -117,6 +117,12 @@ public class SettingsActivity extends Activity {
         final String u = userInput.getText().toString();
         final String p = passInput.getText().toString();
         new Thread(new ProbeTask(this, u, p)).start();
+    }
+
+    /** 测通了就直接存 —— 之前「测试连接」只测不存, 用户以为配好了,
+     *  退出去发现还是「未连接」。 */
+    void saveIfOk(String user, String pass) {
+        prefs.setDav(user, pass);
     }
 
     TextView statusView() {
@@ -204,11 +210,30 @@ public class SettingsActivity extends Activity {
         public void run() {
             String msg;
             boolean ok;
+            String user = act.userInput.getText().toString();
+            String pass = act.passInput.getText().toString();
             try {
                 DavClient c = new DavClient(user, pass);
                 int n = c.list("").size();
+                // 列表通了还不够 —— 原文 PDF 是走 GET 下载的, 得真下一次,
+                // 不然「能连上但打不开 PDF」这种问题要到用的时候才发现。
+                String probe = "（没找到 PDF，跳过下载测试）";
+                boolean dlOk = false;
+                String pdf = c.findFirstPdf("", 3);
+                if (pdf != null) {
+                    byte[] d = c.get(pdf);
+                    if (d != null && d.length > 0) {
+                        probe = "，并成功下载了 " + d.length + " 字节的原文 PDF";
+                        dlOk = true;
+                    } else {
+                        probe = "；但下载测试没通过（GET 返回空）";
+                    }
+                }
                 ok = true;
-                msg = "连接正常，云盘根目录有 " + n + " 项";
+                msg = "连接正常，云盘根目录有 " + n + " 项" + probe;
+                if (!dlOk && !probe.startsWith("（")) {
+                    ok = false;
+                }
             } catch (Exception e) {
                 ok = false;
                 String m = e.getMessage() == null ? e.toString() : e.getMessage();
@@ -216,7 +241,7 @@ public class SettingsActivity extends Activity {
             }
             final String fm = msg;
             final boolean fok = ok;
-            act.runOnUiThread(new StatusTask(act, fm, fok));
+            act.runOnUiThread(new StatusTask(act, fm, fok, user, pass));
         }
     }
 
@@ -224,11 +249,16 @@ public class SettingsActivity extends Activity {
         private final SettingsActivity act;
         private final String msg;
         private final boolean ok;
+        private final String user;
+        private final String pass;
 
-        StatusTask(SettingsActivity act, String msg, boolean ok) {
+        StatusTask(SettingsActivity act, String msg, boolean ok,
+                   String user, String pass) {
             this.act = act;
             this.msg = msg;
             this.ok = ok;
+            this.user = user;
+            this.pass = pass;
         }
 
         @Override
@@ -237,6 +267,14 @@ public class SettingsActivity extends Activity {
             if (s != null) {
                 s.setText(msg);
                 s.setTextColor(Color.parseColor(ok ? "#4F6046" : "#A8482C"));
+            }
+            if (ok) {
+                // 测通了就把凭证存下来, 并直接关掉设置页 ——
+                // 用户不需要再点一次「保存」。
+                act.saveIfOk(user, pass);
+                Toast.makeText(act, "连接正常, 已保存", Toast.LENGTH_SHORT).show();
+                act.setResult(RESULT_OK);
+                act.finish();
             }
         }
     }

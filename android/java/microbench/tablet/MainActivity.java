@@ -123,7 +123,11 @@ public class MainActivity extends Activity {
     /** 打开原生设置页（填坚果云账号）。 */
     void openSettings() {
         try {
-            startActivity(new Intent(this, SettingsActivity.class));
+            // 必须是 startActivityForResult —— 用 startActivity 的话
+            // onActivityResult 永远不会触发, 设置页保存后页面不知道,
+            // 状态就一直显示「未连接坚果云」(踩过这个坑)。
+            startActivityForResult(new Intent(this, SettingsActivity.class),
+                    SettingsActivity.REQ);
         } catch (Exception ignored) {
         }
     }
@@ -132,8 +136,10 @@ public class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == SettingsActivity.REQ && resultCode == RESULT_OK && webView != null) {
-            // 设置变了 -> 重新加载页面, 让它重新探测「坚果云配好了没」
-            webView.evaluateJavascript("location.reload();", null);
+            // 不要 location.reload() —— 那会丢掉页面里已经有的状态。
+            // 通知页面重新探测一次坚果云状态并刷新界面。
+            webView.evaluateJavascript(
+                    "window.__mbRefreshSync && window.__mbRefreshSync();", null);
         }
     }
 

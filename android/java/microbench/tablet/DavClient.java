@@ -466,6 +466,36 @@ public class DavClient {
         }
     }
 
+    /**
+     * 递归找一个 PDF（最多 maxDepth 层），用来做「下载链路」自检。
+     * 根目录下面通常只有目录, PDF 在 MicroBench工作台/01_Literature/... 里。
+     */
+    public String findFirstPdf(String dir, int maxDepth) {
+        List<DavEntry> entries;
+        try {
+            entries = list(dir);
+        } catch (Exception e) {
+            return null;
+        }
+        for (DavEntry e : entries) {
+            if (!e.isDir && e.name.toLowerCase().endsWith(".pdf")) {
+                return e.path;
+            }
+        }
+        if (maxDepth <= 1) {
+            return null;
+        }
+        for (DavEntry e : entries) {
+            if (e.isDir) {
+                String found = findFirstPdf(e.path, maxDepth - 1);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
     // ------------------------------------------------------------------
     // 写
     // ------------------------------------------------------------------

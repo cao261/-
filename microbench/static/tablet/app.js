@@ -118,7 +118,7 @@
   // IndexedDB
   // ------------------------------------------------------------------
   const DB_NAME = "mb_tablet";
-  const DB_VER = 1;
+  const DB_VER = 2;
   let db = null;
 
   function openDB() {
@@ -133,9 +133,14 @@
         if (!d.objectStoreNames.contains("meta")) {
           d.createObjectStore("meta", { keyPath: "k" });
         }
+        // 原文 PDF 的本地缓存 —— 没网的时候也能翻论文
+        if (!d.objectStoreNames.contains("pdfcache")) {
+          d.createObjectStore("pdfcache", { keyPath: "id" });
+        }
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
+      req.onblocked = () => reject(new Error("IndexedDB 被另一个标签页占着"));
     });
   }
 
@@ -182,6 +187,35 @@
       });
     },
     setMeta(k, v) { return tx("meta", "readwrite", (s) => s.put({ k, v })); },
+
+    // ---- 原文 PDF 的本地缓存 ----
+    cachePdf(id, blob) {
+      return tx("pdfcache", "readwrite", (s) => s.put({ id, blob, at: Date.now() }));
+    },
+    getCachedPdf(id) {
+      return new Promise((resolve) => {
+        try {
+          const t = db.transaction("pdfcache", "readonly");
+          const req = t.objectStore("pdfcache").get(id);
+          req.onsuccess = () => resolve(req.result ? req.result.blob : null);
+          req.onerror = () => resolve(null);
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    },
+    cachedPdfIds() {
+      return new Promise((resolve) => {
+        try {
+          const t = db.transaction("pdfcache", "readonly");
+          const req = t.objectStore("pdfcache").getAllKeys();
+          req.onsuccess = () => resolve(req.result || []);
+          req.onerror = () => resolve([]);
+        } catch (e) {
+          resolve([]);
+        }
+      });
+    },
   };
 
   // ------------------------------------------------------------------
@@ -736,6 +770,9 @@
         return r.text();
       },
       async readBlob(path) {
+        // 本地缓存优先 —— 缓存过的离线也能翻
+        const cached = await DB.getCachedPdf(path);
+        if (cached) return cached;
         const r = await fetch(davUrl("file", path));
         if (!r.ok) return null;
         return r.blob();
@@ -754,6 +791,52 @@
     }
     if (state.dirHandle) return BACKENDS.fsa;
     return null;
+  }
+
+  /**
+   * 原生设置页保存完凭证后, 由 Android 调这个 —— 重新探测同步状态并刷新界面。
+   * (之前用 location.reload() 会把页面状态整个丢掉, 而且 onActivityResult
+   *  根本不会触发: startActivity 拿不到 result。)
+   */
+  window.__mbRefreshSync = async function () {
+    if (nativeBridge) {
+      state.syncMode = nativeBridge.davConfigured() ? "dav" : "none";
+    }
+    updateSyncDot();
+    refreshSyncUi();
+    if (state.syncMode === "dav") {
+      toast("坚果云已连接, 正在拉取笔记…");
+      try {
+        await pullFromDir();
+        toast("坚果云已连接");
+      } catch (e) {
+        toast("坚果云已连接, 但拉取失败: " + (e.message || e), true);
+      }
+    }
+  };
+
+  /** 把同步状态显示同步到所有相关 UI。 */
+  function refreshSyncUi() {
+    const mode = $("sync-mode");
+    const detail = $("sync-detail");
+    if (!mode || !detail) return;
+    if (nativeBridge) {
+      if (state.syncMode === "dav") {
+        mode.textContent = "坚果云 WebDAV（真双向）";
+        detail.textContent = "已连接坚果云。笔记改动直接写回云盘里的 vault 目录；" +
+          "原文 PDF 点开时从云盘按需下载。";
+      } else {
+        mode.textContent = "未连接坚果云";
+        detail.textContent = "点「配置坚果云」填邮箱和应用密码，" +
+          "就能直接读写云盘里的 vault 目录（笔记 + 24 篇原文 PDF）。";
+      }
+    } else {
+      mode.textContent = state.syncMode === "fsa"
+        ? "目录直连（真双向）" : "仅本机（未连接文件夹）";
+      detail.textContent = fsSupported()
+        ? "当前浏览器支持直连文件夹。"
+        : "当前浏览器不支持 File System Access，请用 vault 包导入/导出。";
+    }
   }
 
   async function connectDir() {
@@ -1258,7 +1341,7 @@
     if (!meta) { toast("找不到这篇 PDF", true); return; }
     $("pdf-reader").hidden = false;
     $("pdf-title").textContent = meta.name;
-    pdfStatus("正在打开…");
+    pdfStatus("");
 
     if (!currentBackend()) {
       pdfStatus(nativeBridge
@@ -1267,11 +1350,18 @@
           "安卓平板上请选坚果云同步下来的「我的坚果云\\MicroBench工作台」");
       return;
     }
+    // 原文 PDF 不打包进 APK（76 MB），是点开时从云盘按需下载的
+    const kb = Math.round((meta.size || 0) / 1024);
+    pdfStatus(kb ? `正在从云盘下载原文（${kb} KB）…` : "正在从云盘下载原文…");
+    const t0 = Date.now();
     const file = await getVaultFile(pdfId);
     if (!file) {
-      pdfStatus("云盘目录里找不到这个文件：" + meta.name);
+      pdfStatus("云盘里找不到这个文件：" + meta.name);
+      toast("打不开原文：云盘里没找到这个文件。\n" +
+            "检查一下坚果云是不是同步完了，或者路径对不对。", true);
       return;
     }
+    const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
     try {
       const pdfjsLib = await loadPdfJs();
       if (pdfState.url) URL.revokeObjectURL(pdfState.url);
@@ -1487,6 +1577,51 @@
     });
   }
 
+  /**
+   * 把全部原文 PDF 下载到平板本地（IndexedDB），之后没网也能翻。
+   *
+   * 原文一共 76 MB, 平板下完就没网也不影响读 —— 这是「带上飞机看论文」
+   * 真正需要的那一步。
+   */
+  async function cacheAllPdfs() {
+    const backend = currentBackend();
+    if (!backend) {
+      toast("还没连上云盘，先配置坚果云", true);
+      return;
+    }
+    const ids = Object.keys(state.pdfs || {});
+    if (!ids.length) { toast("没有可缓存的原文"); return; }
+    const done = await DB.cachedPdfIds();
+    const todo = ids.filter((id) => done.indexOf(id) < 0);
+    if (!todo.length) { toast("全部原文已经在本地了（可离线阅读）"); return; }
+
+    const total = todo.reduce((a, id) => a + ((state.pdfs[id].size || 0)), 0);
+    let got = 0, ok = 0, fail = 0;
+    const t0 = Date.now();
+    toast(`开始缓存 ${todo.length} 篇原文（约 ${Math.round(total / 1048576)} MB）…`);
+    for (let i = 0; i < todo.length; i++) {
+      const id = todo[i];
+      try {
+        const r = await fetch(davUrl("file", id));
+        if (!r.ok) { fail++; continue; }
+        const blob = await r.blob();
+        await DB.cachePdf(id, blob);
+        ok++;
+        got += blob.size;
+      } catch (e) {
+        fail++;
+      }
+      if (i % 2 === 0 || i === todo.length - 1) {
+        pdfStatus(`缓存中 ${i + 1}/${todo.length}（${Math.round(got / 1048576)} MB）`);
+      }
+    }
+    pdfStatus("");
+    const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
+    toast(`缓存完成：${ok} 篇 ${Math.round(got / 1048576)} MB，用了 ${secs} 秒` +
+          (fail ? `，失败 ${fail}` : "") + "。现在没网也能翻论文了。", fail > 0);
+    await openPdfLib();
+  }
+
   /** 文献库：列出所有 PDF，以及它们关联的笔记 */
   function openPdfLib() {
     const list = $("pdf-lib-list");
@@ -1518,6 +1653,21 @@
       (groups[g] = groups[g] || []).push(id);
     });
 
+    // 缓存状态
+    DB.cachedPdfIds().then((cached) => {
+      const hint = $("pdf-cache-hint");
+      if (!hint) return;
+      if (!cached.length) {
+        hint.textContent = "还没缓存 —— 没网的时候打不开原文";
+      } else {
+        const mb = ids.reduce((a, id) => {
+          const m = state.pdfs[id];
+          return a + ((cached.indexOf(id) >= 0) ? (m.size || 0) : 0);
+        }, 0);
+        hint.textContent = `已缓存 ${cached.length}/${ids.length} 篇（${Math.round(mb / 1048576)} MB），可离线阅读`;
+      }
+    });
+
     Object.keys(groups).sort().forEach((g) => {
       list.appendChild(el("div", "tb-group", g));
       groups[g].sort().forEach((id) => {
@@ -1541,21 +1691,12 @@
   // 设置
   // ------------------------------------------------------------------
   function openSettings() {
+    refreshSyncUi();
     $("cfg-base").value = state.ai.base || "";
     $("cfg-key").value = state.ai.key || "";
     $("cfg-model").value = state.ai.model || "";
     $("cfg-model-t").value = state.ai.modelT || "";
     $("modal-settings").hidden = false;
-    $("sync-mode").textContent = nativeBridge
-      ? (state.syncMode === "dav" ? "坚果云 WebDAV（真双向）" : "未连接坚果云")
-      : (state.syncMode === "fsa" ? "目录直连（真双向）" : "仅本机（未连接文件夹）");
-    $("sync-detail").textContent = nativeBridge
-      ? (state.syncMode === "dav"
-          ? "已连接坚果云。改动会直接写回云盘里的 vault 目录。"
-          : "点「配置坚果云」填邮箱和应用密码，就能直接读写云盘里的 vault 目录。")
-      : (fsSupported()
-          ? "当前浏览器支持直连文件夹。"
-          : "当前浏览器不支持 File System Access（多半不是 Chrome），请用 vault 包导入/导出。");
     $("about-note").textContent =
       `MicroBench 平板工作台 · 本地 ${state.notes.size} 篇 · 待同步 ${state.dirtyCount} 篇`;
   }
@@ -1576,11 +1717,22 @@
     const b = $("btn-sync");
     b.classList.toggle("has-dot", state.dirtyCount > 0);
     const s = $("sync-status");
+    const mode = nativeBridge
+      ? (state.syncMode === "dav" ? "坚果云" : "未连接")
+      : (state.syncMode === "fsa" ? "目录直连" : "本地模式");
     if (s) {
-      const mode = nativeBridge
-        ? (state.syncMode === "dav" ? "坚果云" : "未连接")
-        : (state.syncMode === "fsa" ? "目录直连" : "本地模式");
       s.textContent = `${mode} · 待同步 ${state.dirtyCount}`;
+    }
+    // 顶栏的云���状态标签
+    const c = $("cloud-state");
+    if (c) {
+      const on = nativeBridge ? state.syncMode === "dav" : state.syncMode === "fsa";
+      c.classList.toggle("is-on", on);
+      c.classList.toggle("is-off", nativeBridge && !on);
+      c.textContent = nativeBridge ? (on ? "坚果云" : "未连接") : (on ? "已连接" : "本地");
+      c.title = nativeBridge
+        ? (on ? "坚果云已连接，笔记改动直接写回云盘" : "点设置里的「配置坚果云」连接")
+        : (on ? "已连接本地文件夹" : "未连接文件夹");
     }
   }
 
@@ -1665,7 +1817,12 @@
     // 事件
     $("btn-menu").onclick = () => setPane("nav");
     $("btn-pdfs").onclick = openPdfLib;
+    $("btn-connect-dir").onclick = () => {
+      // APK 里这个按钮直通原生设置页
+      connectDir();
+    };
     $("btn-connect-dir").textContent = nativeBridge ? "配置坚果云" : "连接文件夹（真双向）";
+    $("btn-cache-all").onclick = cacheAllPdfs;
     $("pdf-close").onclick = closePdf;
     $("pdf-prev").onclick = () => gotoPdfPage(pdfState.currentPage - 1);
     $("pdf-next").onclick = () => gotoPdfPage(pdfState.currentPage + 1);
