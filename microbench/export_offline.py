@@ -125,6 +125,129 @@ def _first_heading(body: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# PDF 清单 + 笔记↔PDF 关联
+# ---------------------------------------------------------------------------
+
+# 卡片里引用原文 PDF 的几种写法。
+# 「本地路径」多数在**表格**里（| **本地路径** | `path` |），不是在正文，
+# 所以分隔符不能只认冒号。
+_PDF_REF_RES = [
+    re.compile(r"\[\[([^\]|]+\.pdf)\]"),                       # [[2024_xxx.pdf]]
+    re.compile(r"\*\*本地路径\*\*\s*[|｜:：]\s*`([^`]*\.pdf)`"),
+    re.compile(r"\*\*PDF(?: 路径|路径)?\*\*\s*[|｜:：]\s*`([^`]*\.pdf)`"),
+    re.compile(r"(?m)^\s*[-*]\s*\*{0,2}本地路径\*{0,2}\s*[|｜:：]\s*`([^`]*\.pdf)`"),
+]
+
+
+def collect_pdfs() -> dict:
+    """扫描 vault 里所有 PDF。
+
+    返回 {pdf_id: {"id", "name", "size"}}，pdf_id 是相对 vault 根的正斜杠路径。
+
+    这份清单是平板端「打开原文 PDF」的前提：平板不能猜哪个 PDF 对应哪篇
+    笔记，必须由 PC 导出时把真实路径写进去。
+    """
+    pdfs = {}
+    for folder in VAULT_DIRS:
+        base = REPO / folder
+        if not base.is_dir():
+            continue
+        for pdf in base.rglob("*.pdf"):
+            try:
+                size = pdf.stat().st_size
+            except OSError:
+                size = 0
+            rel = pdf.relative_to(REPO).as_posix()
+            pdfs[rel] = {
+                "id": rel,
+                "name": pdf.name,
+                "size": size,
+                "stem": pdf.stem,
+            }
+    return pdfs
+
+
+def _norm_text(s: str) -> str:
+    """归一化：去掉非字母数字与中文，转小写。"""
+    return re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "", s).lower()
+
+
+def match_pdf_by_title(title: str, pdfs: dict, threshold: int = 70) -> list:
+    """按标题模糊匹配 PDF —— 与 app.py 的 /api/paper/find_pdf 同一套算法。
+
+    卡片里的 [[xxx.pdf]] 引用多半是模板占位（文件名被截断/是示例），
+    真正可靠的线索是论文标题。两条路径都试：
+      1. 正文里写的路径（表格里的「本地路径」列最常见）
+      2. 标题模糊匹配
+
+    阈值比 PC 端严（70 vs 45）：PC 上是用户手动搜、能看到一堆候选再挑；
+    平板上是自动挂「原文 PDF」按钮，误挂比不挂更糟 —— 宁可少挂，
+    用户从「文献库」里自己点开也不费事。
+    """
+    if not title:
+        return []
+    title_clean = _norm_text(title)
+    title_words = [_norm_text(w) for w in re.split(r"\W+", title)
+                    if len(_norm_text(w)) >= 3][:8]
+    if not title_clean:
+        return []
+
+    best = None
+    best_score = 0
+    for pid, meta in pdfs.items():
+        stem_clean = _norm_text(meta["stem"])
+        if not stem_clean:
+            continue
+        score = 0
+        if title_clean[:18] in stem_clean or stem_clean in title_clean:
+            score += 70
+        elif title_clean[:10] in stem_clean:
+            score += 45
+        word_hits = sum(1 for w in title_words if w and w in stem_clean)
+        if word_hits >= 3:
+            score += 25 + word_hits * 10
+        elif word_hits == 2:
+            # 两个词重合很容易撞车 ("magnetic sensor" 满地都是),
+            # 只能给很低的分, 不足以越过阈值
+            score += 20
+        if score > best_score:
+            best_score = score
+            best = pid
+    if best and best_score >= threshold:
+        return [best]
+    return []
+
+
+def link_pdfs_for_note(body: str, pdfs: dict) -> list:
+    """从笔记正文里找出它引用的 PDF（按文件名匹配，容忍路径写法差异）。"""
+    by_name = {}
+    for pid, meta in pdfs.items():
+        by_name.setdefault(meta["name"], pid)
+        by_name.setdefault(meta["stem"], pid)
+
+    found = []
+    for rx in _PDF_REF_RES:
+        for m in rx.finditer(body):
+            raw = m.group(1).strip().replace("\\", "/")
+            if not raw:
+                continue
+            # 完整相对路径直接命中
+            if raw in pdfs:
+                if raw not in found:
+                    found.append(raw)
+                continue
+            # 只给了文件名 -> 按文件名/主干名匹配
+            name = raw.rsplit("/", 1)[-1]
+            for key in (name, name[:-4] if name.lower().endswith(".pdf") else name):
+                pid = by_name.get(key)
+                if pid and pid not in found:
+                    found.append(pid)
+                    break
+    return found
+
+
+
 FRONTMATTER_RE = re.compile(r"\A﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
 
 
@@ -831,7 +954,7 @@ def detect_cloud_dir() -> Path | None:
     return None
 
 
-def build_tablet_html(notes: list[Note], katex_css: str) -> str:
+def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = None) -> str:
     """把平板工作台打包成一个自包含的 HTML 文件。
 
     与只读版的关键差别：
@@ -842,11 +965,13 @@ def build_tablet_html(notes: list[Note], katex_css: str) -> str:
         可写版不行：用户在平板上敲的公式没人替它渲染。
       * 内联 app.js / styles.css —— 平板工作台的逻辑有上千行，藏在
         Python 的字符串模板里没法维护。
+      * 内联 PDF.js —— 平板上要能直接翻论文原文。
     """
     index = (TABLET_DIR / "index.html").read_text(encoding="utf-8")
     app_css = (TABLET_DIR / "styles.css").read_text(encoding="utf-8")
     app_js = (TABLET_DIR / "app.js").read_text(encoding="utf-8")
 
+    pdfjs = pdfjs or {}
     katex_js_path = KATEX_DIST / "katex.min.js"
     katex_js = katex_js_path.read_text(encoding="utf-8") if katex_js_path.exists() else ""
 
@@ -866,14 +991,27 @@ def build_tablet_html(notes: list[Note], katex_css: str) -> str:
             "group": n.folder,
             "body": n.body,
             "mtime": 0,
+            "pdfs": getattr(n, "_pdfs", []),
         })
-    data_json = json.dumps({"notes": payload}, ensure_ascii=False)
+    pdfs = getattr(notes[0], "_pdfs_all", {}) if notes else {}
+    data_json = json.dumps({"notes": payload, "pdfs": pdfs}, ensure_ascii=False)
     data_json = data_json.replace("</", "<\\/")
 
     out = index
     out = out.replace("__ICON__", icon_uri)
     out = out.replace("<!--INLINE_KATEX_CSS-->", "<style>\n" + katex_css + "\n</style>")
     out = out.replace("<!--INLINE_APP_CSS-->", "<style>\n" + app_css + "\n</style>")
+    if pdfjs.get("css"):
+        out = out.replace("<!--INLINE_PDFJS_CSS-->",
+                          "<style>\n" + pdfjs["css"] + "\n</style>")
+    if pdfjs.get("worker"):
+        # worker 源码放 text/plain 里，运行时取出来做成 Blob URL
+        out = out.replace("<!--INLINE_PDFJS_WORKER-->",
+                          '<script type="text/plain" id="mb-pdf-worker-src">\n'
+                          + pdfjs["worker"] + "\n</script>")
+    if pdfjs.get("js"):
+        out = out.replace("<!--INLINE_PDFJS_JS-->",
+                          "<script>\n" + pdfjs["js"] + "\n</script>")
     out = out.replace("<!--INLINE_KATEX_JS-->",
                       "<script>\n" + katex_js + "\n</script>")
     out = out.replace("<!--INLINE_APP_JS-->",
@@ -894,14 +1032,76 @@ def export_tablet(out_path: Path, quiet: bool = False) -> bool:
         return False
     say(f"[tablet] {len(notes)} 篇笔记")
 
+    say("[tablet] 建立 PDF 清单与笔记关联 ...")
+    pdfs = collect_pdfs()
+    linked = 0
+    for n in notes:
+        refs = link_pdfs_for_note(n.body, pdfs)
+        # 路径引用没命中时,退到标题模糊匹配 (与 PC 的 find_pdf 同一套算法)
+        if not refs:
+            refs = match_pdf_by_title(n.title, pdfs)
+        n._pdfs = refs          # type: ignore[attr-defined]
+        if refs:
+            linked += 1
+    if notes:
+        notes[0]._pdfs_all = pdfs   # type: ignore[attr-defined]
+    say(f"[tablet] {len(pdfs)} 个 PDF, {linked} 篇笔记关联到原文")
+
     say("[tablet] 内联 KaTeX 运行时与字体 ...")
     katex_css = build_katex_css()
 
+    say("[tablet] 内联 PDF.js 运行时 ...")
+    pdfjs = build_pdfjs_assets()
+    if not pdfjs.get("js"):
+        print("  [警告] 找不到 PDF.js vendor, 平板将无法打开原文 PDF")
+    else:
+        say(f"         pdf.js {len(pdfjs['js'])//1024} KB + worker "
+            f"{len(pdfjs['worker'])//1024} KB + css {len(pdfjs['css'])//1024} KB")
+
     say("[tablet] 组装单文件 ...")
-    doc = build_tablet_html(notes, katex_css)
+    doc = build_tablet_html(notes, katex_css, pdfjs)
     out_path.write_text(doc, encoding="utf-8")
     say(f"[tablet] 完成: {out_path}  ({out_path.stat().st_size/1024:.0f} KB)")
     return True
+
+
+def build_pdfjs_assets() -> dict:
+    """读取 vendor 里的 PDF.js 运行时。
+
+    worker 必须单独一个 URL（它是个 Worker 脚本），但单文件产物不能有
+    第二个文件 —— 所以把 worker 源码塞进 <script type="text/plain">，
+    运行时用 Blob URL 交给 pdf.js。
+    """
+    base = HERE / "static" / "vendor" / "pdfjs"
+
+    def read(name: str) -> str:
+        p = base / name
+        try:
+            return p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+    js = read("pdf.min.js")
+    worker = read("pdf.worker.min.js")
+    css = read("pdf_viewer.css")
+    # 内联进 HTML 时，源码里出现 </script 会提前关闭 script 标签。
+    for name, text in (("pdf.min.js", js), ("pdf.worker.min.js", worker)):
+        if "</script" in text.lower():
+            raise RuntimeError(f"{name} 含 </script，不能直接内联")
+
+    # PDF.js 的 CSS 会引用 images/ 下的图标。单文件产物里没有这些文件，
+    # 浏览���会去请求然后 404。能内联的就内联（gif 只有 2 KB），
+    # 仓库里本来就不存在的 svg 直接把引用删掉（可选的无障碍功能图标）。
+    img_dir = base / "images"
+    gif = img_dir / "loading-icon.gif"
+    if gif.exists():
+        b64 = base64.b64encode(gif.read_bytes()).decode("ascii")
+        # CSS 里可能是 url(images/x.gif) 也可能是 url("images/x.gif")
+        css = re.sub(r'url\(\s*["\']?images/loading-icon\.gif["\']?\s*\)',
+                      f'url(data:image/gif;base64,{b64})', css)
+    css = re.sub(r'url\(\s*["\']?images/[^)]+["\']?\s*\)', 'none', css)
+
+    return {"js": js, "worker": worker, "css": css}
 
 
 def main() -> int:

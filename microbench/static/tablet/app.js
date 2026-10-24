@@ -397,12 +397,14 @@
   // ------------------------------------------------------------------
   const state = {
     notes: new Map(),       // id -> note
+    pdfs: {},              // pdf id -> {id, name, size, stem}
     currentId: null,
     filter: "",
     ai: { base: "", key: "", model: "MiniMax-M3.1-Flash", modelT: "MiniMax-M3" },
     dirHandle: null,       // FileSystemDirectoryHandle
     syncMode: "local",     // local | dir
     dirtyCount: 0,
+    pendingSelection: "",  // 从 PDF 里划词带过来的原文
   };
 
   const FOLDERS = [
@@ -420,6 +422,8 @@
       raw = JSON.parse(node.textContent);
     } catch (e) { /* ignore */ }
 
+    if (raw && raw.pdfs) state.pdfs = raw.pdfs;
+
     const existing = await DB.allNotes();
     const have = new Map(existing.map((n) => [n.id, n]));
 
@@ -433,6 +437,7 @@
           rel: r.rel || r.id,
           body: r.body || "",
           html: r.html || "",
+          pdfs: r.pdfs || (old ? old.pdfs : []),
           dirty: old ? old.dirty : 0,
           deleted: old ? old.deleted : 0,
           baseHash: old ? old.baseHash : hash(r.body || ""),
@@ -505,6 +510,29 @@
     $("crumb").textContent = n.rel || n.id;
     const dirty = $("dirty-flag");
     dirty.hidden = !n.dirty;
+    // 这篇笔记关联到的原文 PDF
+    const pdfBtn = $("btn-pdf-of-note");
+    if (pdfBtn) {
+      const refs = n.pdfs || [];
+      pdfBtn.hidden = refs.length === 0;
+      pdfBtn.textContent = refs.length > 1 ? `原文 PDF (${refs.length})` : "原文 PDF";
+      pdfBtn.onclick = () => {
+        if (refs.length === 1) { openPdf(refs[0]); return; }
+        // 多篇 -> 先列出这一篇的关联,让用户选
+        const list = $("pdf-lib-list");
+        const note = $("pdf-lib-note");
+        list.innerHTML = "";
+        note.textContent = `「${n.title}」关联了 ${refs.length} 篇原文：`;
+        refs.forEach((pid) => {
+          const meta = state.pdfs[pid];
+          const b = el("button", "tb-pdf-item");
+          b.appendChild(el("span", "tb-pdf-item-name", meta ? meta.name : pid));
+          b.onclick = () => { $("pdf-lib").hidden = true; openPdf(pid); };
+          list.appendChild(b);
+        });
+        $("pdf-lib").hidden = false;
+      };
+    }
     $("editor").value = n.body || "";
     $("edit-hint").textContent = n.dirty ? "有未同步的改动" : "";
     const doc = $("doc");
@@ -885,13 +913,14 @@
       return;
     }
     const note = currentNote();
-    const sel = selectedText();
+    const sel = selectedText() || state.pendingSelection || "";
     const bodyText = note ? (note.body || "") : "";
     if (kind === "explain" || kind === "translate") {
-      if (!sel) { toast("先在正文里选中一段文字", true); return; }
+      if (!sel) { toast("先在正文或 PDF 里选中一段文字", true); return; }
     }
     const q = $("ai-question").value.trim();
     if (kind === "ask" && !q) { toast("写下你的问题", true); return; }
+    state.pendingSelection = "";
 
     const model = kind === "translate" ? (cfg.modelT || cfg.model) : cfg.model;
     const messages = PROMPTS[kind](kind === "ask" ? (sel || bodyText.slice(0, 4000)) : (sel || bodyText.slice(0, 6000)), q);
@@ -1000,6 +1029,336 @@
   }
 
   // ------------------------------------------------------------------
+  // PDF 阅读器（pdf.js 内联，worker 用 Blob URL 起）
+  // ------------------------------------------------------------------
+  let _pdfJsPromise = null;
+
+  function loadPdfJs() {
+    if (_pdfJsPromise) return _pdfJsPromise;
+    _pdfJsPromise = (async () => {
+      if (!window.pdfjsLib) throw new Error("PDF.js 没有内联进来");
+      const workerEl = document.getElementById("mb-pdf-worker-src");
+      if (workerEl) {
+        const src = workerEl.textContent || "";
+        const blob = new Blob([src], { type: "text/javascript" });
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(blob);
+      }
+      return window.pdfjsLib;
+    })();
+    return _pdfJsPromise;
+  }
+
+  const pdfState = {
+    doc: null, numPages: 0, scale: 1.15, id: null, url: null,
+    currentPage: 1,
+    rendered: new Set(),   // 已经画过的页码
+    pending: false,
+  };
+
+  /** 从已连接的 vault 目录里取一个文件。没连目录就返回 null。 */
+  async function getVaultFile(relPath) {
+    const h = state.dirHandle;
+    if (!h) return null;
+    const parts = String(relPath).split("/").filter(Boolean);
+    if (!parts.length) return null;
+    let dir = h;
+    try {
+      for (let i = 0; i < parts.length - 1; i++) {
+        dir = await dir.getDirectoryHandle(parts[i]);
+      }
+      const fh = await dir.getFileHandle(parts[parts.length - 1]);
+      return await fh.getFile();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function pdfStatus(msg) {
+    const el = $("pdf-status");
+    if (el) el.textContent = msg || "";
+  }
+
+  async function openPdf(pdfId) {
+    const meta = state.pdfs[pdfId];
+    if (!meta) { toast("找不到这篇 PDF", true); return; }
+    $("pdf-reader").hidden = false;
+    $("pdf-title").textContent = meta.name;
+    pdfStatus("正在打开…");
+
+    if (!state.dirHandle) {
+      pdfStatus("还没连接文件夹 —— PDF 原文在云盘的 vault 目录里，先在设置里「连接文件夹」");
+      return;
+    }
+    const file = await getVaultFile(pdfId);
+    if (!file) {
+      pdfStatus("云盘目录里找不到这个文件：" + meta.name);
+      return;
+    }
+    try {
+      const pdfjsLib = await loadPdfJs();
+      if (pdfState.url) URL.revokeObjectURL(pdfState.url);
+      pdfState.url = URL.createObjectURL(file);
+      pdfState.doc = await pdfjsLib.getDocument({ url: pdfState.url }).promise;
+      pdfState.numPages = pdfState.doc.numPages;
+      pdfState.id = pdfId;
+      pdfState.rendered.clear();
+      pdfState.currentPage = 1;
+      $("pdf-body").innerHTML = "";
+      pdfStatus("");
+      await renderPdfPage(1);
+      $("pdf-pageinfo").textContent = `1 / ${pdfState.numPages}`;
+    } catch (e) {
+      pdfStatus("打开失败：" + e.message);
+    }
+  }
+
+  async function renderPdfPage(n) {
+    const doc = pdfState.doc;
+    if (!doc || n < 1 || n > pdfState.numPages) return;
+    if (pdfState.rendered.has(n)) {
+      const node = document.querySelector(`[data-pdf-page="${n}"]`);
+      if (node) {
+        node.scrollIntoView({ block: "start", behavior: "smooth" });
+        return;
+      }
+    }
+    const pdfjsLib = await loadPdfJs();
+    const page = await doc.getPage(n);
+    const viewport = page.getViewport({ scale: pdfState.scale });
+    const dpr = window.devicePixelRatio || 1;
+
+    const wrap = el("div", "tb-pdf-page");
+    wrap.setAttribute("data-pdf-page", String(n));
+    const canvas = el("canvas");
+    wrap.appendChild(canvas);
+    const textLayer = el("div", "textLayer");
+    textLayer.style.width = viewport.width + "px";
+    textLayer.style.height = viewport.height + "px";
+    wrap.appendChild(textLayer);
+
+    canvas.width = Math.floor(viewport.width * dpr);
+    canvas.height = Math.floor(viewport.height * dpr);
+    canvas.style.width = viewport.width + "px";
+    canvas.style.height = viewport.height + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const body = $("pdf-body");
+    // 按页码顺序插入,保证连续阅读时顺序正确
+    let before = null;
+    for (const child of Array.from(body.children)) {
+      const pn = parseInt(child.getAttribute("data-pdf-page") || "0", 10);
+      if (pn > n) { before = child; break; }
+    }
+    body.insertBefore(wrap, before);
+
+    await page.render({ canvasContext: ctx, viewport }).promise;
+
+    // 文本层：PDF.js 3.11 的 renderTextLayer 是**全局函数**（不是 page 的方法），
+    // 而且要先拿到 getTextContent() 的结果。参数与桌面版 index.html 保持一致。
+    try {
+      const tc = await page.getTextContent();
+      if (pdfjsLib.renderTextLayer) {
+        pdfjsLib.renderTextLayer({
+          textContentSource: tc,
+          textContent: tc,
+          container: textLayer,
+          viewport: viewport,
+          textDivs: [],
+        });
+      } else {
+        renderTextLayerFallback(tc, textLayer, viewport, pdfjsLib);
+      }
+    } catch (e) {
+      console.warn("文本层渲染失败", e);
+    }
+    pdfState.rendered.add(n);
+    if (n === 1) wrap.scrollIntoView({ block: "start" });
+  }
+
+  /** pdf.js 的 renderTextLayer 不可用时的手工兜底（照抄桌面版实现）。 */
+  function renderTextLayerFallback(tc, container, viewport, pdfjsLib) {
+    if (!container || !tc || !tc.items) return;
+    container.innerHTML = "";
+    for (const item of tc.items) {
+      if (!item.str || !item.str.trim()) continue;
+      const span = document.createElement("span");
+      span.textContent = item.str;
+      if (pdfjsLib.Util && pdfjsLib.Util.transform && item.transform) {
+        try {
+          const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+          span.style.left = `${tx[4]}px`;
+          span.style.top = `${tx[5] - (item.height * viewport.scale)}px`;
+        } catch (e) { /* ignore */ }
+      }
+      span.style.fontSize = `${Math.max(8, item.height * viewport.scale)}px`;
+      container.appendChild(span);
+    }
+  }
+
+  /** 往前/往后翻：先渲染目标页，再滚过去。 */
+  async function gotoPdfPage(n) {
+    if (!pdfState.doc) return;
+    const target = Math.max(1, Math.min(pdfState.numPages, n));
+    pdfState.currentPage = target;
+    await renderPdfPage(target);
+    $("pdf-pageinfo").textContent = `${target} / ${pdfState.numPages}`;
+    const node = document.querySelector(`[data-pdf-page="${target}"]`);
+    if (node) node.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
+  /** 缩放后整本重画（页数多时只重画当前附近的页）。 */
+  async function redrawPdf() {
+    if (!pdfState.doc) return;
+    const pages = Array.from(pdfState.rendered).sort((a, b) => a - b);
+    pdfState.rendered.clear();
+    $("pdf-body").innerHTML = "";
+    for (const n of pages) {
+      await renderPdfPage(n);
+    }
+    pdfStatus("");
+  }
+
+  /** 滚动时更新当前页码（读者最关心「我现在在第几页」）。 */
+  function initPdfScrollWatch() {
+    const body = $("pdf-body");
+    if (!body) return;
+    let ticking = false;
+    body.addEventListener("scroll", () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        ticking = false;
+        const mid = body.scrollTop + body.clientHeight / 2;
+        let current = 1;
+        for (const child of Array.from(body.children)) {
+          const n = parseInt(child.getAttribute("data-pdf-page") || "0", 10);
+          if (!n) continue;
+          if (child.offsetTop <= mid) current = n;
+        }
+        if (current !== pdfState.currentPage) {
+          pdfState.currentPage = current;
+          $("pdf-pageinfo").textContent = `${current} / ${pdfState.numPages}`;
+        }
+        // 滚到接近底部 -> 预渲染下一页, 连续读不用等
+        if (body.scrollTop + body.clientHeight > body.scrollHeight - body.clientHeight * 0.8) {
+          const next = pdfState.currentPage + 1;
+          if (next <= pdfState.numPages && !pdfState.rendered.has(next)) {
+            renderPdfPage(next);
+          }
+        }
+      });
+    }, { passive: true });
+  }
+
+  function closePdf() {
+    $("pdf-reader").hidden = true;
+    if (pdfState.url) { URL.revokeObjectURL(pdfState.url); pdfState.url = null; }
+    pdfState.doc = null;
+    pdfState.rendered.clear();
+    $("pdf-body").innerHTML = "";
+  }
+
+  /** 划词气泡：PDF 里选中文字 -> 解读 / 翻译 / 提问 */
+  function initPdfSelection() {
+    const layer = $("pdf-textlayer");
+    const bubble = $("pdf-sel");
+    if (!layer || !bubble) return;
+
+    const hide = () => { bubble.hidden = true; };
+    const show = (sel) => {
+      const text = String(sel || "").trim();
+      if (!text) { hide(); return; }
+      const rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) { hide(); return; }
+      bubble.dataset.text = text;
+      bubble.hidden = false;
+      const top = Math.max(8, rect.top - 52);
+      const left = Math.min(
+        Math.max(8, rect.left),
+        window.innerWidth - bubble.offsetWidth - 8
+      );
+      bubble.style.top = top + "px";
+      bubble.style.left = left + "px";
+    };
+
+    layer.addEventListener("mouseup", () => {
+      setTimeout(() => show(window.getSelection().toString()), 10);
+    });
+    layer.addEventListener("touchend", () => {
+      setTimeout(() => show(window.getSelection().toString()), 60);
+    });
+    layer.addEventListener("scroll", hide);
+
+    bubble.querySelectorAll("[data-pdf-ai]").forEach((b) => {
+      b.onclick = () => {
+        const text = bubble.dataset.text || "";
+        const kind = b.dataset.pdfAi;
+        hide();
+        closePdf();
+        // 交给 AI 面板处理
+        state.pendingSelection = text;
+        $("ai-question").value = kind === "ask" ? "" : "";
+        setPane("ai");
+        if (kind === "ask") {
+          $("ai-question").focus();
+        } else {
+          runAI(kind);
+        }
+      };
+    });
+  }
+
+  /** 文献库：列出所有 PDF，以及它们关联的笔记 */
+  function openPdfLib() {
+    const list = $("pdf-lib-list");
+    const note = $("pdf-lib-note");
+    const ids = Object.keys(state.pdfs || {});
+    list.innerHTML = "";
+
+    if (!ids.length) {
+      note.textContent = "没有找到任何 PDF。";
+      $("pdf-lib").hidden = false;
+      return;
+    }
+    note.textContent = state.dirHandle
+      ? `共 ${ids.length} 篇原文。PDF 直接从已连接的云盘目录读取。`
+      : `共 ${ids.length} 篇原文。⚠ 还没连接文件夹 —— 点开会提示你先连接云盘里的 vault 目录。`;
+
+    // 反查：PDF -> 关联笔记
+    const byPdf = {};
+    state.notes.forEach((n) => {
+      (n.pdfs || []).forEach((pid) => {
+        (byPdf[pid] = byPdf[pid] || []).push(n.title || n.id);
+      });
+    });
+
+    const groups = {};
+    ids.forEach((id) => {
+      const g = id.split("/").slice(0, 2).join("/");
+      (groups[g] = groups[g] || []).push(id);
+    });
+
+    Object.keys(groups).sort().forEach((g) => {
+      list.appendChild(el("div", "tb-group", g));
+      groups[g].sort().forEach((id) => {
+        const meta = state.pdfs[id];
+        const b = el("button", "tb-pdf-item");
+        b.appendChild(el("span", "tb-pdf-item-name", meta.name));
+        const linked = byPdf[id] || [];
+        const size = meta.size ? Math.round(meta.size / 1024) + " KB" : "";
+        const meta2 = el("span", "tb-pdf-item-meta",
+          [size, linked.length ? "关联笔记：" + linked.slice(0, 2).join("、") : ""]
+            .filter(Boolean).join(" · "));
+        b.appendChild(meta2);
+        b.onclick = () => { $("pdf-lib").hidden = true; openPdf(id); };
+        list.appendChild(b);
+      });
+    });
+    $("pdf-lib").hidden = false;
+  }
+
+  // ------------------------------------------------------------------
   // 设置
   // ------------------------------------------------------------------
   function openSettings() {
@@ -1067,7 +1426,15 @@
   }
 
   async function boot() {
+    // 启动阶段标记。平板上白屏时, 这个元素会告诉我们卡在了哪一步
+    // (IndexedDB 打开 / 读种子数据 / 恢复目录句柄 ...)。
+    const stage = (s) => {
+      const e = $("mb-stage");
+      if (e) e.textContent = (e.textContent ? e.textContent + " > " : "") + s;
+    };
+    stage("begin");
     db = await openDB();
+    stage("db");
 
     // 主题
     let theme = "light";
@@ -1075,6 +1442,7 @@
     applyTheme(theme);
 
     await loadSeed();
+    stage("seed:" + state.notes.size);
 
     // AI 配置
     const ai = await DB.getMeta("ai", null);
@@ -1088,6 +1456,7 @@
         state.syncMode = "dir";
       }
     }
+    stage("meta");
 
     // 当前笔记：URL 里的 hash 优先（分享/收藏链接要能直达），
     // 其次是上次看的，最后才是第一篇。
@@ -1099,12 +1468,26 @@
     }
     if (cur) openNote(cur);
     else $("doc").innerHTML = '<div class="tb-empty">还没有笔记</div>';
+    stage("opened");
 
     buildNav();
+    stage("nav");
     updateSyncDot();
+    stage("done");
 
     // 事件
     $("btn-menu").onclick = () => setPane("nav");
+    $("btn-pdfs").onclick = openPdfLib;
+    $("pdf-close").onclick = closePdf;
+    $("pdf-prev").onclick = () => gotoPdfPage(pdfState.currentPage - 1);
+    $("pdf-next").onclick = () => gotoPdfPage(pdfState.currentPage + 1);
+    $("pdf-zoom-in").onclick = () => { pdfState.scale = Math.min(3, pdfState.scale * 1.2); redrawPdf(); };
+    $("pdf-zoom-out").onclick = () => { pdfState.scale = Math.max(0.4, pdfState.scale / 1.2); redrawPdf(); };
+    document.querySelectorAll("[data-close-lib]").forEach((b) => {
+      b.onclick = () => { $("pdf-lib").hidden = true; };
+    });
+    initPdfSelection();
+    initPdfScrollWatch();
     $("btn-sync").onclick = async () => {
       if (state.syncMode === "dir") {
         await pullFromDir();

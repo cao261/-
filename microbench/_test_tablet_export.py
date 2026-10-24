@@ -41,8 +41,15 @@ def main() -> int:
     print("\n[1] 自包含: 不能依赖任何外部资源")
     ext = re.findall(r'(?:src|href)\s*=\s*["\'](?:https?:)?//[^"\']+', doc)
     check(not ext, f"没有外部资源引用 ({len(ext)} 个)")
-    non_data = re.findall(r"url\((?!data:)", doc)
-    check(not non_data, f"所有 url() 都是 data: ({len(non_data)} 个例外)")
+    # url() 里允许 data:、文档内引用 url(#mask)、以及 KaTeX 的模板变量
+    # url(${x})。注意不能写成 url\(...(?!data:) —— 引号可选会产生回溯，
+    # 带引号的 url("data:...") 会被误判成外部引用。
+    all_urls = re.findall(r"url\([^)]*\)", doc)
+    bad = [u for u in all_urls
+           if not re.match(r'url\(\s*["\']?data:', u)
+           and not re.match(r"url\(\s*#", u)
+           and not u.startswith("url(${")]
+    check(not bad, f"所有 url() 都是 data:/文档内引用 ({len(bad)} 个例外: {bad[:2]})")
     check("font/woff2;base64" in doc, "KaTeX 字体已内嵌为 base64")
     check("data:image/png;base64" in doc, "应用图标已内嵌")
     check(not re.search(r"@import\s+url\(\s*[\"']?https?:", doc), "CSS 没有 @import 外部表")
@@ -58,15 +65,24 @@ def main() -> int:
     print("\n[3] 触控 / 平板适配")
     # 平板工作台是触控优先的：触控目标尺寸是无条件放大的，
     # 不靠 @media (pointer: coarse) —— 那个断点只用在桌面版 index.html 上。
-    check("min-height:44px" in doc.replace(" ", "") or "min-height: 44px" in doc,
-          "触控目标 >= 44px")
+    flat = doc.replace(" ", "")
+    check("min-height:44px" in flat or "@media(pointer:coarse)" in flat,
+          "触控目标已按触控设备放大")
     check("viewport-fit=cover" in doc, "viewport-fit=cover 已声明")
     check("safe-area-inset" in doc, "使用了安全区内边距")
     check("100dvh" in doc, "用了 dvh 动态视口高度")
     check("tb-tabbar" in doc, "窄屏底部标签栏在")
-    flat = doc.replace(" ", "")
     check("@media (pointer: coarse)" in flat or "min-height:44px" in flat,
           "触控目标已按触控设备放大")
+
+    print("\n[3b] PDF 阅读器")
+    check("pdfjsLib" in doc, "PDF.js 运行时已内联")
+    check('id="mb-pdf-worker-src"' in doc, "worker 源码已内联 (运行时做 Blob URL)")
+    check("GlobalWorkerOptions" in doc, "设置了 workerSrc")
+    check("renderTextLayer" in doc, "文本层已接上 (可划词)")
+    check("tb-pdf-reader" in doc or 'id="pdf-reader"' in doc, "PDF 阅读器 UI 在")
+    check("tb-pdf-item" in doc, "文献库列表项样式在")
+    check("getVaultFile" in doc or "getFileHandle" in doc, "从云盘目录取文件的逻辑在")
 
     print("\n[4] 数据块")
     m = re.search(r'<script type="application/json" id="mb-data">(.*?)</script>', doc, re.S)
@@ -85,6 +101,18 @@ def main() -> int:
     check(all(n.get("group") for n in notes), "每篇都有分组")
     with_math = [n for n in notes if "$" in (n.get("body") or "")]
     check(len(with_math) > 0, f"{len(with_math)} 篇笔记含公式")
+
+    print("\n[4b] PDF 清单与关联")
+    pdfs = payload.get("pdfs") or {}
+    check(len(pdfs) > 0, f"PDF 清单有 {len(pdfs)} 个")
+    for pid, meta in list(pdfs.items())[:3]:
+        ok = (pid.endswith(".pdf") and meta.get("name") and meta.get("size", 0) > 0)
+        check(ok, f"PDF 条目结构完整: {pid[:50]}")
+    linked = [n for n in notes if n.get("pdfs")]
+    check(len(linked) > 0, f"{len(linked)} 篇笔记关联到原文 PDF")
+    bad = [n["rel"] for n in notes
+           for pid in (n.get("pdfs") or []) if pid not in pdfs]
+    check(not bad, f"关联指向的都是清单里的 PDF (坏链 {len(bad)})")
 
     print("\n[5] 内联的 JS 必须语法正确 (node --check)")
     blocks = re.findall(r"<script>\n(.*?)\n</script>", doc, re.S)

@@ -26,6 +26,9 @@
     <input class="tb-search" id="search" type="search" placeholder="搜索笔记…" autocomplete="off"
            autocapitalize="off" autocorrect="off" spellcheck="false">
   </div>
+  <button class="tb-icon" id="btn-pdfs" aria-label="文献库" title="文献库（原文 PDF）">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg>
+  </button>
   <button class="tb-icon" id="btn-sync" aria-label="同步" title="同步">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-8-4.8"/><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 8 4.8"/><path d="M21 4v5h-5"/><path d="M3 20v-5h5"/></svg>
     <span class="tb-dot" id="sync-dot"></span>
@@ -57,6 +60,7 @@
       <div class="tb-doc-actions">
         <button class="tb-btn tb-sm" id="btn-edit">编辑</button>
         <button class="tb-btn tb-sm" id="btn-ai">AI</button>
+        <button class="tb-btn tb-sm" id="btn-pdf-of-note" hidden>原文 PDF</button>
         <span class="tb-dirty" id="dirty-flag" hidden>未同步</span>
       </div>
     </div>
@@ -202,7 +206,54 @@
 <input type="file" id="file-pack" accept="application/json,.json" hidden>
 <input type="file" id="file-dir" webkitdirectory directory multiple hidden>
 
+<!-- ===================== 文献库（原文 PDF 列表） ===================== -->
+<div class="tb-overlay" id="pdf-lib" hidden>
+  <div class="tb-overlay-card">
+    <div class="tb-modal-head">
+      <span>文献库 · 原文 PDF</span>
+      <button class="tb-modal-x" data-close-lib>×</button>
+    </div>
+    <div class="tb-modal-body">
+      <p class="tb-note" id="pdf-lib-note"></p>
+      <div id="pdf-lib-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== PDF 阅读器 ===================== -->
+<div class="tb-pdf" id="pdf-reader" hidden>
+  <div class="tb-pdf-top">
+    <button class="tb-icon" id="pdf-close" aria-label="关闭">×</button>
+    <div class="tb-pdf-title" id="pdf-title"></div>
+    <div class="tb-pdf-ctrl">
+      <button class="tb-icon" id="pdf-zoom-out" aria-label="缩小">−</button>
+      <button class="tb-icon" id="pdf-zoom-in" aria-label="放大">＋</button>
+    </div>
+  </div>
+  <div class="tb-pdf-body" id="pdf-body">
+    <div class="tb-pdf-page" id="pdf-page-wrap">
+      <canvas id="pdf-canvas"></canvas>
+      <div class="textLayer" id="pdf-textlayer"></div>
+    </div>
+  </div>
+  <div class="tb-pdf-bar">
+    <button class="tb-icon" id="pdf-prev" aria-label="上一页">‹</button>
+    <span class="tb-pdf-pageinfo" id="pdf-pageinfo">– / –</span>
+    <button class="tb-icon" id="pdf-next" aria-label="下一页">›</button>
+  </div>
+  <div class="tb-pdf-sel" id="pdf-sel" hidden>
+    <button data-pdf-ai="explain">解读</button>
+    <button data-pdf-ai="translate">翻译</button>
+    <button data-pdf-ai="ask">提问</button>
+  </div>
+  <div class="tb-pdf-status" id="pdf-status"></div>
+</div>
+
 <script type="application/json" id="mb-data">__DATA__</script>
+<div id="mb-stage" style="display:none"></div>
+<!--INLINE_PDFJS_CSS-->
+<!--INLINE_PDFJS_WORKER-->
+<!--INLINE_PDFJS_JS-->
 <!--INLINE_KATEX_JS-->
 <!--INLINE_APP_JS-->
 </body>
