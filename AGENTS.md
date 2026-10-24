@@ -530,6 +530,7 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 | `e4bdbae` | 模板随代码走（全新克隆不 500） |
 | `b4f1e97` | 行尾归一 LF（`.gitattributes`），冲突从巨型块降到语义块 |
 | `d1be3b7` | 桌面改成独立应用窗口（pywebview/WebView2），快捷方式不再走浏览器 |
+| `d8002df` | 表格渲染成真表格 + 旧快照按抽取版本作废 + 公式改用 PDF 原图裁图 |
 
 ---
 
