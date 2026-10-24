@@ -631,7 +631,137 @@
     return typeof window.showDirectoryPicker === "function";
   }
 
+  /* ------------------------------------------------------------------
+     存储后端抽象
+     ------------------------------------------------------------------
+     两种形态, 网页代码不用分叉:
+       fsa  —— 浏览器里用 File System Access API 直连本地文件夹
+       dav  —— APK 里用原生桥走坚果云 WebDAV
+     APK 里的 WebView **没有** showDirectoryPicker, 所以必须留 dav 这条路。
+     ------------------------------------------------------------------ */
+  const nativeBridge = (typeof window !== "undefined" && window.MicroBench)
+    ? window.MicroBench : null;
+  let _nativeSeq = 0;
+  const _nativeWaiters = {};
+  window.__mbNativeResolve = function (cbId, ok, payload) {
+    const w = _nativeWaiters[cbId];
+    if (!w) return;
+    delete _nativeWaiters[cbId];
+    if (ok) w.resolve(payload);
+    else w.reject(new Error((payload && payload.error) || "原生调用失败"));
+  };
+  function nativeCall(method, args) {
+    return new Promise((resolve, reject) => {
+      const id = "cb" + (++_nativeSeq);
+      _nativeWaiters[id] = { resolve, reject };
+      try {
+        nativeBridge[method].apply(nativeBridge, args.concat([id]));
+      } catch (e) {
+        delete _nativeWaiters[id];
+        reject(e);
+      }
+    });
+  }
+
+  /** 逐段编码, 保留 / 作分隔符 (Java 侧按段拼 URL) */
+  function davUrl(kind, path) {
+    const segs = String(path || "").split("/")
+      .filter((s) => s && s !== "." && s !== "..")
+      .map(encodeURIComponent);
+    return "/dav/" + kind + "/" + segs.join("/");
+  }
+
+  const BACKENDS = {
+    fsa: {
+      mode: "fsa",
+      async list(dir) {
+        const h = state.dirHandle;
+        if (!h) return [];
+        const out = [];
+        const walk = async (d, prefix) => {
+          for await (const entry of d.values()) {
+            if (entry.name.startsWith(".")) continue;
+            if (entry.kind === "directory") {
+              if (SKIP_DIRS.has(entry.name)) continue;
+              await walk(entry, prefix + entry.name + "/");
+            } else {
+              out.push({
+                path: prefix + entry.name,
+                name: entry.name,
+                isDir: false,
+                size: 0,
+              });
+            }
+          }
+        };
+        try {
+          const d = dir ? await h.getDirectoryHandle(dir) : h;
+          await walk(d, dir ? dir + "/" : "");
+        } catch (e) { /* 目录不存在 */ }
+        return out;
+      },
+      async readText(path) {
+        const f = await getVaultFile(path);
+        return f ? f.text() : null;
+      },
+      async readBlob(path) {
+        return await fsaGetFile(path);
+      },
+      async writeText(path, text) {
+        const h = state.dirHandle;
+        if (!h) throw new Error("还没连接文件夹");
+        const parts = path.split("/");
+        let dir = h;
+        for (let i = 0; i < parts.length - 1; i++) {
+          dir = await dir.getDirectoryHandle(parts[i], { create: true });
+        }
+        const fh = await dir.getFileHandle(parts[parts.length - 1], { create: true });
+        const w = await fh.createWritable();
+        await w.write(text);
+        await w.close();
+      },
+    },
+
+    dav: {
+      mode: "dav",
+      async list(dir) {
+        const r = await fetch(davUrl("list", dir));
+        if (!r.ok) throw new Error("列目录失败 HTTP " + r.status);
+        const arr = await r.json();
+        return Array.isArray(arr) ? arr : [];
+      },
+      async readText(path) {
+        const r = await fetch(davUrl("file", path));
+        if (!r.ok) return null;
+        return r.text();
+      },
+      async readBlob(path) {
+        const r = await fetch(davUrl("file", path));
+        if (!r.ok) return null;
+        return r.blob();
+      },
+      async writeText(path, text) {
+        await nativeCall("put", [path, text]);
+      },
+    },
+  };
+
+  /** 当前该用哪个后端。APK 里优先 WebDAV; 浏览器里用 FSA。 */
+  function currentBackend() {
+    if (nativeBridge && typeof nativeBridge.davConfigured === "function"
+        && nativeBridge.davConfigured()) {
+      return BACKENDS.dav;
+    }
+    if (state.dirHandle) return BACKENDS.fsa;
+    return null;
+  }
+
   async function connectDir() {
+    // APK 里没有 showDirectoryPicker, 走原生设置页填坚果云账号
+    if (nativeBridge) {
+      nativeBridge.openSettings();
+      return;
+    }
     if (!fsSupported()) {
       toast("这个浏览器不支持直连文件夹，请用 Chrome，或改用「载入 vault 包」", true);
       return;
@@ -639,7 +769,7 @@
     try {
       const h = await window.showDirectoryPicker({ mode: "readwrite", id: "mb-vault" });
       state.dirHandle = h;
-      state.syncMode = "dir";
+      state.syncMode = "fsa";
       await DB.setMeta("dir_handle", h);   // FileSystemHandle 可结构化克隆
       $("sync-mode").textContent = "目录直连（真双向）";
       $("sync-detail").textContent = "已连接：" + h.name;
@@ -671,23 +801,59 @@
     return out;
   }
 
+  /** 列出云盘里的所有 .md 笔记（相对 vault 根的路径）。 */
+  async function listRemoteNotes(backend) {
+    if (backend.mode === "fsa") {
+      const h = state.dirHandle;
+      if (!await ensurePermission(h, false)) { toast("没有读取权限", true); return null; }
+      const files = await walkDir(h, "", []);
+      const out = [];
+      for (const f of files) {
+        const file = await f.handle.getFile();
+        out.push({ path: f.path, text: await file.text(), mtime: file.lastModified });
+      }
+      return out;
+    }
+    // WebDAV: 递归列目录
+    const out = [];
+    const walk = async (dir) => {
+      let entries;
+      try {
+        entries = await backend.list(dir);
+      } catch (e) {
+        return;
+      }
+      for (const e of entries) {
+        if (e.isDir) {
+          if (SKIP_DIRS.has(e.name)) continue;
+          await walk(e.path);
+        } else if (e.name.toLowerCase().endsWith(".md")) {
+          const text = await backend.readText(e.path);
+          if (text == null) continue;
+          out.push({ path: e.path, text, mtime: e.mtime || 0 });
+        }
+      }
+    };
+    await walk("");
+    return out;
+  }
+
   async function pullFromDir() {
-    const h = state.dirHandle;
-    if (!h) return;
-    if (!await ensurePermission(h, false)) { toast("没有读取权限", true); return; }
-    const files = await walkDir(h, "", []);
+    const backend = currentBackend();
+    if (!backend) return;
+    const files = await listRemoteNotes(backend);
+    if (!files) return;
     let added = 0, updated = 0, conflicts = 0;
 
     for (const f of files) {
-      const file = await f.handle.getFile();
-      const text = await file.text();
+      const text = f.text;
       const cur = state.notes.get(f.path);
       if (!cur) {
         const note = {
           id: f.path, title: firstHeading(text) || f.path.split("/").pop(),
           group: f.path.split("/")[0] || "_其它", rel: f.path,
           body: text, html: "", dirty: 0, deleted: 0,
-          baseHash: hash(text), mtime: file.lastModified,
+          baseHash: hash(text), mtime: f.mtime || 0,
         };
         state.notes.set(f.path, note);
         await DB.putNote(note);
@@ -703,7 +869,7 @@
         cur.html = "";
         cur.title = firstHeading(text) || cur.title;
         cur.baseHash = hash(text);
-        cur.mtime = file.lastModified;
+        cur.mtime = f.mtime || cur.mtime;
         await DB.putNote(cur);
         updated++;
       }
@@ -750,20 +916,18 @@
   }
 
   async function pushToDir() {
-    const h = state.dirHandle;
-    if (!h) { toast("还没连接文件夹", true); return; }
-    if (!await ensurePermission(h, true)) { toast("没有写入权限", true); return; }
+    const backend = currentBackend();
+    if (!backend) {
+      toast(nativeBridge ? "还没配坚果云账号，点设置填一下" : "还没连接文件夹", true);
+      return;
+    }
     const dirty = [...state.notes.values()].filter((n) => n.dirty && !n.deleted);
     if (!dirty.length) { toast("没有待同步的改动"); return; }
 
     let ok = 0, fail = 0;
     for (const n of dirty) {
       try {
-        const dir = await ensureDir(h, n.group);
-        const fh = await dir.getFileHandle(n.id.split("/").pop(), { create: true });
-        const w = await fh.createWritable();
-        await w.write(n.body || "");
-        await w.close();
+        await backend.writeText(n.id, n.body || "");
         n.dirty = 0;
         n.baseHash = hash(n.body || "");
         await DB.putNote(n);
@@ -776,7 +940,7 @@
     state.dirtyCount = [...state.notes.values()].filter((x) => x.dirty && !x.deleted).length;
     updateSyncDot();
     buildNav();
-    toast(`已写入 ${ok} 篇到文件夹` + (fail ? `，失败 ${fail}` : ""), fail > 0);
+    toast(`已写入 ${ok} 篇到云盘` + (fail ? `，失败 ${fail}` : ""), fail > 0);
   }
 
   async function ensureDir(root, group) {
@@ -1057,6 +1221,17 @@
 
   /** 从已连接的 vault 目录里取一个文件。没连目录就返回 null。 */
   async function getVaultFile(relPath) {
+    const b = currentBackend();
+    if (!b) return null;
+    try {
+      return await b.readBlob(relPath);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** FSA 专用：从本地目录句柄取文件。 */
+  async function fsaGetFile(relPath) {
     const h = state.dirHandle;
     if (!h) return null;
     const parts = String(relPath).split("/").filter(Boolean);
@@ -1085,9 +1260,11 @@
     $("pdf-title").textContent = meta.name;
     pdfStatus("正在打开…");
 
-    if (!state.dirHandle) {
-      pdfStatus("还没连接文件夹 —— PDF 原文在云盘的 vault 目录里。" +
-                "安卓平板上请选坚果云同步下来的「我的坚果云\\MicroBench工作台」");
+    if (!currentBackend()) {
+      pdfStatus(nativeBridge
+        ? "还没配置坚果云 —— 点设置里的「配置坚果云」填账号和应用密码"
+        : "还没连接文件夹 —— PDF 原文在云盘的 vault 目录里。" +
+          "安卓平板上请选坚果云同步下来的「我的坚果云\\MicroBench工作台」");
       return;
     }
     const file = await getVaultFile(pdfId);
@@ -1369,11 +1546,16 @@
     $("cfg-model").value = state.ai.model || "";
     $("cfg-model-t").value = state.ai.modelT || "";
     $("modal-settings").hidden = false;
-    $("sync-mode").textContent = state.syncMode === "dir"
-      ? "目录直连（真双向）" : "仅本机（未连接文件夹）";
-    $("sync-detail").textContent = fsSupported()
-      ? "当前浏览器支持直连文件夹。"
-      : "当前浏览器不支持 File System Access（多半不是 Chrome），请用 vault 包导入/导出。";
+    $("sync-mode").textContent = nativeBridge
+      ? (state.syncMode === "dav" ? "坚果云 WebDAV（真双向）" : "未连接坚果云")
+      : (state.syncMode === "fsa" ? "目录直连（真双向）" : "仅本机（未连接文件夹）");
+    $("sync-detail").textContent = nativeBridge
+      ? (state.syncMode === "dav"
+          ? "已连接坚果云。改动会直接写回云盘里的 vault 目录。"
+          : "点「配置坚果云」填邮箱和应用密码，就能直接读写云盘里的 vault 目录。")
+      : (fsSupported()
+          ? "当前浏览器支持直连文件夹。"
+          : "当前浏览器不支持 File System Access（多半不是 Chrome），请用 vault 包导入/导出。");
     $("about-note").textContent =
       `MicroBench 平板工作台 · 本地 ${state.notes.size} 篇 · 待同步 ${state.dirtyCount} 篇`;
   }
@@ -1395,9 +1577,10 @@
     b.classList.toggle("has-dot", state.dirtyCount > 0);
     const s = $("sync-status");
     if (s) {
-      s.textContent = state.syncMode === "dir"
-        ? `目录直连 · 待同步 ${state.dirtyCount}`
-        : `本地模式 · 待同步 ${state.dirtyCount}`;
+      const mode = nativeBridge
+        ? (state.syncMode === "dav" ? "坚果云" : "未连接")
+        : (state.syncMode === "fsa" ? "目录直连" : "本地模式");
+      s.textContent = `${mode} · 待同步 ${state.dirtyCount}`;
     }
   }
 
@@ -1450,12 +1633,14 @@
     const ai = await DB.getMeta("ai", null);
     if (ai) state.ai = Object.assign(state.ai, ai);
 
-    // 目录句柄（安卓 Chrome 可持久化）
-    if (fsSupported()) {
+    // 目录句柄（安卓 Chrome 可持久化）/ 坚果云 WebDAV（APK）
+    if (nativeBridge) {
+      state.syncMode = nativeBridge.davConfigured() ? "dav" : "none";
+    } else if (fsSupported()) {
       const h = await DB.getMeta("dir_handle", null);
       if (h) {
         state.dirHandle = h;
-        state.syncMode = "dir";
+        state.syncMode = "fsa";
       }
     }
     stage("meta");
@@ -1480,6 +1665,7 @@
     // 事件
     $("btn-menu").onclick = () => setPane("nav");
     $("btn-pdfs").onclick = openPdfLib;
+    $("btn-connect-dir").textContent = nativeBridge ? "配置坚果云" : "连接文件夹（真双向）";
     $("pdf-close").onclick = closePdf;
     $("pdf-prev").onclick = () => gotoPdfPage(pdfState.currentPage - 1);
     $("pdf-next").onclick = () => gotoPdfPage(pdfState.currentPage + 1);

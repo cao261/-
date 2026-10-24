@@ -43,6 +43,14 @@ microbench/_vendor/
 MicroBench_离线阅读版.html
 MicroBench_平板工作台.html
 
+# 打包好的 APK 与签名密钥 —— 密钥绝对不能进版本库
+MicroBench-平板工作台.apk
+MicroBench-平板工作台.apk.idsig
+android/microbench-tablet.jks
+android/build/
+android/assets/
+android/_davtest_classes/
+
 # Vault contents (user actual notes/literature) — keep on disk only
 00_Dashboard/
 01_Literature/

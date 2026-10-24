@@ -1,0 +1,233 @@
+# -*- coding: utf-8 -*-
+"""
+一个最小的 WebDAV 服务器，用来对拍 DavClient（Java）。
+
+真机上没法自动测 WebDAV，所以这里用 Python 起一个只实现
+PROPFIND / GET / PUT / MKCOL / DELETE 的假服务器，然后让
+Java 的 DavClient 连上来跑一遍。
+
+跑法:  python android/_test_dav.py
+"""
+import base64
+import http.server
+import os
+import shutil
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE / "_davtest_root"
+PORT = 8765
+
+# 假服务器上的文件树
+FILES = {
+    "我的坚果云/MicroBench工作台/00_Dashboard/主工作台看板.md": "# 看板\n\n内容\n",
+    "我的坚果云/MicroBench工作台/01_Literature/01_论文原文_PDF/a paper.pdf": "PDF-BYTES",
+}
+
+
+def xml_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _auth_ok(self) -> bool:
+        h = self.headers.get("Authorization", "")
+        if not h.startswith("Basic "):
+            return False
+        try:
+            raw = base64.b64decode(h[6:]).decode("utf-8")
+        except Exception:
+            return False
+        return raw == "me@example.com:app-pass-123"
+
+    def _deny(self):
+        body = b"unauthorized"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="dav"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Allow", "OPTIONS,GET,PUT,PROPFIND,MKCOL,DELETE")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_PROPFIND(self):
+        if not self._auth_ok():
+            return self._deny()
+        path = self.path.split("?")[0]
+        # 请求行里的 path 是百分号编码的, 这里要解回来再和文件树比对
+        path = unquote(path)
+        # 剥掉 dav 根, 剩下的才和 FILES 的 key 对得上
+        if path.startswith("/dav/"):
+            path = path[4:]
+        path = path.lstrip("/")
+        if path and not path.endswith("/"):
+            path += "/"
+        prefix = path
+        items = []
+        seen = set()
+        for full in FILES:
+            if not full.startswith(prefix):
+                continue
+            rest = full[len(prefix):]
+            if "/" not in rest:
+                items.append((rest, False, len(FILES[full].encode("utf-8"))))
+            else:
+                d = rest.split("/")[0] + "/"
+                if d not in seen:
+                    seen.add(d)
+                    items.append((d, True, 0))
+        body = ['<?xml version="1.0" encoding="utf-8"?>',
+                 '<D:multistatus xmlns:D="DAV:">']
+        for name, is_dir, size in items:
+            href = "/dav/" + quote(prefix + name)
+            body.append("<D:response>")
+            body.append(f"<D:href>{xml_escape(href)}</D:href>")
+            body.append("<D:propstat><D:prop>")
+            if is_dir:
+                body.append("<D:resourcetype><D:collection/></D:resourcetype>")
+            else:
+                body.append("<D:resourcetype/>")
+                body.append(f"<D:getcontentlength>{size}</D:getcontentlength>")
+            body.append("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>")
+            body.append("</D:response>")
+        body.append("</D:multistatus>")
+        data = "".join(body).encode("utf-8")
+        if os.environ.get("DAV_DEBUG"):
+            print(f"[mock] PROPFIND {self.path} -> {len(items)} items, {len(data)} bytes",
+                  file=sys.stderr, flush=True)
+            print(data.decode("utf-8")[:600], file=sys.stderr, flush=True)
+        self.send_response(207)
+        self.send_header("Content-Type", "application/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if not self._auth_ok():
+            return self._deny()
+        path = self.path.split("?")[0]
+        key = path.lstrip("/")
+        if key.startswith("dav/"):
+            key = key[4:]
+        key = unquote(key)
+        if key not in FILES:
+            body = b"not found"
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        data = FILES[key].encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_PUT(self):
+        if not self._auth_ok():
+            return self._deny()
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n) if n else b""
+        key = unquote(self.path.split("?")[0].lstrip("/"))
+        if key.startswith("dav/"):
+            key = key[4:]
+        FILES[key] = body.decode("utf-8", "replace")
+        self.send_response(201)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_MKCOL(self):
+        if not self._auth_ok():
+            return self._deny()
+        self.send_response(201)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_DELETE(self):
+        if not self._auth_ok():
+            return self._deny()
+        key = unquote(self.path.split("?")[0].lstrip("/"))
+        if key.startswith("dav/"):
+            key = key[4:]
+        FILES.pop(key, None)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def quote(p: str) -> str:
+    from urllib.parse import quote as q
+    return q(p, safe="/")
+
+
+def unquote(p: str) -> str:
+    from urllib.parse import unquote as u
+    return u(p)
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main() -> int:
+    srv = Server(("127.0.0.1", PORT), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    print(f"mock webdav on 127.0.0.1:{PORT}")
+    time.sleep(0.5)
+
+    # 编译并跑 Java 测试。
+    # 注意: javac 的命令行参数经 os.system 走一遍 cmd, 路径里有中文/空格
+    # 就会被 cmd 拆坏。所以整个测试挪到纯 ASCII 目录编译。
+    jdk = os.environ.get("MB_JDK", r"D:\Desktop\杂物\z\Zotero\jdk")
+    stage = Path(os.environ.get("TEMP", r"C:\Windows\Temp")) / "mb_davtest"
+    if stage.exists():
+        import shutil
+        shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    import shutil
+    shutil.copy(HERE / "java" / "microbench" / "tablet" / "DavClient.java",
+                stage / "DavClient.java")
+    shutil.copy(HERE / "TestDav.java", stage / "TestDav.java")
+    out = stage / "classes"
+    out.mkdir(exist_ok=True)
+
+    javac = str(Path(jdk) / "bin" / "javac.exe")
+    java = str(Path(jdk) / "bin" / "java.exe")
+    cmd = [javac, "-encoding", "UTF-8", "-nowarn", "-d", str(out),
+           str(stage / "DavClient.java"), str(stage / "TestDav.java")]
+    print("compiling...", flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stdout)
+        print(r.stderr)
+        print("javac 失败")
+        return 1
+    print("running...", flush=True)
+    r = subprocess.run([java, "-cp", str(out), "TestDav", f"http://127.0.0.1:{PORT}/dav/"],
+                       capture_output=True, text=True)
+    print(r.stdout)
+    if r.stderr.strip():
+        print(r.stderr, file=sys.stderr)
+    srv.shutdown()
+    return r.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

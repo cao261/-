@@ -359,7 +359,60 @@ python microbench/export_offline.py "D:/OneDrive/MicroBench.html"
 
 ---
 
-## 📁 目录结构与规范说明
+## 📦 平板工作台 APK（安卓）
+
+除了「拷一个 HTML 过去」，还可以直接装成 **APK 应用**（0.88 MB，自带图标、全屏、可离线）。
+
+**产物**：`MicroBench-平板工作台.apk`（已签名）
+
+### 装到平板
+
+1. 把 `MicroBench-平板工作台.apk` 传到平板（微信文件传输 / U 盘 / 网盘都行）；
+2. 在平板上点这个文件 → 系统会提示「禁止安装未知来源应用」→ 按提示允许**当前这个应用**（文件管理器 / 浏览器）安装；
+3. 装好后桌面会出现 MicroBench 图标。
+
+> 第一次点开会有一次「允许未知来源」的提示，是正常的一次性授权。
+
+### 第一次打开：连坚果云
+
+APK 里**内置了坚果云 WebDAV 客户端**，不用再装云盘 App、也不用选文件夹：
+
+1. 点右上角 **设置**（齿轮）→ **同步** → **配置坚果云**；
+2. 填两个值：
+   - **账号**：你的坚果云登录邮箱
+   - **密码**：**应用密码**（不是账号密码！）——
+     在坚果云**网页版** → 设置 → 安全选项 → **应用密码** → 新建一个（名字随便起，比如 `tablet`）；
+3. 点「测试连接」→ 显示「连接正常」就对了 → **保存**；
+4. 回到工作台 → 顶栏的**同步按钮**（两个箭头）→ 自动拉取云盘里的 vault。
+
+> **应用密码不是账号密码** —— 这是最常见的卡点。坚果云网页版里单独生成一个，
+> 撤销也只影响这一个应用。
+
+### APK 里能做什么
+
+和浏览器版完全一致：
+
+- 📖 **翻原文 PDF**（内嵌 PDF.js，直接从坚果云读，不经过任何服务器）
+- ✍️ 写笔记 / 新建 / 速记，改动**直接写回云盘里的 vault**
+- 🤖 AI 解读、翻译、摘要、提问（设置里填 MiniMax API Key，key 只存本机）
+- 🔍 全文搜索、划词、公式渲染、深色模式
+
+### 重新构建 APK
+
+```powershell
+pwsh android/build_apk.ps1
+```
+
+用的是 Android 官方 `aapt2 + javac + d8 + zipalign + apksigner`，
+**不走 Gradle**（省掉一整套 Maven 依赖）。签名密钥在 `android/microbench-tablet.jks`，
+密码 `microbench2026` —— **升级版本必须用同一个密钥**，否则装不上（会提示签名冲突）。
+
+> 工程在 `android/`：
+> `java/microbench/tablet/` 是原生壳（MainActivity / DavClient / DavPathHandler / DavBridge / SettingsActivity），
+> `build_apk.ps1` 是构建脚本，`_test_dav.py` 是 WebDAV 客户端的对拍测试
+> （起一个 Python 假 WebDAV 服务器，让 Java 侧真跑一遍 PROPFIND/GET/PUT）。
+
+---
 
 ```text
 个人工作台/
