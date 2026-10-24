@@ -153,6 +153,65 @@ def main() -> int:
           "urlFor 会拼上 vault 前缀")
     check("rootLen" in dav, "去尾斜杠时保住了根的斜杠")
 
+    print("\n[10] TLS 必须做主机名验证 (裸 socket 默认不验)")
+    check("setEndpointIdentificationAlgorithm" in code_only(dav),
+          "裸 socket 开了 endpointIdentificationAlgorithm")
+    check("getDefaultHostnameVerifier" in code_only(dav),
+          "握手后再验一次主机名")
+    # 顺序必须是 createSocket() -> setSSLParameters -> connect
+    code = code_only(dav)
+    i_create = code.find(".createSocket()")
+    i_params = code.find("setSSLParameters")
+    i_connect = code.find("sock.connect(")
+    check(i_create >= 0 and i_params > i_create and i_connect > i_params,
+          "顺序是 createSocket() -> setSSLParameters -> connect")
+    check(".createSocket(host" not in code and ".createSocket(u.getHost()" not in code,
+          "没有用 createSocket(host,port) (内部就握手了, 主机名验证来不及生效)")
+
+    print("\n[11] 不能依赖 API 26 才有的 java.util.Base64 (minSdk 是 24)")
+    check("java.util.Base64" not in code_only(dav), "DavClient 没有 import java.util.Base64")
+    check("base64(" in dav, "用了自实现的 Base64")
+    check("isLoopback" in dav, "http 根只对回环地址豁免 (明文会把应用密码送出去)")
+
+    print("\n[12] 设置页不能跨线程改 UI (CalledFromWrongThreadException)")
+    probe = settings.split("class ProbeTask")[1] if "class ProbeTask" in settings else ""
+    probe_body = probe.split("class StatusTask")[0] if probe else ""
+    check("setText" not in probe_body,
+          "ProbeTask (后台线程) 里没有 setText")
+    check("runOnUiThread" in settings, "UI 更新走 runOnUiThread")
+    check("vaultInput.setText" in code_only(settings),
+          "vault 位置在主线程上回填")
+    check("getPartial" in settings,
+          "下载链路测试只读文件头 (不拉整篇 PDF)")
+
+    print("\n[13] 凭证不能被系统备份出去")
+    check('android:allowBackup="false"' in manifest, "allowBackup=false")
+
+    print("\n[14] 原生壳的交互不能是死的")
+    check("onShowFileChooser" in main_java,
+          "有 WebChromeClient.onShowFileChooser (导入 vault 包才有点击反应)")
+    check("REQ_FILE" in main_java, "文件选择有独立的请求码")
+    check("parseResult" in main_java, "文件选择结果回传给网页")
+    check("onBackPressed" in main_java, "物理返回键不是直接退出应用")
+    check("onDestroy" in main_java and "destroy()" in main_java,
+          "WebView 在 onDestroy 里销毁 (不然每次切后台都漏一份)")
+    check("httpPost" in bridge and "httpPost" in app_js,
+          "AI 请求走原生代理 (APK 里页面的 fetch 会被 CORS 打死)")
+
+    print("\n[15] 页面侧的同步链路不能断")
+    check('state.syncMode === "dir"' not in app_js,
+          "同步按钮不再判断永远不成立的 \"dir\"")
+    idx = app_js.find('btn-sync").onclick')
+    handler = app_js[idx:idx + 500] if idx >= 0 else ""
+    check("currentBackend()" in handler,
+          "同步按钮按 currentBackend() 判断")
+    check("pullFromDir" in handler and "pushToDir" in handler,
+          "同步按钮真的会拉 + 写")
+    check("pushToDir(true)" in app_js, "保存后会自动写回云盘")
+    check("scan.pdfs" in app_js, "PDF 清单从云盘实时扫 (云盘新加的论文能看见)")
+    check("parseSse" in app_js, "SSE 解析抽成了共用函数 (原生代理也用)")
+    check("httpPost" in app_js, "AI 请求在 APK 里走原生代理")
+
     print(f"\n{'=' * 60}")
     print(f"PASS {len(PASS)}  FAIL {len(FAIL)}")
     for f in FAIL:

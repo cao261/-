@@ -3,15 +3,26 @@ package microbench.tablet;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * 暴露给网页的原生桥。
  *
  * 读走 /dav/* （见 DavPathHandler），写只能走这里 —— 那边只能处理 GET。
  *
- * ⚠️ 这里刻意**不用 lambda、也不用匿名内部类**：
+ * 另外还代理一次 AI 请求（httpPost）—— APK 里页面的 origin 是
+ * https://appassets.androidplatform.net，外部 API 不会回这个 origin 的
+ * Access-Control-Allow-Origin，fetch 必被 CORS 打死。走原生就没有跨域问题。
+ *
+ * ⚠ 这里刻意**不用 lambda、也不用匿名内部类**：
  *   - 匿名内部类：d8 8.2.2 读它会抛 NullPointerException
  *     ("Cannot invoke String.length() because <parameter1> is null")
  *   - lambda：javac 用 android.jar 作 bootclasspath 时找不到
@@ -21,9 +32,19 @@ import java.nio.charset.StandardCharsets;
  */
 public class DavBridge {
 
+    /** 一次原生调用的最长等待时间（毫秒）。 */
+    private static final int NATIVE_TIMEOUT_MS = 120_000;
+
     private final Prefs prefs;
     private final WebView webView;
     private final MainActivity activity;
+
+    /**
+     * 所有原生任务走**同一个单线程池**。
+     * 以前每写一个文件就 new Thread —— 批量推 24 篇笔记就是 24 个线程
+     * 各自建一条 TLS 连接，机器直接卡住。
+     */
+    private static final ExecutorService POOL = Executors.newSingleThreadExecutor();
 
     public DavBridge(Prefs prefs, WebView webView, MainActivity activity) {
         this.prefs = prefs;
@@ -48,13 +69,38 @@ public class DavBridge {
     /** 写一个文件到云盘。 */
     @JavascriptInterface
     public void put(String path, String text, String callbackId) {
-        new Thread(new DavTask(this, path, text, callbackId, false)).start();
+        if (path == null || path.trim().isEmpty()) {
+            post(callbackId, false, "{\"ok\":false,\"error\":\"路径为空\"}");
+            return;
+        }
+        POOL.execute(new DavTask(this, path, text == null ? "" : text, callbackId, false));
     }
 
     /** 删一个文件。 */
     @JavascriptInterface
     public void delete(String path, String callbackId) {
-        new Thread(new DavTask(this, path, null, callbackId, true)).start();
+        if (path == null || path.trim().isEmpty()) {
+            post(callbackId, false, "{\"ok\":false,\"error\":\"路径为空\"}");
+            return;
+        }
+        POOL.execute(new DavTask(this, path, null, callbackId, true));
+    }
+
+    /**
+     * 代理一次 HTTP POST（给 AI 接口用）。
+     *
+     * 只有 https 放行 —— 明文 HTTP 会把 API Key 裸奔出去。
+     *
+     * @param auth 形如 "Bearer xxx"，为空就不加 Authorization 头
+     */
+    @JavascriptInterface
+    public void httpPost(String url, String body, String auth, String callbackId) {
+        if (url == null || !url.toLowerCase().startsWith("https://")) {
+            post(callbackId, false, "{\"ok\":false,\"error\":\"只允许 https\"}");
+            return;
+        }
+        POOL.execute(new HttpTask(this, url, body == null ? "" : body,
+                auth == null ? "" : auth, callbackId));
     }
 
     void post(String callbackId, boolean ok, String payload) {
@@ -135,6 +181,79 @@ public class DavBridge {
                 ok = false;
             }
             bridge.post(callbackId, ok, result);
+        }
+    }
+
+    /** 代理一次 AI 的 HTTP POST。 */
+    private static class HttpTask implements Runnable {
+        private final DavBridge bridge;
+        private final String url;
+        private final String body;
+        private final String auth;
+        private final String callbackId;
+
+        HttpTask(DavBridge bridge, String url, String body, String auth,
+                 String callbackId) {
+            this.bridge = bridge;
+            this.url = url;
+            this.body = body;
+            this.auth = auth;
+            this.callbackId = callbackId;
+        }
+
+        @Override
+        public void run() {
+            boolean ok;
+            String result;
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                try {
+                    c.setRequestMethod("POST");
+                    c.setConnectTimeout(30_000);
+                    c.setReadTimeout(NATIVE_TIMEOUT_MS);
+                    c.setDoOutput(true);
+                    c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                    c.setRequestProperty("Accept", "text/event-stream, application/json");
+                    if (!auth.isEmpty()) {
+                        c.setRequestProperty("Authorization", auth);
+                    }
+                    byte[] data = body.getBytes(StandardCharsets.UTF_8);
+                    c.setFixedLengthStreamingMode(data.length);
+                    try (OutputStream os = c.getOutputStream()) {
+                        os.write(data);
+                    }
+                    int code = c.getResponseCode();
+                    InputStream in = (code >= 200 && code < 300)
+                            ? c.getInputStream() : c.getErrorStream();
+                    String text = in == null ? "" : new String(readAll(in), StandardCharsets.UTF_8);
+                    if (code >= 200 && code < 300) {
+                        ok = true;
+                        result = "{\"ok\":true,\"status\":" + code + ",\"body\":"
+                                + jsonEscape(text) + "}";
+                    } else {
+                        ok = false;
+                        result = "{\"ok\":false,\"status\":" + code + ",\"error\":"
+                                + jsonEscape(text) + "}";
+                    }
+                } finally {
+                    c.disconnect();
+                }
+            } catch (Exception e) {
+                String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+                ok = false;
+                result = "{\"ok\":false,\"error\":" + jsonEscape(msg) + "}";
+            }
+            bridge.post(callbackId, ok, result);
+        }
+
+        private static byte[] readAll(InputStream in) throws IOException {
+            ByteArrayOutputStream bo = new ByteArrayOutputStream(16 * 1024);
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bo.write(buf, 0, n);
+            }
+            return bo.toByteArray();
         }
     }
 

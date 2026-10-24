@@ -133,6 +133,65 @@ public class TestDav {
             check(dd != null, "探测后能下载 vault 内的文件");
         }
 
+        System.out.println("[9] Base64 (自己实现的, 不能依赖 API 26 的 java.util.Base64)");
+        String[] b64samples = {
+            "", "a", "ab", "abc", "abcd",
+            "me@example.com:app-pass-123",
+            "中文密码测试",
+            "a1b2c3d4e5f6g7h8i9j0",
+        };
+        boolean b64ok = true;
+        StringBuilder b64diff = new StringBuilder();
+        for (String s : b64samples) {
+            String mine = DavClient.base64(s);
+            String ref = java.util.Base64.getEncoder().encodeToString(
+                    s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            if (!mine.equals(ref)) {
+                b64ok = false;
+                b64diff.append("[").append(s).append("] mine=").append(mine)
+                        .append(" ref=").append(ref).append(" ");
+            }
+        }
+        check(b64ok, "自实现 Base64 与 JDK 结果一致 " + b64diff);
+
+        System.out.println("[10] 文件名里的 '+' 不会被解成空格");
+        check("C++入门.pdf".equals(DavClient.urlDecode("C%2B%2B%E5%85%A5%E9%97%A8.pdf")),
+                "%2B 正确解回 '+'");
+        check("C++入门.pdf".equals(DavClient.urlDecode("C++入门.pdf")),
+                "字面 '+' 保持不变 (不能变成空格)");
+        // 端到端: 服务器把 '+' 原样写在 href 里
+        byte[] plus = c.get("我的坚果云/MicroBench工作台/01_Literature/C++入门.pdf");
+        check(plus != null && new String(plus, "UTF-8").contains("PDF-PLUS"),
+                "带 '+' 的文件能下载到: "
+                        + (plus == null ? "(null)" : new String(plus, "UTF-8")));
+        boolean sawPlus = false;
+        List<DavClient.DavEntry> litFiles =
+                c.list("我的坚果云/MicroBench工作台/01_Literature");
+        if (litFiles != null) {
+            for (DavClient.DavEntry e : litFiles) {
+                if (e.name.contains("+")) {
+                    sawPlus = true;
+                }
+            }
+        }
+        check(sawPlus, "列目录时 '+' 保住了");
+
+        System.out.println("[11] http 根只在回环地址上豁免");
+        check(DavClient.isLoopback("http://127.0.0.1:8765/dav/"), "127.0.0.1 算回环");
+        check(DavClient.isLoopback("http://localhost:8765/dav/"), "localhost 算回环");
+        check(!DavClient.isLoopback("https://dav.jianguoyun.com/dav/"),
+                "公网地址不算回环");
+        DavClient httpPub = new DavClient("u", "p", "http://dav.jianguoyun.com/dav/");
+        check(httpPub.urlFor("x.md").startsWith("https://"),
+                "公网的 http 根被强制升级成 https: " + httpPub.urlFor("x.md"));
+
+        System.out.println("[12] 只读文件头 (测下载链路, 不拉整篇)");
+        int got = c.getPartial("我的坚果云/MicroBench工作台/00_Dashboard/主工作台看板.md",
+                64 * 1024);
+        check(got > 0, "getPartial 读到了字节: " + got);
+        int tiny = c.getPartial("我的坚果云/MicroBench工作台/00_Dashboard/主工作台看板.md", 4);
+        check(tiny == 4, "getPartial 遵守上限: " + tiny);
+
         System.out.println();
         System.out.println("PASS " + pass + "  FAIL " + fail);
         System.exit(fail == 0 ? 0 : 1);

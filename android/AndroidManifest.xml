@@ -11,7 +11,7 @@
         android:label="MicroBench"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
@@ -31,7 +31,7 @@
             android:name=".SettingsActivity"
             android:exported="false"
             android:label="坚果云连接"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
-
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density|smallestScreenSize"
+            android:windowSoftInputMode="adjustResize" />
     </application>
 </manifest>

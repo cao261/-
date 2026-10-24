@@ -123,9 +123,13 @@ public class SettingsActivity extends Activity {
 
     private void testConnection() {
         status.setText("正在连接…");
-        final String u = userInput.getText().toString();
+        // ⚠ 在**主线程**上把输入框的值取出来。
+        //   后台线程再去读 View 是数据竞争（TextView.mText 不是 volatile），
+        //   而且下面要改 UI, 跨线程改会抛 CalledFromWrongThreadException。
+        final String u = userInput.getText().toString().trim();
         final String p = passInput.getText().toString();
-        new Thread(new ProbeTask(this, u, p)).start();
+        final String v = vaultInput.getText().toString().trim();
+        new Thread(new ProbeTask(this, u, p, v)).start();
     }
 
     /** 测通了就直接存 —— 之前「测试连接」只测不存, 用户以为配好了,
@@ -183,8 +187,10 @@ public class SettingsActivity extends Activity {
 
         @Override
         public void onClick(View v) {
-            act.prefs.setDav(act.userInput.getText().toString(),
+            act.prefs.setDav(act.userInput.getText().toString().trim(),
                     act.passInput.getText().toString());
+            // vault 位置也一起存 —— 否则下次连的是错的目录。
+            act.prefs.setDavVaultRoot(act.vaultInput.getText().toString().trim());
             Toast.makeText(act, "已保存", Toast.LENGTH_SHORT).show();
             act.setResult(RESULT_OK);
             act.finish();
@@ -209,62 +215,62 @@ public class SettingsActivity extends Activity {
         private final SettingsActivity act;
         private final String user;
         private final String pass;
+        private final String vault;
 
-        ProbeTask(SettingsActivity act, String user, String pass) {
+        ProbeTask(SettingsActivity act, String user, String pass, String vault) {
             this.act = act;
             this.user = user;
             this.pass = pass;
+            this.vault = vault;
         }
 
         @Override
         public void run() {
             String msg;
             boolean ok;
-            String user = act.userInput.getText().toString();
-            String pass = act.passInput.getText().toString();
-            String vault = act.vaultInput.getText().toString().trim();
+            // 用户手填的 vault 位置优先；没填就自动探测。
+            String detected = vault;
             try {
-                DavClient c = new DavClient(user, pass);
+                // 用 prefs 里存的根，而不是写死的 DEFAULT_ROOT ——
+                // 否则自定义根根本没法治。
+                DavClient c = new DavClient(user, pass, act.prefs.davRoot());
 
                 // ① 先定 vault 在云盘里的位置。
                 //    网页给的是 vault 相对路径, 没有这个前缀就会打到
                 //    「我的坚果云/01_Literature/...」上 —— 列目录看着正常
                 //    (根目录确实有东西), 下载却全部 404。
-                String detected = vault;
-                if (detected.isEmpty()) {
+                if (detected == null || detected.isEmpty()) {
                     detected = c.detectVaultRoot();
                     if (detected == null) {
                         detected = "";
                     }
                 }
                 c.setVaultRoot(detected);
-                act.vaultInput.setText(detected);
 
                 // ② 列目录
                 int n = c.list("").size();
 
-                // ③ 下载链路也得验 —— 只验列目录等于没验下载
+                // ③ 下载链路也得验 —— 只验列目录等于没验下载。
+                //    但只取文件头 64 KB 就够: 整篇 PDF 拉下来既慢
+                //    （9 MB 走公网）又占内存, 而验链路只需要证明 GET 通。
                 String probe;
-                boolean dlOk = false;
+                boolean dlOk = true;
                 String pdf = c.findFirstPdf("", 3);
                 if (pdf != null) {
-                    byte[] d = c.get(pdf);
-                    if (d != null && d.length > 0) {
-                        probe = "，并成功下载了 " + d.length + " 字节的原文 PDF";
-                        dlOk = true;
+                    int got = c.getPartial(pdf, 64 * 1024);
+                    if (got > 4) {
+                        probe = "，并成功读到了原文 PDF 的开头（" + got + " 字节）";
                     } else {
                         probe = "；但下载测试没通过（GET 返回空）";
+                        dlOk = false;
                     }
                 } else {
                     probe = "（没找到 PDF，跳过下载测试）";
                 }
 
-                ok = true;
+                ok = dlOk;
                 msg = "连接正常，vault 位于「" + (detected.isEmpty() ? "(根目录)" : detected)
                         + "」，笔记 " + n + " 篇" + probe;
-                if (!dlOk && !probe.startsWith("（")) {
-                    ok = false;
-                }
             } catch (Exception e) {
                 ok = false;
                 String m = e.getMessage() == null ? e.toString() : e.getMessage();
@@ -272,7 +278,7 @@ public class SettingsActivity extends Activity {
             }
             final String fm = msg;
             final boolean fok = ok;
-            final String fvault = vault;
+            final String fvault = detected == null ? "" : detected;
             act.runOnUiThread(new StatusTask(act, fm, fok, user, pass, fvault));
         }
     }
@@ -297,6 +303,14 @@ public class SettingsActivity extends Activity {
 
         @Override
         public void run() {
+            // ⚠ UI 只能在主线程上改。
+            //   之前在后台线程里直接 act.vaultInput.setText(...) →
+            //   CalledFromWrongThreadException → 被上面的 catch 吞掉 →
+            //   判定成「失败」→ saveIfOk 永远不执行 →
+            //   **「测试并保存」永远存不进凭证**，这是头号阻断问题。
+            if (act.vaultInput != null && !vault.isEmpty()) {
+                act.vaultInput.setText(vault);
+            }
             TextView s = act.statusView();
             if (s != null) {
                 s.setText(msg);
@@ -305,7 +319,7 @@ public class SettingsActivity extends Activity {
             if (ok) {
                 // 测通了就把凭证和 vault 位置都存下来, 并直接关掉设置页 ——
                 // 用户不需要再点一次「保存」。
-                act.saveIfOk(user, pass, act.vaultInput.getText().toString().trim());
+                act.saveIfOk(user, pass, vault);
                 Toast.makeText(act, "连接正常, 已保存", Toast.LENGTH_SHORT).show();
                 act.setResult(RESULT_OK);
                 act.finish();

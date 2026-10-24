@@ -389,6 +389,33 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 - 声明写在块里 → 块级作用域，块外调不到 → 这就是为什么代码里有十几处 `window.X = X` 导出。
   **新写代码请直接放顶层，不要塞进裸花括号块。**
 
+### 4.11 安卓平板 APK（手工打包，不走 Gradle）
+
+> 完整审查报告见 [`docs/HANDOFF_TABLET_2026-10-25.md`](docs/HANDOFF_TABLET_2026-10-25.md)。
+> 下面是「改回去也不会立刻报错、但功能会静默坏掉」的那几条，护栏在
+> `android/_test_apk_contract.py`（68 项）里钉死了。
+
+- **裸 socket 的 TLS 顺序**：`createSocket()`（无参）→ `setSSLParameters(
+  endpointIdentificationAlgorithm=HTTPS)` → `connect()`。
+  ⚠ 用 `createSocket(host, port)` **是错的** —— 那个版本内部就完成了 TLS 握手，
+  这时再设参数来不及，**主机名验证等于没开**，坚果云应用密码会裸奔在中间人面前。
+- **`java.util.Base64` 是 API 26 才有的**，而 minSdk 是 24 → Android 7.x 上
+  第一次网络请求就 `NoClassDefFoundError`（d8 不拦，只警告）。
+  `android.util.Base64` 是 API 8，但 Android 专有、桌面 JVM 跑不了（要对拍测试）。
+  → 自己写 20 行，两边都能跑。
+- **跨线程改 View = `CalledFromWrongThreadException`**：后台线程里
+  `setText()` → 抛异常 → 被 `catch (Exception)` 吞掉 → 判定成「失败」。
+  表现是「测试并保存永远失败、凭证存不进去」。**UI 只能在主线程上改。**
+- **`HttpURLConnection` 只放行标准方法**，PROPFIND/MKCOL 只能裸 socket；
+  裸 socket 默认**不做主机名验证**，要手动开。
+- **`URLDecoder` 走 form 编码规则**，`+` 会被解成空格 → 文件名带 `+` 的论文
+  永远打不开。解码前先把 `+` 换成 `%2B`。
+- **APK 里的 origin 是 `https://appassets.androidplatform.net`** → 外部 API
+  不会回这个 origin 的 CORS 头，`fetch` 必被打死。AI 请求要**走原生代理**。
+- **导出器的占位符必须先替换再内联**：否则内联的 JS 里只要出现 `__DATA__`
+  字面量（哪怕只在注释里），就会被整份数据 JSON 顶掉（实测 72KB → 332KB，JS 全废）。
+- **测试不能读仓库根目录那份旧产物**：改完代码忘了重导出，测试照样全绿。
+
 ---
 
 ## 5. 通用教训（从上面提炼的原则）

@@ -6,12 +6,16 @@ import android.content.Intent;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Bundle;
+import android.webkit.ConsoleMessage;
 import android.webkit.SslErrorHandler;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -41,10 +45,15 @@ public class MainActivity extends Activity {
     private static final String START_URL =
             "https://" + APP_DOMAIN + "/assets/index.html";
 
+    /** <input type="file"> 的请求码。跟设置页的 REQ 区分开。 */
+    private static final int REQ_FILE = 1002;
+
     private WebView webView;
     private Prefs prefs;
     private DavPathHandler davHandler;
     private DavBridge bridge;
+    /** 文件选择器回调（网页里的 <input type="file">）。 */
+    private ValueCallback<Uri[]> filePathCallback;
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -58,8 +67,11 @@ public class MainActivity extends Activity {
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
-        s.setAllowFileAccess(true);
-        s.setAllowContentAccess(true);
+        // 本应用的资源**全部**走 shouldInterceptRequest 从 assets 里发 ——
+        // 没有任何地方需要 file:// 或 content:// 的直接读取权限。
+        // 关掉它们，页面就没法偷偷摸本地文件。
+        s.setAllowFileAccess(false);
+        s.setAllowContentAccess(false);
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setSupportZoom(false);          // 页面自己管缩放
         s.setUseWideViewPort(true);
@@ -71,8 +83,83 @@ public class MainActivity extends Activity {
         bridge = new DavBridge(prefs, webView, this);
         webView.addJavascriptInterface(bridge, "MicroBench");
 
+        // 网页里的 <input type="file">（导入 vault 包）需要 WebChromeClient
+        // 配合 —— 没有它, 点那个按钮会**什么都不发生**。
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView view,
+                                             ValueCallback<Uri[]> callback,
+                                             FileChooserParams params) {
+                // 必须先把旧的回调清掉 —— 不清的话 <input> 会永久卡住,
+                // 之后再点导入永远没反应。
+                if (filePathCallback != null) {
+                    filePathCallback.onReceiveValue(null);
+                }
+                filePathCallback = callback;
+                try {
+                    startActivityForResult(params.createIntent(), REQ_FILE);
+                    return true;
+                } catch (Exception e) {
+                    filePathCallback = null;
+                    return false;
+                }
+            }
+
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage cm) {
+                // 默认实现会把 console.log 全部丢掉 —— 真机调试就没有探针了。
+                // 转进 logcat, 至少还能看。
+                android.util.Log.d("MicroBench",
+                        cm.message() + " @" + cm.sourceId() + ":" + cm.lineNumber());
+                return true;
+            }
+        });
+
         setContentView(webView);
         webView.loadUrl(START_URL);
+    }
+
+    /**
+     * 物理返回键。
+     * 优先级: 关掉 PDF 阅读器 -> 关掉设置弹窗 -> 网页后退 -> 退出应用。
+     * 少了这一段, 在 PDF 阅读器里按返回会**直接退出应用**。
+     */
+    @Override
+    public void onBackPressed() {
+        if (webView == null) {
+            super.onBackPressed();
+            return;
+        }
+        String js = "(function(){"
+                + "var r=false;"
+                + "if (document.getElementById('pdf-reader')"
+                + "    && !document.getElementById('pdf-reader').hidden) {"
+                + "  document.getElementById('pdf-reader').hidden=true; r=true; }"
+                + "else if (document.getElementById('pdf-lib')"
+                + "    && !document.getElementById('pdf-lib').hidden) {"
+                + "  document.getElementById('pdf-lib').hidden=true; r=true; }"
+                + "else if (document.getElementById('modal-settings')"
+                + "    && !document.getElementById('modal-settings').hidden) {"
+                + "  document.getElementById('modal-settings').hidden=true; r=true; }"
+                + "else if (document.getElementById('modal-new')"
+                + "    && !document.getElementById('modal-new').hidden) {"
+                + "  document.getElementById('modal-new').hidden=true; r=true; }"
+                + "else { var d=document.querySelector('.tb-shell');"
+                + "  if (d && d.classList.contains('side-open')) {"
+                + "    d.classList.remove('side-open'); r=true; } }"
+                + "return r; })()";
+        webView.evaluateJavascript(js, new ValueCallback<String>() {
+            @Override
+            public void onReceiveValue(String value) {
+                if (!"true".equals(value)) {
+                    if (webView.canGoBack()) {
+                        webView.goBack();
+                    } else {
+                        MainActivity.super.onBackPressed();
+                    }
+                }
+            }
+        });
     }
 
     /**
@@ -112,7 +199,11 @@ public class MainActivity extends Activity {
             // SslError.getUrl() 返回的是 String。
             String url = error.getUrl();
             Uri u = url == null ? null : Uri.parse(url);
-            if (u != null && APP_DOMAIN.equals(u.getHost())) {
+            // ⚠ 只放行「证书不受信任」这一种 —— 其它错误类型一律取消。
+            //   全放行的话，万一有请求漏过拦截器（域名写错了一点点），
+            //   就会带着 vault 的源码和凭证发到真实互联网上去。
+            if (u != null && APP_DOMAIN.equals(u.getHost())
+                    && error.getPrimaryError() == SslError.SSL_UNTRUSTED) {
                 handler.proceed();
             } else {
                 handler.cancel();
@@ -128,19 +219,94 @@ public class MainActivity extends Activity {
             // 状态就一直显示「未连接坚果云」(踩过这个坑)。
             startActivityForResult(new Intent(this, SettingsActivity.class),
                     SettingsActivity.REQ);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            // 静默失败的话用户只会觉得「点了没反应」。
+            Toast.makeText(this, "打不开设置页：" + (e.getMessage() == null
+                    ? e.toString() : e.getMessage()), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        // 进程被系统杀掉再回来时，WebView 的状态（当前笔记/滚动位置）
+        // 靠这个恢复 —— 不然用户得从头再翻一遍。
+        if (webView != null) {
+            webView.saveState(outState);
+        }
+    }
+
+    @Override
+    protected void onRestoreInstanceState(Bundle savedInstanceState) {
+        super.onRestoreInstanceState(savedInstanceState);
+        if (webView != null) {
+            webView.restoreState(savedInstanceState);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        // 进后台后页面的定时器和同步线程还在跑 —— 平板切几个应用就发烫。
+        if (webView != null) {
+            webView.onPause();
+            webView.pauseTimers();
+        }
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (webView != null) {
+            webView.resumeTimers();
+            webView.onResume();
         }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+
+        // ① 网页里的 <input type="file">（导入 vault 包）选完文件要回传给网页。
+        //    不回传的话, 网页的 FileReader 永远等不到文件 —— 表现为
+        //    「点了导入，什么也没发生」。
+        if (requestCode == REQ_FILE) {
+            if (filePathCallback != null) {
+                Uri[] uris = null;
+                if (resultCode == RESULT_OK && data != null) {
+                    try {
+                        uris = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
+                    } catch (Exception e) {
+                        uris = null;
+                    }
+                }
+                filePathCallback.onReceiveValue(uris);
+                filePathCallback = null;
+            }
+            return;
+        }
+
+        // ② 原生设置页保存完凭证回来 —— 通知页面重新探测同步状态并刷新界面。
         if (requestCode == SettingsActivity.REQ && resultCode == RESULT_OK && webView != null) {
             // 不要 location.reload() —— 那会丢掉页面里已经有的状态。
-            // 通知页面重新探测一次坚果云状态并刷新界面。
             webView.evaluateJavascript(
                     "window.__mbRefreshSync && window.__mbRefreshSync();", null);
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        // WebView 不销毁的话, 每次退到后台再进来都会攒一个实例 ——
+        // 平板内存不大, 攒几次就开始卡。
+        if (webView != null) {
+            // 先摘掉 JS 桥, 不然后台线程回调会打到一个已经销毁的 WebView 上。
+            webView.removeJavascriptInterface("MicroBench");
+            webView.stopLoading();
+            webView.setWebChromeClient(null);
+            webView.destroy();
+            webView = null;
+        }
+        super.onDestroy();
     }
 
     // ------------------------------------------------------------------

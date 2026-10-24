@@ -2,18 +2,17 @@ package microbench.tablet;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
-import java.net.ProtocolException;
 import java.net.Socket;
-import java.net.URI;
 import java.net.URL;
-import java.util.ArrayList;
-import java.util.Base64;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,6 +47,12 @@ public class DavClient {
     /** 一次请求的上限：PDF 也就几 MB，够用。 */
     private static final int TIMEOUT_MS = 60_000;
 
+    /**
+     * 单次下载的体积上限。原文 PDF 几 MB 到几十 MB, 128 MB 足够 ——
+     * 同时也防住畸形响应（错误的 Content-Length / chunk-size）把内存吃光。
+     */
+    private static final long MAX_DOWNLOAD_BYTES = 128L * 1024 * 1024;
+
     private final String user;
     private final String pass;
     private String root;
@@ -61,6 +66,10 @@ public class DavClient {
      */
     private String vaultRoot;
 
+    /** 探测 vault 位置时的 PROPFIND 预算（每发一次都是一次 TLS 握手）。 */
+    private static final int MAX_PROPFIND_CALLS = 24;
+    private int probeCalls = 0;
+
     public DavClient(String user, String pass) {
         this(user, pass, DEFAULT_ROOT);
     }
@@ -73,8 +82,31 @@ public class DavClient {
         this.user = user == null ? "" : user.trim();
         this.pass = pass == null ? "" : pass.trim();
         String r = (root == null || root.trim().isEmpty() ? DEFAULT_ROOT : root.trim());
+        // ⚠ 只允许 https。清单里的 usesCleartextTraffic=false 拦得住
+        //   HttpURLConnection, **拦不住裸 socket**（PROPFIND/MKCOL 走的那条）——
+        //   那样 Basic Auth 的应用密码就是明文过网。
+        //   唯一的例外是回环地址：测试用的假 WebDAV 服务器就跑在本机，
+        //   回环上的流量根本不离开这台机器。
+        if (r.toLowerCase().startsWith("http://") && !isLoopback(r)) {
+            r = "https://" + r.substring("http://".length());
+        }
         this.root = r.endsWith("/") ? r : r + "/";
         this.vaultRoot = normalizeVaultRoot(vaultRoot);
+    }
+
+    /** 根是不是回环地址（测试服务器 / 本机服务）。 */
+    public static boolean isLoopback(String url) {
+        try {
+            String h = new URL(url).getHost();
+            if (h == null) {
+                return false;
+            }
+            h = h.toLowerCase();
+            return "localhost".equals(h) || "::1".equals(h) || "[::1]".equals(h)
+                    || "127.0.0.1".equals(h) || h.startsWith("127.");
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     public String vaultRoot() {
@@ -177,12 +209,56 @@ public class DavClient {
     }
 
     private String basicAuth() {
-        String raw = user + ":" + pass;
+        return "Basic " + base64(user + ":" + pass);
+    }
+
+    /**
+     * Base64 编码。
+     *
+     * ⚠ 为什么自己写, 不用现成的:
+     *   - `java.util.Base64` 是 **API 26** 才有的类, 而本应用 minSdk 是 24。
+     *     d8 不会拦它（只在 --min-api 之下给个警告）, 编译能过 ——
+     *     但在 Android 7.0/7.1 上第一次网络请求就 NoClassDefFoundError,
+     *     整个应用直接不可用。
+     *   - `android.util.Base64` 从 API 8 就有, 可惜是 Android 专有的,
+     *     桌面 JVM 上跑不了（我们用假 WebDAV 服务器对拍测试）。
+     * 自己写 20 行, 两边都能跑, 而且不绑任何 API 级别。
+     */
+    public static String base64(String raw) {
+        byte[] data;
         try {
-            return "Basic " + Base64.getEncoder().encodeToString(raw.getBytes("UTF-8"));
+            data = raw.getBytes("UTF-8");
         } catch (Exception e) {
-            return "Basic ";
+            data = raw.getBytes();
         }
+        final String T =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        StringBuilder sb = new StringBuilder(((data.length + 2) / 3) * 4);
+        int i = 0;
+        while (i + 2 < data.length) {
+            int v = ((data[i] & 0xFF) << 16)
+                    | ((data[i + 1] & 0xFF) << 8)
+                    | (data[i + 2] & 0xFF);
+            sb.append(T.charAt((v >> 18) & 63));
+            sb.append(T.charAt((v >> 12) & 63));
+            sb.append(T.charAt((v >> 6) & 63));
+            sb.append(T.charAt(v & 63));
+            i += 3;
+        }
+        int rest = data.length - i;
+        if (rest == 1) {
+            int v = (data[i] & 0xFF) << 16;
+            sb.append(T.charAt((v >> 18) & 63));
+            sb.append(T.charAt((v >> 12) & 63));
+            sb.append('=').append('=');
+        } else if (rest == 2) {
+            int v = ((data[i] & 0xFF) << 16) | ((data[i + 1] & 0xFF) << 8);
+            sb.append(T.charAt((v >> 18) & 63));
+            sb.append(T.charAt((v >> 12) & 63));
+            sb.append(T.charAt((v >> 6) & 63));
+            sb.append('=');
+        }
+        return sb.toString();
     }
 
     // ------------------------------------------------------------------
@@ -237,13 +313,58 @@ public class DavClient {
 
         Socket sock;
         if ("https".equals(proto)) {
-            sock = SSLSocketFactory.getDefault().createSocket();
+            // ⚠️ 必须用**无参** createSocket()。
+            //
+            // 无参版本返回的是一个**还没连接、还没握手**的 socket —— 握手
+            // 发生在后面的 connect() 里。所以顺序必须是:
+            //     createSocket() -> setSSLParameters() -> connect()
+            // 这样 endpointIdentificationAlgorithm=HTTPS 才真正生效,
+            // TLS 会校验证书上的主机名是不是 dav.jianguoyun.com。
+            //
+            // 反过来用 createSocket(host, port) 是**错**的: 那个版本在
+            // createSocket 内部就把 TLS 握手做完了, 这时再 setSSLParameters
+            // 已经来不及 —— 主机名验证等于没开, 坚果云的应用密码就
+            // 裸奔在中间人面前。
+            SSLSocket ss;
+            try {
+                ss = (SSLSocket) SSLSocketFactory.getDefault().createSocket();
+            } catch (Exception e) {
+                throw new IOException("无法创建 TLS 连接: " + e.getMessage());
+            }
+            try {
+                SSLParameters params = ss.getSSLParameters();
+                params.setEndpointIdentificationAlgorithm("HTTPS");
+                ss.setSSLParameters(params);
+            } catch (Exception ignored) {
+                // 老实现不支持这个开关 —— 不该崩, 只是少了主机名验证
+            }
+            sock = ss;
         } else {
             sock = new Socket();
         }
         try {
             sock.connect(new InetSocketAddress(host, port), TIMEOUT_MS);
             sock.setSoTimeout(TIMEOUT_MS);
+
+            // 双保险：握手完再验一次主机名。
+            // 万一上面的 setEndpointIdentificationAlgorithm 被老实现吞掉了
+            // （我们 catch 了那个异常），这里还能拦下来 ——
+            // 坚果云的应用密码是长期凭证，裸奔一次就全泄露了。
+            if (sock instanceof SSLSocket) {
+                try {
+                    if (!javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
+                            .verify(host, ((SSLSocket) sock).getSession())) {
+                        throw new IOException("服务器证书的主机名对不上: " + host);
+                    }
+                } catch (javax.net.ssl.SSLPeerUnverifiedException e) {
+                    throw new IOException("服务器证书的主机名对不上: " + host);
+                } catch (IOException e) {
+                    throw e;
+                } catch (Exception e) {
+                    // 主机名验证器本身不可用 —— 不因为这个把连接掐断,
+                    // 上面那层参数已经生效了。
+                }
+            }
 
             StringBuilder head = new StringBuilder();
             head.append(method).append(' ').append(target).append(" HTTP/1.1\r\n");
@@ -284,8 +405,10 @@ public class DavClient {
     }
 
     private static Resp readResponse(InputStream in) throws IOException {
+        // 裸 socket 逐字节读很慢 —— 套一层缓冲
+        BufferedInputStream bin = new BufferedInputStream(in, 32 * 1024);
         Resp r = new Resp();
-        String status = readLine(in);
+        String status = readLine(bin);
         if (status == null) {
             throw new IOException("服务器没返回状态行");
         }
@@ -297,7 +420,7 @@ public class DavClient {
         }
 
         String line;
-        while ((line = readLine(in)) != null && !line.isEmpty()) {
+        while ((line = readLine(bin)) != null && !line.isEmpty()) {
             int c = line.indexOf(':');
             if (c <= 0) {
                 continue;
@@ -314,17 +437,30 @@ public class DavClient {
 
         String te = r.header("transfer-encoding");
         if (te != null && te.toLowerCase().contains("chunked")) {
-            r.body = readChunked(in);
+            r.body = readChunked(bin);
         } else {
             String cl = r.header("content-length");
-            int n = 0;
+            long n = 0;
             if (cl != null) {
                 try {
-                    n = Integer.parseInt(cl.trim());
+                    n = Long.parseLong(cl.trim());
                 } catch (NumberFormatException ignored) {
                 }
             }
-            r.body = (n > 0) ? readFully(in, n) : new byte[0];
+            if (n > MAX_DOWNLOAD_BYTES) {
+                throw new IOException("响应体超过上限 "
+                        + (MAX_DOWNLOAD_BYTES / 1048576) + " MB");
+            }
+            if (n > 0) {
+                r.body = readFully(bin, (int) n);
+            } else {
+                // ⚠ 没有 Content-Length、也不是 chunked。
+                //   有些服务器（尤其是走反代的）用「关连接」表示结束。
+                //   这时必须**读到 EOF** —— 否则 body 被当成空的,
+                //   PROPFIND 解析出 0 条目, 页面上显示「目录为空」,
+                //   真空目录和解析失败根本分不开。
+                r.body = readAllBytes(bin, MAX_DOWNLOAD_BYTES, 16 * 1024);
+            }
         }
         return r;
     }
@@ -349,7 +485,8 @@ public class DavClient {
     }
 
     private static byte[] readChunked(InputStream in) throws IOException {
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(16 * 1024);
+        long total = 0;
         while (true) {
             String sizeLine = readLine(in);
             if (sizeLine == null) {
@@ -363,7 +500,15 @@ public class DavClient {
             try {
                 size = Integer.parseInt(sizeLine.trim(), 16);
             } catch (NumberFormatException e) {
-                break;
+                // 畸形 chunk-size —— 明确报错, **别静默 break**。
+                // 静默截断的话上层只看到一句「DAV error」, 完全查不出原因;
+                // 而且 size 直接来自网络, 7FFFFFFF 会让 new byte[n] 抛
+                // OutOfMemoryError —— 那是 Error, catch (Exception) 抓不住,
+                // 线程直接死。
+                throw new IOException("服务器返回了畸形的 chunk-size: " + sizeLine.trim());
+            }
+            if (size < 0) {
+                throw new IOException("服务器返回了负数的 chunk-size: " + size);
             }
             if (size == 0) {
                 // 读完 trailer
@@ -372,6 +517,11 @@ public class DavClient {
                     // 忽略
                 }
                 break;
+            }
+            total += size;
+            if (total > MAX_DOWNLOAD_BYTES) {
+                throw new IOException("响应体超过上限 "
+                        + (MAX_DOWNLOAD_BYTES / 1048576) + " MB");
             }
             out.write(readFully(in, size));
             readLine(in);   // 每个 chunk 后面的 CRLF
@@ -411,8 +561,54 @@ public class DavClient {
             throw new IOException("WebDAV GET " + path + " -> HTTP " + code
                     + (err.isEmpty() ? "" : " " + err));
         }
-        try (InputStream in = c.getInputStream()) {
-            return readAllBytes(in);
+        // 先看 Content-Length —— 太大的直接拒掉, 别把内存吃光。
+        // 原文 PDF 最大的 9.3 MB, 128 MB 的上限绰绰有余。
+        String cl = c.getHeaderField("Content-Length");
+        long expect = 0;
+        if (cl != null) {
+            try {
+                expect = Long.parseLong(cl.trim());
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        if (expect > MAX_DOWNLOAD_BYTES) {
+            c.disconnect();
+            throw new IOException("文件太大（" + (expect / 1048576) + " MB），超过上限");
+        }
+        try (InputStream in = new BufferedInputStream(c.getInputStream(), 32 * 1024)) {
+            return readAllBytes(in, MAX_DOWNLOAD_BYTES, (int) Math.min(expect, 8L * 1024 * 1024));
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    /**
+     * 只读文件开头的一小段（默认 64 KB），用来验证**下载链路**通不通。
+     *
+     * 之前是整篇 PDF 读进内存只为了看一眼 —— 一篇 9 MB 的论文,
+     * 「测试连接」这一下就能把平板的内存吃掉一大块，还把等待时间拉长。
+     */
+    public int getPartial(String path, int maxBytes) throws IOException {
+        HttpURLConnection c = open("GET", path, null);
+        int code = c.getResponseCode();
+        try {
+            if (code != 200) {
+                String err = readAll(c.getErrorStream());
+                throw new IOException("WebDAV GET " + path + " -> HTTP " + code
+                        + (err.isEmpty() ? "" : " " + err));
+            }
+            try (InputStream in = new BufferedInputStream(c.getInputStream(), 16 * 1024)) {
+                byte[] buf = new byte[Math.max(1, maxBytes)];
+                int off = 0;
+                while (off < buf.length) {
+                    int r = in.read(buf, off, buf.length - off);
+                    if (r < 0) {
+                        break;
+                    }
+                    off += r;
+                }
+                return off;
+            }
         } finally {
             c.disconnect();
         }
@@ -532,9 +728,13 @@ public class DavClient {
         return h;
     }
 
-    private static String urlDecode(String s) {
+    public static String urlDecode(String s) {
         try {
-            return java.net.URLDecoder.decode(s, "UTF-8");
+            // ⚠ URLDecoder 走的是 **form 编码**规则 —— 它会把 "+" 解成空格。
+            //   但路径里的 "+" 是字面量：「C++入门.pdf」会被解成「C 入门.pdf」，
+            //   列目录看着正常，点开却永远 404。
+            //   先把 "+" 换成 %2B 再解，就对了。
+            return java.net.URLDecoder.decode(s.replace("+", "%2B"), "UTF-8");
         } catch (Exception e) {
             return s;
         }
@@ -549,6 +749,7 @@ public class DavClient {
      * 所以必须**递归**找, 只看一两层会漏掉。
      */
     public String detectVaultRoot() {
+        probeCalls = 0;
         return detectVaultAt("", 3);
     }
 
@@ -557,6 +758,13 @@ public class DavClient {
      * 优先返回带 01_Literature 的目录 —— 那是最强的信号。
      */
     private String detectVaultAt(String dir, int depth) {
+        // 探测是要发 PROPFIND 的, 每一次都是一次完整的 TLS 握手。
+        // 云盘里目录一多, 「测试并保存」能卡好几分钟 —— 给它一个预算,
+        // 超了就让用户手动填 vault 位置, 别把人吊在那儿。
+        if (probeCalls >= MAX_PROPFIND_CALLS) {
+            return null;
+        }
+        probeCalls++;
         List<DavEntry> entries;
         try {
             entries = listRaw(dir);
@@ -588,6 +796,15 @@ public class DavClient {
                 return e.path;
             }
         }
+        // 常见 vault 目录名 —— 命中就直接进去, 不用在整朵云盘里瞎逛
+        for (DavEntry e : dirs) {
+            if (isLikelyVaultName(e.name)) {
+                String found = detectVaultAt(e.path, depth - 1);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
         for (DavEntry e : dirs) {
             String found = detectVaultAt(e.path, depth - 1);
             if (found != null) {
@@ -595,6 +812,15 @@ public class DavClient {
             }
         }
         return hasMd ? dir : null;
+    }
+
+    /** 目录名像不像我们的 vault（省得在别人的文件夹里瞎逛）。 */
+    private static boolean isLikelyVaultName(String name) {
+        if (name == null) {
+            return false;
+        }
+        String n = name.toLowerCase();
+        return n.contains("microbench") || n.contains("工作台");
     }
 
     /** 列目录（不带 vault 前缀的原始 WebDAV 路径）—— 探测 vault 位置时用。 */
@@ -616,6 +842,14 @@ public class DavClient {
      * 根目录下面通常只有目录, PDF 在 MicroBench工作台/01_Literature/... 里。
      */
     public String findFirstPdf(String dir, int maxDepth) {
+        return findFirstPdf(dir, maxDepth, new int[]{0});
+    }
+
+    private String findFirstPdf(String dir, int maxDepth, int[] budget) {
+        // 同样有预算 —— 否则在云盘里能逛到天荒地老
+        if (budget[0]++ >= 20) {
+            return null;
+        }
         List<DavEntry> entries;
         try {
             entries = list(dir);
@@ -632,7 +866,7 @@ public class DavClient {
         }
         for (DavEntry e : entries) {
             if (e.isDir) {
-                String found = findFirstPdf(e.path, maxDepth - 1);
+                String found = findFirstPdf(e.path, maxDepth - 1, budget);
                 if (found != null) {
                     return found;
                 }
@@ -649,11 +883,11 @@ public class DavClient {
     public void put(String path, byte[] data) throws IOException {
         String parent = parentOf(path);
         if (parent != null && !parent.isEmpty()) {
-            try {
-                mkdirs(parent);
-            } catch (IOException ignored) {
-                // 目录已存在时坚果云会返回 405，忽略即可
-            }
+            // 不用 catch 吞掉错误 —— 「目录已存在」坚果云返回 405，
+            // 而 mkcol() 内部已经把 405 当成成功了。这里抛出来的
+            // 一定是真错误（鉴权失败 / 网络不通），
+            // 吞掉的话后面 PUT 只会报一个看不懂的 409。
+            mkdirs(parent);
         }
         HttpURLConnection c = open("PUT", path, null);
         c.setDoOutput(true);
@@ -735,10 +969,25 @@ public class DavClient {
     }
 
     private static byte[] readAllBytes(InputStream in) throws IOException {
-        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream(Math.max(4096, in.available()));
+        return readAllBytes(in, MAX_DOWNLOAD_BYTES, 16 * 1024);
+    }
+
+    /**
+     * @param limit    累计上限 —— 超过就抛 IOException（不是 OOM）
+     * @param initial  预估大小，用来一次性把缓冲区开够（少几次 realloc）
+     */
+    private static byte[] readAllBytes(InputStream in, long limit, int initial)
+            throws IOException {
+        int cap = Math.max(16 * 1024, Math.min(initial, 8 * 1024 * 1024));
+        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream(cap);
         byte[] buf = new byte[16 * 1024];
         int n;
+        long total = 0;
         while ((n = in.read(buf)) > 0) {
+            total += n;
+            if (total > limit) {
+                throw new IOException("响应体超过上限 " + (limit / 1048576) + " MB");
+            }
             bo.write(buf, 0, n);
         }
         return bo.toByteArray();

@@ -32,6 +32,20 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass
 
+    # ⚠ 先**重新导出**再检查。
+    #   以前这个测试直接读仓库根目录里那份 HTML —— 那是上一次构建留下的
+    #   旧产物。改了 app.js 却忘了重导出，测试照样全绿，交付给用户的
+    #   却是老版本。测试必须对着**刚导出来的**东西说话。
+    print("[0] 重新导出平板工作台单文件")
+    ex = subprocess.run(
+        [sys.executable, str(REPO / "microbench" / "export_offline.py"),
+         "--tablet", str(BUNDLE), "--quiet"],
+        capture_output=True, text=True, encoding="utf-8")
+    if ex.returncode != 0:
+        print(f"  导出失败: {ex.stdout[-500:]} {ex.stderr[-500:]}")
+        return 1
+    print(f"  已重新导出: {BUNDLE.name}")
+
     if not BUNDLE.exists():
         print(f"产物不存在: {BUNDLE}\n先跑: python microbench/export_offline.py --tablet")
         return 1

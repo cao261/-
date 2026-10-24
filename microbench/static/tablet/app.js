@@ -599,6 +599,21 @@
     updateSyncDot();
     buildNav();
     openNote(n.id);
+
+    // ⚠ 以前只写 IndexedDB —— 平板上改的笔记**永远写不回坚果云**。
+    //   结果是下次同步发现云端版本不一样，走冲突分支，
+    //   每改一次就多出一份「冲突合并」副本 —— 双向同步其实是单向的。
+    if (currentBackend()) {
+      const r = await pushToDir(true);
+      if (r.ok > 0) {
+        toast("已保存并写回云盘");
+        return;
+      }
+      if (r.fail > 0) {
+        toast("已存本地，但写回云盘失败：" + r.fail + " 篇", true);
+        return;
+      }
+    }
     toast("已保存到平板本地");
   }
 
@@ -687,10 +702,20 @@
   function nativeCall(method, args) {
     return new Promise((resolve, reject) => {
       const id = "cb" + (++_nativeSeq);
-      _nativeWaiters[id] = { resolve, reject };
+      // 超时兜底 —— 原生那边要是不回调（Activity 已销毁 / 线程卡死），
+      // Promise 会永远挂着, 界面就一直转圈。
+      const timer = setTimeout(() => {
+        if (_nativeWaiters[id]) {
+          delete _nativeWaiters[id];
+          reject(new Error("原生调用超时（" + method + "）"));
+        }
+      }, 150000);
+      const finish = (fn) => (v) => { clearTimeout(timer); fn(v); };
+      _nativeWaiters[id] = { resolve: finish(resolve), reject: finish(reject) };
       try {
         nativeBridge[method].apply(nativeBridge, args.concat([id]));
       } catch (e) {
+        clearTimeout(timer);
         delete _nativeWaiters[id];
         reject(e);
       }
@@ -864,41 +889,62 @@
     }
   }
 
-  async function ensurePermission(handle, writable) {
+  async function ensurePermission(handle, writable, quiet) {
     if (!handle) return false;
     const opts = { mode: writable ? "readwrite" : "read" };
     if (await handle.queryPermission(opts) === "granted") return true;
+    // 启动时不要弹权限框（用户刚打开应用就被问一遍很烦）
+    if (quiet) return false;
     return await handle.requestPermission(opts) === "granted";
   }
 
-  async function walkDir(dir, prefix, out) {
-    for await (const entry of dir.values()) {
-      if (entry.name.startsWith(".")) continue;
-      if (entry.kind === "directory") {
-        if (SKIP_DIRS.has(entry.name)) continue;
-        await walkDir(entry, prefix + entry.name + "/", out);
-      } else if (entry.name.toLowerCase().endsWith(".md")) {
-        out.push({ path: prefix + entry.name, handle: entry });
-      }
-    }
-    return out;
-  }
+  /**
+   * 扫描云盘里的笔记 **和原文 PDF**。
+   *
+   * ⚠ 以前 PDF 清单是「导出期烤进页面」的静态清单（__DATA__.pdfs）——
+   *   云盘里新加的论文在平板上**根本发现不了**，文献库里永远是那 24 篇。
+   *   现在改成每次同步实时扫。
+   *
+   * 返回 { notes: [{path,text,mtime}], pdfs: {path: {id,name,size,stem}} }
+   */
+  async function scanRemote(backend, quiet) {
+    const notes = [];
+    const pdfs = {};
+    const addPdf = (path, name, size) => {
+      const stem = String(name || "").replace(/\.pdf$/i, "");
+      pdfs[path] = { id: path, name: name, size: size || 0, stem: stem };
+    };
 
-  /** 列出云盘里的所有 .md 笔记（相对 vault 根的路径）。 */
-  async function listRemoteNotes(backend) {
     if (backend.mode === "fsa") {
       const h = state.dirHandle;
-      if (!await ensurePermission(h, false)) { toast("没有读取权限", true); return null; }
-      const files = await walkDir(h, "", []);
-      const out = [];
-      for (const f of files) {
-        const file = await f.handle.getFile();
-        out.push({ path: f.path, text: await file.text(), mtime: file.lastModified });
+      if (!await ensurePermission(h, false, quiet)) {
+        if (!quiet) toast("没有读取权限", true);
+        return null;
       }
-      return out;
+      const walk = async (d, prefix) => {
+        for await (const entry of d.values()) {
+          if (entry.name.startsWith(".")) continue;
+          if (entry.kind === "directory") {
+            if (SKIP_DIRS.has(entry.name)) continue;
+            await walk(entry, prefix + entry.name + "/");
+          } else {
+            const path = prefix + entry.name;
+            const lower = entry.name.toLowerCase();
+            if (lower.endsWith(".md")) {
+              const file = await entry.getFile();
+              notes.push({ path, text: await file.text(), mtime: file.lastModified });
+            } else if (lower.endsWith(".pdf")) {
+              const file = await entry.getFile();
+              addPdf(path, entry.name, file.size);
+            }
+          }
+        }
+      };
+      await walk(h, "");
+      return { notes, pdfs };
     }
+
     // WebDAV: 递归列目录
-    const out = [];
     const walk = async (dir) => {
       let entries;
       try {
@@ -910,23 +956,36 @@
         if (e.isDir) {
           if (SKIP_DIRS.has(e.name)) continue;
           await walk(e.path);
-        } else if (e.name.toLowerCase().endsWith(".md")) {
-          const text = await backend.readText(e.path);
-          if (text == null) continue;
-          out.push({ path: e.path, text, mtime: e.mtime || 0 });
+        } else {
+          const lower = e.name.toLowerCase();
+          if (lower.endsWith(".md")) {
+            const text = await backend.readText(e.path);
+            if (text == null) continue;
+            notes.push({ path: e.path, text, mtime: e.mtime || 0 });
+          } else if (lower.endsWith(".pdf")) {
+            // 不下载内容, 只登记清单 —— 大小从 PROPFIND 里就有
+            addPdf(e.path, e.name, e.size || 0);
+          }
         }
       }
     };
     await walk("");
-    return out;
+    return { notes, pdfs };
   }
 
-  async function pullFromDir() {
+  async function pullFromDir(quiet) {
     const backend = currentBackend();
     if (!backend) return;
-    const files = await listRemoteNotes(backend);
-    if (!files) return;
+    const scan = await scanRemote(backend, quiet);
+    if (!scan) return;
+    const files = scan.notes;
     let added = 0, updated = 0, conflicts = 0;
+
+    // 原文 PDF 清单：实时扫出来的直接覆盖旧的（云盘里新加的论文立刻能看见），
+    // 旧的不删 —— 扫到一半失败时不至于把已有的原文从列表里抹掉。
+    const merged = Object.assign({}, state.pdfs || {});
+    Object.keys(scan.pdfs || {}).forEach((id) => { merged[id] = scan.pdfs[id]; });
+    state.pdfs = merged;
 
     for (const f of files) {
       const text = f.text;
@@ -959,10 +1018,14 @@
     }
     buildNav();
     if (state.currentId) openNote(state.currentId);
+    const nPdfs = Object.keys(state.pdfs || {}).length;
     $("sync-detail").textContent =
       `已连接 ${files.length} 篇 · 新增 ${added} · 更新 ${updated}` +
-      (conflicts ? ` · 冲突 ${conflicts}` : "");
-    toast(`读取完成：新增 ${added}，更新 ${updated}` + (conflicts ? `，冲突 ${conflicts}` : ""));
+      (conflicts ? ` · 冲突 ${conflicts}` : "") +
+      ` · 原文 ${nPdfs} 篇`;
+    if (!quiet) {
+      toast(`读取完成：新增 ${added}，更新 ${updated}` + (conflicts ? `，冲突 ${conflicts}` : ""));
+    }
   }
 
   async function resolveConflict(localNote, diskText) {
@@ -998,14 +1061,20 @@
     toast("发现冲突，已另存为「冲突合并」笔记，两边都没丢", true);
   }
 
-  async function pushToDir() {
+  /** 把本地改动写回云盘。返回 {ok, fail} —— silent=true 时不弹 toast。 */
+  async function pushToDir(silent) {
     const backend = currentBackend();
     if (!backend) {
-      toast(nativeBridge ? "还没配坚果云账号，点设置填一下" : "还没连接文件夹", true);
-      return;
+      if (!silent) {
+        toast(nativeBridge ? "还没配坚果云账号，点设置填一下" : "还没连接文件夹", true);
+      }
+      return { ok: 0, fail: 0 };
     }
     const dirty = [...state.notes.values()].filter((n) => n.dirty && !n.deleted);
-    if (!dirty.length) { toast("没有待同步的改动"); return; }
+    if (!dirty.length) {
+      if (!silent) toast("没有待同步的改动");
+      return { ok: 0, fail: 0 };
+    }
 
     let ok = 0, fail = 0;
     for (const n of dirty) {
@@ -1023,7 +1092,10 @@
     state.dirtyCount = [...state.notes.values()].filter((x) => x.dirty && !x.deleted).length;
     updateSyncDot();
     buildNav();
-    toast(`已写入 ${ok} 篇到云盘` + (fail ? `，失败 ${fail}` : ""), fail > 0);
+    if (!silent) {
+      toast(`已写入 ${ok} 篇到云盘` + (fail ? `，失败 ${fail}` : ""), fail > 0);
+    }
+    return { ok, fail };
   }
 
   async function ensureDir(root, group) {
@@ -1152,6 +1224,32 @@
     return sel && sel.toString().trim() ? sel.toString().trim() : "";
   }
 
+  /**
+   * 解析一段 SSE 文本，拆出正文和思考过程。
+   *
+   * 原生代理拿到的是**完整**的 SSE 文本（没法做流式增量），
+   * 浏览器路径是边收边解析 —— 两条路共用这个函数。
+   */
+  function parseSse(raw) {
+    let content = "";
+    let reasoning = "";
+    const lines = String(raw || "").split("\n");
+    for (const line of lines) {
+      const s = line.trim();
+      if (!s.startsWith("data:")) continue;
+      const p2 = s.slice(5).trim();
+      if (!p2 || p2 === "[DONE]") continue;
+      try {
+        const obj = JSON.parse(p2);
+        const ch = (obj.choices && obj.choices[0]) || {};
+        const d = ch.delta || {};
+        if (d.content) content += d.content;
+        if (d.reasoning_content) reasoning += d.reasoning_content;
+      } catch (e) { /* 心跳/畸形行忽略 */ }
+    }
+    return { content, reasoning };
+  }
+
   async function runAI(kind) {
     const cfg = state.ai;
     if (!cfg.key) {
@@ -1196,13 +1294,43 @@
     }
 
     try {
-      const res = await fetch(`${cfg.base.replace(/\/+$/, "")}/chat/completions`, {
+      const url = `${cfg.base.replace(/\/+$/, "")}/chat/completions`;
+      const bodyStr = JSON.stringify(payload);
+
+      // APK 里页面跑在 https://appassets.androidplatform.net ——
+      // 外部 AI 接口不会回这个 origin 的 Access-Control-Allow-Origin，
+      // **fetch 必被 CORS 打死**。走原生代理就没有跨域问题。
+      // 代价：原生代理拿不到流式增量，只能一次性拿回完整 SSE 文本。
+      if (nativeBridge && typeof nativeBridge.httpPost === "function") {
+        const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${cfg.key}`]);
+        if (!r || !r.ok) {
+          throw new Error("HTTP " + ((r && r.status) || "?") + " "
+            + String((r && (r.error || r.body)) || "").slice(0, 200));
+        }
+        const parsed = parseSse(r.body);
+        const full = parsed.content;
+        if (full) {
+          buf.innerHTML = renderMarkdown(full);
+          status.textContent = `完成 · ${model}`;
+        } else if (parsed.reasoning) {
+          // 正文空、只剩思考 —— 思考把 max_tokens 预算吃光了
+          buf.innerHTML = renderMarkdown(parsed.reasoning);
+          status.textContent = "上游只返回了思考过程（正文预算被吃光）—— 换个模型或调大 max_tokens";
+          status.setAttribute("data-error", "1");
+        } else {
+          status.textContent = "上游返回了空内容 — 换个模型或把 max_tokens 调大";
+          status.setAttribute("data-error", "1");
+        }
+        return;
+      }
+
+      const res = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${cfg.key}`,
         },
-        body: JSON.stringify(payload),
+        body: bodyStr,
         signal: aiAbort.signal,
       });
       if (!res.ok) {
@@ -1252,16 +1380,31 @@
     const hint = $("llm-hint");
     hint.textContent = "测试中…";
     try {
-      const res = await fetch(`${state.ai.base.replace(/\/+$/, "")}/chat/completions`, {
+      const url = `${state.ai.base.replace(/\/+$/, "")}/chat/completions`;
+      const bodyStr = JSON.stringify({
+        model: state.ai.model, messages: [{ role: "user", content: "1" }],
+        max_tokens: 8, temperature: 0.1,
+      });
+      // APK 里走原生代理（页面的 fetch 会被 CORS 打死）
+      if (nativeBridge && typeof nativeBridge.httpPost === "function") {
+        const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${state.ai.key}`]);
+        if (r && r.ok) {
+          hint.textContent = "连接正常";
+          hint.removeAttribute("data-error");
+        } else {
+          hint.textContent = `HTTP ${(r && r.status) || "?"} `
+            + String((r && (r.error || r.body)) || "").slice(0, 160);
+          hint.setAttribute("data-error", "1");
+        }
+        return;
+      }
+      const res = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${state.ai.key}`,
         },
-        body: JSON.stringify({
-          model: state.ai.model, messages: [{ role: "user", content: "1" }],
-          max_tokens: 8, temperature: 0.1,
-        }),
+        body: bodyStr,
       });
       if (res.ok) { hint.textContent = "连接正常"; hint.removeAttribute("data-error"); }
       else {
@@ -1834,11 +1977,16 @@
     initPdfSelection();
     initPdfScrollWatch();
     $("btn-sync").onclick = async () => {
-      if (state.syncMode === "dir") {
+      // ⚠ 以前这里判断的是一个**从来不出现**的 syncMode 取值（"dir"）——
+      //   而 syncMode 的实际取值只有 "local"/"fsa"/"dav"/"none"，
+      //   ⇒ 点顶栏的「同步」只会再弹一次设置页，
+      //   真正的 pullFromDir/pushToDir 在 APK 里永远走不到。
+      const b = currentBackend();
+      if (b) {
         await pullFromDir();
         await pushToDir();
       } else {
-        openSettings();
+        connectDir();      // APK 里 connectDir 会转去原生设置页
       }
     };
     $("btn-settings").onclick = openSettings;
@@ -1859,7 +2007,6 @@
       await DB.setMeta("current_note", null);
       location.reload();
     };
-    $("btn-connect-dir").onclick = connectDir;
     $("btn-import-pack").onclick = () => $("file-pack").click();
     $("btn-export-pack").onclick = () => downloadPack(true);
     $("btn-test-llm").onclick = testLLM;
@@ -1911,6 +2058,19 @@
       const id = hashNoteId();
       if (id && id !== state.currentId && state.notes.has(id)) openNote(id);
     });
+
+    // 云盘已经连上了 —— 启动后自动拉一次。
+    // 以前只在「配好账号返回设置页」那一次拉取，之后每次打开应用
+    // 都只能看到上次打包进来的静态种子数据 —— PC 上改过的笔记
+    // 在平板上不会自己出现。
+    if (state.syncMode === "dav") {
+      // 延后一点，别跟首屏渲染抢主线程
+      setTimeout(() => {
+        pullFromDir(true).catch((e) => {
+          console.warn("启动时拉取云盘失败", e);
+        });
+      }, 400);
+    }
 
     // 离开前提醒还有未同步的改动
     window.addEventListener("beforeunload", (e) => {

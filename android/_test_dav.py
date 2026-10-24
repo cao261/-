@@ -27,6 +27,11 @@ PORT = 8765
 FILES = {
     "我的坚果云/MicroBench工作台/00_Dashboard/主工作台看板.md": "# 看板\n\n内容\n",
     "我的坚果云/MicroBench工作台/01_Literature/01_论文原文_PDF/a paper.pdf": "PDF-BYTES",
+    # 文件名带 "+" —— WebDAV 服务器完全可能把 "+" 原样写在 href 里
+    # (RFC 3986 里路径里的 "+" 就是字面量)。而 java.net.URLDecoder 走的是
+    # form 编码规则, 会把 "+" 解成空格 —— 「C++入门.pdf」就变成
+    # 「C 入门.pdf」, 那个文件永远打不开。
+    "我的坚果云/MicroBench工作台/01_Literature/C++入门.pdf": "PDF-PLUS",
 }
 
 
@@ -94,6 +99,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  '<D:multistatus xmlns:D="DAV:">']
         for name, is_dir, size in items:
             href = "/dav/" + quote(prefix + name)
+            # ⚠ 故意把 "%2B" 还原成字面 "+" —— 模拟那些不把 "+" 百分号编码
+            #   的 WebDAV 服务器（真实存在）。客户端必须扛住这个。
+            href = href.replace("%2B", "+")
             body.append("<D:response>")
             body.append(f"<D:href>{xml_escape(href)}</D:href>")
             body.append("<D:propstat><D:prop>")

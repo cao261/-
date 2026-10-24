@@ -998,7 +998,13 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
     data_json = data_json.replace("</", "<\\/")
 
     out = index
+    # ⚠ 占位符必须**先**替换, 再内联 CSS/JS。
+    #   顺序反了的话, 内联的 app.js 里只要出现 "__DATA__" 这个字面量
+    #   (哪怕只是注释里提了一句), 就会被整份数据 JSON 顶掉 ——
+    #   实测踩过: app.js 的注释里多了句 "(__DATA__.pdfs)",
+    #   导出的 HTML 直接从 72KB 涨到 332KB, 内联的 JS 全废。
     out = out.replace("__ICON__", icon_uri)
+    out = out.replace("__DATA__", data_json)
     out = out.replace("<!--INLINE_KATEX_CSS-->", "<style>\n" + katex_css + "\n</style>")
     out = out.replace("<!--INLINE_APP_CSS-->", "<style>\n" + app_css + "\n</style>")
     if pdfjs.get("css"):
@@ -1016,7 +1022,6 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
                       "<script>\n" + katex_js + "\n</script>")
     out = out.replace("<!--INLINE_APP_JS-->",
                       "<script>\n" + app_js + "\n</script>")
-    out = out.replace("__DATA__", data_json)
     return out
 
 
