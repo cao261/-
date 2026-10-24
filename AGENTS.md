@@ -22,7 +22,7 @@
 | 是什么 | Obsidian vault + FastAPI 本地服务（科研文献精读工作台） |
 | 仓库根 | `E:\zaiwu\个人工作台`（**它同时是 vault 根**） |
 | 服务 | `python -m uvicorn microbench.app:app --host 127.0.0.1 --port 5000` |
-| 启动 | 双击 `start_workbench.bat`（= 桌面快捷方式「MicroBench 工作台」） |
+| 启动 | **桌面应用**：双击 `MicroBench Desktop.bat`（= 桌面快捷方式「MicroBench 工作台」）→ 独立原生窗口，不走浏览器<br>**网页版**：双击 `start_workbench.bat`（= 快捷方式「MicroBench 网页版」）→ 服务 + 默认浏览器 |
 | 前端 | **单文件** `microbench/static/index.html`（CSS+JS 全在里面，~7900 行） |
 | 后端 | `microbench/app.py`（API 全部在一个文件里，~4000 行） |
 | 抽取层 | `microbench/paper_text.py`（双栏顺序、公式保护） |
@@ -143,6 +143,7 @@ python -m pytest tests/ -q            # 全绿
 | 路径安全 / 卡片模板 / vault 统计 | `microbench/generator.py` |
 | 抓论文（arXiv/DOI/Crossref） | `microbench/paper_fetcher.py` + `microbench/netutil.py` |
 | 离线/平板工作台导出 | `microbench/export_offline.py` |
+| 桌面独立窗口（应用形态） | `desktop.py` + `MicroBench Desktop.bat` + `install_shortcuts.ps1` |
 | vault 搬进坚果云 | `microbench/move_vault_to_cloud.py` |
 | 平板变更包合并 | `microbench/merge_changes.py` |
 
@@ -388,6 +389,43 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
   → HTML 的 inline `onchange` 处理器报 ReferenceError。
 - 声明写在块里 → 块级作用域，块外调不到 → 这就是为什么代码里有十几处 `window.X = X` 导出。
   **新写代码请直接放顶层，不要塞进裸花括号块。**
+
+### 4.11 桌面应用窗口（pywebview / Edge WebView2）
+
+用户要求「点开就像独立应用，不要在浏览器里」→ 2026-10-24 落地 `desktop.py`（根目录）。
+用的是 Windows 自带的 **Edge WebView2**（`pywebview` 驱动），不是 Electron，不打包 100MB 运行时。
+
+| 入口 | 行为 |
+|---|---|
+| `MicroBench Desktop.bat` | `pythonw desktop.py` —— **无黑窗**；日志写 `logs/desktop.log` |
+| `install_shortcuts.ps1` | 装桌面/开始菜单快捷方式（**名字不能带前导下划线**，见 §4.9） |
+| `start_workbench.bat` | 网页版：服务 + 默认浏览器（服务跑在独立控制台窗口） |
+
+坑（都踩过）：
+
+- **pywebview 事件回调的形参必须叫 `window`**。`webview/event.py` 的派发规则是
+  「0 参 → 无参调用；形参名含 `window` → 传窗口对象；否则按触发时的 args 调用」，
+  而 `loaded` / `closing` 的 args 是**空的** → 写成 `def _on_loaded(win)` 会抛
+  `TypeError: missing 1 required positional argument`（而且被 pywebview 的
+  `logger.exception` 吞掉，只在日志里留一行，窗口照样开着，很难察觉）。
+- **`private_mode` 默认是 `True`** → 每次启动 localStorage 全清（主题、Obsidian vault 名、
+  阅读器状态、答疑面板几何全丢）。必须 `private_mode=False` + `storage_path`。
+- **`pythonw.exe` 下 `sys.stdout` / `sys.stderr` 是 `None`** → uvicorn 的日志处理器
+  拿到 None 会静默丢日志。启动时把两个流接管成 `_Tee(原流, 日志文件)`。
+- **跨进程置前窗口**：`SetForegroundWindow` 直接调经常无效，要
+  `AttachThreadInput(当前线程, 前台窗口线程)` 再 `BringWindowToTop` + `SetForegroundWindow`。
+- **单实例**：用 `EnumWindows` 按标题找已有窗口（认「微电子科研工作台」，
+  **别认** `MicroBench Server - python -m uvicorn ...` 那个控制台窗口，否则会误杀服务）。
+  第二次双击改为激活已有窗口，否则会出现「两个窗口，关一个把服务带走」。
+- **端口探测必须校验页面特征串**（`b"MicroBench" in body`），老教训复用（§4.4 / start_workbench.bat）。
+  探测请求要带 `ProxyHandler({})`：本机 `HTTP_PROXY` 指向本地代理客户端，代理没开时必 ProxyError。
+- **兜底链**：pywebview 不可用 → Edge/Chrome `--app=` 模式（同样无地址栏）；
+  这条路线里服务必须**分离进程**（`DETACHED_PROCESS`），否则启动器一退出服务就死。
+  再不行就弹 `MessageBoxW` 报错 —— 绝不静默失败。
+
+> ⚠️ 改 `desktop.py` 时的连带影响：它跑的是**同一个** `microbench.app:app`，
+> 端口、vault 路径、`.env` 全部一致。窗口关掉 = 它自己起的服务停掉；
+> 若服务是 `start_workbench.bat` 起的（它不是本进程起的），窗口关掉**不会**停服务。
 
 ---
 

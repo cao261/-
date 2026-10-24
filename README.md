@@ -9,16 +9,24 @@
 本工作台采用**“双模协同”**架构，既是标准的 **Obsidian 双链知识库**，也是一个**本地可运行的自动化科研辅助工具**。
 
 ### 方式零：桌面快捷方式（最快，30 秒上手）
-本机已配置好两个桌面快捷方式，**双击即可，无需进目录**：
+本机已配置好三个桌面快捷方式，**双击即可，无需进目录**：
 
 | 快捷方式 | 作用 |
 | --- | --- |
-| **MicroBench 工作台** | 自动启动本地服务 → 等就绪 → 自动打开浏览器到 `http://127.0.0.1:5000` |
+| **MicroBench 工作台** ⭐ | 启动本地服务 → 弹出一个**独立的应用窗口**（没有地址栏/标签页，和普通软件一样） |
+| **MicroBench 网页版** | 启动本地服务 → 用**默认浏览器**打开 `http://127.0.0.1:5000`（需要多标签/浏览器插件时用） |
 | **MicroBench 项目目录** | 直接打开项目文件夹 |
 
-- 服务端跑在独立的 `MicroBench Server` 控制台窗口里，**日志实时可见**；
-- 停止服务：切到该窗口按 `Ctrl+C`，或直接关闭该窗口；
-- 重复双击不会启动多个实例——脚本会先探测服务是否已存在，已存在就直接开浏览器。
+- **应用窗口**由 `MicroBench Desktop.bat` → `desktop.py` 拉起，用的是 Windows 自带的
+  **Edge WebView2**（pywebview 驱动）：无地址栏、无标签页、无扩展按钮，任务栏有独立条目和专属图标；
+- 窗口位置与尺寸跨次启动保留（`logs/window_state.json`），主题 / Obsidian vault 名 / 阅读器状态
+  等 localStorage 也保留（pywebview 默认隐私模式会清空，这里显式关掉了）；
+- 重复双击**不会**开出第二个窗口：已存在应用窗口时，改为把那个窗口顶到前台；
+- 关闭应用窗口 = 退出应用（它自己起的服务随之停止，不留后台残留进程）；
+- 想知道发生了什么？看 `logs/desktop.log`。
+
+> 换设备/换路径后快捷方式要重装：`pwsh -NoProfile -File install_shortcuts.ps1`
+> （脚本名**不能带前导下划线**，根目录的 `/_*.ps1` 被 `.gitignore` 排除，传不到另一台设备）。
 
 ### 方式一：直接在 Obsidian 中打开使用
 1. 打开 **Obsidian** 软件（需先安装，本机目前**未安装**）；
@@ -35,12 +43,13 @@
 
 ---
 
-### 方式二：双击运行本地 Web 辅助控制台 (推荐)
-双击运行根目录下的 **`start_workbench.bat`**（桌面快捷方式「MicroBench 工作台」执行的就是它）：
+### 方式二：双击运行本地 Web 辅助控制台
+双击运行根目录下的 **`start_workbench.bat`**（桌面快捷方式「MicroBench 网页版」执行的就是它）：
 1. 脚本会自动切到项目根目录、校验依赖、启动本地服务；
 2. **等服务真正就绪后**再自动打开浏览器到 **`http://127.0.0.1:5000`**，不会撞上"连接被拒绝"；
 3. 若 5000 端口已被本工作台占用，则直接开浏览器，不会重复起进程；
-4. **核心功能**：
+4. 服务端跑在独立的 `MicroBench Server` 控制台窗口里，**日志实时可见**；停止服务：切到该窗口按 `Ctrl+C`，或直接关闭该窗口；
+4. **核心功能**（应用窗口与网页版完全一致）：
    - 📖 **文献一键抓取与建档**：输入 arXiv ID 或 DOI（如 `2303.15982` 或 `10.1038/nature14539`），一键自动获取标题、作者、摘要并生成结构化 Markdown 精读卡片；
    - 📂 **从仓库论文库直接开读**：下拉框一键列出 `01_Literature/**/01_论文原文_PDF/` 里的论文，选中即进入双栏精读（**不复制文件**）；也可用深链 `http://127.0.0.1:5000/?open_pdf=<vault 相对路径>` 直接打开某篇；
    - 🧪 **复现工程脚手架生成**：输入项目名称，自动生成包含 `configs/`、`scripts/`、`data/`、`plots/` 与基准对齐 `README.md` 的标准化工程；
@@ -377,7 +386,10 @@ python microbench/export_offline.py "D:/OneDrive/MicroBench.html"
 ├── assets/                     # 桌面快捷方式图标 (microbench.ico)
 ├── requirements.txt            # Python 轻量依赖
 ├── .env                        # 模型 API Key 配置（已 gitignore，勿提交）
-├── start_workbench.bat         # Windows 一键启动脚本 (仅本机，桌面快捷方式指向此文件)
+├── desktop.py                  # 桌面应用启动器 (pywebview / Edge WebView2 独立窗口)
+├── MicroBench Desktop.bat      # 桌面应用入口 (pythonw 启动, 不弹黑窗)
+├── install_shortcuts.ps1       # 安装/刷新桌面与开始菜单快捷方式
+├── start_workbench.bat         # Windows 一键启动脚本 (网页版: 服务 + 默认浏览器)
 ├── start_workbench_lan.bat     # Windows 一键启动脚本 (平板 / 局域网)
 ├── start_offline_sync.bat      # 离线阅读版同步器 (可导出到云盘)
 └── MicroBench_离线阅读版.html   # 离线快照 (单文件, 平板可离线阅读)
