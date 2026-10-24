@@ -1660,6 +1660,60 @@
     .md-h3 { margin: 0.9em 0 0.4em; font-size: 0.97rem; }
     .md-h4 { margin: 0.75em 0 0.3em; font-size: 0.9rem; color: var(--fg-muted); }
     .md-h2:first-child, .md-h3:first-child, .md-h4:first-child { margin-top: 0; }
+    /* -------------------------------------------------------------------
+       Markdown 表格：模型本来就把表格输出成 "| a | b |"，渲染层不支持
+       表格时用户看到的是一堆竖线（"表格的翻译很乱"+"占篇幅很大"）。
+       现在渲染成真正的表格：单元格不换行（nowrap）+ 横向滚动，
+       纵向占用比竖线文本少一大截。
+       ------------------------------------------------------------------- */
+    .md-table-wrap {
+      overflow-x: auto;
+      margin: 0.6em 0 0.9em;
+      max-width: 100%;
+      border-radius: 6px;
+      border: 1px solid var(--line-soft);
+    }
+    .md-table {
+      border-collapse: collapse;
+      width: auto;
+      min-width: 100%;
+      font-size: 0.86em;
+      line-height: 1.45;
+      font-family: var(--font-sans);
+    }
+    .md-table th, .md-table td {
+      border-right: 1px solid var(--line-soft);
+      border-bottom: 1px solid var(--line-soft);
+      padding: 3px 9px;
+      white-space: nowrap;
+      text-align: left;
+      vertical-align: top;
+    }
+    .md-table th:last-child, .md-table td:last-child { border-right: none; }
+    .md-table tbody tr:last-child td { border-bottom: none; }
+    .md-table thead th {
+      background: var(--surface-sunken);
+      font-weight: 600;
+      color: var(--fg-strong);
+      position: sticky;
+      top: 0;
+    }
+    .md-table tbody tr:nth-child(even) td { background: rgba(127, 127, 127, 0.06); }
+    /* 公式原图：从 PDF 原页裁下来的图，贴进译文 */
+    .formula-shot {
+      display: inline-block;
+      vertical-align: middle;
+      max-width: 100%;
+      margin: 2px 0;
+    }
+    .formula-shot-img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      border-radius: 3px;
+      background: var(--surface-sunken);
+    }
+    .formula-fallback { color: var(--fg-muted); font-size: 0.9em; }
     /* formatMarkdownLite wraps prose in bare <p> (no class), so the answer
        surfaces need their own paragraph rhythm. */
     .qa-answer p, .result-slot p, .reader-section-body p { margin: 0 0 0.7em 0; }
@@ -3897,7 +3951,15 @@
               );
               if (r.ok) {
                 const snap = await r.json();
-                if (snap && snap.pages && snap.pages.length > 0) {
+                if (snap && snap.stale_extractor) {
+                  // 旧快照是按老版抽取算法翻的（栏序错、公式是占位符）→
+                  // 服务端已整份作废，这里如实告诉用户，别让他以为修复没生效。
+                  showToast(
+                    "♻️ 旧版译文已失效（抽取算法已升级：栏序/公式重做），正在重新翻译",
+                    true,
+                    5200
+                  );
+                } else if (snap && snap.pages && snap.pages.length > 0) {
                   const { matched, stale } = await applySnapshotToState(_pdfState, snap);
                   if (matched > 0) {
                     const staleNote = stale > 0
@@ -4071,6 +4133,8 @@
           try {
             textEl.className = "page-text";
             textEl.innerHTML = formatMarkdownLite(snapPage.translation);
+            // 公式原图：从 PDF 原页按坐标裁出来贴进译文
+            renderFormulaImages(textEl, (pdfState && pdfState.relativePath) || "", pg.num);
             // 快照恢复后立刻重放这一页的批注高亮（在 KaTeX 渲染之前）
             applyAnnotationsToPage(pg.num, textEl);
             if (typeof renderMathIn === "function") renderMathIn(textEl);
@@ -4825,6 +4889,8 @@
 
         textEl.className = "page-text";
         textEl.innerHTML = formatMarkdownLite(translated);
+        // 公式原图：从 PDF 原页按坐标裁出来贴进译文
+        renderFormulaImages(textEl, (_pdfState && _pdfState.relativePath) || "", pageNum);
         // 先打高亮再渲染公式：引文里含公式时，用的是 TeX 源，
         // 在 KaTeX 渲染前匹配最准（渲染后也能匹配，但这里更直接）
         applyAnnotationsToPage(pageNum, textEl);
@@ -5268,6 +5334,9 @@
     // appear inside math (`<`, `>`, `&`, `"`).
     function _unrenderMathPlaceholders(html) {
       if (!html) return "";
+      // 公式原图标记（⟦FORMULA:x0,y0,x1,y1⟧）没法搬进 .md —— 坐标对读者
+      // 没有意义，而且换个 PDF 就失效了。导出时换成一句人话。
+      html = String(html).replace(/⟦FORMULA:[^⟧]*⟧/g, "【公式：见 PDF 原文】");
       const un = (s) => String(s)
         .replace(/&lt;/g, "<")
         .replace(/&gt;/g, ">")
@@ -5349,6 +5418,32 @@
       h = h.replace(new RegExp(I_OPEN + "([^" + I_OPEN + I_CLOSE + "]+?)" + I_CLOSE, "g"),
                     (_, body) => `<span class="math-placeholder math-inline">${body}</span>`);
 
+      // 7.5) Markdown 表格 → 真正的 <table>
+      //     为什么必须做：模型本来就把表格输出成 "| 性能 | BaTiO3 | ..." 的
+      //     Markdown 表格，但渲染层没有表格支持 → 用户看到的是一堆竖线加
+      //     换行，"原有的表格形式完全看不出来"，还占掉半屏篇幅
+      //     （2026-10-24 用户原话："表格的翻译，他都是很乱非常之乱……
+      //     占的篇幅非常大"）。
+      //     表格块单独成段，前后用空行隔开，免得被 <p> 包住。
+      const _tables = [];
+      {
+        const _lines = h.split("\n");
+        const _kept = [];
+        let _i = 0;
+        while (_i < _lines.length) {
+          const _tbl = _matchMarkdownTable(_lines, _i);
+          if (_tbl) {
+            _tables.push(_tbl.html);
+            _kept.push("", "\u0005TABLE" + (_tables.length - 1) + "\u0006", "");
+            _i = _tbl.next;
+          } else {
+            _kept.push(_lines[_i]);
+            _i++;
+          }
+        }
+        h = _kept.join("\n");
+      }
+
       // 8) Paragraphs — wrap each blank-line-separated block in <p>; CSS controls spacing.
       //    Pre-existing heading tags (h2 / h3 / h4) are preserved by being matched first.
       //    We split on blank lines, wrap each non-heading segment in <p>.
@@ -5356,6 +5451,8 @@
       const wrapped = segments.map(seg => {
         const trimmed = seg.trim();
         if (!trimmed) return "";
+        // 表格占位符 → 单独成块（不能被 <p> 包住）
+        if (/^\u0005TABLE\d+\u0006$/.test(trimmed)) return trimmed;
         // NB: the display-math placeholder is a <div class="math-display-block">,
         // not a <math-display-block> tag — matching the bare tag name silently
         // failed, so display formulas got wrapped in <p> and their line breaks
@@ -5365,8 +5462,127 @@
         }
         return "<p>" + trimmed.replace(/\n/g, "<br>") + "</p>";
       }).join("");
-      return wrapped;
+      // 表格占位符 → 真正的 <table>
+      return wrapped.replace(/\u0005TABLE(\d+)\u0006/g,
+                             (_, idx) => _tables[Number(idx)] || "");
     }
+
+    /**
+     * 从第 i 行开始，试着识别一个 Markdown 表格。
+     * 判据：第 1 行含 "|"；第 2 行是分隔行（只由 | - : 空格 组成且至少有一个 "-"）；
+     *       之后的行含 "|" 就属于表格。
+     * 返回 {html, next}；不是表格返回 null。
+     */
+    function _matchMarkdownTable(lines, i) {
+      const head = (lines[i] || "").trim();
+      if (!head || head.indexOf("|") < 0) return null;
+      const sep = (lines[i + 1] || "").trim();
+      if (!sep || sep.indexOf("-") < 0 || sep.indexOf("|") < 0) return null;
+      if (!/^[\s|:-]+$/.test(sep)) return null;
+
+      const rows = [];
+      let j = i + 2;
+      while (j < lines.length) {
+        const ln = (lines[j] || "").trim();
+        if (!ln || ln.indexOf("|") < 0) break;
+        rows.push(ln);
+        j++;
+      }
+      if (!rows.length) return null;
+
+      const splitCells = (row) => {
+        let s = row.trim();
+        if (s.startsWith("|")) s = s.slice(1);
+        if (s.endsWith("|")) s = s.slice(0, -1);
+        return s.split("|").map(c => c.trim());
+      };
+      // 对齐方式来自分隔行（:--- 左对齐 / ---: 右对齐 / :---: 居中）
+      const aligns = splitCells(sep).map(c => {
+        const left = c.startsWith(":");
+        const right = c.endsWith(":");
+        if (left && right) return ' style="text-align:center"';
+        if (right) return ' style="text-align:right"';
+        return "";
+      });
+
+      const headCells = splitCells(head);
+      let html = '<div class="md-table-wrap"><table class="md-table"><thead><tr>';
+      headCells.forEach((c, k) => {
+        html += "<th" + (aligns[k] || "") + ">" + c + "</th>";
+      });
+      html += "</tr></thead><tbody>";
+      for (const row of rows) {
+        const cells = splitCells(row);
+        html += "<tr>";
+        headCells.forEach((_, k) => {
+          html += "<td" + (aligns[k] || "") + ">" + (cells[k] || "") + "</td>";
+        });
+        html += "</tr>";
+      }
+      html += "</tbody></table></div>";
+      return { html: html, next: j };
+    }
+
+    /**
+     * 把译文里的 ⟦FORMULA:x0,y0,x1,y1⟧ 换成从 PDF 原页裁下来的公式图。
+     *
+     * 为什么这么做：公式在 PDF 里是矢量排版（分子一行、分母一行、上下标各
+     * 一行），文本层抽出来是乱序碎片，硬拼 LaTeX 极容易把分子分母装反
+     * （用户原话："分子分母分不清谁是谁"）。错公式比没公式危险得多 ——
+     * 用户会照着它去算。所以抽取层只记坐标，这里裁原图贴进去：和论文里
+     * 长得一模一样。
+     *
+     * 裁图失败（PDF 被挪走/接口报错）→ 退回文字提示，不留破图。
+     */
+    function renderFormulaImages(container, relativePath, pageNum) {
+      if (!container || !relativePath) return;
+      if ((container.textContent || "").indexOf("⟦FORMULA:") < 0) return;
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      for (const node of nodes) {
+        const v = node.nodeValue || "";
+        if (v.indexOf("⟦FORMULA:") < 0) continue;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        const re = /⟦FORMULA:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧/g;
+        let m;
+        while ((m = re.exec(v)) !== null) {
+          if (m.index > last) {
+            frag.appendChild(document.createTextNode(v.slice(last, m.index)));
+          }
+          frag.appendChild(_formulaShotNode(m, relativePath, pageNum));
+          last = m.index + m[0].length;
+        }
+        if (last < v.length) frag.appendChild(document.createTextNode(v.slice(last)));
+        if (node.parentNode) node.parentNode.replaceChild(frag, node);
+      }
+    }
+
+    function _formulaShotNode(m, relativePath, pageNum) {
+      const x0 = parseFloat(m[1]), y0 = parseFloat(m[2]);
+      const x1 = parseFloat(m[3]), y1 = parseFloat(m[4]);
+      const wrap = document.createElement("span");
+      wrap.className = "formula-shot";
+      wrap.title = "公式原图（从 PDF 原页裁出，与论文一致）";
+      const img = document.createElement("img");
+      img.className = "formula-shot-img";
+      img.alt = "公式原图";
+      img.loading = "lazy";
+      // 1pt = 1/72 inch；按 96dpi 折算成 CSS 像素，让公式显示成论文里的尺寸
+      const wpx = Math.max(60, Math.min(620, Math.round((x1 - x0) * 1.3333)));
+      img.style.width = wpx + "px";
+      img.src = "/api/paper/formula_image?relative_path=" + encodeURIComponent(relativePath)
+        + "&page=" + encodeURIComponent(String(pageNum || 1))
+        + "&rect=" + encodeURIComponent([x0, y0, x1, y1].join(","))
+        + "&scale=4";
+      img.onerror = function () {
+        wrap.innerHTML = '<span class="formula-fallback">【公式未能完整提取：请对照左侧 PDF 原文】</span>';
+      };
+      wrap.appendChild(img);
+      return wrap;
+    }
+    window.renderFormulaImages = renderFormulaImages;
 
     /**
      * Run KaTeX on all .math-display-block and .math-placeholder elements inside a container.

@@ -328,6 +328,19 @@ PDF_X_TOLERANCE = 1.5
 _X_BINS = 120       # x 方向直方图分箱数
 _Y_BANDS = 60       # y 方向分带数（用于定位双栏起始位置）
 
+# ---------------------------------------------------------------------------
+# 抽取算法版本号
+# ---------------------------------------------------------------------------
+# 每次改动「页内阅读顺序 / 公式处理 / 表格抽取」的算法都必须 +1。
+#
+# 翻译快照里记着生成它时的版本号。抽取算法一改，旧快照里的译文就是
+# 「按老算法翻出来的」——栏序是错的、公式是占位符——继续拿来用只会让用户
+# 以为修复没生效（2026-10-24 实测：10-23 14:17 的快照被 10-23 16:36 的
+# 栏序修复甩在后面，读者照旧恢复旧快照，用户看到的还是"先翻译右边那栏"）。
+#
+# 版本对不上 → 快照里的页一律作废重翻。
+EXTRACTOR_VERSION = 2
+
 # pdfplumber 无法解码的字符会输出成 "(cid:12)" 这种占位符。
 _CID_RE = re.compile(r"\(cid:\d+\)")
 # 连续多个 cid 通常是一整段公式/符号（一次能抽出十几个），
@@ -400,19 +413,54 @@ _RELATION_RE = re.compile(r"[=≈≤≥¼]")
 _FRAGMENT_CHARS = "ðÞ[]()"
 
 
-def _is_formulaish_line(line: str) -> bool:
-    """判断一行是不是「公式或公式碎片」而不是正文句子。"""
-    s = line.strip()
+def _is_mathish_line(line: str) -> bool:
+    """判断一行是不是「公式或公式碎片」而不是正文句子。
+
+    **正文优先**（2026-10-24 修）：早先的判据是「有关系符号就是公式」，
+    结果把这种行整行吞成了公式图：
+
+        f(ω) = −∞ f(t) exp ( − iωt) dt. Substituting the inverse
+
+    —— 行尾的正文（Substituting the inverse）跟着进了图，译文里这句话
+    直接消失。实测 IEEE 论文 2024_1f_noise 第 3 页：'substituting'、
+    'inverse' 两个词在译文里整个不见。
+
+    所以现在：**先数"词状 token"**（≥3 个字母、不含数字/符号、且不是
+    (cid:N) 这种占位符）。出现 ≥2 个 → 是正文，不碰。
+
+    为什么不是"有没有长词"（≥4 字母）：公式符号本身也会是长词
+    （ε_eff 抽成 "eeff"），按"有没有"会把 eq (3) 判成正文；
+    为什么不是"≥2 个长词"：正文行 "are assumed: α = 0.05, d = 2 nm, ..."
+    只有 "assumed" 一个长词，按那个判据它会变成公式图 →
+    整句话（含 0.05 这些数值）从译文里消失（实测 1f_noise 第 5 页）。
+
+    词状 token（≥3 字母、纯字母）：
+        are assumed: α = 0.05 …   → are / assumed / and  = 3 个 → 正文 ✓
+        eeﬀ ¼ 33 33 (3)           → eeff               = 1 个 → 公式 ✓
+        E;31 nsp ð1 (cid:4) …     → nsp                = 1 个 → 公式 ✓
+        f(ω) = … Substituting the inverse → exp/Substituting/the/inverse = 4 → 正文 ✓
+    """
+    s = (line or "").strip()
     if not s:
         return False
+    if len(s) > 200:
+        return False
+    # (cid:N) 是 PDF 无法解码的符号占位符，不是"词"
+    probe = re.sub(r"\(cid:\d+\)", " ", s)
+    wordish = re.findall(r"(?<![A-Za-z])[A-Za-z]{3,}(?![A-Za-z])", probe)
+    if len(wordish) >= 2:
+        return False          # 正文，不碰
     if _RELATION_RE.search(s):
         # 有关系符号 → 是公式（长度上限放宽，公式行可以很长）
         return len(s) <= 160
-    # 有正常英文单词（>=4 字母）→ 一定是正文
-    if re.search(r"[A-Za-z]{4,}", s):
-        return False
-    if len(s) > 60:
-        return False
+    if "(cid:" in s or "[?]" in s:
+        return True
+    # 纯符号行："− ×"、"Z−∞"、"∞"、"× −" —— 公式的积分上下限、乘号残留。
+    # 这类行不含 4 字母词，但也不含数字/括号，很容易被当成正文，
+    # 一断行公式就被切成好几段（实测 eq (12) 被切成 3 块）。
+    letters = re.findall(r"[A-Za-z]", s)
+    if len(letters) <= 2 and len(s) <= 12:
+        return True
     has_digit = any(ch.isdigit() for ch in s)
     has_special = any(ch in _FRAGMENT_CHARS for ch in s)
     short_words_only = bool(re.fullmatch(r"[A-Za-z]{1,3}(\s+[A-Za-z]{1,3})*", s))
@@ -444,7 +492,7 @@ def _mark_broken_formulas(text: str) -> str:
     runs: list[list[int]] = []
     cur: list[int] = []
     for idx, line in enumerate(lines):
-        if _is_formulaish_line(line):
+        if _is_mathish_line(line):
             cur.append(idx)
         else:
             if cur:
@@ -475,6 +523,232 @@ def _mark_broken_formulas(text: str) -> str:
             continue
         in_formula = False
         out.append(line)
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 公式区域：带 bbox 的标记
+# ---------------------------------------------------------------------------
+# 公式在 PDF 里是矢量排版：分子一行、分母一行、上下标各一行，文本层抽出来
+# 是乱序碎片（实测 α_E,31 = n·d₃₁ᵐ·g₃₁ /(n·s₁₁ᴱ(1-(k₃₁ᴱ)²) - s₃₃ᵐ(1-n))
+# 被抽成 6 行碎片，模型看着只会瞎猜）。
+#
+# 两条路：
+#   a) 照碎片拼 LaTeX —— 极容易把分子分母装反（用户原话："分子分母分不清
+#      谁是谁"）。而错公式比没公式危险得多：用户会照着它去算。
+#   b) 不猜：**把公式在 PDF 上的位置记下来**，前端按这个坐标从原页裁一张图
+#      贴进译文 —— 和论文里长得一模一样，绝不会错。
+#
+# 走 b。标记格式：⟦FORMULA:x0,y0,x1,y1⟧（PDF 页坐标，左上角原点，单位 pt）。
+# 标记要原样穿过模型的翻译（提示词要求逐字照抄），前端再拿它去裁图。
+FORMULA_MARKER_BBOX_RE = re.compile(
+    r"⟦FORMULA:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),"
+    r"(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧"
+)
+
+# 公式块的竖直高度上限（pt）。超过这个高度就不是"一行公式"，多半是表格。
+_FORMULA_MAX_HEIGHT = 90.0
+
+
+def _crop_lines(page, bbox, margin: float = 16.0) -> list[dict]:
+    """裁一块区域，返回该区域的文本行（每行带 bbox）。
+
+    为什么不用 extract_text()：它只给字符串。我们要的是「哪一行在哪」——
+    公式要按位置裁图（⟦FORMULA:x0,y0,x1,y1⟧），行要能定位。
+
+    实测：把 extract_text_lines() 的行文本用 "\\n" 拼起来，与 extract_text()
+    的输出**逐字相同**（JACERS 综述第 2 页左栏 823 字符完全一致），所以换用
+    行级抽取不会改变正文内容，只是多带了坐标。
+
+    **为什么要向外扩 margin 再按行顶过滤**（2026-10-24 实测）：
+    pdfplumber 裁剪时会把压在裁剪边上的字形**切掉一半**，剩下的半个字形
+    的 top 被裁到边界值 → 它跟下一行的字混成同一行 → 两行被**逐字交错**：
+
+        cannot be coprocessed with oxide ferroelectrics, as sintering
+        would oxidize the iron and dramatically reduce the alloys supe-
+        → cwaonunlodtobxiediczoeptrhoeciersosnedanwditdhraomxiadteicaflelryroree
+
+    这行乱码直接进了翻译。扩边裁剪 → 行完整落在裁剪框里，不再被切；
+    再按「行的 top 属于哪一带」过滤 → 每行只归属一带，不重不漏。
+    """
+    x0, y0, x1, y1 = bbox
+    box = (x0, max(0.0, y0 - margin), x1, y1 + margin)
+    try:
+        cropped = page.crop(box)
+    except Exception:
+        return []
+    try:
+        raw = cropped.extract_text_lines(
+            x_tolerance=PDF_X_TOLERANCE, return_chars=False)
+    except Exception:
+        raw = []
+    out: list[dict] = []
+    for ln in raw or []:
+        text = (ln.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            top = float(ln.get("top", 0.0))
+            bottom = float(ln.get("bottom", 0.0))
+            lx0 = float(ln.get("x0", 0.0))
+            lx1 = float(ln.get("x1", 0.0))
+        except (TypeError, ValueError):
+            continue
+        # 只保留「行顶属于这一带」的行 —— 相邻带的行在这里出现，但归它们
+        if not (y0 - 0.01 <= top < y1):
+            continue
+        out.append({
+            "text": text,
+            "x0": lx0,
+            "x1": lx1,
+            "top": top,
+            "bottom": bottom,
+        })
+    return out
+
+
+def _line_intervals(words) -> list[tuple[float, float]]:
+    """所有文字行的 y 区间（按 top 聚类，重叠的合并）。
+
+    用来判断「某个裁剪边界是不是切在字上」。
+    """
+    if not words:
+        return []
+    spans: list[list[float]] = []
+    for w in sorted(words, key=lambda w: float(w["top"])):
+        try:
+            t = float(w["top"])
+            b = float(w.get("bottom", t))
+        except (TypeError, ValueError):
+            continue
+        if spans and t <= spans[-1][1] + 0.5:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([t, b])
+    return [(a, b) for a, b in spans]
+
+
+def _snap_to_line_edge(y: float, intervals) -> float:
+    """裁剪边界切在字上时，把边界上移到那一行的顶边。
+
+    为什么必须修：pdfplumber 裁到半行时，那一行会被截断/错位，实测
+    （JACERS 综述第 2 页右栏）相邻两行被逐字交错成一团乱码：
+
+        erties of magnetostrictive materials previously used in ME lam-
+        inate composites. Ferrites have large resistances (relative to
+        → einrtaitees ocof mmpaognsietteos.strFicetrirvietems ahtaevrie...
+
+    这行乱码直接进了翻译（模型只能靠上下文硬猜）。上移到行顶边 → 整行完整
+    地落在同一块里，既不截断也不丢字。
+    """
+    for t, b in intervals:
+        if t < y < b:
+            return max(0.0, t - 0.01)
+    return y
+
+
+def _mark_attached_lines(lines: list[dict]) -> list[bool]:
+    """标出「其实是上一行上标/下标」的短行。
+
+    判据：短行 + y 区间和上一条**正文行**重叠 ≥ 60% + x 区间被它包住。
+
+    为什么必须做：论文里的上标（引用序号 3）、下标（d₃₁ 的 31）、α_ME 的
+    ME，在文本层里都是**独立的一行**。不排除它们，"a" + "ME" 会被当成
+    两行公式碎片，公式块的位置也就算不准了。
+
+    只对正文行生效：公式行下面挂着的小字（分母的下标 11/31/33）是公式
+    的一部分，不能摘出去。
+    """
+    attached = [False] * len(lines)
+    for i in range(1, len(lines)):
+        j = i - 1
+        while j >= 0 and attached[j]:
+            j -= 1
+        if j < 0:
+            continue
+        prev = lines[j]
+        cur = lines[i]
+        if _is_mathish_line(prev["text"]):
+            continue          # 上一行是公式 → 挂在它下面的小字属于公式
+        pw = prev["bottom"] - prev["top"]
+        cw = cur["bottom"] - cur["top"]
+        if pw <= 0 or cw <= 0:
+            continue
+        overlap = min(prev["bottom"], cur["bottom"]) - max(prev["top"], cur["top"])
+        if overlap <= 0 or overlap / cw < 0.6:
+            continue
+        if cur["x0"] >= prev["x0"] - 0.5 and cur["x1"] <= prev["x1"] + 0.5:
+            attached[i] = True
+    return attached
+
+
+def _formula_spans(lines: list[dict], attached: list[bool]) -> list[tuple[int, int]]:
+    """找出公式块，返回 [(起始行号, 结束行号), ...]。
+
+    判据（比「看着像公式」严格，因为误判的代价不对称）：
+      - 连续若干行都是"数学行"（没有 ≥2 个 4 字母以上的英文词）；
+      - 块里含关系符号（= ≈ ≤ ≥，PDF 里常被抽成 ¼）。
+        **必须有等号**：表格行也含大量 (cid: 碎片（"d 31(pC/N) (cid:4)90 ..."），
+        但表格行没有等号 —— 没有这一条，整张表会变成一张图，
+        用户就没法翻译表里的内容了（实测 JACERS Table I 整表被吞）。
+      - 块的高度不超过 90pt（超高的多半是表格，不是公式）。
+    """
+    runs: list[list[int]] = []
+    cur: list[int] = []
+    for i, ln in enumerate(lines):
+        if attached[i] or not _is_mathish_line(ln["text"]):
+            if cur:
+                runs.append(cur)
+                cur = []
+            continue
+        cur.append(i)
+    if cur:
+        runs.append(cur)
+
+    out: list[tuple[int, int]] = []
+    for run in runs:
+        if len(run) > 12:
+            continue
+        seg = "\n".join(lines[i]["text"] for i in run)
+        height = (lines[run[-1]]["bottom"] - lines[run[0]]["top"])
+        if height > _FORMULA_MAX_HEIGHT:
+            continue
+        if _RELATION_RE.search(seg):
+            out.append((run[0], run[-1]))
+    return out
+
+
+def _lines_to_text(lines: list[dict], mark_formulas: bool = True) -> str:
+    """把文本行拼成整段文本，并把公式块换成带坐标的标记。"""
+    if not lines:
+        return ""
+    spans = _formula_spans(lines, _mark_attached_lines(lines)) if mark_formulas else []
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        hit = None
+        for a, b in spans:
+            if a == i:
+                hit = (a, b)
+                break
+        if hit:
+            a, b = hit
+            x0 = min(lines[k]["x0"] for k in range(a, b + 1))
+            x1 = max(lines[k]["x1"] for k in range(a, b + 1))
+            top = min(lines[k]["top"] for k in range(a, b + 1))
+            bottom = max(lines[k]["bottom"] for k in range(a, b + 1))
+            # 往外留一点边距，别把上下标/分数线切掉
+            pad = 2.0
+            out.append(
+                "⟦FORMULA:{:.1f},{:.1f},{:.1f},{:.1f}⟧".format(
+                    max(0.0, x0 - pad), max(0.0, top - pad),
+                    x1 + pad, bottom + pad)
+            )
+            i = b + 1
+            continue
+        out.append(lines[i]["text"])
+        i += 1
     return "\n".join(out)
 
 
@@ -567,6 +841,30 @@ def _extract_page_text_raw(page) -> str:
     return _join_reading_order(left_parts, right_parts, span_units, "\n\n".join(front))
 
 
+def _band_kind(bw, width: float, x_mid: float, x_bin: int) -> str:
+    """判断这一带是「双栏」（split）还是「整宽」（span）。
+
+    判据：**栏缝位置有没有空隙**。
+
+    为什么不能再看「两边各有多少词」（2026-10-24 实测踩坑）：
+    左栏只剩几个词的带（公式的下标行 "11 31 33"）会被判成「整宽」→
+    整宽裁剪把左右两栏的文字合进同一行 → 变成
+    "11 31 33 rior magnetostriction. Also, Terfenol-D has ..." 这种
+    逐字交错的乱码，直接进了译文。
+
+    现在只看栏缝：中间空 → 双栏（各裁各的）；中间被填满 → 整宽
+    （跨栏表格、整宽图注）。
+
+    容差用 **2 个分箱**（≈10pt）而不是 3 个：
+    跨栏表格的两半之间也有缝（实测 JACERS Table I：左右两半的缝只有 ~7pt），
+    容差 3 时表格行被判成「双栏」→ **行被栏缝劈成两半** → 模型对不上列 →
+    表格数值整体错位一行（实测 d31 那行的 16.5 跑到了 d33 行）。
+    容差 2 时表格行判成「整宽」→ 整行抽出来 → 数值顺序正确。
+    """
+    cover = _x_cover(bw, width, _X_BINS)
+    return "split" if _has_gap_near(cover, x_bin, tol_bins=2) else "span"
+
+
 def _extract_top_region(page, words, width, height, y_split, x_mid):
     """把「双栏正文起点以上」的区域按栏拆开。
 
@@ -593,42 +891,32 @@ def _extract_top_region(page, words, width, height, y_split, x_mid):
 
     band_h = max(8.0, height / 40.0)
     x_bin = int(round(x_mid / width * _X_BINS))
+    intervals = _line_intervals(words)
+    # 注意：顶部区域**不能**把相邻的同类带合并成一块。
+    # 试过（2026-10-24）：合并后一个块的裁剪范围横跨了整页顶部，
+    # 左栏那一侧把公式碎片和右栏正文混进了同一行 —— 阅读顺序直接乱掉
+    #（右栏第一段里插进了左栏的分母碎片 "nsp11ð1..."）。
+    # 代价只是每带之间多一个段落断裂（译文里那句话会被拆成两段），
+    # 远比顺序错乱好。
     y = 0.0
     while y < y_split - 0.01:
         y1 = min(y + band_h, y_split)
+        y1 = _snap_to_line_edge(y1, intervals)
+        if y1 <= y + 0.01:
+            y1 = min(y + band_h, y_split)
         bw = [w for w in words if y <= w["top"] < y1]
         if bw:
-            cover = _x_cover(bw, width, _X_BINS)
-            left_n = sum(1 for w in bw if w["x1"] <= x_mid)
-            right_n = sum(1 for w in bw if w["x0"] >= x_mid)
-            # 真正的双栏带：栏缝干净 + 两边都够多字
-            is_split = (
-                _has_gap_near(cover, x_bin)
-                and left_n >= 4
-                and right_n >= 4
-            )
-            if not is_split:
-                # 不是双栏 → 判断是「整宽块」还是「单栏块」
-                xs = min(w["x0"] for w in bw)
-                xe = max(w["x1"] for w in bw)
-                wide = (xe - xs) >= width * 0.5
-                cross = any(
-                    w["x0"] < x_mid - 2 and w["x1"] > x_mid + 2 for w in bw
-                )
-                is_split = not (wide or cross)
+            kind = _band_kind(bw, width, x_mid, x_bin)
             try:
-                if is_split:
-                    lt = page.crop((0, y, x_mid, y1)).extract_text(
-                        x_tolerance=PDF_X_TOLERANCE) or ""
-                    rt = page.crop((x_mid, y, width, y1)).extract_text(
-                        x_tolerance=PDF_X_TOLERANCE) or ""
+                if kind == "split":
+                    lt = _lines_to_text(_crop_lines(page, (0, y, x_mid, y1)))
+                    rt = _lines_to_text(_crop_lines(page, (x_mid, y, width, y1)))
                     if lt.strip():
                         left_parts.append(lt.strip())
                     if rt.strip():
                         right_parts.append(rt.strip())
                 else:
-                    st = page.crop((0, y, width, y1)).extract_text(
-                        x_tolerance=PDF_X_TOLERANCE) or ""
+                    st = _lines_to_text(_crop_lines(page, (0, y, width, y1)))
                     if st.strip():
                         front.append(st.strip())
             except Exception:
@@ -658,7 +946,11 @@ def _join_reading_order(left_parts, right_parts, span_units, top_txt="") -> str:
     parts.extend(p for p in left_parts if p.strip())
     parts.extend(p for p in right_parts if p.strip())
     for unit in span_units or []:
-        parts.extend(p for p in unit if p.strip())
+        # 单元内部用单换行连着（表格的标题和它的表体必须紧挨着），
+        # 单元之间空一行（它们是独立的一块内容）。
+        block = "\n".join(p for p in unit if p.strip())
+        if block:
+            parts.append(block)
     return "\n\n".join(parts)
 
 
@@ -694,6 +986,22 @@ def _vote_column_gap(words, width, height, y_split):
     return x_mid
 
 
+def _looks_like_body_text(bw, x_mid: float) -> bool:
+    """判断一带里的文字「像正文」而不是「像表格行」。
+
+    正文：两栏都有不少词，而且有像英文单词的东西（≥4 字母）。
+    表格行：词多但都很短（数字、单位、下标），没有英文单词。
+    """
+    def bodyish(ws) -> bool:
+        if len(ws) < 8:
+            return False
+        txt = " ".join(w["text"] for w in ws)
+        return len(re.findall(r"[A-Za-z]{4,}", txt)) >= 4
+    left = [w for w in bw if w["x1"] <= x_mid]
+    right = [w for w in bw if w["x0"] >= x_mid]
+    return bodyish(left) and bodyish(right)
+
+
 def _extract_by_bands(page, words, width, height, y_split, x_mid):
     """按水平带分组切页。
 
@@ -708,14 +1016,17 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
     """
     band_h = max(8.0, height / 40.0)
     x_bin = int(round(x_mid / width * _X_BINS))
+    intervals = _line_intervals(words)
     groups = []   # [kind, y0, y1]
     y = y_split
     while y < height:
-        bw = [w for w in words if y <= w["top"] < y + band_h]
-        y1 = y + band_h
+        y1 = min(y + band_h, height)
+        y1 = _snap_to_line_edge(y1, intervals)
+        if y1 <= y + 0.01:
+            y1 = min(y + band_h, height)
+        bw = [w for w in words if y <= w["top"] < y1]
         if bw:
-            cover = _x_cover(bw, width, _X_BINS)
-            kind = "split" if _has_gap_near(cover, x_bin) else "span"
+            kind = _band_kind(bw, width, x_mid, x_bin)
             if groups and groups[-1][0] == kind:
                 groups[-1][2] = y1
             else:
@@ -726,18 +1037,33 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
     right_parts: list[str] = []
     units: list[list[str]] = []
     pending: list[str] = []
+    table_mode = False
     try:
         for kind, gy0, gy1 in groups:
+            bw = [w for w in words if gy0 <= w["top"] < gy1]
             if kind == "span":
-                st = page.crop((0, gy0, width, gy1)).extract_text(
-                    x_tolerance=PDF_X_TOLERANCE) or ""
+                # 跨栏块多半是表格：表格行也长得像公式碎片（"d 31(pC/N) 90 ..."），
+                # 但表格必须保持文本形态交给模型排版，所以这里不标公式。
+                st = _lines_to_text(
+                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False)
+                if st.strip():
+                    pending.append(st.strip())
+                table_mode = True
+                continue
+            if table_mode and not _looks_like_body_text(bw, x_mid):
+                # 表格的表体：整宽抽，行不被栏缝劈开。
+                # 为什么必须整宽：跨栏表格的行被栏缝切成两半后，
+                # 压在栏缝上的数字还会被切碎（"1350" → "13" + "350"），
+                # 模型对不上列 → 表格数值整体错位一行
+                # （实测 JACERS Table I：d31 行的 16.5 跑到了 d33 行）。
+                st = _lines_to_text(
+                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False)
                 if st.strip():
                     pending.append(st.strip())
                 continue
-            lt = page.crop((0, gy0, x_mid, gy1)).extract_text(
-                x_tolerance=PDF_X_TOLERANCE) or ""
-            rt = page.crop((x_mid, gy0, width, gy1)).extract_text(
-                x_tolerance=PDF_X_TOLERANCE) or ""
+            table_mode = False
+            lt = _lines_to_text(_crop_lines(page, (0, gy0, x_mid, gy1)))
+            rt = _lines_to_text(_crop_lines(page, (x_mid, gy0, width, gy1)))
             if pending:
                 # 上面紧挨着跨栏块 → 这一组是表格的表体，整块保留
                 unit = list(pending)

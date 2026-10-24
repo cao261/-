@@ -25,7 +25,8 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import (HTMLResponse, FileResponse, StreamingResponse,
+                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -1260,6 +1261,74 @@ async def api_serve_pdf(
     )
 
 
+@app.get("/api/paper/formula_image")
+async def api_formula_image(
+    relative_path: str = Query(..., min_length=3, max_length=500),
+    page: int = Query(..., ge=1, le=2000),
+    rect: str = Query(..., min_length=5, max_length=120,
+                      description="裁剪区域 x0,y0,x1,y1（PDF 点，左上角原点）"),
+    scale: float = Query(4.0, ge=1.0, le=8.0),
+):
+    """
+    按页坐标裁一块区域，返回 PNG —— 给「公式原图」用。
+
+    为什么需要这个接口：公式在 PDF 里是矢量排版（分子一行、分母一行、
+    上下标各一行），文本层抽出来是乱序碎片。硬拼 LaTeX 极容易把分子分母
+    装反（用户原话："分子分母分不清谁是谁"），而错公式比没公式危险得多
+    —— 用户会照着它去算。所以抽取层只记下公式在页面上的坐标，由这里裁
+    原图，前端贴进译文：和论文里长得一模一样，绝不会错。
+    """
+    try:
+        pdf_path = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
+
+    try:
+        parts = [float(p) for p in rect.split(",")]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="rect 格式应为 x0,y0,x1,y1")
+    if len(parts) != 4:
+        raise HTTPException(status_code=400, detail="rect 格式应为 x0,y0,x1,y1")
+    x0, y0, x1, y1 = parts
+    if x1 <= x0 or y1 <= y0:
+        raise HTTPException(status_code=400, detail="rect 区域无效")
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:  # pragma: no cover - env dependent
+        raise HTTPException(status_code=500,
+                            detail="公式裁图需要 PyMuPDF (fitz), 请先 pip install pymupdf") from exc
+
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            if page > doc.page_count:
+                raise HTTPException(status_code=404, detail=f"页码越界: {page}")
+            pg = doc.load_page(page - 1)
+            pr = pg.rect
+            # 裁剪区必须落在页面内，且不能大得离谱（防 abused 参数换内存）
+            cx0, cy0 = max(pr.x0, min(x0, pr.x1)), max(pr.y0, min(y0, pr.y1))
+            cx1, cy1 = min(pr.x1, max(x1, pr.x0)), min(pr.y1, max(y1, pr.y0))
+            if cx1 - cx0 <= 0 or cy1 - cy0 <= 0:
+                raise HTTPException(status_code=400, detail="rect 区域无效")
+            if (cx1 - cx0) > pr.width or (cy1 - cy0) > pr.height:
+                raise HTTPException(status_code=400, detail="rect 区域超出页面")
+            pix = pg.get_pixmap(clip=fitz.Rect(cx0, cy0, cx1, cy1),
+                                 matrix=fitz.Matrix(scale, scale), alpha=False)
+            png = pix.tobytes("png")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"公式裁图失败: {e}")
+
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.get("/api/vault/file")
 async def api_vault_file(
     relative_path: str = Query(..., min_length=3, max_length=500,
@@ -2078,10 +2147,17 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 12. PDF 抽取常把希腊字母抽成普通字母, 例如磁电电压系数 α_ME 会变成
     "a" + 换行 + "ME" 或 "a_ME"。遇到这种明显失真时, 请按学科标准写法
     还原成规范符号 (如 α_ME), 并统一全文写法
-13. 原文中的 "⟦FORMULA⟧" 表示这里是一个公式, 但 PDF 的排版（分子分母、上下标
-    各占一行）导致文本无法完整提取。**请原样输出 "⟦FORMULA⟧" 这几个字符**,
+13. 原文中的 "⟦FORMULA⟧" 或 "⟦FORMULA:x0,y0,x1,y1⟧" 表示这里是一个公式, 但 PDF 的
+    排版（分子分母、上下标各占一行）导致文本无法完整提取。
+    **请原样输出这几个字符 (连同冒号后面的坐标一起, 一个数字都不要改)**,
     绝对不要根据上下文猜测、补全, 更不要用你记忆里的公式替代它 ——
     编出来的公式比没有公式危险得多, 用户会照着它去算。
+    系统会把带坐标的那种标记换成论文里的公式原图, 所以坐标务必逐字照抄。
+14. 原文里的表格请用 **Markdown 表格** 输出: 第一行是表头, 第二行是
+    "|---|---|" 这样的分隔行, 之后每行一条记录, 单元格之间用 " | " 分隔。
+    不要把表格摊成一行行的普通文字, 也不要自己加 "参数/单位" 之类的列。
+15. 表格里的量纲、单位、上下标保持原样 (如 "d31 (pC/N)"、"Tc (°C)"),
+    不要翻译成中文单位, 也不要改写数值
 """
 
 
@@ -3210,6 +3286,7 @@ async def api_pdf_snapshot_list():
             "total_pages": len(pages),
             "translated_pages": sum(1 for p in pages if p.get("translation")),
             "schema_version": data.get("schema_version", 0),
+            "extractor_version": data.get("extractor_version"),
         })
     out.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
     return {"snapshots": out}
@@ -3229,6 +3306,24 @@ async def api_pdf_snapshot_load(
     data = _safe_read_json(_snapshot_path(paper_id))
     if not data:
         raise HTTPException(status_code=404, detail=f"快照不存在: {paper_id}")
+
+    # 抽取算法版本对不上 → 整份快照作废。
+    #
+    # 为什么必须作废而不是照用：快照里的译文是**按当时的抽取算法翻出来的**。
+    # 2026-10-24 实测踩坑：10-23 14:17 存的快照（栏序修复之前）被 10-23 16:36
+    # 的修复甩在后面，读者照旧恢复旧快照，用户看到的还是"先翻译右边那栏"，
+    # 还以为修复没生效 —— 其实代码早就修好了。
+    #
+    # 作废后返回空页列表，阅读器会照常把没翻的页重新翻一遍（旧的译文本来
+    # 就是坏的，重翻不亏）。
+    from .paper_text import EXTRACTOR_VERSION
+    saved_ver = data.get("extractor_version")
+    if saved_ver != EXTRACTOR_VERSION:
+        data = dict(data)
+        data["pages"] = []
+        data["stale_extractor"] = True
+        data["saved_extractor_version"] = saved_ver
+        data["current_extractor_version"] = EXTRACTOR_VERSION
     return data
 
 
@@ -3259,8 +3354,11 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
 
     pages_out = [p.model_dump() for p in req.pages]
 
+    from .paper_text import EXTRACTOR_VERSION
     payload = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        # 抽取算法版本：加载时对不上就整份作废（见 api_pdf_snapshot_load）
+        "extractor_version": EXTRACTOR_VERSION,
         "paper_id": safe_id,
         "paper_title": req.paper_title,
         "relative_path": req.relative_path,

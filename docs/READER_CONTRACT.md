@@ -134,7 +134,87 @@ if chunk.strip():
 
 ---
 
-## 4. 答疑面板最小化 = 收成侧边栏
+## 4. 公式：不猜 LaTeX，直接裁论文原图
+
+**用户原话（2026-10-24）**："公式渲染还有问题……基本没有和文中的公式一样的……
+分子分母分不清谁是谁……反正这个公式就还没有参考意义"。
+
+### 4.1 为什么不能拼 LaTeX
+
+公式在 PDF 里是矢量排版（分子一行、分母一行、上下标各一行），文本层抽出来
+是乱序碎片。照碎片拼 LaTeX 极容易把**分子分母装反** —— 而错公式比没公式
+危险得多：用户会照着它去算（本项目的铁律，见 AGENTS.md §4.6）。
+
+### 4.2 现在的做法：只记坐标，裁原图
+
+| 环节 | 位置 | 说明 |
+|---|---|---|
+| 识别 | `paper_text._formula_spans()` | 连续的「数学行」且含等号 → 一个公式块 |
+| 记坐标 | `paper_text._lines_to_text()` | 输出 `⟦FORMULA:x0,y0,x1,y1⟧`（PDF 页坐标，pt） |
+| 穿过模型 | `app.py` 提示词第 13 条 | 要求模型**逐字照抄**标记（连坐标一起） |
+| 清洗 | `translation.sanitize_translation()` | 坐标坏了（数量不对/不成比例）→ 退回文字提示 |
+| 裁图 | `app.py` `GET /api/paper/formula_image` | PyMuPDF 按坐标裁 PNG，`scale=4`（≈288 DPI） |
+| 显示 | `index.html` `renderFormulaImages()` | 标记 → `<img class="formula-shot-img">`，失败退回文字 |
+
+实测（JACERS 综述第 2 页 eq (2)）：裁出来的就是论文里那个分式，
+**分子 `n d₃₃ᵐ g₃₁ᵖ`、分母 `n s₁₁ᵖ(1−(k₃₁ᵖ)²) − s₃₃ᵐ(1−n)` 一模一样**。
+
+### 4.3 判据（改动时必须一起改）
+
+一条行被当成「数学行」的条件：
+
+1. **词状 token < 2 个**（≥3 字母的纯字母词，`(cid:N)` 不算）
+   → 正文优先：`are assumed: α = 0.05, …` 有 3 个词状 token → 是正文；
+   `eeﬀ ¼ 33 33 (3)` 只有 1 个 → 是公式。
+2. 含关系符号（`= ≈ ≤ ≥`，PDF 里常被抽成 `¼`）
+   → **必须有等号**：表格行也含大量 `(cid:)` 碎片，但表格行没有等号 ——
+   没有这一条，整张表会变成一张图，用户就没法翻译表里的内容了。
+3. 块高 ≤ 90pt（超高的多半是表格）。
+
+⚠️ **正文绝不能被吞进公式图**（实测踩过：IEEE 论文
+`f(ω) = … Substituting the inverse` 整行被吞 → 译文里这句话直接消失）。
+判据放宽前先跑 `tests/test_reader_formula_table.py`。
+
+### 4.4 改这块时必须跑
+
+```bash
+python -m pytest tests/test_reader_formula_table.py -v
+```
+
+---
+
+## 5. 表格：Markdown 表格必须渲染成真正的 `<table>`
+
+**用户原话（2026-10-24）**："表格的翻译，他都是很乱非常之乱……
+他这个原有的表格形式完全看不出来，而且占的篇幅非常大"。
+
+模型本来就把表格输出成 `| 性能 | BaTiO₃ | … |` 的 **Markdown 表格**，
+但渲染层没有表格支持 → 用户看到的是一堆竖线加换行。
+
+- 渲染：`index.html` `formatMarkdownLite()` 里的 `_matchMarkdownTable()`
+  （表头 + `|---|---|` 分隔行 → `<table class="md-table">`）
+- 样式：`index.html` `.md-table`（单元格 `nowrap` + 横向滚动 → 纵向占位大幅缩小）
+- 提示词：`app.py` 第 14/15 条 —— 表格用 Markdown 表格输出，量纲单位保持原样
+- 护栏：`microbench/_test_reader_markdown.js`（node 跑真实前端代码）
+  + `tests/test_reader_formula_table.py` 里的一条 pytest 包装
+
+---
+
+## 6. 翻译快照必须带「抽取算法版本号」
+
+**踩坑（2026-10-24）**：10-23 14:17 存的快照被 10-23 16:36 的栏序修复甩在
+后面 → 读者照旧恢复旧快照 → 用户看到的还是"先翻译右边那栏"，
+**还以为修复没生效**（其实代码早就修好了）。
+
+- `paper_text.EXTRACTOR_VERSION`：改了「页内顺序 / 公式 / 表格抽取」就 +1
+- 快照保存时由服务端盖上 `extractor_version`
+- 加载时（`GET /api/pdf/snapshot/load`）版本对不上 → **整份作废**，
+  返回空页列表 → 阅读器照常把没翻的页重翻一遍
+- 前端会弹一条提示："♻️ 旧版译文已失效（抽取算法已升级…），正在重新翻译"
+
+---
+
+## 7. 答疑面板最小化 = 收成侧边栏
 
 **用户原话**："划线解答有点问题，最好点最小化能够缩小至侧边栏"。
 
@@ -144,13 +224,15 @@ if chunk.strip():
 
 ---
 
-## 5. 改完必跑
+## 8. 改完必跑
 
 ```bash
 python -m pytest tests -q
+node microbench/_test_reader_markdown.js
 ```
 
 - `tests/test_column_order.py` —— 页内顺序契约
 - `tests/test_qa_fixes.py` —— 空正文检测 / 多模态 / 侧边栏契约
+- `tests/test_reader_formula_table.py` —— 公式坐标 / 表格渲染 / 快照版本化
 
 仓库有 pre-commit 钩子，提交时会自动跑离线测试套件。

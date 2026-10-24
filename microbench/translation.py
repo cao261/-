@@ -513,16 +513,44 @@ def sanitize_translation(text: str) -> str:
     # 4) 落单的 $ 换成全角 ＄（多半是版权行的页价）
     out = _fix_odd_dollars("".join(pieces)).strip()
 
-    # 5) 公式碎片标记 → 人话。
-    #    抽取阶段把「PDF 排版导致无法完整提取的公式」整段标成 ⟦FORMULA⟧，
-    #    提示词要求模型原样输出这个标记（防止它凭空编一个公式出来）。
-    #    这里把它换成用户看得懂的提示：公式没抽出来，请对照 PDF 原文。
-    if "⟦FORMULA⟧" in out:
-        out = out.replace(
-            "⟦FORMULA⟧",
-            "【公式未能完整提取：PDF 排版导致分子/分母与上下标被打散，"
-            "请对照左侧 PDF 原文】",
-        )
+    # 5) 公式标记
+    #    - 带坐标的 ⟦FORMULA:x0,y0,x1,y1⟧：**保留**。前端拿这四个坐标去 PDF
+    #      原页裁一张图，贴进译文里 —— 和论文里长得一模一样，绝不会把分子
+    #      分母装反。模型偶尔在坐标里加空格或抄错位数，这里修一次；
+    #      修不好（数字不成比例）就退回文字提示，绝不放行坏坐标 ——
+    #      那会裁到页面上无关的地方去。
+    #    - 裸的 ⟦FORMULA⟧：没有坐标，裁不了图 → 换成文字提示。
+    out = _normalize_formula_markers(out)
+    return out
+
+
+# 公式标记（带坐标）—— 前端靠它去 PDF 原页裁图。
+# 说明：实际归一化用一个正则一次搞定（⟦FORMULA:...⟧ 里不是 4 个数就退回
+# 文字提示），这里只留常量。
+FORMULA_TEXT_FALLBACK = (
+    "【公式未能完整提取：PDF 排版导致分子/分母与上下标被打散，"
+    "请对照左侧 PDF 原文】"
+)
+
+
+def _normalize_formula_markers(text: str) -> str:
+    """修好带坐标的公式标记；修不好的换成文字提示。"""
+
+    def repl(m: re.Match) -> str:
+        raw = m.group(1)
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) != 4:
+            return FORMULA_TEXT_FALLBACK
+        try:
+            x0, y0, x1, y1 = (float(p) for p in parts)
+        except ValueError:
+            return FORMULA_TEXT_FALLBACK
+        if x1 <= x0 or y1 <= y0:
+            return FORMULA_TEXT_FALLBACK
+        return "⟦FORMULA:{:.1f},{:.1f},{:.1f},{:.1f}⟧".format(x0, y0, x1, y1)
+
+    out = re.sub(r"⟦FORMULA:([^⟧]*)⟧", repl, text)
+    out = out.replace("⟦FORMULA⟧", FORMULA_TEXT_FALLBACK)
     return out
 
 
