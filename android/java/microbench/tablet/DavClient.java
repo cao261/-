@@ -51,16 +51,52 @@ public class DavClient {
     private final String user;
     private final String pass;
     private String root;
+    /**
+     * vault 在 WebDAV 里的位置（相对 dav 根），例如 "我的坚果云/MicroBench工作台"。
+     *
+     * ⚠️ 这个前缀必须有 —— 网页侧给的路径是 **vault 相对路径**
+     * (01_Literature/...)，而 WebDAV 的根是「我的坚果云」那一层。
+     * 少了前缀，请求就会打到「我的坚果云/01_Literature/...」上 —— 那里是空的，
+     * 列目录看着正常（根目录确实有东西），下载却全部 404。
+     */
+    private String vaultRoot;
 
     public DavClient(String user, String pass) {
         this(user, pass, DEFAULT_ROOT);
     }
 
     public DavClient(String user, String pass, String root) {
+        this(user, pass, root, "");
+    }
+
+    public DavClient(String user, String pass, String root, String vaultRoot) {
         this.user = user == null ? "" : user.trim();
         this.pass = pass == null ? "" : pass.trim();
         String r = (root == null || root.trim().isEmpty() ? DEFAULT_ROOT : root.trim());
         this.root = r.endsWith("/") ? r : r + "/";
+        this.vaultRoot = normalizeVaultRoot(vaultRoot);
+    }
+
+    public String vaultRoot() {
+        return vaultRoot;
+    }
+
+    private static String normalizeVaultRoot(String p) {
+        if (p == null) {
+            return "";
+        }
+        String s = p.trim().replace('\\', '/');
+        while (s.startsWith("/")) {
+            s = s.substring(1);
+        }
+        while (s.endsWith("/")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        return s;
+    }
+
+    public void setVaultRoot(String p) {
+        this.vaultRoot = normalizeVaultRoot(p);
     }
 
     public boolean isConfigured() {
@@ -70,6 +106,26 @@ public class DavClient {
     /** 把 vault 相对路径拼成 WebDAV URL（逐段编码，中文与空格都要编码）。 */
     public String urlFor(String path) {
         StringBuilder sb = new StringBuilder(root);
+        // 先拼 vault 前缀
+        if (!vaultRoot.isEmpty()) {
+            for (String seg : vaultRoot.split("/")) {
+                if (!seg.isEmpty()) {
+                    sb.append(encodeSegment(seg)).append('/');
+                }
+            }
+        }
+        return appendPath(sb, path);
+    }
+
+    /** 同上，但**不带** vault 前缀 —— 探测 vault 位置时要用。 */
+    public String rawUrlFor(String path) {
+        return appendPath(new StringBuilder(root), path);
+    }
+
+    private static String appendPath(StringBuilder sb, String path) {
+        // 记住根的结束位置 —— 去尾斜杠时不能把根自己的 "/" 也删掉
+        // ("https://host/dav/" 变成 ".../dav" 的话, WebDAV 根目录就打偏了)
+        int rootLen = sb.length();
         String p = path == null ? "" : path.replace('\\', '/');
         for (String seg : p.split("/")) {
             if (seg.isEmpty() || ".".equals(seg) || "..".equals(seg)) {
@@ -77,8 +133,7 @@ public class DavClient {
             }
             sb.append(encodeSegment(seg)).append('/');
         }
-        // 末尾去掉多余的 /
-        while (sb.length() > root.length() && sb.charAt(sb.length() - 1) == '/') {
+        while (sb.length() > rootLen && sb.charAt(sb.length() - 1) == '/') {
             sb.setLength(sb.length() - 1);
         }
         return sb.toString();
@@ -161,7 +216,17 @@ public class DavClient {
     /** 用裸 socket 发一个请求, 支持任意方法。 */
     private Resp rawRequest(String method, String path, byte[] body,
                              String contentType, String depth) throws IOException {
-        URL u = new URL(urlFor(path));
+        return rawRequest(method, path, body, contentType, depth, true);
+    }
+
+    /**
+     * @param vaultRelative true=path 相对 vault 根（会带上 vaultRoot 前缀）
+     *                      false=path 相对 WebDAV 根（探测 vault 位置时用）
+     */
+    private Resp rawRequest(String method, String path, byte[] body,
+                             String contentType, String depth,
+                             boolean vaultRelative) throws IOException {
+        URL u = new URL(vaultRelative ? urlFor(path) : rawUrlFor(path));
         String proto = u.getProtocol();
         int port = u.getPort() > 0 ? u.getPort() : ("https".equals(proto) ? 443 : 80);
         String host = u.getHost();
@@ -454,6 +519,15 @@ public class DavClient {
         if (m >= 0) {
             h = h.substring(m + marker.length());
         }
+        // 再去掉 vault 前缀（网页侧用的是 vault 相对路径）
+        if (!vaultRoot.isEmpty()) {
+            String vr = vaultRoot + "/";
+            if (h.startsWith(vr)) {
+                h = h.substring(vr.length());
+            } else if (h.equals(vaultRoot)) {
+                h = "";
+            }
+        }
         h = h.replaceFirst("^/+", "").replaceFirst("/+$", "");
         return h;
     }
@@ -464,6 +538,77 @@ public class DavClient {
         } catch (Exception e) {
             return s;
         }
+    }
+
+    /**
+     * 自动找到 vault 在云盘里的位置。
+     *
+     * 判据: 哪个目录下面有 `01_Literature` / `00_Dashboard`，
+     * 或者直接躺着 .md 笔记。
+     * 典型路径是「我的坚果云/MicroBench工作台」—— 在 WebDAV 根下面两层,
+     * 所以必须**递归**找, 只看一两层会漏掉。
+     */
+    public String detectVaultRoot() {
+        return detectVaultAt("", 3);
+    }
+
+    /**
+     * 递归找 vault 位置。
+     * 优先返回带 01_Literature 的目录 —— 那是最强的信号。
+     */
+    private String detectVaultAt(String dir, int depth) {
+        List<DavEntry> entries;
+        try {
+            entries = listRaw(dir);
+        } catch (Exception e) {
+            return null;
+        }
+        boolean hasLit = false;
+        boolean hasMd = false;
+        List<DavEntry> dirs = new ArrayList<>();
+        for (DavEntry e : entries) {
+            if (e.isDir) {
+                dirs.add(e);
+                if ("01_Literature".equals(e.name) || "00_Dashboard".equals(e.name)) {
+                    hasLit = true;
+                }
+            } else if (e.name.toLowerCase().endsWith(".md")) {
+                hasMd = true;
+            }
+        }
+        if (hasLit) {
+            return dir;                     // 最强信号
+        }
+        if (depth <= 1) {
+            return hasMd ? dir : null;
+        }
+        // 往下找一层, 但优先看有没有目录就叫 01_Literature
+        for (DavEntry e : dirs) {
+            if ("01_Literature".equals(e.name) || "00_Dashboard".equals(e.name)) {
+                return e.path;
+            }
+        }
+        for (DavEntry e : dirs) {
+            String found = detectVaultAt(e.path, depth - 1);
+            if (found != null) {
+                return found;
+            }
+        }
+        return hasMd ? dir : null;
+    }
+
+    /** 列目录（不带 vault 前缀的原始 WebDAV 路径）—— 探测 vault 位置时用。 */
+    private List<DavEntry> listRaw(String dir) throws Exception {
+        String body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                + "<D:propfind xmlns:D=\"DAV:\"><D:prop>"
+                + "<D:resourcetype/><D:getcontentlength/><D:getlastmodified/>"
+                + "</D:prop></D:propfind>";
+        Resp r = rawRequest("PROPFIND", dir, body.getBytes(StandardCharsets.UTF_8),
+                "application/xml; charset=utf-8", "1", false);
+        if (r.code != 207 && r.code != 200) {
+            throw new IOException("WebDAV PROPFIND " + dir + " -> HTTP " + r.code);
+        }
+        return parseMultiStatus(new String(r.body, StandardCharsets.UTF_8), dir);
     }
 
     /**

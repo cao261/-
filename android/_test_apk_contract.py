@@ -142,6 +142,17 @@ def main() -> int:
     check("pdfcache" in app_js, "IndexedDB 里有 pdfcache store")
     check("DB_VER = 2" in app_js, "IndexedDB 版本 >= 2 (新增 pdfcache)")
 
+    print("\n[9] vault 前缀 (网页给的是 vault 相对路径, 少前缀就全 404)")
+    check("vaultRoot" in dav, "DavClient 有 vaultRoot")
+    check("detectVaultRoot" in dav, "能自动探测 vault 在云盘里的位置")
+    check("rawUrlFor" in dav, "有不带前缀的 URL 构造 (探测时用)")
+    check("davVaultRoot" in read(JAVA / "Prefs.java"), "Prefs 存了 vault 位置")
+    check("detectVaultRoot" in settings, "设置页会调用自动探测")
+    # 关键: urlFor 必须带前缀, 而 appendPath 不能把根自己的斜杠删掉
+    check("urlFor" in dav and "vaultRoot" in dav.split("urlFor")[1][:600],
+          "urlFor 会拼上 vault 前缀")
+    check("rootLen" in dav, "去尾斜杠时保住了根的斜杠")
+
     print(f"\n{'=' * 60}")
     print(f"PASS {len(PASS)}  FAIL {len(FAIL)}")
     for f in FAIL:

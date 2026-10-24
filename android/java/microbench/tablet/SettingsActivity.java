@@ -31,6 +31,7 @@ public class SettingsActivity extends Activity {
     private Prefs prefs;
     private EditText userInput;
     private EditText passInput;
+    private EditText vaultInput;
     private TextView status;
 
     @Override
@@ -79,6 +80,14 @@ public class SettingsActivity extends Activity {
         passInput.setTextSize(16);
         box.addView(passInput, lp(-1, dp(50), 0, 0, 0, 12));
 
+        box.addView(label("vault 在云盘里的位置（一般自动探测）"), lp(-1, -2, 0, 0, 0, 4));
+        vaultInput = new EditText(this);
+        vaultInput.setInputType(InputType.TYPE_CLASS_TEXT);
+        vaultInput.setHint("例如：我的坚果云/MicroBench工作台");
+        vaultInput.setText(prefs.davVaultRoot());
+        vaultInput.setTextSize(15);
+        box.addView(vaultInput, lp(-1, dp(50), 0, 0, 0, 12));
+
         status = new TextView(this);
         status.setTextSize(13);
         status.setTextColor(Color.parseColor("#4F6046"));
@@ -121,8 +130,9 @@ public class SettingsActivity extends Activity {
 
     /** 测通了就直接存 —— 之前「测试连接」只测不存, 用户以为配好了,
      *  退出去发现还是「未连接」。 */
-    void saveIfOk(String user, String pass) {
+    void saveIfOk(String user, String pass, String vaultRoot) {
         prefs.setDav(user, pass);
+        prefs.setDavVaultRoot(vaultRoot);
     }
 
     TextView statusView() {
@@ -212,12 +222,29 @@ public class SettingsActivity extends Activity {
             boolean ok;
             String user = act.userInput.getText().toString();
             String pass = act.passInput.getText().toString();
+            String vault = act.vaultInput.getText().toString().trim();
             try {
                 DavClient c = new DavClient(user, pass);
+
+                // ① 先定 vault 在云盘里的位置。
+                //    网页给的是 vault 相对路径, 没有这个前缀就会打到
+                //    「我的坚果云/01_Literature/...」上 —— 列目录看着正常
+                //    (根目录确实有东西), 下载却全部 404。
+                String detected = vault;
+                if (detected.isEmpty()) {
+                    detected = c.detectVaultRoot();
+                    if (detected == null) {
+                        detected = "";
+                    }
+                }
+                c.setVaultRoot(detected);
+                act.vaultInput.setText(detected);
+
+                // ② 列目录
                 int n = c.list("").size();
-                // 列表通了还不够 —— 原文 PDF 是走 GET 下载的, 得真下一次,
-                // 不然「能连上但打不开 PDF」这种问题要到用的时候才发现。
-                String probe = "（没找到 PDF，跳过下载测试）";
+
+                // ③ 下载链路也得验 —— 只验列目录等于没验下载
+                String probe;
                 boolean dlOk = false;
                 String pdf = c.findFirstPdf("", 3);
                 if (pdf != null) {
@@ -228,9 +255,13 @@ public class SettingsActivity extends Activity {
                     } else {
                         probe = "；但下载测试没通过（GET 返回空）";
                     }
+                } else {
+                    probe = "（没找到 PDF，跳过下载测试）";
                 }
+
                 ok = true;
-                msg = "连接正常，云盘根目录有 " + n + " 项" + probe;
+                msg = "连接正常，vault 位于「" + (detected.isEmpty() ? "(根目录)" : detected)
+                        + "」，笔记 " + n + " 篇" + probe;
                 if (!dlOk && !probe.startsWith("（")) {
                     ok = false;
                 }
@@ -241,7 +272,8 @@ public class SettingsActivity extends Activity {
             }
             final String fm = msg;
             final boolean fok = ok;
-            act.runOnUiThread(new StatusTask(act, fm, fok, user, pass));
+            final String fvault = vault;
+            act.runOnUiThread(new StatusTask(act, fm, fok, user, pass, fvault));
         }
     }
 
@@ -251,14 +283,16 @@ public class SettingsActivity extends Activity {
         private final boolean ok;
         private final String user;
         private final String pass;
+        private final String vault;
 
         StatusTask(SettingsActivity act, String msg, boolean ok,
-                   String user, String pass) {
+                   String user, String pass, String vault) {
             this.act = act;
             this.msg = msg;
             this.ok = ok;
             this.user = user;
             this.pass = pass;
+            this.vault = vault;
         }
 
         @Override
@@ -269,9 +303,9 @@ public class SettingsActivity extends Activity {
                 s.setTextColor(Color.parseColor(ok ? "#4F6046" : "#A8482C"));
             }
             if (ok) {
-                // 测通了就把凭证存下来, 并直接关掉设置页 ——
+                // 测通了就把凭证和 vault 位置都存下来, 并直接关掉设置页 ——
                 // 用户不需要再点一次「保存」。
-                act.saveIfOk(user, pass);
+                act.saveIfOk(user, pass, act.vaultInput.getText().toString().trim());
                 Toast.makeText(act, "连接正常, 已保存", Toast.LENGTH_SHORT).show();
                 act.setResult(RESULT_OK);
                 act.finish();

@@ -11,6 +11,7 @@ public class Prefs {
     private static final String K_DAV_USER = "dav_user";
     private static final String K_DAV_PASS = "dav_pass";
     private static final String K_DAV_ROOT = "dav_root";
+    private static final String K_DAV_VAULT = "dav_vault_root";
 
     private final SharedPreferences sp;
 
@@ -36,6 +37,15 @@ public class Prefs {
                 .putString(K_DAV_PASS, pass == null ? "" : pass).apply();
     }
 
+    /** vault 在云盘里的位置（相对 WebDAV 根），如「我的坚果云/MicroBench工作台」。 */
+    public String davVaultRoot() {
+        return sp.getString(K_DAV_VAULT, "");
+    }
+
+    public void setDavVaultRoot(String p) {
+        sp.edit().putString(K_DAV_VAULT, p == null ? "" : p.trim()).apply();
+    }
+
     public boolean davConfigured() {
         return !davUser().isEmpty() && !davPass().isEmpty();
     }
@@ -45,6 +55,6 @@ public class Prefs {
         if (!davConfigured()) {
             return null;
         }
-        return new DavClient(davUser(), davPass(), davRoot());
+        return new DavClient(davUser(), davPass(), davRoot(), davVaultRoot());
     }
 }

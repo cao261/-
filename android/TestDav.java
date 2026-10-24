@@ -97,6 +97,42 @@ public class TestDav {
                     "DavEntry.toJson 结构正确: " + js);
         }
 
+        System.out.println("[7] vault 前缀 (网页给的是 vault 相对路径)");
+        // 真实场景: vault 在「我的坚果云/MicroBench工作台」下, 网页给的却是
+        // 「01_Literature/...」这种相对路径 —— 少了前缀, 列目录看着正常
+        // (根目录确实有东西), 但下载全部 404。
+        DavClient prefixed = new DavClient("me@example.com", "app-pass-123",
+                root, "我的坚果云/MicroBench工作台");
+        String pu = prefixed.urlFor("00_Dashboard/主工作台看板.md");
+        check(pu.contains("%E6%88%91") || pu.contains("%E4%B8%BB"),
+                "前缀里的中文也被编码: " + pu);
+        check(pu.contains("dav/") && pu.indexOf("dav/") < pu.indexOf("00_Dashboard"),
+                "URL 顺序是 dav根 -> vault前缀 -> 相对路径");
+
+        List<DavClient.DavEntry> pfiles = prefixed.list("00_Dashboard");
+        check(pfiles != null && !pfiles.isEmpty(),
+                "带前缀能列出 vault 内的笔记: "
+                        + (pfiles == null || pfiles.isEmpty() ? "(空)" : pfiles.get(0).path));
+        if (pfiles != null && !pfiles.isEmpty()) {
+            check(!pfiles.get(0).path.contains("我的坚果云"),
+                    "返回的路径是 vault 相对路径 (不含前缀): " + pfiles.get(0).path);
+        }
+        byte[] pdata = prefixed.get("00_Dashboard/主工作台看板.md");
+        check(pdata != null, "带前缀能下载 vault 内的文件");
+        check(pdata != null && new String(pdata, "UTF-8").contains("看板"),
+                "带前缀下载的内容中文没乱码");
+
+        System.out.println("[8] 自动探测 vault 位置");
+        DavClient probe = new DavClient("me@example.com", "app-pass-123", root);
+        String detected = probe.detectVaultRoot();
+        check(detected != null && detected.contains("MicroBench工作台"),
+                "探测出 vault 位置: " + detected);
+        if (detected != null) {
+            probe.setVaultRoot(detected);
+            byte[] dd = probe.get("00_Dashboard/主工作台看板.md");
+            check(dd != null, "探测后能下载 vault 内的文件");
+        }
+
         System.out.println();
         System.out.println("PASS " + pass + "  FAIL " + fail);
         System.exit(fail == 0 ? 0 : 1);
