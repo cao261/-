@@ -962,6 +962,20 @@ def detect_cloud_dir() -> Path | None:
     return None
 
 
+def current_extractor_version():
+    """当前抽取算法版本（`paper_text.EXTRACTOR_VERSION`）。
+
+    平板端要用它判断云盘上的快照是不是**旧算法**翻出来的 ——
+    旧译文是坏的（栏序可能整个反过来），不能给用户看。
+    两端的判断必须一致。
+    """
+    try:
+        from microbench.paper_text import EXTRACTOR_VERSION
+        return EXTRACTOR_VERSION
+    except Exception:
+        return None
+
+
 def collect_translations() -> dict:
     """导出平板工作台时，把**译文快照**一起烤进去。
 
@@ -974,8 +988,20 @@ def collect_translations() -> dict:
 
     平板用 paper_id 算出同样的 key 就能对上（见 app.js 的 paperIdFor /
     safePaperKey —— 必须与 app.py:_paper_id_for 逐字一致）。
+
+    ⚠⚠ 只烤**当前抽取算法**翻出来的译文。
+    2026-10-25 合并两端改动时挖出来的：桌面端给快照加了
+    `extractor_version`（`paper_text.EXTRACTOR_VERSION`）——
+    抽取算法一改，旧快照里的译文就是**坏的**（那是按旧算法翻的，
+    可能整段栏序都是反的），桌面端读取时整份作废重翻。
+    平板端要是照搬，用户看到的就是**错的那一列** ——
+    正是用户最早报的那个问题。两端必须一致。
     """
     out: dict = {}
+    try:
+        from microbench.paper_text import EXTRACTOR_VERSION
+    except Exception:
+        EXTRACTOR_VERSION = None
     snap_dir = REPO / "logs" / "_pdf_snapshots"
     if not snap_dir.is_dir():
         return out
@@ -984,6 +1010,9 @@ def collect_translations() -> dict:
             data = json.loads(fp.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if EXTRACTOR_VERSION is not None:
+            if data.get("extractor_version") != EXTRACTOR_VERSION:
+                continue    # 旧算法翻的 —— 不给平板看
         pages: dict = {}
         for p in data.get("pages") or []:
             try:
@@ -1044,7 +1073,8 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
         })
     pdfs = getattr(notes[0], "_pdfs_all", {}) if notes else {}
     data_json = json.dumps({"notes": payload, "pdfs": pdfs,
-                            "trans": collect_translations()},
+                            "trans": collect_translations(),
+                            "trans_ver": current_extractor_version()},
                            ensure_ascii=False)
     data_json = data_json.replace("</", "<\\/")
 

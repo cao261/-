@@ -400,6 +400,55 @@ function check(cond, label) {
   check(src.indexOf('data-pdf-anno') >= 0 || src.indexOf("pdf-anno") >= 0,
     "划词气泡上有「标注」按钮");
 
+  console.log("\n[13] 译文版本闸门：两端必须一致（旧的坏译文不能给用户看）");
+  await T.openDB();
+  const oldFetch = global.fetch;
+  const snapVer = 4;                    // 当前抽取算法版本（paper_text.EXTRACTOR_VERSION）
+  T.state.transVer = snapVer;
+  T.state.transSeed = {};              // 别让导出版里烤进来的译文干扰
+  const fakeSnap = (payload) => ({ ok: true, json: async () => payload });
+
+  // ① 版本相符 → 正常用
+  global.fetch = async () => fakeSnap({
+    extractor_version: snapVer,
+    pages: [{ page_num: 1, translation: "第一页译文" }],
+  });
+  const good = await T.loadTranslation("01_Literature/_ver_ok.pdf");
+  check(good && good["1"] === "第一页译文", "版本相符的译文能正常载入");
+  check(T.state.transStale === false, "版本相符时不标记为作废");
+
+  // ② 版本不符 → 整份作废
+  global.fetch = async () => fakeSnap({
+    extractor_version: snapVer - 1,
+    pages: [{ page_num: 1, translation: "旧算法的译文" }],
+  });
+  const bad = await T.loadTranslation("01_Literature/_ver_bad.pdf");
+  check(bad === null, "版本不符的译文不用");
+  check(T.state.transStale === true, "版本不符时标记 transStale");
+
+  // ③ **没有** extractor_version → 也要作废
+  //    2026-10-25 实测：本机现存 3 份快照全都没有版本号（都是旧算法翻的）
+  global.fetch = async () => fakeSnap({
+    pages: [{ page_num: 1, translation: "没有版本号的译文" }],
+  });
+  const legacy = await T.loadTranslation("01_Literature/_ver_legacy.pdf");
+  check(legacy === null, "没有 extractor_version 的旧译文也作废");
+  check(T.state.transStale === true, "旧快照（无版本号）也标记 transStale");
+
+  // ④ 本地缓存也必须带版本闸门
+  //    APK 升级（抽取算法变了）后，IndexedDB 里的旧译文不能直接返回 ——
+  //    缓存命中时根本不会去查云盘，也就绕过了版本检查。
+  const relC = "01_Literature/_ver_cache.pdf";
+  const keyC = T.safePaperKey(T.paperIdFor(relC));
+  await T.DB.setMeta(T.transCacheKey(keyC, snapVer - 1), { "1": "旧版本缓存的译文" });
+  global.fetch = async () => { throw new Error("offline"); };
+  const cachedOld = await T.loadTranslation(relC);
+  check(cachedOld === null, "旧版本的本地缓存不会被返回（APK 升级后自动失效）");
+  check(T.transCacheKey(keyC, snapVer) !== T.transCacheKey(keyC, snapVer - 1),
+    "缓存键里带版本号");
+
+  global.fetch = oldFetch;
+
   console.log("\n" + "=".repeat(60));
   console.log("PASS " + pass + "  FAIL " + fail);
   process.exit(fail === 0 ? 0 : 1);

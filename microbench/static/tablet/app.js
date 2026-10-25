@@ -589,6 +589,8 @@
     trans: new Map(),       // paperId -> {pageNum: 译文}（与电脑端共享）
     annos: new Map(),       // paperId -> [批注]
     transSeed: {},          // 导出版里烤进来的译文 {safeKey: {pageNum: 译文}}
+    transVer: null,         // 当前的抽取算法版本（判断译文是不是旧的）
+    transStale: false,      // 这篇的译文是旧算法翻的（已作废）
   };
 
   const FOLDERS = [
@@ -609,6 +611,8 @@
     if (raw && raw.pdfs) state.pdfs = raw.pdfs;
     // 导出版里烤进来的译文（还没连云盘时也能看）
     if (raw && raw.trans) state.transSeed = raw.trans;
+    // 当前的抽取算法版本 —— 用来判断云盘上的译文是不是旧算法翻的
+    if (raw && raw.trans_ver != null) state.transVer = raw.trans_ver;
 
     const existing = await DB.allNotes();
     const have = new Map(existing.map((n) => [n.id, n]));
@@ -2025,33 +2029,70 @@
     return String(pid || "").replace(/[^\p{L}\p{N}_-]/gu, "").slice(0, 128);
   }
 
-  /** 拉一篇论文的译文快照。返回 {pageNum: 译文}，没有就返回 null。 */
+  /**
+   * 译文快照的本地缓存键。**必须带上版本号**。
+   *
+   * ⚠ 为什么：缓存里存的是「按当时那个抽取算法翻出来的译文」。
+   * APK 一升级（抽取算法跟着变），旧缓存里的译文就是**坏的** ——
+   * 而缓存命中时根本不会去查云盘、也就不会过版本闸门，
+   * 于是用户看到的就是旧算法翻的那一列（正是最早报的那个问题）。
+   * 把版本编进键里 → 换版本自动失效，不用手动清缓存。
+   */
+  function transCacheKey(key, ver) {
+    const v = (ver == null) ? "none" : String(ver);
+    return "trans_v" + v + "_" + key;
+  }
+
+  /**
+   * 拉一篇论文的译文快照。返回 {pageNum: 译文}，没有就返回 null。
+   *
+   * ⚠⚠ 抽取算法版本必须与当前一致。
+   *   桌面端给快照加了 `extractor_version` —— 抽取算法一改，
+   *   旧快照里的译文就是**坏的**（按旧算法翻的，可能整段栏序都是反的），
+   *   桌面端读取时整份作废重翻。平板端要是照搬，用户看到的就是**错的那一列**
+   *   —— 正是用户最早报的那个问题。**两端必须一致。**
+   *
+   *   判据与 app.py:api_pdf_snapshot_load 完全相同：
+   *     `saved_ver != 当前版本` → 整份作废。
+   *   ⚠「**没有** extractor_version」也算对不上 —— 那是旧算法翻的
+   *     （2026-10-25 实测：本机现存 3 份快照全都没有版本号）。
+   */
   async function loadTranslation(pdfId) {
     const key = safePaperKey(paperIdFor(pdfId));
     if (!key) return null;
-    // ① 本地缓存 —— 没网也能看译文
-    const cached = await DB.getMeta("trans_" + key, null);
-    if (cached && Object.keys(cached).length) return cached;
+    state.transStale = false;
+    const cur = state.transVer;
+    // ① 本地缓存 —— 没网也能看译文（键里带版本 → 换版本自动失效）
+    if (cur != null) {
+      const cached = await DB.getMeta(transCacheKey(key, cur), null);
+      if (cached && Object.keys(cached).length) return cached;
+    }
     // ② 云盘同步根（最新 —— 电脑端翻完同步过来，平板立刻能看）
     try {
       const r = await fetch(syncUrl("file", "snapshots/" + key + ".json"));
       if (r.ok) {
         const data = await r.json();
+        // 版本对不上就整份作废 —— 与桌面端同一个判据。
+        // 不知道当前版本（cur == null）时也不能用：证明不了它是好的。
+        if (cur == null || data.extractor_version !== cur) {
+          state.transStale = true;
+          return null;
+        }
         const pages = {};
         (data.pages || []).forEach((p) => {
           if (p && p.translation) pages[p.page_num] = p.translation;
         });
         if (Object.keys(pages).length) {
-          await DB.setMeta("trans_" + key, pages);
+          await DB.setMeta(transCacheKey(key, cur), pages);
           return pages;
         }
       }
     } catch (e) {
       console.warn("拉译文快照失败（离线？）", e);
     }
-    // ③ 导出版里烤进来的（还没连云盘时也有）
+    // ③ 导出版里烤进来的（还没连云盘时也有；导出时已按版本过滤过）
     const baked = (state.transSeed || {})[key];
-    if (baked && Object.keys(baked).length) return baked;
+    if (cur != null && baked && Object.keys(baked).length) return baked;
     return null;
   }
 
@@ -2276,8 +2317,12 @@
           ? `已载入译文 ${n} 页` + (annos && annos.length ? ` · 批注 ${annos.length} 条` : "")
           : (annos && annos.length ? `已载入批注 ${annos.length} 条` : ""));
         setTimeout(() => { pdfStatus(""); }, 2600);
+      } else if (state.transStale) {
+        // ⚠ 译文是旧抽取算法翻的 —— 桌面端会整份作废重翻，平板也不能用
+        pdfStatus("这篇的译文是旧版抽取算法翻的（栏序可能不对），已作废 —— "
+          + "在电脑上重翻一次，同步过来就有了");
       } else {
-        pdfStatus("没有找到这台论文的译文快照（电脑端翻译后同步过来就有了）");
+        pdfStatus("没有找到这篇论文的译文快照（在电脑上翻一次，同步过来就有了）");
       }
     } catch (e) {
       pdfStatus("打开失败：" + e.message);
@@ -3285,6 +3330,9 @@
       saveAnnotations: saveAnnotations,
       loadAnnotations: loadAnnotations,
       mergeAnnos: mergeAnnos,
+      // 译文快照的版本闸门（两端必须一致，否则用户看到旧算法翻的坏译文）
+      loadTranslation: loadTranslation,
+      transCacheKey: transCacheKey,
       state: state,
     };
   }

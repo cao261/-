@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import re
+import sys
 import hmac
 import hashlib
 import ipaddress
@@ -26,7 +27,8 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import (HTMLResponse, FileResponse, StreamingResponse,
+                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -728,6 +730,15 @@ class ExplainSelectionRequest(BaseModel):
                                                           "校验图片来源 (只允许 vault 内的 PDF)。")
 
 
+class ReadTableRequest(BaseModel):
+    """把 PDF 里的一个表格区域读成 Markdown（多模态抄表）。"""
+    relative_path: str = Field(..., min_length=3, max_length=500)
+    page: int = Field(..., ge=1, le=2000)
+    rect: str = Field(..., min_length=5, max_length=120,
+                      description="表格区域 x0,y0,x1,y1（PDF 点，左上角原点）")
+    model: str = Field(default="", max_length=64)
+
+
 class TranslatePageRequest(BaseModel):
     """Translate one page of a paper (used by PDF dual-column reader).
     `paper_id` is a stable identifier (e.g. arXiv ID or DOI) — used to
@@ -1257,6 +1268,237 @@ async def api_serve_pdf(
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+def _pdf_clip_png(pdf_path, page: int, rect: tuple, scale: float = 4.0,
+                  max_pixels: int = 4_000_000) -> bytes:
+    """把 PDF 某一页的一块区域裁成 PNG 字节（PyMuPDF）。
+
+    公式原图、表格截图都走这里。rect = (x0, y0, x1, y1)（PDF 点）。
+
+    max_pixels 是**必需的**护栏：裁剪框虽然被限制在页面内，但客户端可以
+    把 scale 调到 8、裁整页 → 4752×6264 ≈ 3000 万像素，一次请求就是
+    ~90MB 的原始 RGB，PNG 编码还会再占一份 → 本机服务被打爆。
+    超了就自动降档（和 paper_text.render_page_png 同一套做法）。
+    """
+    import fitz  # PyMuPDF
+    with fitz.open(str(pdf_path)) as doc:
+        if page < 1 or page > doc.page_count:
+            raise ValueError(f"页码越界: {page} (共 {doc.page_count} 页)")
+        pg = doc.load_page(page - 1)
+        pr = pg.rect
+        cx0 = max(pr.x0, min(rect[0], pr.x1))
+        cy0 = max(pr.y0, min(rect[1], pr.y1))
+        cx1 = min(pr.x1, max(rect[2], pr.x0))
+        cy1 = min(pr.y1, max(rect[3], pr.y0))
+        if cx1 - cx0 <= 0 or cy1 - cy0 <= 0:
+            raise ValueError("裁剪区域无效")
+        if (cx1 - cx0) > pr.width or (cy1 - cy0) > pr.height:
+            raise ValueError("裁剪区域超出页面")
+        # 像素总量保护：超出就按比例降 scale（上限 1.0，保证一定能出来）
+        w_pt, h_pt = cx1 - cx0, cy1 - cy0
+        pixels = (w_pt * scale) * (h_pt * scale)
+        if pixels > max_pixels:
+            scale = max(1.0, scale * (max_pixels / pixels) ** 0.5)
+        pix = pg.get_pixmap(clip=fitz.Rect(cx0, cy0, cx1, cy1),
+                            matrix=fitz.Matrix(scale, scale), alpha=False)
+        return pix.tobytes("png")
+
+
+# ---------------------------------------------------------------------------
+# 表格：截图交给多模态模型抄
+# ---------------------------------------------------------------------------
+# 表格在 PDF 文本层是碎的："d (pC/N) (cid:4)90 (cid:4)175 (cid:4)109 B700 16.5"
+# —— 连负号都认不出，文本模型只能靠上下文猜对齐，结果是**整行数值错位**
+# （实测 JACERS Table I：d31 行的 16.5 跑到了 d33 行，7200 变成 B700）。
+#
+# 用户要求（2026-10-25）："个别单元都抽错的话你也给我直接上这个多模态读图吧。
+# 我要的是阅读的……至少顺序要是很正常的"。
+# → 表格整块裁成图，交给多模态模型逐格抄：图上什么样，表格就什么样。
+
+TABLE_VISION_PROMPT = """你是一个学术论文表格的抄录员。下面这张截图是一篇论文里的一个表格（可能带表题和表注）。
+
+请把它**逐格**抄下来，只输出抄录结果本身（不要解释、不要用代码块围栏）：
+
+1. 如果截图上方有表题（"Table I. ..."），先单独用一行输出它的中文翻译
+2. 然后输出 Markdown 表格：第一行是表头，第二行是 |---|---| 分隔行
+3. **行列顺序、每一个数值都必须和截图完全一致** —— 不要推算、不要补全、
+   不要"修正"你认为不对的数字、不要按常识改单位
+4. 单元格里的上下标写成 LaTeX：d$_{31}$、ε$_{33}$、T$_{c}$、ρ$_{v}$；
+   单位（pC/N、g/cm$^{3}$、°C、ppm、Ω·m）保持原样
+5. 表头和第一列（参数名）译成中文，其余内容保持原样
+6. 截图下方如果有表注，另起一段译成中文
+7. 看不清的单元格写 [?]，**不要猜**"""
+
+
+def _clean_table_markdown(raw: str) -> str:
+    """清掉模型可能加的代码块围栏和多余说明。"""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+async def _read_table_vision(pdf_path, page: int, rect: tuple,
+                             model: str = "") -> str:
+    """裁图 → 多模态模型抄表 → 返回 Markdown。失败抛异常（由调用方兜底）。
+
+    model：用户在前端手动选的模型。**必须跟着走** —— 正文用新模型、表格用
+    旧模型会让人以为"换模型没生效"（2026-10-25 独立审查）。
+    """
+    import base64
+    png = await asyncio.to_thread(_pdf_clip_png, pdf_path, page, rect, 4.0)
+    b64 = base64.b64encode(png).decode("ascii")
+    content = [
+        {"type": "text", "text": TABLE_VISION_PROMPT},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/png;base64,{b64}"}},
+    ]
+    m_name, m_fallback, _cache_key = _resolve_translation_model(model)
+    raw = await asyncio.to_thread(
+        llm.chat,
+        messages=[
+            {"role": "system", "content": "你是表格抄录助手，只输出抄录结果。"},
+            {"role": "user", "content": content},
+        ],
+        max_tokens=4000,
+        temperature=0.0,
+        timeout=180,
+        disable_thinking=llm.translation_disable_thinking(),
+        model_name=m_name or llm.translation_model_name() or None,
+        force_fallback=m_fallback,
+    )
+    return _clean_table_markdown(raw)
+
+
+@app.post("/api/paper/read_table")
+async def api_read_table(req: ReadTableRequest):
+    """把 PDF 里的一个表格区域读成 Markdown（多模态抄表）。"""
+    try:
+        pdf_path = _safe_path(BASE_DIR, req.relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
+    try:
+        rect = tuple(float(x) for x in req.rect.split(","))
+        if len(rect) != 4:
+            raise ValueError("rect 应为 x0,y0,x1,y1")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"rect 无效: {e}")
+    try:
+        table = await _read_table_vision(pdf_path, req.page, rect, req.model)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"表格读取失败: {e}")
+    return {"table": table}
+
+
+async def _prepare_tables(page_text: str, pdf_path, page: int) -> tuple[str, dict]:
+    """把页面文本里的 ⟦TABLE:...⟧ 标记换成中性的 ⟦TABLE_n⟧，
+    并把多模态抄出来的表格存起来（翻译完再按位置拼回去）。
+
+    为什么走多模态：表格在 PDF 文本层是碎的（"d (pC/N) (cid:4)90 ..."），
+    文本模型只能猜对齐 → 整行数值错位。截图给模型看，顺序和数值都对。
+    """
+    from .paper_text import TABLE_MARKER_RE
+    tables: dict[str, str] = {}
+    matches = list(TABLE_MARKER_RE.finditer(page_text))
+    if not matches:
+        return page_text, tables
+
+    # 多张表并行读（每张一次多模态调用；一页通常 1~2 张）
+    async def _read(idx: int, m) -> tuple[str, str]:
+        rect = tuple(float(m.group(i)) for i in range(1, 5))
+        token = f"⟦TABLE_{idx}⟧"
+        try:
+            md = await _read_table_vision(pdf_path, page, rect)
+            if not md.strip():
+                raise RuntimeError("模型返回空内容")
+            print(f"[MicroBench] 第 {page} 页表格已用多模态抄出 "
+                  f"({len(md)} 字符, rect={['%.0f' % v for v in rect]})",
+                  file=sys.stderr)
+            return token, md
+        except Exception as e:
+            print(f"[MicroBench] 第 {page} 页表格读取失败 ({rect}): {e}",
+                  file=sys.stderr)
+            return token, "【表格未能读出，请对照左侧 PDF 原文】"
+
+    results = await asyncio.gather(*[_read(i, m) for i, m in enumerate(matches)])
+    for token, md in results:
+        tables[token] = md
+
+    counter = {"i": 0}
+
+    def _repl(_m) -> str:
+        token = f"⟦TABLE_{counter['i']}⟧"
+        counter["i"] += 1
+        return token
+
+    out = TABLE_MARKER_RE.sub(_repl, page_text)
+    return out, tables
+
+
+@app.get("/api/paper/formula_image")
+async def api_formula_image(
+    relative_path: str = Query(..., min_length=3, max_length=500),
+    page: int = Query(..., ge=1, le=2000),
+    rect: str = Query(..., min_length=5, max_length=120,
+                      description="裁剪区域 x0,y0,x1,y1（PDF 点，左上角原点）"),
+    scale: float = Query(4.0, ge=1.0, le=8.0),
+):
+    """
+    按页坐标裁一块区域，返回 PNG —— 给「公式原图」用。
+
+    为什么需要这个接口：公式在 PDF 里是矢量排版（分子一行、分母一行、
+    上下标各一行），文本层抽出来是乱序碎片。硬拼 LaTeX 极容易把分子分母
+    装反（用户原话："分子分母分不清谁是谁"），而错公式比没公式危险得多
+    —— 用户会照着它去算。所以抽取层只记下公式在页面上的坐标，由这里裁
+    原图，前端贴进译文：和论文里长得一模一样，绝不会错。
+    """
+    try:
+        pdf_path = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
+
+    try:
+        parts = [float(p) for p in rect.split(",")]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="rect 格式应为 x0,y0,x1,y1")
+    if len(parts) != 4:
+        raise HTTPException(status_code=400, detail="rect 格式应为 x0,y0,x1,y1")
+    x0, y0, x1, y1 = parts
+    if x1 <= x0 or y1 <= y0:
+        raise HTTPException(status_code=400, detail="rect 区域无效")
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:  # pragma: no cover - env dependent
+        raise HTTPException(status_code=500,
+                            detail="公式裁图需要 PyMuPDF (fitz), 请先 pip install pymupdf") from exc
+
+    try:
+        png = _pdf_clip_png(pdf_path, page, (x0, y0, x1, y1), scale)
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if "页码越界" in msg else 400
+        raise HTTPException(status_code=code, detail=msg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"公式裁图失败: {e}")
+
+    return Response(
+        content=png,
+        media_type="image/png",
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
@@ -2083,10 +2325,21 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
 12. PDF 抽取常把希腊字母抽成普通字母, 例如磁电电压系数 α_ME 会变成
     "a" + 换行 + "ME" 或 "a_ME"。遇到这种明显失真时, 请按学科标准写法
     还原成规范符号 (如 α_ME), 并统一全文写法
-13. 原文中的 "⟦FORMULA⟧" 表示这里是一个公式, 但 PDF 的排版（分子分母、上下标
-    各占一行）导致文本无法完整提取。**请原样输出 "⟦FORMULA⟧" 这几个字符**,
+13. 原文中的 "⟦FORMULA⟧" 或 "⟦FORMULA:x0,y0,x1,y1⟧" 表示这里是一个公式, 但 PDF 的
+    排版（分子分母、上下标各占一行）导致文本无法完整提取。
+    **请原样输出这几个字符 (连同冒号后面的坐标一起, 一个数字都不要改)**,
     绝对不要根据上下文猜测、补全, 更不要用你记忆里的公式替代它 ——
     编出来的公式比没有公式危险得多, 用户会照着它去算。
+    系统会把带坐标的那种标记换成论文里的公式原图, 所以坐标务必逐字照抄。
+14. 原文里的表格请用 **Markdown 表格** 输出: 第一行是表头, 第二行是
+    "|---|---|" 这样的分隔行, 之后每行一条记录, 单元格之间用 " | " 分隔。
+    不要把表格摊成一行行的普通文字, 也不要自己加 "参数/单位" 之类的列。
+15. 表格里的量纲、单位、上下标保持原样 (如 "d31 (pC/N)"、"Tc (°C)"),
+    不要翻译成中文单位, 也不要改写数值
+16. 原文里出现的 "⟦TABLE_0⟧"、"⟦TABLE_1⟧" 这类标记, 表示那里有一张表格
+    (系统已经用截图把表格逐格读好了, 翻译时会原样放回去)。
+    **请原样输出这个标记**, 不要改写、不要展开、不要自己编一张表、
+    也不要解释它是什么 —— 它的位置就是表格在原文里的位置。
 """
 
 
@@ -2829,6 +3082,7 @@ async def api_translate_page(req: TranslatePageRequest):
     # 的 PDF 上会丢掉单词空格（"compositestructureshavebeen"），而 pdfplumber
     # 用更小的 x_tolerance 能正确切词，并且能按左栏/右栏顺序输出。
     page_text = req.text
+    pdf_path = None
     if req.relative_path:
         try:
             from .generator import BASE_DIR, _safe_path
@@ -2838,6 +3092,7 @@ async def api_translate_page(req: TranslatePageRequest):
             if extracted and len(extracted.strip()) >= 100:
                 page_text = extracted
         except Exception:
+            pdf_path = None
             pass  # 取不到就用客户端传来的文本
 
     # Cache key includes paper_id + page so each page is cached independently.
@@ -2845,11 +3100,23 @@ async def api_translate_page(req: TranslatePageRequest):
     # 换用更好的抽取文本后会自动 miss，不会命中旧的坏结果。
     cache_section_key = f"page:{req.paper_id}:{req.page}"
 
+    # ⚠️ 顺序很重要：**先查缓存，再做表格读图**（2026-10-25 独立审查）。
+    # 表格读图每张要 10~30 秒 + 一次多模态调用；放在缓存查询之前的话，
+    # 缓存命中也得先花这个钱和时间 —— 含表格的页等于缓存完全失效。
+    # 缓存键用**原始** page_text 的哈希（表格标记替换前后保持一致），
+    # 否则存和取会用不同的文本哈希，缓存永远 miss。
+    cache_text = page_text
     if not req.force:
-        cached = cache.get(cache_section_key, page_text, model)
+        cached = cache.get(cache_section_key, cache_text, model)
         if cached:
             cached["from_cache"] = True
             return cached
+
+    # 表格：文本层抽出来的表格是碎的（数值会整行错位），改成裁图让多模态
+    # 模型逐格抄。抄好的表格在翻译完成后按位置拼回去。
+    table_map: dict[str, str] = {}
+    if pdf_path is not None and "⟦TABLE:" in page_text:
+        page_text, table_map = await _prepare_tables(page_text, pdf_path, req.page)
 
     # Translate the whole page in one shot (page text is already < 15K chars)
     # If somehow larger, chunk and translate parts.
@@ -2920,6 +3187,18 @@ async def api_translate_page(req: TranslatePageRequest):
 
     # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
     translation = sanitize_translation(merge_translation_parts(translated_parts))
+    # 把多模态抄好的表格拼回译文（位置由 ⟦TABLE_n⟧ 标记决定）
+    # 拼回译文时前后补空行：模型如果把标记写在句中，Markdown 表格会被插进
+    # 段落中间，前端的表格解析会把这一行前面的正文吞成表头第一格
+    # （2026-10-25 独立审查）。
+    if table_map:
+        for token, md in table_map.items():
+            if token in translation:
+                translation = translation.replace(token, f"\n\n{md}\n\n")
+            elif md and "未能读出" not in md:
+                # 模型偶尔会把标记弄丢 → 兜底：漏掉的表格追加到译文末尾，绝不丢内容
+                translation = f"{translation}\n\n{md}" if translation else md
+    translation = re.sub(r"\n{3,}", "\n\n", translation).strip()
     if not translation:
         raise HTTPException(
             status_code=502,
@@ -2992,9 +3271,9 @@ async def api_translate_page(req: TranslatePageRequest):
         "translated_chunks": len(translated_parts),
         "stopped_reason": stopped_reason,
     }
-    # 缓存写入必须用与读取时完全一致的文本（page_text），否则哈希对不上，
-    # 缓存永远不命中。
-    cache.put(cache_section_key, page_text, model, result)
+    # 缓存写入必须用与读取时完全一致的文本（cache_text = 替换表格标记**之前**
+    # 的原始文本），否则哈希对不上，缓存永远不命中。
+    cache.put(cache_section_key, cache_text, model, result)
     return result
 
 
@@ -3215,6 +3494,7 @@ async def api_pdf_snapshot_list():
             "total_pages": len(pages),
             "translated_pages": sum(1 for p in pages if p.get("translation")),
             "schema_version": data.get("schema_version", 0),
+            "extractor_version": data.get("extractor_version"),
         })
     out.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
     return {"snapshots": out}
@@ -3234,6 +3514,24 @@ async def api_pdf_snapshot_load(
     data = _safe_read_json(_snapshot_path(paper_id))
     if not data:
         raise HTTPException(status_code=404, detail=f"快照不存在: {paper_id}")
+
+    # 抽取算法版本对不上 → 整份快照作废。
+    #
+    # 为什么必须作废而不是照用：快照里的译文是**按当时的抽取算法翻出来的**。
+    # 2026-10-24 实测踩坑：10-23 14:17 存的快照（栏序修复之前）被 10-23 16:36
+    # 的修复甩在后面，读者照旧恢复旧快照，用户看到的还是"先翻译右边那栏"，
+    # 还以为修复没生效 —— 其实代码早就修好了。
+    #
+    # 作废后返回空页列表，阅读器会照常把没翻的页重新翻一遍（旧的译文本来
+    # 就是坏的，重翻不亏）。
+    from .paper_text import EXTRACTOR_VERSION
+    saved_ver = data.get("extractor_version")
+    if saved_ver != EXTRACTOR_VERSION:
+        data = dict(data)
+        data["pages"] = []
+        data["stale_extractor"] = True
+        data["saved_extractor_version"] = saved_ver
+        data["current_extractor_version"] = EXTRACTOR_VERSION
     return data
 
 
@@ -3275,8 +3573,11 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
     existing = _safe_read_json(_snapshot_path(safe_id)) or {}
     pages_out = _merge_snapshot_pages(existing, req, pages_out)
 
+    from .paper_text import EXTRACTOR_VERSION
     payload = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        # 抽取算法版本：加载时对不上就整份作废（见 api_pdf_snapshot_load）
+        "extractor_version": EXTRACTOR_VERSION,
         "paper_id": safe_id,
         "paper_title": req.paper_title,
         "relative_path": req.relative_path,
@@ -3554,6 +3855,10 @@ def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
     if old_sig and new_sig and old_sig != new_sig:
         # 原文变了 —— 旧译文作废，整份以新的为准
         merged = dict(new)
+    elif not (_snapshot_extractor_ok(cur) and _snapshot_extractor_ok(new)):
+        # ⚠ 有一边是旧抽取算法翻出来的 —— 不能按页合并
+        #   （合并会把坏的旧译文合回来，读取时的作废逻辑管不到）。
+        merged = dict(new) if _snapshot_extractor_ok(new) else dict(cur)
     else:
         pages: dict = {}
         for src_pages in ((cur or {}).get("pages") or [], new.get("pages") or []):
@@ -3576,6 +3881,23 @@ def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
     return text
 
 
+def _snapshot_extractor_ok(data: dict) -> bool:
+    """快照的抽取算法版本必须与当前一致。
+
+    ⚠ 这是 2026-10-25 合并两端改动时挖出来的坑：
+    对方（10-24）给快照加了 `extractor_version` —— 抽取算法一改，
+    旧快照里的译文就是**坏的**（那是按旧算法翻的），读取时整份作废。
+    但**磁盘上的旧页还在**，而按 page_num 合并的逻辑会把它们合回来
+    ⇒ 过期译文被复活，而读取时的作废逻辑管不到它（它只看最终那一份）。
+    所以合并之前必须先看版本：对不上就**不合**。
+    """
+    try:
+        from .paper_text import EXTRACTOR_VERSION
+    except Exception:
+        return True
+    return (data or {}).get("extractor_version") == EXTRACTOR_VERSION
+
+
 def _merge_snapshot_pages(existing: dict, req, incoming: list) -> list:
     """把新上传的页与**磁盘上已有的页**按 page_num 合并。
 
@@ -3586,6 +3908,9 @@ def _merge_snapshot_pages(existing: dict, req, incoming: list) -> list:
     源文件变了（paper_text_signature 不同）时不能合并 ——
     老的译文对应的是旧文本，留着就是错的。
     """
+    # ⚠ 抽取算法版本对不上 —— 旧译文是按旧算法翻的（坏的），不能合进来
+    if not _snapshot_extractor_ok(existing):
+        return incoming
     old_pages: dict = {}
     for p in (existing or {}).get("pages") or []:
         try:

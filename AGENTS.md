@@ -22,7 +22,7 @@
 | 是什么 | Obsidian vault + FastAPI 本地服务（科研文献精读工作台） |
 | 仓库根 | `E:\zaiwu\个人工作台`（**它同时是 vault 根**） |
 | 服务 | `python -m uvicorn microbench.app:app --host 127.0.0.1 --port 5000` |
-| 启动 | 双击 `start_workbench.bat`（= 桌面快捷方式「MicroBench 工作台」） |
+| 启动 | **桌面应用**：双击 `MicroBench Desktop.bat`（= 桌面快捷方式「MicroBench 工作台」）→ 独立原生窗口，不走浏览器<br>**网页版**：双击 `start_workbench.bat`（= 快捷方式「MicroBench 网页版」）→ 服务 + 默认浏览器 |
 | 前端 | **单文件** `microbench/static/index.html`（CSS+JS 全在里面，~7900 行） |
 | 后端 | `microbench/app.py`（API 全部在一个文件里，~4000 行） |
 | 抽取层 | `microbench/paper_text.py`（双栏顺序、公式保护） |
@@ -148,6 +148,7 @@ python -m pytest tests/ -q            # 全绿
 | 路径安全 / 卡片模板 / vault 统计 | `microbench/generator.py` |
 | 抓论文（arXiv/DOI/Crossref） | `microbench/paper_fetcher.py` + `microbench/netutil.py` |
 | 离线/平板工作台导出 | `microbench/export_offline.py` |
+| 桌面独立窗口（应用形态） | `desktop.py` + `MicroBench Desktop.bat` + `install_shortcuts.ps1` |
 | vault 搬进坚果云 | `microbench/move_vault_to_cloud.py` |
 | 平板变更包合并 | `microbench/merge_changes.py` |
 
@@ -394,12 +395,170 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 - 声明写在块里 → 块级作用域，块外调不到 → 这就是为什么代码里有十几处 `window.X = X` 导出。
   **新写代码请直接放顶层，不要塞进裸花括号块。**
 
-### 4.11 安卓平板 APK（手工打包，不走 Gradle）
+### 4.11 桌面应用窗口（pywebview / Edge WebView2）
+
+用户要求「点开就像独立应用，不要在浏览器里」→ 2026-10-24 落地 `desktop.py`（根目录）。
+用的是 Windows 自带的 **Edge WebView2**（`pywebview` 驱动），不是 Electron，不打包 100MB 运行时。
+
+| 入口 | 行为 |
+|---|---|
+| `MicroBench Desktop.bat` | `pythonw desktop.py` —— **无黑窗**；日志写 `logs/desktop.log` |
+| `install_shortcuts.ps1` | 装桌面/开始菜单快捷方式（**名字不能带前导下划线**，见 §4.9） |
+| `start_workbench.bat` | 网页版：服务 + 默认浏览器（服务跑在独立控制台窗口） |
+
+坑（都踩过）：
+
+- **pywebview 事件回调的形参必须叫 `window`**。`webview/event.py` 的派发规则是
+  「0 参 → 无参调用；形参名含 `window` → 传窗口对象；否则按触发时的 args 调用」，
+  而 `loaded` / `closing` 的 args 是**空的** → 写成 `def _on_loaded(win)` 会抛
+  `TypeError: missing 1 required positional argument`（而且被 pywebview 的
+  `logger.exception` 吞掉，只在日志里留一行，窗口照样开着，很难察觉）。
+- **`private_mode` 默认是 `True`** → 每次启动 localStorage 全清（主题、Obsidian vault 名、
+  阅读器状态、答疑面板几何全丢）。必须 `private_mode=False` + `storage_path`。
+- **`pythonw.exe` 下 `sys.stdout` / `sys.stderr` 是 `None`** → uvicorn 的日志处理器
+  拿到 None 会静默丢日志。启动时把两个流接管成 `_Tee(原流, 日志文件)`。
+- **跨进程置前窗口**：`SetForegroundWindow` 直接调经常无效，要
+  `AttachThreadInput(当前线程, 前台窗口线程)` 再 `BringWindowToTop` + `SetForegroundWindow`。
+- **单实例**：用 `EnumWindows` 按标题找已有窗口（认「微电子科研工作台」，
+  **别认** `MicroBench Server - python -m uvicorn ...` 那个控制台窗口，否则会误杀服务）。
+  第二次双击改为激活已有窗口，否则会出现「两个窗口，关一个把服务带走」。
+- **端口探测必须校验页面特征串**（`b"MicroBench" in body`），老教训复用（§4.4 / start_workbench.bat）。
+  探测请求要带 `ProxyHandler({})`：本机 `HTTP_PROXY` 指向本地代理客户端，代理没开时必 ProxyError。
+- **兜底链**：pywebview 不可用 → Edge/Chrome `--app=` 模式（同样无地址栏）；
+  这条路线里服务必须**分离进程**（`DETACHED_PROCESS`），否则启动器一退出服务就死。
+  再不行就弹 `MessageBoxW` 报错 —— 绝不静默失败。
+
+> ⚠️ 改 `desktop.py` 时的连带影响：它跑的是**同一个** `microbench.app:app`，
+> 端口、vault 路径、`.env` 全部一致。窗口关掉 = 它自己起的服务停掉；
+> 若服务是 `start_workbench.bat` 起的（它不是本进程起的），窗口关掉**不会**停服务。
+
+### 4.12 阅读器：表格乱 / 栏序错 / 公式没法看（2026-10-24）
+
+用户一次报了三个问题，逐个定位后一起修的。三条的根因**都不在模型**：
+
+**① 表格"很乱 + 占篇幅大"** —— 模型本来就把表格输出成 Markdown 表格
+（`| 性能 | BaTiO₃ | … |`），但渲染层 `formatMarkdownLite()` **没有表格支持**
+→ 用户看到一堆竖线加换行。
+→ 现在渲染成真正的 `<table class="md-table">`（单元格 nowrap + 横向滚动），
+提示词也明确要求"表格用 Markdown 表格输出"。
+
+**② "还是会先翻译先出现字的那一列"** —— **代码早就修好了，用户看的是旧快照**。
+实测：快照 `saved_at=2026-10-23T14:17`，而栏序修复的 commit 是 10-23 16:36
+→ 读者照旧恢复 10-23 14:17 的译文（逐字与用户截图一致）。
+→ 快照现在带 `extractor_version`（`paper_text.EXTRACTOR_VERSION`），
+加载时版本对不上 → **整份作废重翻**。改了抽取算法就必须 +1。
+
+**③ 公式"分子分母分不清谁是谁"** —— 碎片硬拼 LaTeX 会把分子分母装反，
+而**错公式比没公式危险得多**（用户会照着它去算）。
+→ **不拼**：抽取层只记公式在页面上的坐标 `⟦FORMULA:x0,y0,x1,y1⟧`，
+前端拿坐标去 PDF 原页裁一张图贴进译文 —— 和论文里一模一样，绝不会错。
+新增接口 `GET /api/paper/formula_image`（PyMuPDF 按坐标裁 PNG）。
+
+**顺手修的（抽取层）**：
+
+- **裁剪边界切在字上 → 相邻两行被逐字交错成乱码**：
+  `cannot be coprocessed…` + `would oxidize the iron…`
+  → `cwaonunlodtobxiediczoeptrhoeciersosnedanwditdhraomxiadteicaflelryroree`
+  原因：pdfplumber 裁剪会把压在边上的字形**切掉一半**，剩下的 top 被裁到
+  边界值 → 跟下一行的字混成同一行。
+  → 裁剪时**向外扩 16pt**，再按「行的 top 属于哪一带」过滤（`_crop_lines`）。
+- **左栏只剩几个词的带被判成"整宽"** → 整宽裁剪把左右两栏合进同一行
+  → 又是逐字交错。判据改成**只看栏缝干不干净**（`_band_kind`）：
+  中间空 → 双栏；中间被填满 → 整宽（跨栏表格）。
+- **页尾截尾会切坏标记**：标记里有小数点（`⟦TABLE:28.2,494.6,…⟧`），
+  而截尾是按"最后一个句末标点"切的 → 标记被切成半截 → 多模态读不到那张表。
+  → `_trim_page_tail()` 的切点必须避开标记内部，标记自己的 `⟧` 才是合法切点。
+
+**判据的坑（改抽取层时务必记住）**：
+
+- 「有等号就是公式」会把**正文整行吞进公式图**
+  （`f(ω) = … Substituting the inverse` → 译文里这句话消失）。
+  → 现在先数**词状 token**（≥3 字母、纯字母、`(cid:N)` 不算）：
+  ≥2 个 → 是正文。`eeﬀ ¼ 33 33 (3)` 只有 1 个 → 才是公式。
+- 表格行也含大量 `(cid:)` 碎片 → **必须要求等号**，否则整张表变成一张图。
+- 公式判据改紧后要跑全库扫描（24 篇 391 页），确认正文词没被吞。
+
+### 4.13 表格：截图交给多模态模型逐格抄（2026-10-25）
+
+用户原话："对于表格的话个别单元他这个都抽错的话你也给我直接上这个多模态读图吧……
+我要的是这个阅读的……至少顺序要是很正常的"。
+
+**为什么表格不能交给文本模型**：表格在 PDF 文本层是碎的
+（`d (pC/N) (cid:4)90 (cid:4)175 (cid:4)109 B700 16.5` —— 连负号都认不出），
+文本模型只能靠上下文猜对齐 → **整行数值错位**（实测 d31 行的 16.5 跑到 d33 行、
+7200 变成 B700）。
+
+**现在的做法**（与公式同一套路）：
+
+- 抽取层用**表题**（"Table N." / "表 N"）定位表格区域 → 输出
+  `⟦TABLE:x0,y0,x1,y1⟧`（表格碎片不再进正文）；
+- 服务端裁图（PyMuPDF，scale=4 ≈ 288 DPI）→ 多模态模型逐格抄 → Markdown；
+- 标记换成中性的 `⟦TABLE_n⟧` 送进主翻译，翻译完按位置把表格拼回去；
+- 前端渲染成真正的 `<table>`（§4.12①）。
+
+**实测**：JACERS Table I 抄出来是 `−90 | −175 | −109 | | ∼700 | 16.5`
+—— 与论文里印的一模一样，连论文自己把 2605 排进表头的排版毛病都照抄了。
+
+**判据的坑**：
+
+- **不能用"数字多"判表格**：公式行也全是数字（`a ¼ 33 31 (2)`），
+  按数字判会把公式当表格（实测 eq (2)/(3) 被误判成两张表）→ 改成按
+  **"表状行成段"**（词短 + 含数字 + 没有像英文单词的东西）。
+- 判"像英文单词"不能只看字母数：**材料名也是长词**（BaTiO3 / Terfenol-D），
+  要看**是否以小写为主**。
+- 表格区域**只能由"表状行"延续**：表题后面跟一段"短"正文时，区域会一直
+  延伸，把那几段正文从正文里删掉（独立审查发现 13 处）。
+- 表题**不进区域**：留在正文里由主模型翻译，图里只有表体，两者不重复。
+- 主模型偶尔会把 `⟦TABLE_n⟧` 弄丢 → 服务端兜底（漏掉的表格追加到译文末尾）。
+
+**这一轮踩过的三个坑（独立审查揪出来的，2026-10-25）**：
+
+1. **裁剪框越界会抛异常**：`pdfplumber.crop()` 的框超出页面就抛 ValueError。
+   为避开切字而外扩 16pt，很容易把框推出页面下沿 → 整组文字全丢
+   （实测 24/391 页中招，JACERS 第 4~6 页正文只剩 1/4）。
+   → 裁剪框四边都 clamp 到页面内。
+2. **静默的 `except Exception: return []` 会把整页正文丢失藏起来** →
+   兜底必须留痕（打堆栈到 stderr），否则"译文少了一大截"根本查不出来。
+3. **合并同类型带会跨过被排除的表格带** → 整宽裁剪又把表格行捞回正文
+   （表格既在图里又在文字里）→ 用哨兵组打断合并链。
+
+### 4.14 阅读器批注：重译后记录不能丢（2026-10-25）
+
+用户原话："如果我在翻译上写了标注，然后它又被重新翻译了，那这块儿标注是不是就直接没了？
+……这个记录要有。还有就是我点开哪一页，标记的列表是从那个开始的，不要每次都从第一页开始。"
+
+**「失效」不等于「丢失」** —— 这是两条不同的承诺，缺一条用户就白干了：
+
+| 场景 | 表现 |
+|---|---|
+| 译文侧标注（无 `rects`）+ 重译后引文对不上 | 标 **⚠ 位置失效**（虚线边框），但引文/笔记/颜色全保留 |
+| PDF 侧标注（有 `rects`） | 高亮画在 PDF 画布覆盖层上，**不受重译影响** → 不算失效 |
+| 译文又变回原来那句 | `orphan=false`，失效标记**自愈** |
+
+判据在 `applyAnnotationsToPage()`：
+`a.orphan = !(a.rects && a.rects.length)` —— 有 PDF 坐标的永远不算失效。
+
+**抽屉定位**（`openAnnoDrawer()`）：列表按页排序后 → 本页第一条 → 本页没有就落
+**下一页的第一条** → 再没有就退回第一条（旧写法永远 `querySelector(".anno-item")` = 第一条）。
+
+> ⚠️ 改前端后**桌面应用要重启**：`index.html` 是 `no-store`，但 pywebview 只在
+> 启动时拉一次首页，刷新浏览器不等于刷新桌面窗口。
+
+**通用教训**：
+1. **"功能没了"和"位置对不上"要用不同的 UI 表达**。直接删除 = 用户白写；
+   标成"失效但保留"才不伤信任。
+2. **测试要反向验证**：写完 node 断言后 `git stash` 掉改动再跑一遍 ——
+   必须变红，否则说明断言恒真、测了个寂寞。
+3. **前端单文件里的函数可以被切片出来单测**：`sliceFn()` 切源码 + `new Function` 注入桩
+   → 测的是**发布出去的那份代码**，不是抄一份（见 `microbench/_test_reader_annotations.js`）。
+
+
+### 4.15 安卓平板 APK（手工打包，不走 Gradle）
 
 > 完整审查报告见 [`docs/HANDOFF_TABLET_2026-10-25.md`](docs/HANDOFF_TABLET_2026-10-25.md)
 > 和 [`docs/AUDIT_2026-10-25.md`](docs/AUDIT_2026-10-25.md)（第二轮全面审计）。
 > 下面是「改回去也不会立刻报错、但功能会静默坏掉」的那几条，护栏在
-> `android/_test_apk_contract.py`（68 项）里钉死了。
+> `android/_test_apk_contract.py`（104 项）里钉死了。
 
 - **裸 socket 的 TLS 顺序**：`createSocket()`（无参）→ `setSSLParameters(
   endpointIdentificationAlgorithm=HTTPS)` → `connect()`。
@@ -426,7 +585,7 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 - **APK 里的 origin 是 `https://appassets.androidplatform.net`** → 外部 API
   不会回这个 origin 的 CORS 头，`fetch` 必被打死。AI 请求要**走原生代理**。
 
-### 4.12 静默坏掉的三类（2026-10-25 全面审计的产出）
+### 4.16 静默坏掉的三类（2026-10-25 全面审计的产出）
 
 > 详细清单见 [`docs/AUDIT_2026-10-25.md`](docs/AUDIT_2026-10-25.md)。
 > 这一轮最重要的教训不是某个具体 bug，而是下面这三种**形状**。
@@ -454,7 +613,7 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
      （`/on[a-z]+=/` 这种正则分不清「属性名」和「属性值里的文本」，
      会给出假阳性/假阴性）。
 
-### 4.13 这轮自己踩的坑（工具层面的）
+### 4.17 这轮自己踩的坑（工具层面的）
 
 | 坑 | 纪律 |
 |---|---|
@@ -464,6 +623,47 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 | `query kind=editable` 扫到 API Key 字段 → 运行时挂 `requiredNextTool: ask_user` 门禁，**把 bash/read/task_output 一起锁** | 不对含凭证字段的页面做 editable 扫描；`task_output` 带 `offset: 0` 能绕过 |
 | `subprocess.run(text=True)` 在中文 Windows 按 GBK 解码 node 输出 → emoji 路径 `UnicodeDecodeError` | 显式 `encoding="utf-8"`（§4.9） |
 | 删代码时漏掉了一个变量定义 | 后端回归护栏立刻抓到 `NameError` —— 这就是写护栏的价值 |
+
+---
+
+### 4.18 快照版本闸门：三端必须逐字一致（2026-10-25 合并时挖出来）
+
+> **一句话判据（三处一模一样，别改一处漏一处）**：
+> `saved_extractor_version != 当前抽取算法版本` → **整份快照作废**。
+> 「**没有** `extractor_version`」**也算对不上** —— 那是旧算法翻出来的。
+
+三处必须一致：
+
+| 端 | 位置 | 行为 |
+|---|---|---|
+| 桌面端读取 | `app.py: api_pdf_snapshot_load` | 版本不符 → `pages=[]` + `stale_extractor=True`（阅读器照常重翻） |
+| 桌面端合并 | `app.py: _merge_snapshot_pages` / `_merge_snapshot_files` | 先过 `_snapshot_extractor_ok()`，对不上就**不合** |
+| 导出器 | `export_offline.py: collect_translations()` | 只烤当前版本的译文（旧的**不烤**） |
+| 平板端读取 | `static/tablet/app.js: loadTranslation()` | 版本不符 → 返回 null + `state.transStale=true` |
+
+**为什么这是「合并后才暴露」的坑**：对方（10-24）给快照加了 `extractor_version`，
+桌面端读取时整份作废重翻；但**磁盘上的旧页还在**，而**按 page_num 合并**的逻辑
+（本项目自己的设计，为了两台设备轮流翻同一篇时不清空对方翻过的页）
+会把它们**合回来** ⇒ **过期译文被复活**，而读取时的作废逻辑只看最终那一份，
+**管不到它**。→ 合并之前必须先看版本。
+
+**「没有版本号」也算旧 —— 这条最容易写漏**：
+本机现存 3 份快照（`logs/_pdf_snapshots/`）**全都没有** `extractor_version`
+（它们是旧算法翻的，栏序是反的）。
+平板端一度写成「有版本号且不等于当前版本才作废」= **把没版本号的旧快照当成好的放行**
+⇒ 用户看到的就是错的那一列。**宽松判据 = 没有判据。**
+
+**平板本地缓存也必须带版本闸门**：
+译文缓存在 IndexedDB 的 `meta` 里（键 `trans_<paper_key>`），缓存命中时
+**根本不会去查云盘**、也就绕过了版本检查 ⇒ APK 一升级（抽取算法变了），
+旧译文会**从本地缓存直接返回**。
+→ 缓存键改成 `trans_v<版本>_<paper_key>`（`transCacheKey()`），
+换版本自动失效，不用手动清缓存。
+
+**教训**：两端各自「都做了版本检查」**不等于**规则一致 ——
+一个宽松一个严格，用户看到的结果就取决于**看的是哪一端**。
+跨端规则要**逐字对齐**，并且**用同一份行为级测试**锁住（本次：
+`tests/test_tablet_snapshot_version.py` 12 项 + `_test_tablet_hardening.js` 第 [13] 节 8 项）。
 
 ---
 
@@ -505,15 +705,26 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 | 批注点了没反应 / 批注丢了 | mouseup 是否落在气泡上 | 点浮层按钮会触发浮层容器的 mouseup 采集（→ return） |
 | 全量测试绿、单跑某个文件却红 | `.env` 的部署开关是否漏进 pytest 进程 | `llm.py` import 时 `load_dotenv(override=False)`；测试进程要隔离 `.env`（`tests/conftest.py` 已钉死） |
 | 某个 `@slow`/`@llm` 测试偶发红 | 单跑是否通过 | 真打 MiniMax API，偶发；不是代码问题。pre-commit 钩子用 `-m "not slow"` 已排除 |
-| 平板上改的笔记刷新就没了 | `loadSeed` 是不是拿种子覆盖了本地正文 | 种子是导出期快照；本地必须优先（§4.12-1） |
-| 平板上改了笔记但云端没变 | 同步按钮分支 / `pushToDir` 有没有被调到 | `syncMode === "dir"` 永远不成立；`pushToDir` 无并发闸门（§4.12-1） |
-| 平板上划词没反应 | 划词监听绑在哪个节点上 | 绑在会被 `innerHTML=""` 清掉的 textLayer 上 ⇒ 永久失效（§4.12-1） |
-| 平板上笔记整篇空白 | 笔记里是不是有引用块/列表里的公式 | 公式表没跨递归层共享 ⇒ `renderMarkdown` 抛异常（§4.12-1） |
-| 删掉的批注又回来了 | 同步 push 里有没有「兼容旧版本」的回灌 | 本机陈旧副本合并回真源、deleted 传空（§4.12-1） |
-| 另一台设备译文少了几页 | 快照是不是整份替换 | 必须按 `page_num` 合并（§4.12-1） |
-| 平板变更包一条都合不回来 | `merge_changes.safe_target` 用没用 `resolve()` | `resolve()` 穿透 junction ⇒ 全判越界（§4.4 / §4.12-1） |
+| 平板上改的笔记刷新就没了 | `loadSeed` 是不是拿种子覆盖了本地正文 | 种子是导出期快照；本地必须优先（§4.16-1） |
+| 平板上改了笔记但云端没变 | 同步按钮分支 / `pushToDir` 有没有被调到 | `syncMode === "dir"` 永远不成立；`pushToDir` 无并发闸门（§4.16-1） |
+| 平板上划词没反应 | 划词监听绑在哪个节点上 | 绑在会被 `innerHTML=""` 清掉的 textLayer 上 ⇒ 永久失效（§4.16-1） |
+| 平板上笔记整篇空白 | 笔记里是不是有引用块/列表里的公式 | 公式表没跨递归层共享 ⇒ `renderMarkdown` 抛异常（§4.16-1） |
+| 删掉的批注又回来了 | 同步 push 里有没有「兼容旧版本」的回灌 | 本机陈旧副本合并回真源、deleted 传空（§4.16-1） |
+| 另一台设备译文少了几页 | 快照是不是整份替换 | 必须按 `page_num` 合并（§4.16-1） |
+| 平板变更包一条都合不回来 | `merge_changes.safe_target` 用没用 `resolve()` | `resolve()` 穿透 junction ⇒ 全判越界（§4.4 / §4.16-1） |
 | 含 emoji 的路径两端 id 对不上 | paper_id 哈希按码点还是码元 | JS 用 UTF-16 码元，Python `ord()` 是码点（§4.7） |
-
+| 表格显示成一堆竖线、占半屏 | 译文里是不是 `\| a \| b \|` | 渲染层没有 Markdown 表格支持（§4.12①）|
+| 表格数值整行错位 | 译文里是不是 `⟦TABLE:…⟧` 没被替换 | 表格走文本层会错位 → 应由多模态读图抄（§4.13）|
+| 表格整张丢失 | 译文里有没有半截 `⟦TABLE:28.2,` | 页尾截尾把标记切坏了（§4.12）|
+| 公式是占位符 / 分子分母装反 | 译文里有没有 `⟦FORMULA:...⟧` | 抽取层给坐标、前端裁 PDF 原图（§4.12③）|
+| "翻译顺序还是错的" | 快照的 `extractor_version` | 旧快照是**老算法**翻的，整份作废重翻（§4.12②）|
+| 译文里出现逐字交错的乱码行 | 相邻两行被合成一行 | 裁剪边界切在字上，扩边裁剪（§4.12）|
+| 重译后批注不见了 | 抽屉条目有没有"位置失效"提示 | 失效≠丢失：笔记必须保留（§4.14）|
+| 标注列表每次都从第一页开始 | `openAnnoDrawer()` 的定位分支 | 应滚到**当前页**的第一条（§4.14）|
+| 改了前端但桌面窗口没变 | 桌面应用是不是启动在改动之前 | pywebview 只在启动时拉一次首页（§4.14）|
+| 平板上译文还是「错的那一列」 | 云盘快照有没有 `extractor_version` | 两端版本判据不一致；「没版本号」也必须算旧（§4.18）|
+| 平板升了 APK 后译文没变（还是旧的） | 本地缓存键里有没有版本号 | 缓存命中绕过了版本闸门 → 键要带版本（§4.18）|
+| 翻过的译文被翻回旧内容 | 快照合并有没有过版本闸门 | 按 page_num 合并把过期页合回来了（§4.18）|
 ---
 
 ## 7. 关键 commit 索引（改前想回溯就查这里）
@@ -532,8 +743,15 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 | `b4f1e97` | 行尾归一 LF（`.gitattributes`），冲突从巨型块降到语义块 |
 | `6330cfd` | 平板：修「列目录正常但 PDF 全 404」（vault 在云盘里的路径前缀丢了） |
 | `103b2e3` | 平板 APK 首轮系统审查：4 阻断 + 12 重要（TLS 主机名验证、Base64 API 26、批注删除复活、快照整份替换、junction 穿透…） |
-| 见下方 | 平板全面审计：6 阻断 + 11 重要 + AI 面板重做（发送后清空输入栏） |
-
+| 见下方 | 平板全面审计：6 阻断 + 11 重要 + AI 面板重做（发送后清空输入栏） || `d1be3b7` | 桌面改成独立应用窗口（pywebview/WebView2），快捷方式不再走浏览器 |
+| `d8002df` | 表格渲染成真表格 + 旧快照按抽取版本作废 + 公式改用 PDF 原图裁图 |
+| `a6db653` | 表格改走多模态读图（裁图 → M3 逐格抄 → 拼回译文），数值与论文一致 |
+| `00b6beb` | 同一页的多张表并行读图（整页翻译 27 秒） |
+| `8b4fbfb` | 交付前审查：裁图像素上限、清死代码、标记兜底 |
+| `2880b4b` | 阻断级回归：裁剪框越界导致整组正文消失（24/391 页） |
+| `75aa297` | 审查后收紧表格识别 + 修缓存顺序/模型选择/表格拼接 |
+| `a5e1b82` | 文档：记入独立审查揪出的三个坑（裁剪越界/静默吞异常/合并跨表格带） |
+| `9163cda` | 提问发送后自动清空输入框（三处提问入口） |
 ---
 
 ## 8. 已排除的方案：把项目「转成 MiniMax Code 云端项目」（查清后 pass）

@@ -1534,6 +1534,20 @@
     }
     .anno-item-note { font-size: 12.5px; color: var(--fg-strong); line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
     .anno-item-meta { font-size: 10px; color: var(--fg-subtle); margin-top: 5px; display: flex; gap: 8px; }
+    /* 位置失效的批注（该页重译后引文对不上了）：记录留着，笔记不丢，
+       只是标出来"高亮找不到了"，别让用户以为批注被删了。 */
+    .anno-item-orphan { border-style: dashed; border-color: var(--accent-terracotta); }
+    .anno-item-orphan .anno-item-quote { opacity: .75; }
+    .anno-item-orphan-tip {
+      font-size: 11px; color: var(--accent-terracotta);
+      margin: 0 0 5px; line-height: 1.4;
+    }
+    .anno-orphan-warn {
+      font-size: 11.5px; color: var(--accent-terracotta);
+      background: rgba(178, 83, 54, .08);
+      border: 1px solid rgba(178, 83, 54, .3);
+      border-radius: 5px; padding: 6px 8px; margin-bottom: 8px;
+    }
     .anno-empty { padding: var(--s-5); text-align: center; color: var(--fg-subtle); font-size: 12px; }
 
     /* ---------- 原文（PDF 侧）上的高亮覆盖层 ----------
@@ -1660,6 +1674,60 @@
     .md-h3 { margin: 0.9em 0 0.4em; font-size: 0.97rem; }
     .md-h4 { margin: 0.75em 0 0.3em; font-size: 0.9rem; color: var(--fg-muted); }
     .md-h2:first-child, .md-h3:first-child, .md-h4:first-child { margin-top: 0; }
+    /* -------------------------------------------------------------------
+       Markdown 表格：模型本来就把表格输出成 "| a | b |"，渲染层不支持
+       表格时用户看到的是一堆竖线（"表格的翻译很乱"+"占篇幅很大"）。
+       现在渲染成真正的表格：单元格不换行（nowrap）+ 横向滚动，
+       纵向占用比竖线文本少一大截。
+       ------------------------------------------------------------------- */
+    .md-table-wrap {
+      overflow-x: auto;
+      margin: 0.6em 0 0.9em;
+      max-width: 100%;
+      border-radius: 6px;
+      border: 1px solid var(--line-soft);
+    }
+    .md-table {
+      border-collapse: collapse;
+      width: auto;
+      min-width: 100%;
+      font-size: 0.86em;
+      line-height: 1.45;
+      font-family: var(--font-sans);
+    }
+    .md-table th, .md-table td {
+      border-right: 1px solid var(--line-soft);
+      border-bottom: 1px solid var(--line-soft);
+      padding: 3px 9px;
+      white-space: nowrap;
+      text-align: left;
+      vertical-align: top;
+    }
+    .md-table th:last-child, .md-table td:last-child { border-right: none; }
+    .md-table tbody tr:last-child td { border-bottom: none; }
+    .md-table thead th {
+      background: var(--surface-sunken);
+      font-weight: 600;
+      color: var(--fg-strong);
+      position: sticky;
+      top: 0;
+    }
+    .md-table tbody tr:nth-child(even) td { background: rgba(127, 127, 127, 0.06); }
+    /* 公式原图：从 PDF 原页裁下来的图，贴进译文 */
+    .formula-shot {
+      display: inline-block;
+      vertical-align: middle;
+      max-width: 100%;
+      margin: 2px 0;
+    }
+    .formula-shot-img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      border-radius: 3px;
+      background: var(--surface-sunken);
+    }
+    .formula-fallback { color: var(--fg-muted); font-size: 0.9em; }
     /* formatMarkdownLite wraps prose in bare <p> (no class), so the answer
        surfaces need their own paragraph rhythm. */
     .qa-answer p, .result-slot p, .reader-section-body p { margin: 0 0 0.7em 0; }
@@ -3897,7 +3965,15 @@
               );
               if (r.ok) {
                 const snap = await r.json();
-                if (snap && snap.pages && snap.pages.length > 0) {
+                if (snap && snap.stale_extractor) {
+                  // 旧快照是按老版抽取算法翻的（栏序错、公式是占位符）→
+                  // 服务端已整份作废，这里如实告诉用户，别让他以为修复没生效。
+                  showToast(
+                    "♻️ 旧版译文已失效（抽取算法已升级：栏序/公式重做），正在重新翻译",
+                    true,
+                    5200
+                  );
+                } else if (snap && snap.pages && snap.pages.length > 0) {
                   const { matched, stale } = await applySnapshotToState(_pdfState, snap);
                   if (matched > 0) {
                     const staleNote = stale > 0
@@ -4071,6 +4147,8 @@
           try {
             textEl.className = "page-text";
             textEl.innerHTML = formatMarkdownLite(snapPage.translation);
+            // 公式原图：从 PDF 原页按坐标裁出来贴进译文
+            renderFormulaImages(textEl, (pdfState && pdfState.relativePath) || "", pg.num);
             // 快照恢复后立刻重放这一页的批注高亮（在 KaTeX 渲染之前）
             applyAnnotationsToPage(pg.num, textEl);
             if (typeof renderMathIn === "function") renderMathIn(textEl);
@@ -4825,6 +4903,8 @@
 
         textEl.className = "page-text";
         textEl.innerHTML = formatMarkdownLite(translated);
+        // 公式原图：从 PDF 原页按坐标裁出来贴进译文
+        renderFormulaImages(textEl, (_pdfState && _pdfState.relativePath) || "", pageNum);
         // 先打高亮再渲染公式：引文里含公式时，用的是 TeX 源，
         // 在 KaTeX 渲染前匹配最准（渲染后也能匹配，但这里更直接）
         applyAnnotationsToPage(pageNum, textEl);
@@ -5268,6 +5348,11 @@
     // appear inside math (`<`, `>`, `&`, `"`).
     function _unrenderMathPlaceholders(html) {
       if (!html) return "";
+      // 公式原图标记（⟦FORMULA:x0,y0,x1,y1⟧）没法搬进 .md —— 坐标对读者
+      // 没有意义，而且换个 PDF 就失效了。导出时换成一句人话。
+      // 表格标记同理（正常情况下服务端已经换成 Markdown 表格了，这里兜底）。
+      html = String(html).replace(/⟦FORMULA:[^⟧]*⟧/g, "【公式：见 PDF 原文】")
+                      .replace(/⟦TABLE[^⟧]*⟧/g, "【表格：见 PDF 原文】");
       const un = (s) => String(s)
         .replace(/&lt;/g, "<")
         .replace(/&gt;/g, ">")
@@ -5349,6 +5434,32 @@
       h = h.replace(new RegExp(I_OPEN + "([^" + I_OPEN + I_CLOSE + "]+?)" + I_CLOSE, "g"),
                     (_, body) => `<span class="math-placeholder math-inline">${body}</span>`);
 
+      // 7.5) Markdown 表格 → 真正的 <table>
+      //     为什么必须做：模型本来就把表格输出成 "| 性能 | BaTiO3 | ..." 的
+      //     Markdown 表格，但渲染层没有表格支持 → 用户看到的是一堆竖线加
+      //     换行，"原有的表格形式完全看不出来"，还占掉半屏篇幅
+      //     （2026-10-24 用户原话："表格的翻译，他都是很乱非常之乱……
+      //     占的篇幅非常大"）。
+      //     表格块单独成段，前后用空行隔开，免得被 <p> 包住。
+      const _tables = [];
+      {
+        const _lines = h.split("\n");
+        const _kept = [];
+        let _i = 0;
+        while (_i < _lines.length) {
+          const _tbl = _matchMarkdownTable(_lines, _i);
+          if (_tbl) {
+            _tables.push(_tbl.html);
+            _kept.push("", "\u0005TABLE" + (_tables.length - 1) + "\u0006", "");
+            _i = _tbl.next;
+          } else {
+            _kept.push(_lines[_i]);
+            _i++;
+          }
+        }
+        h = _kept.join("\n");
+      }
+
       // 8) Paragraphs — wrap each blank-line-separated block in <p>; CSS controls spacing.
       //    Pre-existing heading tags (h2 / h3 / h4) are preserved by being matched first.
       //    We split on blank lines, wrap each non-heading segment in <p>.
@@ -5356,6 +5467,8 @@
       const wrapped = segments.map(seg => {
         const trimmed = seg.trim();
         if (!trimmed) return "";
+        // 表格占位符 → 单独成块（不能被 <p> 包住）
+        if (/^\u0005TABLE\d+\u0006$/.test(trimmed)) return trimmed;
         // NB: the display-math placeholder is a <div class="math-display-block">,
         // not a <math-display-block> tag — matching the bare tag name silently
         // failed, so display formulas got wrapped in <p> and their line breaks
@@ -5365,8 +5478,127 @@
         }
         return "<p>" + trimmed.replace(/\n/g, "<br>") + "</p>";
       }).join("");
-      return wrapped;
+      // 表格占位符 → 真正的 <table>
+      return wrapped.replace(/\u0005TABLE(\d+)\u0006/g,
+                             (_, idx) => _tables[Number(idx)] || "");
     }
+
+    /**
+     * 从第 i 行开始，试着识别一个 Markdown 表格。
+     * 判据：第 1 行含 "|"；第 2 行是分隔行（只由 | - : 空格 组成且至少有一个 "-"）；
+     *       之后的行含 "|" 就属于表格。
+     * 返回 {html, next}；不是表格返回 null。
+     */
+    function _matchMarkdownTable(lines, i) {
+      const head = (lines[i] || "").trim();
+      if (!head || head.indexOf("|") < 0) return null;
+      const sep = (lines[i + 1] || "").trim();
+      if (!sep || sep.indexOf("-") < 0 || sep.indexOf("|") < 0) return null;
+      if (!/^[\s|:-]+$/.test(sep)) return null;
+
+      const rows = [];
+      let j = i + 2;
+      while (j < lines.length) {
+        const ln = (lines[j] || "").trim();
+        if (!ln || ln.indexOf("|") < 0) break;
+        rows.push(ln);
+        j++;
+      }
+      if (!rows.length) return null;
+
+      const splitCells = (row) => {
+        let s = row.trim();
+        if (s.startsWith("|")) s = s.slice(1);
+        if (s.endsWith("|")) s = s.slice(0, -1);
+        return s.split("|").map(c => c.trim());
+      };
+      // 对齐方式来自分隔行（:--- 左对齐 / ---: 右对齐 / :---: 居中）
+      const aligns = splitCells(sep).map(c => {
+        const left = c.startsWith(":");
+        const right = c.endsWith(":");
+        if (left && right) return ' style="text-align:center"';
+        if (right) return ' style="text-align:right"';
+        return "";
+      });
+
+      const headCells = splitCells(head);
+      let html = '<div class="md-table-wrap"><table class="md-table"><thead><tr>';
+      headCells.forEach((c, k) => {
+        html += "<th" + (aligns[k] || "") + ">" + c + "</th>";
+      });
+      html += "</tr></thead><tbody>";
+      for (const row of rows) {
+        const cells = splitCells(row);
+        html += "<tr>";
+        headCells.forEach((_, k) => {
+          html += "<td" + (aligns[k] || "") + ">" + (cells[k] || "") + "</td>";
+        });
+        html += "</tr>";
+      }
+      html += "</tbody></table></div>";
+      return { html: html, next: j };
+    }
+
+    /**
+     * 把译文里的 ⟦FORMULA:x0,y0,x1,y1⟧ 换成从 PDF 原页裁下来的公式图。
+     *
+     * 为什么这么做：公式在 PDF 里是矢量排版（分子一行、分母一行、上下标各
+     * 一行），文本层抽出来是乱序碎片，硬拼 LaTeX 极容易把分子分母装反
+     * （用户原话："分子分母分不清谁是谁"）。错公式比没公式危险得多 ——
+     * 用户会照着它去算。所以抽取层只记坐标，这里裁原图贴进去：和论文里
+     * 长得一模一样。
+     *
+     * 裁图失败（PDF 被挪走/接口报错）→ 退回文字提示，不留破图。
+     */
+    function renderFormulaImages(container, relativePath, pageNum) {
+      if (!container || !relativePath) return;
+      if ((container.textContent || "").indexOf("⟦FORMULA:") < 0) return;
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      for (const node of nodes) {
+        const v = node.nodeValue || "";
+        if (v.indexOf("⟦FORMULA:") < 0) continue;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        const re = /⟦FORMULA:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧/g;
+        let m;
+        while ((m = re.exec(v)) !== null) {
+          if (m.index > last) {
+            frag.appendChild(document.createTextNode(v.slice(last, m.index)));
+          }
+          frag.appendChild(_formulaShotNode(m, relativePath, pageNum));
+          last = m.index + m[0].length;
+        }
+        if (last < v.length) frag.appendChild(document.createTextNode(v.slice(last)));
+        if (node.parentNode) node.parentNode.replaceChild(frag, node);
+      }
+    }
+
+    function _formulaShotNode(m, relativePath, pageNum) {
+      const x0 = parseFloat(m[1]), y0 = parseFloat(m[2]);
+      const x1 = parseFloat(m[3]), y1 = parseFloat(m[4]);
+      const wrap = document.createElement("span");
+      wrap.className = "formula-shot";
+      wrap.title = "公式原图（从 PDF 原页裁出，与论文一致）";
+      const img = document.createElement("img");
+      img.className = "formula-shot-img";
+      img.alt = "公式原图";
+      img.loading = "lazy";
+      // 1pt = 1/72 inch；按 96dpi 折算成 CSS 像素，让公式显示成论文里的尺寸
+      const wpx = Math.max(60, Math.min(620, Math.round((x1 - x0) * 1.3333)));
+      img.style.width = wpx + "px";
+      img.src = "/api/paper/formula_image?relative_path=" + encodeURIComponent(relativePath)
+        + "&page=" + encodeURIComponent(String(pageNum || 1))
+        + "&rect=" + encodeURIComponent([x0, y0, x1, y1].join(","))
+        + "&scale=4";
+      img.onerror = function () {
+        wrap.innerHTML = '<span class="formula-fallback">【公式未能完整提取：请对照左侧 PDF 原文】</span>';
+      };
+      wrap.appendChild(img);
+      return wrap;
+    }
+    window.renderFormulaImages = renderFormulaImages;
 
     /**
      * Run KaTeX on all .math-display-block and .math-placeholder elements inside a container.
@@ -5774,10 +6006,16 @@
 
 
     async function askPaperQuestion() {
-      const question = document.getElementById("ask-paper-question").value.trim();
+      const qEl = document.getElementById("ask-paper-question");
+      const question = (qEl ? qEl.value.trim() : "");
       if (!question) {
         showToast("请输入问题", true);
         return;
+      }
+      // 发出即清空：问下一题不用先手动删掉上一个问题
+      if (qEl) {
+        qEl.value = "";
+        try { qEl.focus(); } catch (e) { /* 忽略 */ }
       }
       const askBtn = document.querySelector('[onclick="askPaperQuestion()"]');
       const el = document.getElementById("ask-paper-result");
@@ -5821,7 +6059,8 @@
     }
 
     async function crossSectionQA() {
-      const question = document.getElementById("cross-qa-question").value.trim();
+      const qEl = document.getElementById("cross-qa-question");
+      const question = (qEl ? qEl.value.trim() : "");
       if (!question) {
         showToast("请输入跨章节问题", true);
         return;
@@ -5829,6 +6068,11 @@
       if (_readerState.sections.length < 2) {
         showToast("跨章节问答需要至少 2 个章节 (本论文章节不足)", true);
         return;
+      }
+      // 同样：发出去就清空输入框，问下一题不用先手动删。
+      if (qEl) {
+        qEl.value = "";
+        try { qEl.focus(); } catch (e) { /* 忽略 */ }
       }
       // Collect selected sections (default: all non-references sections)
       const checked = Array.from(document.querySelectorAll(".cross-qa-section-cb:checked"))
@@ -6214,7 +6458,10 @@
           label.appendChild(badge);
         }
         badge.textContent = "📝 " + count;
-        badge.title = "本页有 " + count + " 条批注 · 点击查看";
+        const orphanN = _annoState.items.filter(a => a.page === pageNum && a.orphan).length;
+        badge.title = "本页有 " + count + " 条批注"
+          + (orphanN ? "（其中 " + orphanN + " 条位置已失效，笔记仍在）" : "")
+          + " · 点击查看";
         badge.onclick = (e) => { e.stopPropagation(); openAnnoDrawer(pageNum); };
       });
     }
@@ -6726,6 +6973,7 @@
       const noteEl = document.getElementById("anno-note");
       const titleEl = document.getElementById("anno-editor-title");
       const delBtn = document.getElementById("anno-delete-btn");
+      const warnEl = document.getElementById("anno-orphan-warn");
       const sel = _readerSelState || {};
 
       if (annoId) {
@@ -6737,6 +6985,8 @@
         if (noteEl) noteEl.value = a.note || "";
         if (titleEl) titleEl.textContent = "✍ 编辑批注";
         if (delBtn) delBtn.style.display = "inline-block";
+        // 位置失效的标注：明确告诉用户"笔记还在，只是高亮找不到了"
+        if (warnEl) warnEl.style.display = a.orphan ? "block" : "none";
       } else {
         const quote = (sel.text || "").trim();
         if (!quote) { showToast("请先划选一段文字再标注", true); return; }
@@ -6746,6 +6996,7 @@
         if (noteEl) noteEl.value = "";
         if (titleEl) titleEl.textContent = "✍ 新建批注";
         if (delBtn) delBtn.style.display = "none";
+        if (warnEl) warnEl.style.display = "none";
       }
 
       // 位置：贴着划词气泡（没有气泡就放屏幕中间偏上）
@@ -6952,7 +7203,15 @@
       let applied = 0;
       _annoState.items.forEach(a => {
         if (a.page !== pageNum) return;
-        if (_wrapTextWithMark(container, a.quote, a.id, a.color)) applied++;
+        if (_wrapTextWithMark(container, a.quote, a.id, a.color)) {
+          applied++;
+          a.orphan = false;
+        } else {
+          // 译文侧标注（没有 PDF 坐标）遇到重译 → 引文对不上，位置失效。
+          // **记录必须留着**（用户写的笔记不能凭空消失），只是高亮找不到了。
+          // PDF 侧标注有 rects，高亮画在 PDF 画布上，不受重译影响 → 不算失效。
+          a.orphan = !(a.rects && a.rects.length);
+        }
       });
       return applied;
     }
@@ -6995,7 +7254,10 @@
           (slot || head).appendChild(badge);
         }
         badge.textContent = "📝 " + count;
-        badge.title = "本页有 " + count + " 条批注 · 点击查看";
+        const orphanN = _annoState.items.filter(a => a.page === pageNum && a.orphan).length;
+        badge.title = "本页有 " + count + " 条批注"
+          + (orphanN ? "（其中 " + orphanN + " 条位置已失效，笔记仍在）" : "")
+          + " · 点击查看";
       });
     }
 
@@ -7013,10 +7275,13 @@
         items.forEach(a => {
           const el = document.createElement("div");
           el.className = "anno-item";
+          el.dataset.page = String(a.page || 0);
+          if (a.orphan) el.classList.add("anno-item-orphan");
           const color = _ANNO_COLORS.find(c => c.id === a.color);
           el.innerHTML =
             '<div class="anno-item-quote" style="--anno-line:' + ((color && color.hex) || "#FACC15") + '">'
             + escapeHtml(a.quote) + '</div>'
+            + (a.orphan ? '<div class="anno-item-orphan-tip">⚠ 位置失效（该页重译后原文变了）· 笔记已保留</div>' : '')
             + (a.note ? '<div class="anno-item-note">' + escapeHtml(a.note) + '</div>' : '<div class="anno-item-note" style="color:var(--fg-subtle);font-style:italic;">（只高亮，没有笔记）</div>')
             + '<div class="anno-item-meta"><span>' + (a.page > 0 ? "第 " + a.page + " 页" : "章节视图") + '</span><span>' + escapeHtml((a.updated_at || a.created_at || "").slice(0, 10)) + '</span></div>';
           el.onclick = () => {
@@ -7031,8 +7296,17 @@
       }
       drawer.style.display = "flex";
       if (pageNum) {
-        const el = list.querySelector(".anno-item");
-        if (el) el.scrollIntoView({ block: "nearest" });
+        // 定位到**当前页**的批注（不是每次都从第一页的第一条开始）：
+        // 本页的第一条 → 本页没有就落在下一页的第一条 → 再没有就退回第一条。
+        let target = null;
+        const els = Array.from(list.querySelectorAll(".anno-item"));
+        for (const el of els) {
+          const p = parseInt(el.dataset.page || "0", 10);
+          if (p === pageNum) { target = el; break; }
+          if (!target && p > pageNum) target = el;
+        }
+        if (!target) target = els[0] || null;
+        if (target) target.scrollIntoView({ block: "start" });
       }
     }
 
@@ -7567,6 +7841,12 @@
       if (!question) {
         showToast("请输入您想问的问题", true);
         return;
+      }
+      // 发出去就把输入框清空（和常见 AI 软件一样）：
+      // 问完一题想接着问下一题，不用先手动把上一个问题删掉。
+      if (qInput) {
+        qInput.value = "";
+        try { qInput.focus(); } catch (e) { /* 面板收起时忽略 */ }
       }
 
       const welcome = document.getElementById("qa-welcome-placeholder");
@@ -8169,6 +8449,10 @@
           <button class="btn-zoom-toggle" onclick="closeAnnotationEditor()" title="关闭" aria-label="关闭">×</button>
         </div>
         <div id="anno-quote" class="anno-quote"></div>
+        <div id="anno-orphan-warn" class="anno-orphan-warn" style="display:none;">
+          ⚠ 这条批注的位置失效了：该页重新翻译过，译文变了，原来高亮的那句话
+          对不上了。<b>你的笔记仍然保留着</b>（不会被删掉），只是高亮暂时找不到位置。
+        </div>
         <div class="anno-color-row" id="anno-color-row"></div>
         <textarea id="anno-note" class="field-textarea" rows="3"
                   placeholder="写下你的理解、疑问或结论（可留空，只高亮）…"></textarea>
