@@ -45,6 +45,21 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
+# ⚠⚠ 必须把仓库根加进 sys.path —— 否则以**脚本模式**运行时会静默失效。
+#
+#   python microbench/export_offline.py --tablet      ← sys.path[0] 是 microbench/
+#   python -m microbench.export_offline --tablet        ← sys.path[0] 是仓库根
+#
+# 脚本模式下 `from microbench.paper_text import EXTRACTOR_VERSION` 会 ImportError：
+# 仓库根不在 sys.path 里。而 paper_text.py 内部用的是**相对导入**
+# （from .paper_fetcher import ...），只能以包形式导入，不能退化成 `import paper_text`。
+#
+# 后果有多严重：ImportError 被 except 吞掉 → 取不到抽取算法版本 →
+# 译文版本过滤**整个不生效** → 旧算法翻的坏译文照样烤进平板单文件
+# （正是「译文和原文对不上」那个老问题）。**失败得很安静，所以必须有护栏。**
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
 # Folders that hold user content. logs/, microbench/, tests/ are excluded.
 VAULT_DIRS = [
     "00_Dashboard",
@@ -968,11 +983,18 @@ def current_extractor_version():
     平板端要用它判断云盘上的快照是不是**旧算法**翻出来的 ——
     旧译文是坏的（栏序可能整个反过来），不能给用户看。
     两端的判断必须一致。
+
+    ⚠ 取不到就返回 None，**并且要喊出来**：
+      取不到版本 ⇒ 无法证明任何一份译文是好的 ⇒ 导出端必须**一份都不烤**
+      （宁可没有译文，也不要错的那一列）。这里静默失败过一次，别再来第二次。
     """
     try:
         from microbench.paper_text import EXTRACTOR_VERSION
         return EXTRACTOR_VERSION
-    except Exception:
+    except Exception as exc:
+        print(f"[导出器] ⚠ 取不到抽取算法版本（{exc}）—— "
+              f"译文将被全部跳过（宁可没有，也不要旧算法的坏译文）",
+              file=sys.stderr)
         return None
 
 
@@ -996,12 +1018,15 @@ def collect_translations() -> dict:
     可能整段栏序都是反的），桌面端读取时整份作废重翻。
     平板端要是照搬，用户看到的就是**错的那一列** ——
     正是用户最早报的那个问题。两端必须一致。
+
+    ⚠⚠ 取不到当前版本 ⇒ **一份都不烤**（fail closed）。
+    「宽松放行」在这里等于「把旧算法的坏译文发给用户」。
     """
     out: dict = {}
-    try:
-        from microbench.paper_text import EXTRACTOR_VERSION
-    except Exception:
-        EXTRACTOR_VERSION = None
+    EXTRACTOR_VERSION = current_extractor_version()
+    if EXTRACTOR_VERSION is None:
+        # 保守：无法证明译文是好的 → 一份都不给
+        return out
     snap_dir = REPO / "logs" / "_pdf_snapshots"
     if not snap_dir.is_dir():
         return out
@@ -1010,9 +1035,8 @@ def collect_translations() -> dict:
             data = json.loads(fp.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if EXTRACTOR_VERSION is not None:
-            if data.get("extractor_version") != EXTRACTOR_VERSION:
-                continue    # 旧算法翻的 —— 不给平板看
+        if data.get("extractor_version") != EXTRACTOR_VERSION:
+            continue    # 旧算法翻的 —— 不给平板看
         pages: dict = {}
         for p in data.get("pages") or []:
             try:

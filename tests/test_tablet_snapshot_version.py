@@ -22,6 +22,9 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -82,6 +85,78 @@ def test_exporter_publishes_current_version_to_tablet():
         "导出器报给平板的版本跟实际抽取算法版本对不上"
     src = (REPO / "microbench" / "export_offline.py").read_text(encoding="utf-8")
     assert '"trans_ver"' in src, "种子数据里没有 trans_ver"
+
+
+def _export_as_script(out: Path) -> subprocess.CompletedProcess:
+    """像 build_apk.ps1 那样，以**脚本模式**跑导出器。"""
+    return subprocess.run(
+        [sys.executable, str(REPO / "microbench" / "export_offline.py"),
+         "--tablet", str(out), "--quiet"],
+        cwd=str(REPO), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=300,
+    )
+
+
+def test_exporter_as_script_can_resolve_extractor_version():
+    """⚠ 以**脚本模式**跑时，导出器必须能取到抽取算法版本。
+
+    这是个真实踩过的坑：`python microbench/export_offline.py` 时
+    `sys.path[0]` 是 `microbench/`，仓库根不在里面 →
+    `from microbench.paper_text import ...` ImportError
+    （paper_text.py 内部是相对导入，只能以包形式导入）→
+    被 `except` 吞掉 → **译文版本过滤整个不生效** →
+    旧算法翻的坏译文照样烤进平板单文件（正是「译文和原文对不上」那个老问题）。
+
+    失败得很安静，所以必须有这条护栏。
+    """
+    code = (
+        "import sys; sys.path.insert(0, %r); "
+        "import export_offline; "
+        "print('VER=', export_offline.current_extractor_version())"
+    ) % str(REPO / "microbench")
+    proc = subprocess.run([sys.executable, "-c", code], cwd=str(REPO),
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert "取不到抽取算法版本" not in (proc.stderr or ""), \
+        f"脚本模式下取不到抽取算法版本:\n{proc.stderr}"
+    assert proc.stdout.strip() == f"VER= {_cur_ver()}", \
+        f"脚本模式取到的版本不对: {proc.stdout.strip()!r}"
+
+
+def test_exporter_as_script_bakes_only_current_translations(tmp_path):
+    """端到端：脚本模式跑出来的单文件，trans_ver 要有值，且不含旧译文。"""
+    out = tmp_path / "tablet.html"
+    proc = _export_as_script(out)
+    assert proc.returncode == 0, f"导出失败:\n{proc.stdout[-800:]}\n{proc.stderr[-800:]}"
+    assert out.exists(), "导出器没有产出文件"
+
+    html = out.read_text(encoding="utf-8")
+    m = re.search(r'<script type="application/json" id="mb-data">(.*?)</script>', html, re.S)
+    assert m, "单文件里找不到种子数据"
+    data = json.loads(m.group(1).replace("<\\/", "</"))
+
+    assert data.get("trans_ver") == _cur_ver(), (
+        "单文件里没有 trans_ver（平板无法判断译文是不是旧的）—— "
+        f"实际是 {data.get('trans_ver')!r}")
+    assert "取不到抽取算法版本" not in (proc.stderr or ""), \
+        f"导出时没能取到抽取算法版本:\n{proc.stderr[-500:]}"
+
+    # 烤进去的每一份译文，都必须来自当前版本的快照
+    snap_dir = REPO / "logs" / "_pdf_snapshots"
+    baked = data.get("trans") or {}
+    if not snap_dir.is_dir():
+        return
+    for stem in baked:
+        fp = snap_dir / f"{stem}.json"
+        if not fp.exists():
+            continue
+        try:
+            d = json.loads(fp.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        assert d.get("extractor_version") == _cur_ver(), \
+            f"{stem} 是旧算法翻的，却被烤进了平板单文件"
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +287,30 @@ def test_merge_files_respects_version(tmp_path):
     merged = json.loads(text)
     assert [p["page_num"] for p in merged["pages"]] == [1, 2], \
         f"当前版本的译文没被合并: {merged['pages']}"
+
+
+def test_merge_files_keeps_content_when_both_sides_are_stale(tmp_path):
+    """两边都是旧版本时，不能把内容弄丢。
+
+    ⚠ 曾经的写法：`merged = dict(new) if ok(new) else dict(cur)` ——
+    两边都旧时永远选 `cur`。而「本机刚建立、还没有这份快照」时
+    `cur` 是空的 ⇒ 拉一次同步就把本机快照写成 **0 页**，
+    看着像「这篇没翻过」，其实是被合并逻辑吃掉了。
+    """
+    from microbench.app import _merge_snapshot_files
+
+    dst = tmp_path / "dst.json"      # 本机这边：还没有内容
+    src = tmp_path / "src.json"      # 云端来的一份旧快照
+    dst.write_text(json.dumps({"pages": []}, ensure_ascii=False), encoding="utf-8")
+    src.write_text(json.dumps(
+        _snap("p", ver=None, pages=[{"page_num": 1, "translation": "旧的"}]),
+        ensure_ascii=False), encoding="utf-8")
+
+    text = _merge_snapshot_files(dst, src)
+    assert text is not None, "旧快照被整个丢掉了"
+    merged = json.loads(text)
+    assert len(merged.get("pages") or []) == 1, \
+        "旧快照的内容被合并逻辑吃掉了（看着像「没翻过」）"
 
 
 # ---------------------------------------------------------------------------

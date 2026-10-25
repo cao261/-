@@ -669,7 +669,65 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 **教训**：两端各自「都做了版本检查」**不等于**规则一致 ——
 一个宽松一个严格，用户看到的结果就取决于**看的是哪一端**。
 跨端规则要**逐字对齐**，并且**用同一份行为级测试**锁住（本次：
-`tests/test_tablet_snapshot_version.py` 12 项 + `_test_tablet_hardening.js` 第 [13] 节 8 项）。
+`tests/test_tablet_snapshot_version.py` 15 项 + `_test_tablet_hardening.js` 第 [13] 节 8 项）。
+
+#### ⚠⚠ 导出版陷阱：`export_offline.py` **以脚本模式**跑时取不到版本
+
+**症状**：代码里明明写了「只烤当前版本的译文」，平板单文件里却还是躺着
+**旧的坏译文**（栏序反的），而且 `trans_ver` 是 `None`。
+
+**根因**：`export_offline.py` 两种跑法，`sys.path` 不一样：
+
+| 跑法 | `sys.path[0]` | `from microbench.paper_text import ...` |
+|---|---|---|
+| `python microbench/export_offline.py`（**脚本模式**） | `microbench/` | ❌ ImportError（仓库根不在 path 里） |
+| `python -m microbench.export_offline` | 仓库根 | ✅ |
+
+而 `paper_text.py` 内部用的是**相对导入**（`from .paper_fetcher import ...`），
+只能以包形式导入 —— **退化成 `import paper_text` 也不行**。
+
+**后果**：`except Exception: return None` → 取不到版本 → 版本过滤**整个不生效**
+→ 旧的坏译文照样烤进平板单文件。**失败得很安静**：没有报错、没有告警、
+所有测试都绿（因为测试跑的是 `import microbench.export_offline`，
+走的是**包模式**，包模式是好的！）。
+
+**修法**（`export_offline.py` 顶部）：
+
+```python
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+if str(REPO) not in sys.path:      # ← 脚本模式必须有这一步
+    sys.path.insert(0, str(REPO))
+```
+
+**配套纪律（三条，缺一不可）**：
+1. **取不到版本就 fail closed**：一份译文都不烤 + **往 stderr 喊一声**。
+   「宽松放行」在这里等于「把旧算法的坏译文发给用户」。
+2. **护栏必须跑在「出问题的那种跑法」上**：
+   `tests/test_tablet_snapshot_version.py::test_exporter_as_script_*`
+   用 `subprocess` 真的以脚本模式跑一遍导出器 ——
+   只在包模式下测，护栏是假的。
+3. **交付验收盯产物，不盯代码**：
+   `tests/test_apk_delivery.py` 直接拆 APK、读 `assets/index.html` 里的
+   种子，断言 `trans_ver == 当前版本` 且**没有一份旧译文的 key**。
+
+**通用教训**：`try: import X / except: return 默认值` 这种写法，
+在**默认值本身决定了对错**的地方（默认值=「放行」而不是「拒绝」），
+就是把错误藏起来的最佳位置。
+要么让失败**响**，要么让它**保守**（fail closed）——
+**不能又安静又宽松**。
+
+#### ⚠ 交付物不能被测试顺手改掉
+
+`_test_tablet_export.py` 原来会**重新导出到仓库根目录**那份
+`MicroBench_平板工作台.html`（交付物）。于是：
+「跑了一下导出测试」→ 交付物被换成新的 → 交付验收拿它跟 APK 里的
+`assets/index.html` 逐字节比对 → **必然不一致** → 验收红。
+（2026-10-25 被这个绊了两次。）
+
+→ **交付物只由构建脚本产出**（`android/build_apk.ps1` 导出一次，
+再 `Copy-Item` 到仓库根目录，保证两份**逐字节相同**）。
+测试一律导出到**临时文件**，不许碰交付物。
 
 ---
 

@@ -13,6 +13,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -36,21 +37,30 @@ def main() -> int:
     #   以前这个测试直接读仓库根目录里那份 HTML —— 那是上一次构建留下的
     #   旧产物。改了 app.js 却忘了重导出，测试照样全绿，交付给用户的
     #   却是老版本。测试必须对着**刚导出来的**东西说话。
-    print("[0] 重新导出平板工作台单文件")
+    #
+    # ⚠⚠ 导出到**临时文件**，不要覆盖仓库根目录那份产物。
+    #   根目录那份是**交付物**（用户直接用 Chrome 打开的，也是交付验收
+    #   拿来跟 APK 里内嵌的页面逐字节比对的参照物）。
+    #   测试去改它 ⇒ 别的套件/验收看到的就是「被测试动过手脚」的版本，
+    #   两份一比必然不一致（2026-10-25 实际被这个坑绊了两次）。
+    #   交付物只由构建脚本（android/build_apk.ps1）产出。
+    print("[0] 重新导出平板工作台单文件（到临时文件，不碰交付物）")
+    tmp_dir = tempfile.mkdtemp(prefix="mb_tablet_export_")
+    tmp_bundle = Path(tmp_dir) / BUNDLE.name
     ex = subprocess.run(
         [sys.executable, str(REPO / "microbench" / "export_offline.py"),
-         "--tablet", str(BUNDLE), "--quiet"],
+         "--tablet", str(tmp_bundle), "--quiet"],
         capture_output=True, text=True, encoding="utf-8")
     if ex.returncode != 0:
         print(f"  导出失败: {ex.stdout[-500:]} {ex.stderr[-500:]}")
         return 1
-    print(f"  已重新导出: {BUNDLE.name}")
+    print(f"  已重新导出: {tmp_bundle}")
 
-    if not BUNDLE.exists():
-        print(f"产物不存在: {BUNDLE}\n先跑: python microbench/export_offline.py --tablet")
+    if not tmp_bundle.exists():
+        print(f"产物不存在: {tmp_bundle}\n先跑: python microbench/export_offline.py --tablet")
         return 1
 
-    doc = BUNDLE.read_text(encoding="utf-8")
+    doc = tmp_bundle.read_text(encoding="utf-8")
 
     print("\n[1] 自包含: 不能依赖任何外部资源")
     ext = re.findall(r'(?:src|href)\s*=\s*["\'](?:https?:)?//[^"\']+', doc)

@@ -3858,7 +3858,18 @@ def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
     elif not (_snapshot_extractor_ok(cur) and _snapshot_extractor_ok(new)):
         # ⚠ 有一边是旧抽取算法翻出来的 —— 不能按页合并
         #   （合并会把坏的旧译文合回来，读取时的作废逻辑管不到）。
-        merged = dict(new) if _snapshot_extractor_ok(new) else dict(cur)
+        if _snapshot_extractor_ok(new):
+            merged = dict(new)
+        elif _snapshot_extractor_ok(cur):
+            merged = dict(cur)
+        else:
+            # ⚠⚠ 两边**都是**旧的 —— 别因为「都旧」就把内容丢了。
+            #   取**有内容**的那一份（本机刚建立、还没内容时，
+            #   旧写法会选中空的那份 → 拉一次同步就把本机快照写成 0 页，
+            #   看着像「这篇没翻过」，其实是被合并逻辑吃掉了）。
+            #   留着旧内容不危险：桌面端读取时会整份作废重翻，
+            #   平板端有版本闸门也会拒用 —— 它们都看版本，不看有没有内容。
+            merged = dict(new) if new.get("pages") else dict(cur)
     else:
         pages: dict = {}
         for src_pages in ((cur or {}).get("pages") or [], new.get("pages") or []):

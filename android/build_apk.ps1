@@ -51,6 +51,16 @@ if ($LASTEXITCODE -ne 0) { throw "导出失败" }
 $assetSize = [math]::Round((Get-Item "$Build\assets\index.html").Length / 1MB, 2)
 Write-Host "  assets/index.html  $assetSize MB"
 
+# 1b) 仓库根目录那份（用户直接用 Chrome 打开的那份）必须与 APK 里内嵌的
+#     **逐字节相同** —— 交付验收就是比对这两份。
+#
+#     ⚠ 不能「再导出一次」：两次导出之间 vault 可能变（笔记被改、翻译被重翻），
+#       出来的字节就不一样了 ⇒ 验收永远红。
+#     ⇒ 导出**一次**，然后直接复制。
+$RepoBundle = Join-Path $Repo "MicroBench_平板工作台.html"
+Copy-Item "$Build\assets\index.html" $RepoBundle -Force
+Write-Host "  同步到 $RepoBundle"
+
 # 2) 图标
 Write-Host "  生成图标..."
 & python (Join-Path $Root "_make_icons.py")

@@ -152,15 +152,50 @@ def test_bundle_in_apk_matches_repo_copy():
 
 
 def test_translations_are_baked_in(parts):
-    """译文要真的烤进单文件（没连云盘也得有译文）。"""
+    """译文要真的烤进单文件（没连云盘也得有译文），且**绝不能混进旧算法的坏译文**。
+
+    ⚠ 为什么这么严：旧抽取算法翻出来的译文是**坏的**（栏序可能整个反过来）——
+    用户看到的就是「译文和原文对不上」。宁可一份译文都没有，也不能给错的。
+    所以判据不是「有译文就行」，而是「**只有当前版本的**译文」。
+    """
     html, _dex, _exporter = parts
     m = re.search(r'<script type="application/json" id="mb-data">(.*?)</script>',
                   html, re.S)
     assert m, "找不到种子数据"
     data = json.loads(m.group(1).replace("<\\/", "</"))
     trans = data.get("trans") or {}
-    assert trans, "单文件里没有译文 —— 没连云盘时就只有原文了"
-    assert sum(len(v) for v in trans.values()) > 0, "译文是空的"
+
+    # ⚠ 必须带当前抽取算法版本 —— 平板靠它判断云盘上的译文是不是旧的
+    try:
+        from microbench.paper_text import EXTRACTOR_VERSION
+    except Exception:
+        EXTRACTOR_VERSION = None
+    if EXTRACTOR_VERSION is not None:
+        assert data.get("trans_ver") == EXTRACTOR_VERSION, (
+            "单文件里没有 trans_ver（或对不上）—— 平板会把旧算法翻的坏译文当成好的。"
+            f"实际 trans_ver={data.get('trans_ver')!r}，当前版本={EXTRACTOR_VERSION!r}")
+
+    # 磁盘上「当前版本」的译文必须都烤进去；「旧版本」的一份都不许有
+    snap_dir = REPO / "logs" / "_pdf_snapshots"
+    if snap_dir.is_dir():
+        current, stale = [], []
+        for fp in snap_dir.glob("*.json"):
+            try:
+                d = json.loads(fp.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if d.get("extractor_version") == EXTRACTOR_VERSION:
+                current.append(fp.stem)
+            else:
+                stale.append(fp.stem)
+        if current:
+            assert trans, "有当前版本的译文，却一份都没烤进单文件"
+            for stem in current:
+                assert stem in trans, f"当前版本的译文没烤进去: {stem}"
+        for stem in stale:
+            assert stem not in trans, \
+                f"旧抽取算法翻的坏译文被烤进了单文件: {stem}"
+
     assert len(data.get("pdfs") or {}) >= 20, "PDF 清单不全"
     assert len(data.get("notes") or []) >= 20, "笔记不全"
 
