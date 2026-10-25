@@ -1347,7 +1347,11 @@ def _clean_table_markdown(raw: str) -> str:
 
 async def _read_table_vision(pdf_path, page: int, rect: tuple,
                              model: str = "") -> str:
-    """裁图 → 多模态模型抄表 → 返回 Markdown。失败抛异常（由调用方兜底）。"""
+    """裁图 → 多模态模型抄表 → 返回 Markdown。失败抛异常（由调用方兜底）。
+
+    model：用户在前端手动选的模型。**必须跟着走** —— 正文用新模型、表格用
+    旧模型会让人以为"换模型没生效"（2026-10-25 独立审查）。
+    """
     import base64
     png = await asyncio.to_thread(_pdf_clip_png, pdf_path, page, rect, 4.0)
     b64 = base64.b64encode(png).decode("ascii")
@@ -1356,6 +1360,7 @@ async def _read_table_vision(pdf_path, page: int, rect: tuple,
         {"type": "image_url",
          "image_url": {"url": f"data:image/png;base64,{b64}"}},
     ]
+    m_name, m_fallback, _cache_key = _resolve_translation_model(model)
     raw = await asyncio.to_thread(
         llm.chat,
         messages=[
@@ -1366,7 +1371,8 @@ async def _read_table_vision(pdf_path, page: int, rect: tuple,
         temperature=0.0,
         timeout=180,
         disable_thinking=llm.translation_disable_thinking(),
-        model_name=llm.translation_model_name() or None,
+        model_name=m_name or llm.translation_model_name() or None,
+        force_fallback=m_fallback,
     )
     return _clean_table_markdown(raw)
 
@@ -1483,7 +1489,9 @@ async def api_formula_image(
     try:
         png = _pdf_clip_png(pdf_path, page, (x0, y0, x1, y1), scale)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        msg = str(e)
+        code = 404 if "页码越界" in msg else 400
+        raise HTTPException(status_code=code, detail=msg)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"公式裁图失败: {e}")
 
@@ -3082,22 +3090,28 @@ async def api_translate_page(req: TranslatePageRequest):
             pdf_path = None
             pass  # 取不到就用客户端传来的文本
 
-    # 表格：文本层抽出来的表格是碎的（数值会整行错位），改成裁图让多模态
-    # 模型逐格抄。抄好的表格在翻译完成后按位置拼回去。
-    table_map: dict[str, str] = {}
-    if pdf_path is not None and "⟦TABLE:" in page_text:
-        page_text, table_map = await _prepare_tables(page_text, pdf_path, req.page)
-
     # Cache key includes paper_id + page so each page is cached independently.
     # 缓存键里还带文本哈希（见 translation.TranslationCache._key_for），
     # 换用更好的抽取文本后会自动 miss，不会命中旧的坏结果。
     cache_section_key = f"page:{req.paper_id}:{req.page}"
 
+    # ⚠️ 顺序很重要：**先查缓存，再做表格读图**（2026-10-25 独立审查）。
+    # 表格读图每张要 10~30 秒 + 一次多模态调用；放在缓存查询之前的话，
+    # 缓存命中也得先花这个钱和时间 —— 含表格的页等于缓存完全失效。
+    # 缓存键用**原始** page_text 的哈希（表格标记替换前后保持一致），
+    # 否则存和取会用不同的文本哈希，缓存永远 miss。
+    cache_text = page_text
     if not req.force:
-        cached = cache.get(cache_section_key, page_text, model)
+        cached = cache.get(cache_section_key, cache_text, model)
         if cached:
             cached["from_cache"] = True
             return cached
+
+    # 表格：文本层抽出来的表格是碎的（数值会整行错位），改成裁图让多模态
+    # 模型逐格抄。抄好的表格在翻译完成后按位置拼回去。
+    table_map: dict[str, str] = {}
+    if pdf_path is not None and "⟦TABLE:" in page_text:
+        page_text, table_map = await _prepare_tables(page_text, pdf_path, req.page)
 
     # Translate the whole page in one shot (page text is already < 15K chars)
     # If somehow larger, chunk and translate parts.
@@ -3169,13 +3183,17 @@ async def api_translate_page(req: TranslatePageRequest):
     # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
     translation = sanitize_translation(merge_translation_parts(translated_parts))
     # 把多模态抄好的表格拼回译文（位置由 ⟦TABLE_n⟧ 标记决定）
+    # 拼回译文时前后补空行：模型如果把标记写在句中，Markdown 表格会被插进
+    # 段落中间，前端的表格解析会把这一行前面的正文吞成表头第一格
+    # （2026-10-25 独立审查）。
     if table_map:
         for token, md in table_map.items():
             if token in translation:
-                translation = translation.replace(token, md)
+                translation = translation.replace(token, f"\n\n{md}\n\n")
             elif md and "未能读出" not in md:
                 # 模型偶尔会把标记弄丢 → 兜底：漏掉的表格追加到译文末尾，绝不丢内容
                 translation = f"{translation}\n\n{md}" if translation else md
+    translation = re.sub(r"\n{3,}", "\n\n", translation).strip()
     if not translation:
         raise HTTPException(
             status_code=502,
@@ -3248,9 +3266,9 @@ async def api_translate_page(req: TranslatePageRequest):
         "translated_chunks": len(translated_parts),
         "stopped_reason": stopped_reason,
     }
-    # 缓存写入必须用与读取时完全一致的文本（page_text），否则哈希对不上，
-    # 缓存永远不命中。
-    cache.put(cache_section_key, page_text, model, result)
+    # 缓存写入必须用与读取时完全一致的文本（cache_text = 替换表格标记**之前**
+    # 的原始文本），否则哈希对不上，缓存永远不命中。
+    cache.put(cache_section_key, cache_text, model, result)
     return result
 
 

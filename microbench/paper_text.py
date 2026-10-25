@@ -357,7 +357,8 @@ _Y_BANDS = 60       # y 方向分带数（用于定位双栏起始位置）
 #
 # 2026-10-24: 2（公式改用坐标 + 边界吸附）
 # 2026-10-25: 3（表格整块改成"多模态读图"标记）
-EXTRACTOR_VERSION = 3
+# 2026-10-25: 4（裁剪框夹到页内 —— 越界会让整组正文消失）
+EXTRACTOR_VERSION = 4
 
 # pdfplumber 无法解码的字符会输出成 "(cid:12)" 这种占位符。
 _CID_RE = re.compile(r"\(cid:\d+\)")
@@ -1054,6 +1055,38 @@ def _looks_like_body_text(bw, x_mid: float) -> bool:
     return bodyish(left) and bodyish(right)
 
 
+def _band_is_table_like(bw, x_mid: float) -> bool:
+    """这一带像不像表格行（可以并进表格区域）。
+
+    表格区域**只能由这样的带延续**（2026-10-25 独立审查发现 13 处
+    表格区域把正文也吞了进去）：表题后面如果跟着一段"短"正文
+    （左右栏各不到 8 个词 → _looks_like_body_text 判不出来），
+    区域就会一直延伸，把那几段正文从正文里删掉，还当成表格让多模态
+    "逐格抄" —— 正文就这么消失了。
+    → 区域收尾看的是「像不像表格行」，不是「像不像正文」。
+
+    表格行的样子：**词很短、含数字、没有像英文单词的东西**
+    （"BaTiO3 PZT-5 PZNPT 2605"）。正文段落的词是长单词
+    （"the following parameters"），表格行里没有。
+
+    判"像英文单词"不能只看字母数：**材料名也是长词**
+    （BaTiO3 / Terfenol-D / PZNPT），所以再看**是否以小写为主**
+    （真英文单词大多是小写，材料名是大小写混排）。
+    """
+    if _looks_like_body_text(bw, x_mid):
+        return False
+    txt = " ".join(w["text"] for w in bw)
+    prose_words = 0
+    for w in re.findall(r"[A-Za-z]{4,}", txt):
+        low = sum(1 for c in w if c.islower())
+        if low >= len(w) * 0.6:
+            prose_words += 1
+    if prose_words >= 4:
+        return False          # 有像英文单词的东西 → 是正文
+    digits = sum(1 for w in bw if any(ch.isdigit() for ch in w["text"]))
+    return digits >= 1
+
+
 # 论文里的表格必有表题（"Table I. Properties of ..." / "TABLE 2" / "表 1"）。
 # **用表题定位表格**，而不是用"有很多数字"—— 公式行也全是数字
 # （"a ¼ 33 31 (2)"），按数字判会把公式当表格（实测 eq (2)/(3) 被误判）。
@@ -1062,41 +1095,65 @@ _TABLE_CAPTION_RE = re.compile(
     r"([0-9]+|[ivxlc]+|[A-Z])?\s*[.):、]?", re.IGNORECASE)
 
 
-def _find_table_regions(bands, x_mid: float, max_gap: float = 16.0):
+def _numeric_rows(bw) -> int:
+    """这一带里有几行是"数字行"（含 3 个以上数字的短词）。"""
+    n = 0
+    for w in bw:
+        if sum(1 for c in w["text"] if c.isdigit()) >= 3:
+            n += 1
+    return n
+
+
+def _find_table_regions(bands, x_mid: float, max_gap: float = 16.0,
+                        min_bands: int = 2, min_numeric: int = 2):
     """找出页面上的表格区域。
 
-    返回 [[(y0, y1, bw), ...], ...]（每个区域 = 表题带 + 往下连续的表体带）。
+    返回 [[(y0, y1, bw), ...], ...]（每个区域 = 连续的若干"表状带"）。
 
-    判据：
-      - 起点是**表题带**（文本以 "Table N." / "表 N" 开头）；
-      - 往下收连续的「表状带」（不是正文 + 含好几个数字），
-        带之间的空隙不超过 max_gap；
-      - 区域里至少要有一行数字行（否则只是图注）。
+    判据：**连续的表状带**（词短、含数字、没有像英文单词的东西），
+    至少 2 带、其中至少 2 带是数字行。
+
+    为什么不用"表题"定位（2026-10-25 独立审查后改）：
+      - 表题常常不在带首（带高 ~20pt，一条带塞两行）→ 覆盖率只有 2/43；
+      - 改成"表状行成段"后，表的**行**本身（"d 31(pC/N) 90 175 ..."）
+        才是可靠的信号。
+      - 表题所在的带不算"表状带"（表题是长单词）→ 表题**留在正文里**，
+        由主模型翻译；图片里只有表体，不会重复。
     """
     regions: list[list] = []
-    i = 0
-    while i < len(bands):
-        kind, gy0, gy1, bw = bands[i]
-        txt = " ".join(w["text"] for w in bw)
-        if not _TABLE_CAPTION_RE.match(txt):
-            i += 1
-            continue
-        reg = [(gy0, gy1, bw)]
-        j = i + 1
-        prev = gy1
-        while j < len(bands):
-            k2, y0, y1, b2 = bands[j]
-            if _looks_like_body_text(b2, x_mid) or y0 - prev > max_gap:
-                break
-            reg.append((y0, y1, b2))
-            prev = y1
-            j += 1
-        numeric = sum(
-            1 for (_, _, b) in reg
-            if sum(1 for w in b if any(ch.isdigit() for ch in w["text"])) >= 3)
-        if len(reg) >= 2 and numeric >= 1:
-            regions.append(reg)
-        i = j
+    cur: list = []
+    prev_y1 = None
+    prev_band = None      # 上一个带（用来把表题并进区域）
+
+    def _numeric_count(reg):
+        return sum(1 for (_, _, bw) in reg if _numeric_rows(bw) >= 1)
+
+    def _close(cur_reg):
+        """收尾一个区域。
+
+        表题（"Table I. Properties of ..."）**不进区域** —— 它留在正文里，
+        由主模型翻译；图片里只有表体。两者不重复。
+        """
+        if not cur_reg:
+            return None
+        if len(cur_reg) >= min_bands and _numeric_count(cur_reg) >= min_numeric:
+            return cur_reg
+        return None
+
+    for kind, gy0, gy1, bw in bands:
+        table_like = _band_is_table_like(bw, x_mid)
+        if table_like and cur and prev_y1 is not None and gy0 - prev_y1 <= max_gap:
+            cur.append((gy0, gy1, bw))
+        else:
+            closed = _close(cur)
+            if closed:
+                regions.append(closed)
+            cur = [(gy0, gy1, bw)] if table_like else []
+        prev_y1 = gy1
+        prev_band = (kind, gy0, gy1, bw)
+    closed = _close(cur)
+    if closed:
+        regions.append(closed)
     return regions
 
 
@@ -1139,6 +1196,10 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
     groups = []   # [kind, y0, y1]
     for kind, gy0, gy1, bw in bands:
         if (round(gy0, 2), round(gy1, 2)) in table_bands:
+            # ⚠️ 必须**打断合并链**：否则前后两个同类型的带会被并成一个大组，
+            # 整宽裁剪又把中间的表格行捞回正文（表格既在图里又在文字里，
+            # 重复且模型照样会乱对齐）。
+            groups.append(["__table__", gy0, gy1])
             continue
         if groups and groups[-1][0] == kind:
             groups[-1][2] = gy1
@@ -1154,8 +1215,10 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
     table_mode = False
     try:
         for kind, gy0, gy1 in groups:
+            if kind == "__table__":
+                continue          # 表格区域：整块换成"多模态读图"标记，不走正文
             bw = [w for w in words if gy0 <= w["top"] < gy1]
-            if table_mode and not _looks_like_body_text(bw, x_mid):
+            if table_mode and _band_is_table_like(bw, x_mid):
                 # 表格的表体：整宽抽，行不被栏缝劈开。
                 # 为什么必须整宽：跨栏表格的行被栏缝切成两半后，
                 # 压在栏缝上的数字还会被切碎（"1350" → "13" + "350"），

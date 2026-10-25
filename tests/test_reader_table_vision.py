@@ -61,8 +61,13 @@ def test_markers_survive_the_page_tail_trim():
     """
     text = _page_text(2)
     from microbench import paper_text as pt
-    # 页面末尾的标记必须完整
-    assert "⟦TABLE:28.2,639.4,536.3,754.1⟧" in text, "页尾的表格标记被截断了"
+    # 页面末尾的表格标记必须完整（半截标记 → 多模态读不到 → 整张表丢失）
+    marks = pt.TABLE_MARKER_RE.findall(text)
+    assert marks, "第 2 页没有表格标记"
+    assert text.count("⟦TABLE:") == len(marks), "有半截的表格标记（页尾截尾切坏了）"
+    for m in marks:
+        x0, y0, x1, y1 = (float(v) for v in m)
+        assert x1 > x0 and y1 > y0, f"表格坐标无效: {m}"
     # 标记内部的小数点不能被当成切点
     trimmed = pt._trim_page_tail("正文。\n\n⟦TABLE:1.5,2.5,3.5,4.5⟧")
     assert trimmed.endswith("⟧"), f"标记被页尾截断切坏了: {trimmed!r}"
