@@ -67,7 +67,9 @@ from .plot_compare import (
     compute_metrics,
     _parse_csv_points,
 )
-from .paper_text import fetch_full_text, split_into_sections, extract_text_from_pdf
+from .paper_text import (fetch_full_text, split_into_sections,
+                          extract_text_from_pdf, extract_page_text_with_glyphs)
+from . import glyphs as glyphs_mod
 from . import lan as lan_helpers
 from .lan import resolve_token as _resolve_lan_token
 
@@ -719,6 +721,35 @@ def translation_model_choices() -> list[dict]:
             "custom": True,
         })
     return out
+
+
+async def _resolve_page_glyphs(text: str, glyphs: list, pdf_source, page_no: int,
+                               model: str = "") -> str:
+    """把文本里的 ⟦G:n⟧ 换成真实符号（× ≈ ≥ …），认不出来的退回 "[?]"。
+
+    为什么需要：TeX 数学字体在 PDF 里没有 ToUnicode 映射，pdfplumber 解不出来
+    （2026-10-25 用户反馈："有 × 的它都显示成个？"）。
+    这些字形在 PDF 里是画出来的 → 裁一小块图让多模态认字，认一次存进词典，
+    之后查表即可（零成本、跨论文复用）。
+
+    词典放 vault/logs/glyph_dict.json → 两台设备通过坚果云共用一份。
+    """
+    if not text or not glyphs:
+        return text
+    m_name, m_fallback, _cache_key = _resolve_translation_model(model)
+    try:
+        return await glyphs_mod.resolve_glyphs(
+            text, glyphs, pdf_source, page_no,
+            model_name=m_name or None, force_fallback=m_fallback,
+            dict_path=GLYPH_DICT_PATH,
+        )
+    except Exception as e:
+        print(f"[MicroBench] 符号解析失败（退回 [?]）: {e}", file=sys.stderr)
+        return glyphs_mod.strip_markers(text)
+
+
+# 符号词典：字形 → 符号 的缓存。放 vault/logs 下（坚果云会同步，两台设备共用）
+GLYPH_DICT_PATH = Path(BASE_DIR) / "logs" / "glyph_dict.json"
 
 
 @app.get("/api/llm/translation_models")
@@ -1859,6 +1890,12 @@ async def api_upload_pdf(
     if not pages:
         raise HTTPException(status_code=400, detail="未能从 PDF 中识别出有效文字 (可能是扫描图片版 PDF)")
 
+    # 解不出的数学符号（× ≈ ≥ …）：裁图让多模态认字，章节视图也能看到真符号
+    for _p in pages:
+        if _p.get("glyphs"):
+            _p["text"] = await _resolve_page_glyphs(
+                _p["text"], _p["glyphs"], pdf_bytes, _p["page"])
+
     sections = split_into_sections(pages)
     if not sections:
         full_text = "\n\n".join(p["text"] for p in pages)
@@ -1981,6 +2018,12 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
 
     if not pages:
         raise HTTPException(status_code=400, detail="未能从 PDF 中识别出有效文字 (可能是扫描图片版 PDF)")
+
+    # 解不出的数学符号（× ≈ ≥ …）：裁图让多模态认字，章节视图也能看到真符号
+    for _p in pages:
+        if _p.get("glyphs"):
+            _p["text"] = await _resolve_page_glyphs(
+                _p["text"], _p["glyphs"], pdf_bytes, _p["page"])
 
     sections = split_into_sections(pages)
     if not sections:
@@ -3186,11 +3229,14 @@ async def api_translate_page(req: TranslatePageRequest):
     if req.relative_path:
         try:
             from .generator import BASE_DIR, _safe_path
-            from .paper_text import extract_page_text_from_path
             pdf_path = _safe_path(BASE_DIR, req.relative_path)
-            extracted = extract_page_text_from_path(pdf_path, req.page)
+            extracted, page_glyphs = extract_page_text_with_glyphs(pdf_path, req.page)
             if extracted and len(extracted.strip()) >= 100:
                 page_text = extracted
+                # 解不出的数学符号（× ≈ ≥ …）→ 裁图让多模态认字
+                if page_glyphs:
+                    page_text = await _resolve_page_glyphs(
+                        page_text, page_glyphs, pdf_path, req.page, req.model)
         except Exception:
             pdf_path = None
             pass  # 取不到就用客户端传来的文本

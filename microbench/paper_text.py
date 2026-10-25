@@ -193,15 +193,20 @@ def _classify_title_to_section(title: str) -> Optional[str]:
 def extract_text_from_pdf(pdf_bytes: bytes) -> list[dict]:
     """
     Extract per-page text from a PDF using pdfplumber.
-    Returns list of {page: int, text: str}.
+    Returns list of {page: int, text: str, glyphs: list}.
+
+    glyphs：本页「解不出的字符」清单（解出来的那些不在里面）。
+    文本里对应的位置是 ⟦G:<下标>⟧ 标记 —— 服务端拿 glyphs 去裁图，
+    交给多模态模型认字（× ≈ ≥ 这些符号文本层解不出来，字形却是画出来的）。
     """
     pages = []
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for i, page in enumerate(pdf.pages, start=1):
-                text = _extract_page_text(page)
-                pages.append({"page": i, "text": text})
+                glyphs: list = []
+                text = _extract_page_text(page, glyphs)
+                pages.append({"page": i, "text": text, "glyphs": glyphs})
     except ImportError:
         # pdfplumber not installed — fall back to pypdf
         try:
@@ -209,7 +214,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> list[dict]:
             reader = PdfReader(io.BytesIO(pdf_bytes))
             for i, page in enumerate(reader.pages, start=1):
                 text = page.extract_text() or ""
-                pages.append({"page": i, "text": text})
+                pages.append({"page": i, "text": text, "glyphs": []})
         except ImportError:
             raise RuntimeError(
                 "PDF 文本提取需要 pdfplumber 或 pypdf。请运行 "
@@ -242,10 +247,32 @@ def extract_page_text_from_path(pdf_path, page_no: int) -> str:
         return _trim_page_tail(_extract_page_text(pdf.pages[page_no - 1]))
 
 
+def extract_page_text_with_glyphs(pdf_path, page_no: int) -> tuple[str, list]:
+    """抽一页文本，并一并返回本页「解不出的字符」清单。
+
+    返回 (text, glyphs)：
+      - text 里解不出的字符是 ⟦G:<下标>⟧ 标记（下标 = glyphs 的下标）
+      - glyphs 每项含 font / cid / 坐标，服务端据此裁图让多模态认字
+
+    给「按页翻译」和「章节翻译」用：翻译前先把标记换成真实符号，
+    模型看到的才是 "500 × larger" 而不是 "500 [?] larger"。
+    """
+    glyphs: list = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(pdf_path)) as doc:
+            if page_no < 1 or page_no > len(doc.pages):
+                return "", glyphs
+            text = _extract_page_text(doc.pages[page_no - 1], glyphs)
+    except Exception:
+        return "", glyphs
+    return text, glyphs
+
+
 _PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
 _SENTENCE_END_RE = re.compile(r"[.!?。！？]")
 # 抽取层插入的标记（公式/表格）。页尾截断必须避开它们内部的小数点。
-_MARKER_RE = re.compile(r"⟦(?:FORMULA|TABLE):[^⟧\n]*⟧")
+_MARKER_RE = re.compile(r"⟦(?:FORMULA|TABLE):[^⟧\n]*⟧|⟦G:\d+⟧")
 # 末尾残片最多砍掉这么多字符，防止整页没有句号时把大半页都砍掉。
 _MAX_TAIL_TRIM_CHARS = 1500
 
@@ -358,13 +385,99 @@ _Y_BANDS = 60       # y 方向分带数（用于定位双栏起始位置）
 # 2026-10-24: 2（公式改用坐标 + 边界吸附）
 # 2026-10-25: 3（表格整块改成"多模态读图"标记）
 # 2026-10-25: 4（裁剪框夹到页内 —— 越界会让整组正文消失）
-EXTRACTOR_VERSION = 4
+# 2026-10-25: 5（解不出的数学符号带锚点标记 → 服务端"看图认字"）
+EXTRACTOR_VERSION = 5
 
 # pdfplumber 无法解码的字符会输出成 "(cid:12)" 这种占位符。
-_CID_RE = re.compile(r"\(cid:\d+\)")
+# （有捕获组：符号认字要拿到字符号；.sub() 的用法不受影响）
+_CID_RE = re.compile(r"\(cid:(\d+)\)")
 # 连续多个 cid 通常是一整段公式/符号（一次能抽出十几个），
 # 逐个替换会让译文里出现 "[?][?][?][?][?][?][?][?]" 这种刷屏。
 _CID_RUN_RE = re.compile(r"(?:\(cid:\d+\)[ \t]*){2,}")
+
+# 解不出的字符在文本里的占位标记：⟦G:<序号>⟧
+# 序号 = 该字符在「本页未解出字符表」里的下标（表按 page.chars 的内容流顺序排，
+# 同一份 PDF 任何时候算出来都一样）。
+#
+# 为什么不用 "[?]": 那是**放弃**的标记 —— 用户看到 "500 [?] larger" 根本读不出
+# 那是乘号。而这些符号（× ≈ ≥ ≤ …）在 PDF 里是**有字形的**，只是 TeX 数学字体
+# 缺 ToUnicode 映射、pdfplumber 解不出来。标记带下标后，服务端可以：
+#   ① 按坐标裁出这个字形 → ② 交给多模态模型认字 → ③ 存进「符号词典」缓存
+# 之后同一形状的符号直接查表，零成本、零模型调用。
+#
+# 注意：**绝不能把 "(cid:N)" 原样交给文本模型** —— 它会把 cid 猜成
+# \approx / \times，编出论文里根本没有的公式（2026-10-25 实测事故）。
+GLYPH_MARKER_RE = re.compile(r"⟦G:(\d+)⟧")
+
+
+def _unknown_glyphs(page) -> list[dict]:
+    """本页里 pdfplumber 解码失败的字符。
+
+    顺序 = page.chars 的内容流顺序（不排序！）—— 因为 page.chars 与
+    page.extract_text() 的字符顺序一致，排序会破坏这种对应。
+
+    每条记录：
+        font   字体名（含子集标签，如 "KOGOBA+AdvP4C4E74"）
+        cid    pdfplumber 给的字符号
+        x0/x1/top/bottom  页面坐标（用来裁图 + 认字）
+    """
+    out: list[dict] = []
+    try:
+        chars = page.chars
+    except Exception:
+        return out
+    for ch in chars:
+        t = ch.get("text") or ""
+        m = _CID_RE.match(t)
+        if not m:
+            continue
+        out.append({
+            "font": ch.get("fontname") or "",
+            "cid": m.group(1),
+            "x0": float(ch.get("x0", 0.0)),
+            "x1": float(ch.get("x1", 0.0)),
+            "top": float(ch.get("top", 0.0)),
+            "bottom": float(ch.get("bottom", 0.0)),
+        })
+    return out
+
+
+def _mark_glyph_words(words, glyphs) -> list[dict]:
+    """把 word 文本里的 "(cid:N)" 换成带锚点的标记 ⟦G:<下标>⟧。
+
+    怎么把 word 里的 cid 对回具体字形？靠**位置**：字形的 x 区间落在 word 的
+    x 区间内、top 与 word 同行 → 唯一匹配。word 里有多个 cid 时按 x 顺序
+    一一对应（pdfplumber 的 word 内部也是按 x 排的）。
+
+    匹配不上就保持原样 → 后面 _clean_cid_markers 兜成 "[?]"（宁可空着，
+    也不能指错字形 —— 指错了等于编造）。
+    """
+    if not glyphs:
+        return words
+    for w in words:
+        t = w.get("text") or ""
+        if "(cid:" not in t:
+            continue
+        wx0 = float(w.get("x0", 0.0))
+        wx1 = float(w.get("x1", 0.0))
+        wtop = float(w.get("top", 0.0))
+        # 这个 word 覆盖到的字形（按 x 排）
+        cand = [i for i, g in enumerate(glyphs)
+                 if g["x0"] >= wx0 - 3.0 and g["x1"] <= wx1 + 3.0
+                 and abs(g["top"] - wtop) <= 3.0]
+        cand.sort(key=lambda i: glyphs[i]["x0"])
+        out: list[str] = []
+        pos = 0
+        for k, m in enumerate(_CID_RE.finditer(t)):
+            out.append(t[pos:m.start()])
+            if k < len(cand):
+                out.append(f"⟦G:{cand[k]}⟧")
+            else:
+                out.append("[?]")
+            pos = m.end()
+        out.append(t[pos:])
+        w["text"] = "".join(out)
+    return words
 
 
 def _clean_cid_markers(text: str) -> str:
@@ -415,12 +528,16 @@ def _longest_gap(cover, lo: int, hi: int):
     return best_a, best_len
 
 
-def _extract_page_text(page) -> str:
+def _extract_page_text(page, out_glyphs: Optional[list] = None) -> str:
     """
     抽取单页文本，按阅读顺序排列：整宽区域(标题/摘要) -> 左栏 -> 右栏。
     任何一步检测不可靠都退回 pdfplumber 的普通抽取（只是空格仍然修好）。
+
+    out_glyphs：出参。传入一个 list，本页解不出的字符会按顺序 append 进去
+    （含坐标），服务端拿它把 ⟦G:n⟧ 认成真实符号。
     """
-    return _mark_broken_formulas(_clean_cid_markers(_extract_page_text_raw(page)))
+    return _mark_broken_formulas(
+        _clean_cid_markers(_extract_page_text_raw(page, out_glyphs)))
 
 
 # 公式碎片的标记。送给模型前先把碎公式整段替换成它，模型照抄即可。
@@ -464,15 +581,16 @@ def _is_mathish_line(line: str) -> bool:
         return False
     if len(s) > 200:
         return False
-    # (cid:N) 是 PDF 无法解码的符号占位符，不是"词"
+    # (cid:N) / ⟦G:n⟧ 是 PDF 无法解码的符号占位符，不是"词"
     probe = re.sub(r"\(cid:\d+\)", " ", s)
+    probe = GLYPH_MARKER_RE.sub(" ", probe)
     wordish = re.findall(r"(?<![A-Za-z])[A-Za-z]{3,}(?![A-Za-z])", probe)
     if len(wordish) >= 2:
         return False          # 正文，不碰
     if _RELATION_RE.search(s):
         # 有关系符号 → 是公式（长度上限放宽，公式行可以很长）
         return len(s) <= 160
-    if "(cid:" in s or "[?]" in s:
+    if "(cid:" in s or "[?]" in s or GLYPH_MARKER_RE.search(s):
         return True
     # 纯符号行："− ×"、"Z−∞"、"∞"、"× −" —— 公式的积分上下限、乘号残留。
     # 这类行不含 4 字母词，但也不含数字/括号，很容易被当成正文，
@@ -503,7 +621,7 @@ def _mark_broken_formulas(text: str) -> str:
     "=" 和 "[?]" 往往不在同一行 —— 所以按「连续的公式碎片行」成段判定：
     段里同时出现 [?] 和关系符号，才整段替换。
     """
-    if not text or "[?]" not in text:
+    if not text or ("[?]" not in text and not GLYPH_MARKER_RE.search(text)):
         return text
     lines = text.split("\n")
 
@@ -526,7 +644,16 @@ def _mark_broken_formulas(text: str) -> str:
         if len(run) > 10:
             continue
         seg = "\n".join(lines[i] for i in run)
-        if "[?]" in seg and _RELATION_RE.search(seg):
+        has_unk = ("[?]" in seg) or bool(GLYPH_MARKER_RE.search(seg))
+        # 关系符号可能自己也是解不出的字符（数学字体里 "=" 就是），
+        # 所以除了"有字面关系符号"，还要看**这行像不像公式**
+        # （_is_mathish_line：没有 ≥2 个长词 + 带未解出符号 → 公式行）。
+        # 必须**逐行**判：_is_mathish_line 对超过 200 字符的整段直接返回 False，
+        # 而公式块往往就是一大段（实测某数学页一整段公式 600+ 字符）。
+        # 正文里的行内符号（"up to 500× larger than any other ME materials"
+        # 有很多长词）不会被误判成公式。
+        any_mathish = any(_is_mathish_line(lines[i]) for i in run)
+        if has_unk and (_RELATION_RE.search(seg) or any_mathish):
             drop.update(run)
 
     if not drop:
@@ -765,8 +892,105 @@ def _formula_spans(lines: list[dict], attached: list[bool]) -> list[tuple[int, i
     return out
 
 
-def _lines_to_text(lines: list[dict], mark_formulas: bool = True) -> str:
-    """把文本行拼成整段文本，并把公式块换成带坐标的标记。"""
+def _mark_line_glyphs(line: dict, glyphs: list) -> str:
+    """把一行文本里的 "(cid:N)" 换成带锚点的标记 ⟦G:<下标>⟧。
+
+    怎么对回具体字形：字形的 x 区间落在这一行里、且垂直方向落在**行的带内**
+    （含上下标）→ 唯一匹配。
+
+    注意：**不能拿字形的 top 直接跟行的 top 比**（容差 4pt 就够）——
+    数学公式里的上下标、分数线高度差很多，按 top 比会一个都匹配不上
+    （实测某数学页 632 个 cid 一个都没标上）。判据改成"落在行的垂直带内"。
+
+    **只有孤立符号才给锚点**：连续的 cid（中间只隔空格）是一整块东西
+    （公式碎片 / 参考文献编号 "[12]"），旧行为把它们折叠成**一个** "[?]"——
+    文本不膨胀、模型也不会被灌几百个标记。折叠成整块的那些保持旧行为。
+
+    对不上就留 "[?]"，**宁可空着也不能指错**（指错等于编造）。
+    """
+    text = line.get("text") or ""
+    if "(cid:" not in text:
+        return text
+    lx0 = float(line.get("x0", 0.0))
+    lx1 = float(line.get("x1", 0.0))
+    ltop = float(line.get("top", 0.0))
+    lbottom = float(line.get("bottom", ltop))
+    cand = [i for i, g in enumerate(glyphs)
+            if g["x0"] >= lx0 - 4.0 and g["x1"] <= lx1 + 4.0
+            and g["top"] >= ltop - 8.0 and g["bottom"] <= lbottom + 8.0]
+    cand.sort(key=lambda i: glyphs[i]["x0"])
+
+    occ = list(_CID_RE.finditer(text))
+    if not occ:
+        return text
+    # 把连续的 cid 归成组（中间只隔空格/制表符）
+    groups: list[list[int]] = []
+    k = 0
+    while k < len(occ):
+        j = k
+        while (j + 1 < len(occ)
+               and occ[j + 1].start() - occ[j].end() <= 3):
+            j += 1
+        groups.append(list(range(k, j + 1)))
+        k = j + 1
+
+    out: list[str] = []
+    pos = 0
+    ci = 0            # 候选字形的游标
+    for grp in groups:
+        m0 = occ[grp[0]]
+        out.append(text[pos:m0.start()])
+        picked = cand[ci:ci + len(grp)]
+        ci += len(grp)
+        if len(grp) == 1 and picked:
+            # 孤立符号 → 带锚点，交给服务端认字
+            out.append(f"⟦G:{picked[0]}⟧")
+        else:
+            # 连续一整块 → 整体占位（跟旧行为一致，不给模型灌标记）
+            out.append("[?]")
+        pos = occ[grp[-1]].end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _plain_lines_with_glyphs(page, glyphs: list) -> str:
+    """把整页文本按行抽出来、标上字形锚点，再拼回去（兜底路径用）。
+
+    为什么不用 extract_text()：它只给字符串，没有每行的几何信息，
+    cid 就无法与页面上的具体字形对应（→ 全部退回 "[?]"，还被当成坏公式丢掉）。
+    行级抽取（extract_text_lines）带 bbox，与 extract_text 的输出**逐字相同**
+    （AGENTS.md §4.12 实测过这个等价性），所以换它不改正文，只多带坐标。
+
+    抽不出来就返回空串 → 调用方继续用原来的 plain。
+    """
+    if not glyphs:
+        return ""
+    try:
+        lines = page.extract_text_lines(
+            x_tolerance=PDF_X_TOLERANCE, return_chars=False)
+    except Exception:
+        return ""
+    if not lines:
+        return ""
+    out: list[str] = []
+    for ln in lines:
+        try:
+            t = (ln.get("text") or "").strip()
+        except Exception:
+            continue
+        if not t:
+            continue
+        out.append(_mark_line_glyphs(ln, glyphs))
+    return "\n".join(out)
+
+
+def _lines_to_text(lines: list[dict], mark_formulas: bool = True,
+                   glyphs: Optional[list] = None) -> str:
+    """把文本行拼成整段文本，并把公式块换成带坐标的标记。
+
+    glyphs：本页「解不出的字符」表。给了就把行里的 "(cid:N)" 换成
+    带锚点的标记 ⟦G:<下标>⟧，服务端据此裁图让多模态认字。
+    """
     if not lines:
         return ""
     spans = _formula_spans(lines, _mark_attached_lines(lines)) if mark_formulas else []
@@ -794,7 +1018,7 @@ def _lines_to_text(lines: list[dict], mark_formulas: bool = True) -> str:
             )
             i = b + 1
             continue
-        out.append(lines[i]["text"])
+        out.append(_mark_line_glyphs(lines[i], glyphs) if glyphs else lines[i]["text"])
         i += 1
     return "\n".join(out)
 
@@ -822,12 +1046,21 @@ def _find_vertical_split(words, width, height):
     return 0.0
 
 
-def _extract_page_text_raw(page) -> str:
+def _extract_page_text_raw(page, out_glyphs: Optional[list] = None) -> str:
     plain = ""
     try:
         plain = page.extract_text(x_tolerance=PDF_X_TOLERANCE) or ""
     except Exception:
         plain = ""
+
+    # 解不出的数学符号：换成带锚点的标记 ⟦G:n⟧（服务端据此"看图认字"）
+    glyphs = _unknown_glyphs(page)
+    if out_glyphs is not None:
+        out_glyphs.extend(glyphs)
+    if glyphs:
+        marked_plain = _plain_lines_with_glyphs(page, glyphs)
+        if marked_plain:
+            plain = marked_plain
 
     try:
         width, height = float(page.width), float(page.height)
@@ -874,12 +1107,12 @@ def _extract_page_text_raw(page) -> str:
 
     # 3) 按带分组切页 → 左栏正文 / 右栏正文 / 整宽块
     left_parts, right_parts, span_units = _extract_by_bands(
-        page, words, width, height, y_split, x_mid)
+        page, words, width, height, y_split, x_mid, glyphs=glyphs)
 
     # 3b) 双栏正文起点以上的区域也要分栏 —— 见 _extract_top_region 的说明。
     #     这一步是「先翻译右边的了」那个 bug 的真正修复点。
     front, top_left, top_right = _extract_top_region(
-        page, words, width, height, y_split, x_mid)
+        page, words, width, height, y_split, x_mid, glyphs=glyphs)
     left_parts = top_left + left_parts
     right_parts = top_right + right_parts
 
@@ -912,7 +1145,8 @@ def _band_kind(bw, width: float, x_mid: float, x_bin: int) -> str:
     return "split" if _has_gap_near(cover, x_bin, tol_bins=2) else "span"
 
 
-def _extract_top_region(page, words, width, height, y_split, x_mid):
+def _extract_top_region(page, words, width, height, y_split, x_mid,
+                          glyphs: Optional[list] = None):
     """把「双栏正文起点以上」的区域按栏拆开。
 
     返回 (整宽块, 左栏段, 右栏段)。
@@ -956,14 +1190,17 @@ def _extract_top_region(page, words, width, height, y_split, x_mid):
             kind = _band_kind(bw, width, x_mid, x_bin)
             try:
                 if kind == "split":
-                    lt = _lines_to_text(_crop_lines(page, (0, y, x_mid, y1)))
-                    rt = _lines_to_text(_crop_lines(page, (x_mid, y, width, y1)))
+                    lt = _lines_to_text(_crop_lines(page, (0, y, x_mid, y1)),
+                                        glyphs=glyphs)
+                    rt = _lines_to_text(_crop_lines(page, (x_mid, y, width, y1)),
+                                        glyphs=glyphs)
                     if lt.strip():
                         left_parts.append(lt.strip())
                     if rt.strip():
                         right_parts.append(rt.strip())
                 else:
-                    st = _lines_to_text(_crop_lines(page, (0, y, width, y1)))
+                    st = _lines_to_text(_crop_lines(page, (0, y, width, y1)),
+                                        glyphs=glyphs)
                     if st.strip():
                         front.append(st.strip())
             except Exception:
@@ -1157,7 +1394,8 @@ def _find_table_regions(bands, x_mid: float, max_gap: float = 16.0,
     return regions
 
 
-def _extract_by_bands(page, words, width, height, y_split, x_mid):
+def _extract_by_bands(page, words, width, height, y_split, x_mid,
+                       glyphs: Optional[list] = None):
     """按水平带分组切页。
 
     返回 (正文左栏段, 正文右栏段, 整宽单元列表)。
@@ -1225,7 +1463,8 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
                 # 模型对不上列 → 表格数值整体错位一行
                 # （实测 JACERS Table I：d31 行的 16.5 跑到了 d33 行）。
                 st = _lines_to_text(
-                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False)
+                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False,
+                    glyphs=glyphs)
                 if st.strip():
                     table_rows.append(st.strip())
                 table_words.extend(bw)
@@ -1239,13 +1478,16 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
                 # 跨栏块多半是表格：表格行也长得像公式碎片（"d 31(pC/N) 90 ..."），
                 # 但表格必须保持文本形态交给模型排版，所以这里不标公式。
                 st = _lines_to_text(
-                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False)
+                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False,
+                    glyphs=glyphs)
                 if st.strip():
                     pending.append(st.strip())
                 table_mode = True
                 continue
-            lt = _lines_to_text(_crop_lines(page, (0, gy0, x_mid, gy1)))
-            rt = _lines_to_text(_crop_lines(page, (x_mid, gy0, width, gy1)))
+            lt = _lines_to_text(_crop_lines(page, (0, gy0, x_mid, gy1)),
+                                glyphs=glyphs)
+            rt = _lines_to_text(_crop_lines(page, (x_mid, gy0, width, gy1)),
+                                glyphs=glyphs)
             if pending:
                 # 跨栏块（表题之类）自己成一块，不把后面的正文拖进来 ——
                 # 正文必须留在它自己的栏位里（阅读顺序不能乱）。
