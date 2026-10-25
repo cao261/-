@@ -128,4 +128,45 @@ public class Prefs {
             // 探测失败（没网 / 密码错）→ 维持原样，让页面显示真实状态
         }
     }
+
+    /**
+     * **重新**探测 vault 位置（不管原来配的是空还是错）。
+     *
+     * ⚠ 为什么还要这一层（空的那层不够）：
+     *   前面 resolveRootsIfMissing 只在「前缀是空的」时兜底。
+     *   但用户也可能**手填错了**前缀（比如云盘里改过目录名），
+     *   或者装过某版探测有 bug 的 APK —— 那样前缀是**非空但错的**，
+     *   前面的兜底不会触发。
+     *   → 列目录结果是空的时候，用这个再探一次：
+     *     位置变了就存下来并返回新客户端，没变说明确实是空的 → 返回 null。
+     *
+     * @return 新客户端（已带上探测到的位置）；没变化或失败返回 null
+     */
+    public synchronized DavClient redetectVaultRoot() {
+        if (!davConfigured()) {
+            return null;
+        }
+        try {
+            DavClient c = new DavClient(davUser(), davPass(), davRoot());
+            String v = c.detectVaultRoot();
+            if (v == null || v.isEmpty()) {
+                return null;
+            }
+            if (v.equals(davVaultRoot())) {
+                return null;          // 位置没变 → 没得救，不是路径问题
+            }
+            setDavVaultRoot(v);
+            c.setVaultRoot(v);
+            // 同步根（译文快照 / 批注）是 vault 根的**兄弟目录** ——
+            // vault 位置变了，同步根也可能跟着变（改名/搬家），
+            // 一起刷新，否则译文同步还是坏的。
+            String s = c.detectSyncRoot(v);
+            if (s != null && !s.isEmpty()) {
+                setDavSyncRoot(s);
+            }
+            return c;
+        } catch (Exception e) {
+            return null;
+        }
+    }
 }

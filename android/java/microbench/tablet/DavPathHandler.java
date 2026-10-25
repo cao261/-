@@ -45,6 +45,14 @@ public class DavPathHandler {
     private boolean rootsResolved = false;
     /** 上次尝试探测的时刻。 */
     private long lastProbeAt = 0;
+    /**
+     * 上次「重探测」的时刻（前缀非空但可能配错了的那种自愈）。
+     *
+     * ⚠ 重探测比普通探测更贵 —— 它要递归整个云盘（好几次 PROPFIND）。
+     *   所以必须节流：5 分钟内最多重探一次，
+     *   否则「列一个真空的目录」也会触发全盘扫描，几秒就能把坚果云打到限流。
+     */
+    private long lastRedetectAt = 0;
 
     public DavPathHandler(Prefs prefs) {
         this.prefs = prefs;
@@ -79,6 +87,38 @@ public class DavPathHandler {
             }
         } catch (Exception e) {
             // 探测失败就当没配 —— 下面的请求会给出可读的错误
+        }
+    }
+
+    /**
+     * 「前缀配错了」的自愈：重新探测一次 vault 位置。
+     *
+     * ⚠ 什么时候需要它（区别于 {@link #ensureRoots()}）：
+     *   ensureRoots 只管「前缀是**空**的」；
+     *   而用户手填错了前缀、或者装过探测有 bug 的旧版 APK 时，
+     *   前缀是**非空但错的** —— 探不到空值那层就不会触发。
+     *   症状一模一样：列目录全是 0 条、文件全 404。
+     *
+     * @return 探测到新位置后、用新位置造好的客户端；没变化/失败返回 null
+     */
+    private DavClient tryRedetect(boolean syncRoot) {
+        if (syncRoot) {
+            return null;                   // 同步根不是 vault 的一部分，不参与重探测
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastRedetectAt < PROBE_RETRY_INTERVAL_MS) {
+            return null;                   // 节流：5 分钟内最多重探一次
+        }
+        lastRedetectAt = now;
+        try {
+            DavClient c = prefs.redetectVaultRoot();
+            if (c != null) {
+                rootsResolved = true;
+                lastProbeAt = now;
+            }
+            return c;
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -124,6 +164,15 @@ public class DavPathHandler {
                     : "坚果云账号还没配置") + "\"}]");
         }
         List<DavClient.DavEntry> entries = c.list(dir);
+        // ⚠ 「0 个条目」有两种可能：目录真的是空的 / 前缀配错了。
+        //   WebDAV 对**不存在的目录**回 207 + 空集合（不报 404），
+        //   所以这里没法靠状态码区分 —— 只能靠「重探一次位置对不对」。
+        if (entries.isEmpty()) {
+            DavClient fixed = tryRedetect(syncRoot);
+            if (fixed != null) {
+                entries = fixed.list(dir);
+            }
+        }
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < entries.size(); i++) {
             if (i > 0) {
@@ -145,6 +194,15 @@ public class DavPathHandler {
                                     .getBytes(StandardCharsets.UTF_8)));
         }
         byte[] data = c.get(path);
+        if (data == null) {
+            // ⚠ 404 有两种可能：文件真的没了 / 前缀配错了。
+            //   后者正是用户看到的「24 篇原文全 404」——
+            //   重探一次位置，位置对上了就能真下到文件。
+            DavClient fixed = tryRedetect(syncRoot);
+            if (fixed != null) {
+                data = fixed.get(path);
+            }
+        }
         if (data == null) {
             return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
                     new HashMap<String, String>(),

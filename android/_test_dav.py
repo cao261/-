@@ -215,7 +215,56 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def find_jdk():
+    """找一个可用的 JDK。
+
+    ⚠ 之前这里写死了「D:\\Desktop\\杂物\\z\\Zotero\\jdk」——
+      那是**这台机**的路径。另一台设备（25353）没有这个目录，
+      javac 直接失败 → 这个套件红 → 它的 auto_sync 判定「测试失败」，
+      **再也推不上去**。而且那个红是环境问题，不是代码问题。
+      → 改成多路查找；实在找不到就 SKIP（不算失败）。
+    """
+    import shutil as _sh
+    cands = []
+    for env in ("MB_JDK", "JAVA_HOME"):
+        v = os.environ.get(env)
+        if v:
+            cands.append(v)
+    cands.append(r"D:\Desktop\杂物\z\Zotero\jdk")
+    # 常见安装位置
+    for base in (r"C:\Program Files\Java", r"C:\Program Files\Eclipse Adoptium",
+                 r"C:\Program Files\Microsoft\jdk", r"D:\Android\Sdk"):
+        p = Path(base)
+        if p.is_dir():
+            try:
+                for child in sorted(p.iterdir()):
+                    cands.append(str(child))
+            except OSError:
+                pass
+    # PATH 上的 javac
+    w = _sh.which("javac")
+    if w:
+        cands.append(str(Path(w).parent.parent))
+
+    seen = set()
+    for c in cands:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        javac = Path(c) / "bin" / "javac.exe"
+        java = Path(c) / "bin" / "java.exe"
+        if javac.is_file() and java.is_file():
+            return c
+    return None
+
+
 def main() -> int:
+    jdk = find_jdk()
+    if not jdk:
+        print("SKIP: 没找到 JDK（javac），跳过 Java 测试。"
+              "（环境问题，不是代码问题 —— 设 MB_JDK 指向 JDK 根目录即可启用）")
+        return 0
+
     srv = Server(("127.0.0.1", PORT), Handler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -225,7 +274,6 @@ def main() -> int:
     # 编译并跑 Java 测试。
     # 注意: javac 的命令行参数经 os.system 走一遍 cmd, 路径里有中文/空格
     # 就会被 cmd 拆坏。所以整个测试挪到纯 ASCII 目录编译。
-    jdk = os.environ.get("MB_JDK", r"D:\Desktop\杂物\z\Zotero\jdk")
     stage = Path(os.environ.get("TEMP", r"C:\Windows\Temp")) / "mb_davtest"
     if stage.exists():
         import shutil
@@ -235,13 +283,34 @@ def main() -> int:
     shutil.copy(HERE / "java" / "microbench" / "tablet" / "DavClient.java",
                 stage / "DavClient.java")
     shutil.copy(HERE / "TestDav.java", stage / "TestDav.java")
+
+    # ⚠ 桩类：让 Prefs / DavPathHandler（依赖 Android 框架类）能在普通 JDK 下跑。
+    #   桩放在 android/_stub/ 下，**不能**进 android/java ——
+    #   build_apk.ps1 会把 android/java 全编译一遍，桩类跟真 android.jar 撞类，
+    #   APK 直接编不过。
+    stub_src = HERE / "_stub"
+    stub_files = sorted(stub_src.rglob("*.java"))
+    for sf in stub_files:
+        rel = sf.relative_to(stub_src)          # 保住 android/content/... 的层级
+        dst = stage / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(sf, dst)
+
+    # 真实依赖 Android 的两个类 + 对应测试
+    for cls in ("Prefs.java", "DavPathHandler.java"):
+        shutil.copy(HERE / "java" / "microbench" / "tablet" / cls, stage / cls)
+    shutil.copy(HERE / "TestDavPath.java", stage / "TestDavPath.java")
+
     out = stage / "classes"
     out.mkdir(exist_ok=True)
 
     javac = str(Path(jdk) / "bin" / "javac.exe")
     java = str(Path(jdk) / "bin" / "java.exe")
-    cmd = [javac, "-encoding", "UTF-8", "-nowarn", "-d", str(out),
-           str(stage / "DavClient.java"), str(stage / "TestDav.java")]
+    sources = [str(stage / "DavClient.java"), str(stage / "TestDav.java")]
+    sources += [str(stage / c) for c in ("Prefs.java", "DavPathHandler.java")]
+    sources += [str(stage / "TestDavPath.java")]
+    sources += [str(stage / sf.relative_to(stub_src)) for sf in stub_files]
+    cmd = [javac, "-encoding", "UTF-8", "-nowarn", "-d", str(out)] + sources
     print("compiling...", flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -255,8 +324,21 @@ def main() -> int:
     print(r.stdout)
     if r.stderr.strip():
         print(r.stderr, file=sys.stderr)
+    rc = r.returncode
+
+    # 第二个测试：真跑在手机上的那条链路（DavPathHandler + 自愈）
+    print("--- TestDavPath（DavPathHandler 自愈链路）---", flush=True)
+    r2 = subprocess.run([java, "-cp", str(out), "TestDavPath",
+                         f"http://127.0.0.1:{PORT}/dav/"],
+                        capture_output=True, text=True)
+    print(r2.stdout)
+    if r2.stderr.strip():
+        print(r2.stderr, file=sys.stderr)
+    if r2.returncode != 0:
+        rc = r2.returncode
+
     srv.shutdown()
-    return r.returncode
+    return rc
 
 
 if __name__ == "__main__":

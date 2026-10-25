@@ -306,6 +306,51 @@ def main() -> int:
     check("const backendNow = currentBackend()" in app_js,
           "文献库按 currentBackend() 判断（DAV 模式下不再谎报「还没连接文件夹」）")
 
+    print("\n[21] 前缀「配错了」也要能自愈（非空但错的那一类）")
+    # [20] 管的是「前缀是空的」。但还有一类：前缀**非空但是错的** ——
+    #   用户手填错、云盘里改过目录名、或者装过探测有 bug 的旧版 APK。
+    #   那时 ensureRoots() 看到「非空」就放行 → 症状跟空前缀一模一样
+    #   （列目录 0 条、PDF 全 404），用户看到的还是「已连接 0 篇」。
+    prefs_java3 = read(JAVA / "Prefs.java")
+    handler_java3 = read(JAVA / "DavPathHandler.java")
+    code_handler3 = code_only(handler_java3)
+    code_prefs3 = code_only(prefs_java3)
+    check("redetectVaultRoot" in code_prefs3,
+          "Prefs 有「重新探测 vault 位置」的兜底")
+    check("detectVaultRoot" in code_prefs3 and "setDavVaultRoot" in code_prefs3,
+          "重探测真的探了位置并写回去")
+    check("tryRedetect" in code_handler3,
+          "DavPathHandler 有重探测的入口")
+    # ⚠ 必须真的接在**两条故障路径**上：
+    #   列目录返回空（用户看到「0 篇」）+ 取文件 404（24 篇原文全挂）
+    #   只接一条的话，另一条的症状照样复现 —— 所以逐条查，不靠数个数。
+    check(re.search(r"if \(entries\.isEmpty\(\)\) \{\s*DavClient fixed = tryRedetect",
+                    code_handler3) is not None,
+          "重探测接在「列目录返回空」这条路径上（用户看到的 0 篇）")
+    check(re.search(r"if \(data == null\) \{\s*DavClient fixed = tryRedetect",
+                    code_handler3) is not None,
+          "重探测接在「取文件 404」这条路径上（24 篇原文全挂）")
+    check("PROBE_RETRY_INTERVAL_MS" in code_handler3,
+          "重探测有节流（探测要递归整个云盘，不能每个空目录都扫一遍）")
+    # 同步根是 vault 根的兄弟目录 —— vault 位置变了，同步根也得跟着刷新
+    check("detectSyncRoot" in code_prefs3 and "setDavSyncRoot" in code_prefs3,
+          "重探测时同步根也一起刷新（否则译文快照还是读不到）")
+
+    print("\n[22] 测试用的 Android 桩类不能进 APK")
+    # android/_stub/ 里放了 android.content / android.webkit 的桩，
+    # 让 DavPathHandler 的自愈逻辑能在普通 JVM 里被真正跑一遍。
+    # ⚠ 它们**绝不能**挪进 android/java/ —— build_apk.ps1 会把那儿全编译一遍，
+    #   桩类跟真 android.jar 撞类，APK 直接编不过。
+    stub_dir = HERE / "_stub"
+    check(stub_dir.is_dir(), "桩类目录存在（测试台要靠它）")
+    stub_in_java = list((HERE / "java").rglob("android/content/*.java")) + \
+        list((HERE / "java").rglob("android/webkit/*.java"))
+    check(not stub_in_java,
+          "桩类没被挪进 android/java（否则 APK 编不过）: "
+              + (", ".join(str(p) for p in stub_in_java) or "(无)"))
+    check((HERE / "TestDavPath.java").is_file(),
+          "有 TestDavPath（自愈链路的回归测试）")
+
     print(f"\n{'=' * 60}")
     print(f"PASS {len(PASS)}  FAIL {len(FAIL)}")
     for f in FAIL:
