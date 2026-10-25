@@ -893,6 +893,49 @@ GitHub 访问**需要默认代理** `http://127.0.0.1:65532`；
    才占位。**不能一个 "[?]" 了事** —— 用户读到的是乱码。
 3. **认出来的东西必须过白名单**：词典是最后一道闸，模型说了不该收的字符就丢掉。
 
+### 4.23 浏览器实测：MCP 浏览器工具点不动这个页面，改用 Edge + CDP（2026-10-25）
+
+用户要求「所有功能都要用浏览器当真人走一遍」（重要的事说三遍）。实测下来：
+
+**MCP 内置 Browser 工具在这个页面上 click 不可用**，两个坑：
+1. **后台标签页鼠标事件不投递**：`hover` 返回 `hovered:false`、
+   `click` 返回 success 但事件根本没到元素（inline onclick 全都不触发，
+   console 里连一条报错都没有）。
+2. **页面持续重绘 → 稳定性检查永远超时**：PDF.js 渲染 + 译文流式渲染让元素
+   的 bounding box 一直在动，`click` 每次耗时恰好 5.5 秒然后放弃。
+   ⚠️ `click` 返回 `success: true` **不代表事件真的派发了** —— 必须用
+   "点击后 DOM 有没有变"来验证，不能看返回值。
+
+**可靠的替代方案：Edge + CDP（Chrome DevTools Protocol）**，本机 Edge 自带
+`--remote-debugging-port`，不需要装 Playwright/Puppeteer（那要下 ~150MB
+浏览器，本机网络不稳）：
+- `Runtime.evaluate` → 精确执行页面 JS（定位元素、读状态）
+- `Input.dispatchMouseEvent` → **真人级鼠标事件**（不是直接调函数）
+- `Page.captureScreenshot` → 截图取证
+- 关键：**`Target.activateTarget` 激活标签页**，否则后台标签的 rAF/定时器被
+  Chrome 节流，页面加载慢到无法接受。
+- `websocket-client` 装一下即可（`pip install websocket-client`，几十 KB）。
+
+**自己写 CDP 脚本时踩的三个坑**：
+1. **`offsetParent !== null` 不能用来判可见性** —— `position:fixed` 元素的
+   `offsetParent` **恒为 null** → 浮动按钮会被误判成"不可见"。
+   改用 `getBoundingClientRect()` 宽高 + `getComputedStyle` 的
+   display/visibility/opacity。
+2. **等 modal 打开要等 `getComputedStyle(#reader-modal).display !== 'none'`**，
+   不能只看"内容注入了没有" —— 内容注入 ≠ 可见（内部元素宽高为 0，
+   照样点不到）。实测 `open_vault_pdf` 首开要 40+ 秒（要抽取全文）。
+3. **`?open_pdf=` 前面不能多写斜杠** —— 写成 `?open_pdf=/01_Literature/...`
+   会找不到文件，modal 永远不打开（白等 5 分钟）。
+
+**通用教训**：
+1. **自动化工具"点了"不等于"点到了"**。判断点击是否生效要看**状态变化**
+   （DOM / 网络请求 / 截图），不能信工具返回的 success。
+2. **工具失灵时先怀疑工具，别急着改产品代码**。先做一个对照实验
+   （在稳定页面 vs 复杂页面上点同一个按钮），把"应用有 bug"和"工具有 bug"
+   分开，否则会去改本来正确的代码。
+3. **能自动化的交互一定要自己跑一遍**。本轮就靠真人点击抓出了三个真 bug：
+   标题被挤成竖排、进度徽标吃掉模型徽标、429 报错甩英文机器话。
+
 ## 5. 通用教训（从上面提炼的原则）
 
 1. **先定位根因，再改代码。** 拿不准就在可疑位置加 `console.log` 探针 + 用浏览器的
