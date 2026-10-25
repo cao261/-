@@ -264,6 +264,127 @@ agnes_limiter = SlidingWindowRateLimiter(max_requests=9, min_interval=6.0)
 # Primary (MiniMax M2.7) — 30 RPM observed ceiling → 28 cap + 2s min spacing
 primary_limiter = SlidingWindowRateLimiter(max_requests=28, min_interval=2.0)
 
+# 自定义模型（.env 里 LLM_CUSTOM_N_*）各有自己的限流档，不能跟主模型共用。
+# 这里按 (rpm, min_interval) 缓存 limiter：同档的模型共用一个，不同档的分开。
+_custom_limiters: dict[tuple, SlidingWindowRateLimiter] = {}
+_custom_limiters_lock = Lock()
+
+
+def _limiter_for(rpm: int, min_interval: float) -> SlidingWindowRateLimiter:
+    """按 (rpm, 间隔) 取一个限流器；同档共用一个。"""
+    cap = max(1, rpm - 1)
+    key = (cap, round(min_interval, 2))
+    with _custom_limiters_lock:
+        lim = _custom_limiters.get(key)
+        if lim is None:
+            lim = SlidingWindowRateLimiter(max_requests=cap, min_interval=min_interval)
+            _custom_limiters[key] = lim
+        return lim
+
+
+# ---------------------------------------------------------------------------
+# 自定义模型（用户自己的 API 模型）
+# ---------------------------------------------------------------------------
+# 在 .env 里按编号配置，最多 5 个：
+#
+#   LLM_CUSTOM_1_NAME=我的视觉模型
+#   LLM_CUSTOM_1_BASE_URL=https://api.example.com/v1
+#   LLM_CUSTOM_1_MODEL=my-vision-model
+#   LLM_CUSTOM_1_API_KEY=sk-xxx          # 留空则复用 LLM_API_KEY
+#   LLM_CUSTOM_1_RPM=30                   # 每分钟请求上限（默认 30，同主模型）
+#
+# 前提：**OpenAI 兼容**（POST {base_url}/chat/completions）。
+# 表格/公式要靠多模态读图，所以模型还得支持图片输入（见 docs/LLM_CONTRACT.md）。
+#
+# 限流：只有 **Agnes（免费版）** 有严格速率限制，所以它单独一档（9/60s + 6s 间隔）。
+# 付费模型（MiniMax / DeepSeek / 自己的 API）默认按主模型那档走（30 RPM + 2s 间隔），
+# 基本感觉不到；对方的限制更紧时把 LLM_CUSTOM_N_RPM 调小即可。
+
+CUSTOM_MODEL_PREFIX = "custom:"
+CUSTOM_MODEL_SLOTS = 5
+# 付费模型的默认档：跟主模型一样宽松（用户原话："DeepSeek 和 MiniMax 这个速率
+# 就不用管了"—— 只有免费版 Agnes 才吃速率）
+DEFAULT_CUSTOM_RPM = 30
+DEFAULT_CUSTOM_MIN_INTERVAL = 2.0
+
+
+def custom_model_configs() -> list[dict]:
+    """读 .env 里的自定义模型清单（LLM_CUSTOM_N_*）。"""
+    out: list[dict] = []
+    for i in range(1, CUSTOM_MODEL_SLOTS + 1):
+        base_url = (os.getenv(f"LLM_CUSTOM_{i}_BASE_URL", "") or "").strip().rstrip("/")
+        model = (os.getenv(f"LLM_CUSTOM_{i}_MODEL", "") or "").strip()
+        if not base_url or not model:
+            continue
+        name = (os.getenv(f"LLM_CUSTOM_{i}_NAME", "") or "").strip() or model
+        api_key = (os.getenv(f"LLM_CUSTOM_{i}_API_KEY", "") or "").strip() \
+            or (os.getenv("LLM_API_KEY", "") or "").strip()
+        try:
+            rpm = int((os.getenv(f"LLM_CUSTOM_{i}_RPM", "") or "").strip() or DEFAULT_CUSTOM_RPM)
+        except ValueError:
+            rpm = DEFAULT_CUSTOM_RPM
+        rpm = max(1, min(rpm, 120))
+        # 间隔按 rpm 推，留 10% 余量；至少 1 秒
+        min_interval = max(1.0, round(60.0 / rpm * 0.9, 2)) \
+            if rpm != DEFAULT_CUSTOM_RPM else DEFAULT_CUSTOM_MIN_INTERVAL
+        out.append({
+            "id": f"{CUSTOM_MODEL_PREFIX}{name}",
+            "label": name,
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
+            "rpm": rpm,
+            "min_interval": min_interval,
+            "configured": bool(api_key),
+            "is_fallback": False,
+            "is_custom": True,
+        })
+    return out
+
+
+def resolve_model_config(model_id: str) -> Optional[dict]:
+    """按模型 id 找配置。
+
+    - ""            → None（跟随默认设置）
+    - "agnes"       → 备用模型配置（Agnes）
+    - "custom:xxx"  → 自定义模型配置
+    - 其它名字       → None（表示"同一套 key/base_url 下的另一个模型名"）
+    """
+    mid = (model_id or "").strip()
+    if not mid:
+        return None
+    if mid.lower() in ("agnes", "fallback", "agnes-3.0-flash"):
+        cfg = dict(model_manager.get_fallback_config())
+        cfg.setdefault("id", "agnes")
+        cfg.setdefault("label", "Agnes 3.0 Flash")
+        cfg.setdefault("rpm", 11)
+        cfg.setdefault("min_interval", 6.0)
+        return cfg
+    if mid.startswith(CUSTOM_MODEL_PREFIX):
+        for cfg in custom_model_configs():
+            if cfg["id"] == mid:
+                return cfg
+    return None
+
+
+def limiter_for_config(cfg: dict) -> SlidingWindowRateLimiter:
+    """按配置取限流器：主/备用各用自己那套；自定义模型按它自己的 RPM 档。"""
+    if cfg.get("is_fallback"):
+        return agnes_limiter
+    if cfg.get("is_custom"):
+        return _limiter_for(int(cfg.get("rpm") or DEFAULT_CUSTOM_RPM),
+                             float(cfg.get("min_interval") or 6.0))
+    return primary_limiter
+
+
+def is_agnes_config(cfg: dict) -> bool:
+    """这个配置是不是走 Agnes 档（决定 429 退避策略与限流档）。"""
+    if not cfg:
+        return False
+    return bool(cfg.get("is_fallback")) or \
+        "agnes" in (cfg.get("base_url") or "").lower() or \
+        "agnes" in (cfg.get("model") or "").lower()
+
 
 # ---------------------------------------------------------------------------
 # Secret redaction for anything that reaches the browser
@@ -570,6 +691,20 @@ class DualModelManager:
                 "primary": primary_limiter.stats(),
                 "agnes": agnes_limiter.stats(),
             },
+            # 自定义模型（用户自己的 API 模型）：给界面下拉框和限流提示用
+            "custom_models": [
+                {
+                    "id": c["id"],
+                    "label": c["label"],
+                    "model": c["model"],
+                    "base_url": _safe_base_url(c["base_url"]),
+                    "configured": c["configured"],
+                    "rpm": c["rpm"],
+                    "min_interval": c["min_interval"],
+                    "rate_limit": limiter_for_config(c).stats(),
+                }
+                for c in custom_model_configs()
+            ],
         }
 
 
@@ -742,7 +877,9 @@ def _invoke_model(
     thinking，传 disabled 会返回 400。这里遇到 400 且错误信息提到 thinking
     时会自动去掉该参数重试一次。
     """
-    is_agnes = cfg.get("is_fallback") or "agnes" in cfg.get("base_url", "").lower() or "agnes" in cfg.get("model", "").lower()
+    is_agnes = is_agnes_config(cfg)
+    # 限流器按配置取：主/备用各一套，自定义模型按它自己的 RPM 档
+    limiter = limiter_for_config(cfg)
 
     url = f"{cfg['base_url']}/chat/completions"
     payload = {
@@ -796,13 +933,8 @@ def _invoke_model(
                 return False, "超出本次请求的时限, 已放弃重试", last_status
             attempt_timeout = max(2, min(timeout, int(left)))
 
-        if is_agnes:
-            # Respect Agnes 10 RPM rate limit & min spacing
-            agnes_limiter.acquire()
-        else:
-            # Primary model (MiniMax) rate limit
-            primary_limiter.acquire()
-
+        # 限流：主/备用各一套；自定义模型按它自己的 RPM 档
+        limiter.acquire()
         try:
             if netutil.proxy_bypassed():
                 # 已经确认环境代理是死的 → 用 proxies 显式置空来直连。
@@ -997,6 +1129,7 @@ def chat(
     model_name: Optional[str] = None,
     deadline: Optional[float] = None,
     force_fallback: bool = False,
+    ret: Optional[dict] = None,
 ) -> str:
     """
     Single-turn chat completion with automatic failover and degradation management.
@@ -1023,12 +1156,25 @@ def chat(
     if requests is None:
         raise LLMError("requests 包未安装, 请先 pip install requests")
 
+    def _note(used_model: str, fell_back: bool = False) -> None:
+        """记录**实际**用的是哪个模型。
+
+        界面上的模型徽标必须显示实际用的模型：用户选了自定义模型但它连不上
+        时，我们会自动退回主模型 —— 这时如果还显示"用户选的那个"，
+        用户会以为"选模型没生效"（或者反过来，以为新模型在工作）。
+        """
+        if ret is not None:
+            ret["model"] = used_model
+            ret["fallback_used"] = fell_back
+
     primary = model_manager.get_primary_config()
-    if model_name and model_name != primary["model"]:
+    custom_cfg = resolve_model_config(model_name) if model_name else None
+    is_custom = bool(custom_cfg and custom_cfg.get("is_custom"))
+    if model_name and not is_custom and model_name != primary["model"]:
         primary = dict(primary, model=model_name)
     fallback = model_manager.get_fallback_config()
 
-    if not primary["configured"] and not fallback["configured"]:
+    if not primary["configured"] and not fallback["configured"] and not is_custom:
         raise LLMError(
             "LLM 未配置: 请设置环境变量 LLM_API_KEY (主模型) 或 AGNES_API_KEY (备用模型). "
             "可在工作台根目录编辑 .env 文件."
@@ -1044,8 +1190,30 @@ def chat(
             budget=[MAX_UPSTREAM_CALLS_PER_REQUEST], deadline=deadline,
         )
         if success:
+            _note(fallback["model"])
             return res
         raise LLMError(f"备用模型调用失败: {res}")
+
+    # 用户选了自定义模型（自己的 base_url/key）：先用它。
+    # 连不上 / 报错 → **自动退回**主模型 → 备用模型链路（用户原话：
+    # "如果发现连不上了，它能自动退"）。退回时打 stderr，别静悄悄换模型。
+    if is_custom:
+        if not custom_cfg.get("configured"):
+            raise LLMError(
+                f"自定义模型「{custom_cfg.get('label')}」没有配置 API key"
+                f"（在 .env 里填 LLM_CUSTOM_N_API_KEY，或让它复用 LLM_API_KEY）"
+            )
+        success, res, status_code = _invoke_with_budget_escalation(
+            custom_cfg, messages, max_tokens, temperature, timeout, json_mode,
+            max_retries=max_retries, disable_thinking=disable_thinking,
+            budget=[MAX_UPSTREAM_CALLS_PER_REQUEST], deadline=deadline,
+        )
+        if success:
+            _note(custom_cfg.get("label") or custom_cfg.get("model"))
+            return res
+        print(f"[MicroBench] 自定义模型「{custom_cfg.get('label')}」调用失败，"
+              f"自动退回默认模型链路: {res}", file=sys.stderr)
+        # 继续往下走主/备链路（primary 已经是默认配置，没被改写）
 
     # Opportunistic auto-recovery probe if degraded and probe cooldown reached
     if model_manager.is_degraded and primary["configured"] and model_manager.should_opportunistic_probe():
@@ -1072,6 +1240,7 @@ def chat(
             deadline=deadline,
         )
         if success:
+            _note(primary["model"])
             return res
 
         # Reasoning-model budget guard: MiniMax-M2.7 emits a <think> block
@@ -1090,6 +1259,7 @@ def chat(
                 deadline=deadline,
             )
             if retry_success:
+                _note(primary["model"])
                 return retry_res
             res = f"{res} (重试 {bigger} tokens 仍为空)"
 
@@ -1115,6 +1285,7 @@ def chat(
                 deadline=deadline,
             )
             if fb_success:
+                _note(fallback["model"], fell_back=True)
                 return fb_res
             raise LLMError(f"降格模型 (Agnes) 调用失败: {fb_res} (原主模型报错: {res})")
 
@@ -1129,6 +1300,7 @@ def chat(
             deadline=deadline,
         )
         if success:
+            _note(fallback["model"], fell_back=True)
             return res
         raise LLMError(f"备用模型 ({fallback['model']}) 调用失败: {res}")
 
@@ -1239,7 +1411,7 @@ def close_async_clients() -> None:
         _async_client_cache.clear()
 
 
-async def _acquire_limiter_async(is_agnes: bool):
+async def _acquire_limiter_async(is_agnes: bool, cfg: Optional[dict] = None):
     """Await the right provider's rate limiter without blocking the loop.
 
     Both providers must be limited on the async path. The primary limiter
@@ -1247,8 +1419,10 @@ async def _acquire_limiter_async(is_agnes: bool):
     endpoints could fire at MiniMax with no RPM protection at all — which
     is exactly how a per-minute cap gets hit, which used to be
     misclassified as "quota exhausted" and triggered a demotion.
+
+    cfg 给了就按配置选限流器（自定义模型有自己的 RPM 档）；没给就走老的两档。
     """
-    limiter = agnes_limiter if is_agnes else primary_limiter
+    limiter = limiter_for_config(cfg) if cfg else (agnes_limiter if is_agnes else primary_limiter)
     await asyncio.to_thread(limiter.acquire)
 
 
@@ -1273,7 +1447,8 @@ async def _invoke_model_async(
     if httpx is None:
         return False, "httpx 包未安装, 请先 pip install httpx", None
 
-    is_agnes = cfg.get("is_fallback") or "agnes" in cfg.get("base_url", "").lower() or "agnes" in cfg.get("model", "").lower()
+    is_agnes = is_agnes_config(cfg)
+    limiter = limiter_for_config(cfg)
 
     url = f"{cfg['base_url']}/chat/completions"
     payload = {
@@ -1427,6 +1602,8 @@ async def chat_async(
     json_mode: bool = False,
     max_retries: int = 2,
     cancel_event: Optional[asyncio.Event] = None,
+    model_name: Optional[str] = None,
+    force_fallback: bool = False,
 ) -> str:
     """Async version of chat() with cancellation support.
 
@@ -1443,12 +1620,40 @@ async def chat_async(
 
     primary = model_manager.get_primary_config()
     fallback = model_manager.get_fallback_config()
+    custom_cfg = resolve_model_config(model_name) if model_name else None
+    is_custom = bool(custom_cfg and custom_cfg.get("is_custom"))
 
-    if not primary["configured"] and not fallback["configured"]:
+    if not primary["configured"] and not fallback["configured"] and not is_custom:
         raise LLMError(
             "LLM 未配置: 请设置环境变量 LLM_API_KEY (主模型) 或 AGNES_API_KEY (备用模型). "
             "可在工作台根目录编辑 .env 文件."
         )
+
+    # 用户选了自定义模型：先用它；连不上就自动退回主模型 → 备用模型
+    if is_custom:
+        if not custom_cfg.get("configured"):
+            raise LLMError(
+                f"自定义模型「{custom_cfg.get('label')}」没有配置 API key"
+                f"（在 .env 里填 LLM_CUSTOM_N_API_KEY，或让它复用 LLM_API_KEY）"
+            )
+        ok, res, _ = await _invoke_model_async(
+            custom_cfg, messages, max_tokens, temperature, timeout, json_mode,
+            max_retries=max_retries, cancel_event=cancel_event,
+        )
+        if ok:
+            return res
+        print(f"[MicroBench] 自定义模型「{custom_cfg.get('label')}」调用失败，"
+              f"自动退回默认模型链路: {res}", file=sys.stderr)
+
+    # 强制走备用模型（用户在界面上选了 Agnes）
+    if force_fallback and fallback["configured"]:
+        ok, res, _ = await _invoke_model_async(
+            fallback, messages, max_tokens, temperature, timeout, json_mode,
+            max_retries=max_retries, cancel_event=cancel_event,
+        )
+        if ok:
+            return res
+        raise LLMError(f"备用模型调用失败: {res}")
 
     # Opportunistic auto-recovery probe (async — the probe is a blocking
     # requests.post with a 15s timeout; running it inline on the event
@@ -1571,12 +1776,8 @@ async def _stream_model(
     # rather than at the call sites so that no streaming path can bypass
     # it — the primary (MiniMax) limiter used to be missing entirely from
     # the async/stream code, which is how the per-minute cap got hit.
-    is_agnes = (
-        cfg.get("is_fallback")
-        or "agnes" in cfg.get("base_url", "").lower()
-        or "agnes" in cfg.get("model", "").lower()
-    )
-    await _acquire_limiter_async(is_agnes)
+    is_agnes = is_agnes_config(cfg)
+    await _acquire_limiter_async(is_agnes, cfg)
 
     # Use the shared pooled client (per event loop) instead of building a
     # new AsyncClient per stream: a fresh client means a fresh TLS
@@ -1695,6 +1896,8 @@ async def chat_stream_async(
     timeout: int = DEFAULT_TIMEOUT,
     cancel_event: Optional[asyncio.Event] = None,
     disable_thinking: bool = False,
+    model_name: Optional[str] = None,
+    force_fallback: bool = False,
 ) -> AsyncIterator[str]:
     """Streaming version of chat() with cancellation support.
 
@@ -1732,14 +1935,52 @@ async def chat_stream_async(
     """
     primary = model_manager.get_primary_config()
     fallback = model_manager.get_fallback_config()
+    custom_cfg = resolve_model_config(model_name) if model_name else None
+    is_custom = bool(custom_cfg and custom_cfg.get("is_custom"))
 
-    if not primary["configured"] and not fallback["configured"]:
+    if not primary["configured"] and not fallback["configured"] and not is_custom:
         raise LLMError(
             "LLM 未配置: 请设置环境变量 LLM_API_KEY 或 AGNES_API_KEY."
         )
 
     if cancel_event is not None and cancel_event.is_set():
         raise asyncio.CancelledError("client disconnected before stream start")
+
+    # 用户选了自定义模型：先用它；连不上就自动退回主模型 → 备用模型
+    if is_custom:
+        if not custom_cfg.get("configured"):
+            raise LLMError(
+                f"自定义模型「{custom_cfg.get('label')}」没有配置 API key"
+                f"（在 .env 里填 LLM_CUSTOM_N_API_KEY，或让它复用 LLM_API_KEY）"
+            )
+        emitted = False
+        try:
+            async for chunk in _stream_model(
+                custom_cfg, messages, max_tokens, temperature, timeout, cancel_event,
+                disable_thinking=disable_thinking,
+            ):
+                if chunk.strip():
+                    emitted = True
+                yield chunk
+            return
+        except asyncio.CancelledError:
+            raise
+        except LLMError as e:
+            if emitted:
+                # 已经吐了一半内容 → 不能换模型重来（会出现两段答案粘在一起）
+                raise
+            print(f"[MicroBench] 自定义模型「{custom_cfg.get('label')}」流式调用失败，"
+                  f"自动退回默认模型链路: {e}", file=sys.stderr)
+            # 继续往下走主/备链路
+
+    # 强制走备用模型（用户在界面上选了 Agnes 答疑）
+    if force_fallback and fallback["configured"]:
+        async for chunk in _stream_model(
+            fallback, messages, max_tokens, temperature, timeout, cancel_event,
+            disable_thinking=disable_thinking,
+        ):
+            yield chunk
+        return
 
     # Opportunistic auto-recovery probe. Without this, the three SSE
     # reader panels could never leave the degraded (Agnes) state on their

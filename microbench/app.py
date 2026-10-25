@@ -649,6 +649,9 @@ def _resolve_translation_model(requested: str):
       - force_fallback：True = 强制走备用模型（Agnes）
       - cache_key_model：缓存键里用的模型名 —— 必须反映实际用的模型，
         否则换模型翻译会命中旧模型的缓存（换模型等于没换）
+
+    自定义模型（.env 里 LLM_CUSTOM_N_*）的 id 形如 "custom:我的模型"，
+    原样传下去：llm.chat 会按 id 找到它自己的 base_url / key / 限流档。
     """
     req = (requested or "").strip()
     if not req:
@@ -656,11 +659,16 @@ def _resolve_translation_model(requested: str):
     if req.lower() in ("agnes", "fallback", "agnes-3.0-flash"):
         fb_name = llm.model_manager.get_fallback_config().get("model") or "agnes-3.0-flash"
         return "", True, fb_name
+    if req.startswith(llm.CUSTOM_MODEL_PREFIX):
+        cfg = llm.resolve_model_config(req)
+        if cfg:
+            return req, False, req
     return req, False, req
 
 
 # 可供界面选择的翻译模型。MiniMax 系共用同一套 key/base_url；
-# 'agnes' 走备用模型（免费无限，但更慢）。
+# 'agnes' 走备用模型（免费无限，但更慢）；
+# 用户自己的 API 模型由 .env 的 LLM_CUSTOM_N_* 追加（见 llm.custom_model_configs）。
 TRANSLATION_MODEL_CHOICES = (
     {"id": "", "label": "跟随当前设置", "hint": "默认：LLM_TRANSLATION_MODEL 或主模型"},
     {"id": "MiniMax-M3", "label": "MiniMax-M3", "hint": "直译最快最稳（推荐）"},
@@ -670,15 +678,59 @@ TRANSLATION_MODEL_CHOICES = (
 )
 
 
+def _qa_model_args(model: str = "") -> dict:
+    """把前端传来的模型 id 转成 llm.chat / llm.chat_stream_async 的参数。
+
+    ''        → 跟随默认（主模型，降级时自动走备用）
+    'agnes'  → 强制走备用模型
+    'custom:x' → 用户自己的 API 模型（自己的 base_url/key/限流档）
+    其它      → 同一套 key/base_url 下的另一个模型名
+    """
+    m_name, m_fallback, _ = _resolve_translation_model(model)
+    return {"model_name": m_name or None, "force_fallback": m_fallback}
+
+
+def _effective_model_name(requested: str = "") -> str:
+    """这次请求**实际**会用哪个模型（给界面上的模型徽标显示）。
+
+    不能直接用 llm.get_llm_status()["active_model"] —— 那是全局状态，
+    用户手动选了自定义模型时它显示的还是主模型，会让人以为"选模型没生效"。
+    """
+    m_name, m_fallback, _ = _resolve_translation_model(requested)
+    if m_fallback:
+        return llm.model_manager.get_fallback_config().get("model") or "agnes-3.0-flash"
+    if m_name:
+        cfg = llm.resolve_model_config(m_name)
+        if cfg:
+            return cfg.get("label") or cfg.get("model") or m_name
+        return m_name
+    return llm.get_llm_status().get("active_model") or "default"
+
+
+def translation_model_choices() -> list[dict]:
+    """界面上能选的模型 = 内置的 + 用户自己配的（.env LLM_CUSTOM_N_*）。"""
+    out = [dict(m) for m in TRANSLATION_MODEL_CHOICES]
+    for c in llm.custom_model_configs():
+        out.append({
+            "id": c["id"],
+            "label": c["label"],
+            "hint": (f"你自己的 API 模型 · {c['model']} · {c['rpm']} RPM"
+                     + ("" if c["configured"] else " · ⚠ 没配 API key")),
+            "custom": True,
+        })
+    return out
+
+
 @app.get("/api/llm/translation_models")
 async def api_llm_translation_models():
     """界面上的「换模型翻译」下拉框选项。"""
+    active = llm.translation_active_model()
     return {
         "models": [
-            dict(m, active=(m["id"] == llm.translation_active_model()))
-            for m in TRANSLATION_MODEL_CHOICES
+            dict(m, active=(m["id"] == active))
+            for m in translation_model_choices()
         ],
-        "active_model": llm.translation_active_model(),
+        "active_model": active,
         "primary": llm.model_manager.get_primary_config().get("model", ""),
         "fallback": llm.model_manager.get_fallback_config().get("model", ""),
     }
@@ -695,6 +747,9 @@ class ExplainRequest(BaseModel):
     sections: list = Field(..., min_length=1, max_length=20,
                             description="paper sections [{title, text}, ...]")
     paper_title: Optional[str] = Field(default="", max_length=300)
+    model: Optional[str] = Field(default="", max_length=64,
+                                 description="用哪个模型回答：'' = 跟随默认, "
+                                             "'agnes' = 备用模型, 'custom:xxx' = 自定义模型")
 
 
 class ExplainSelectionRequest(BaseModel):
@@ -703,6 +758,9 @@ class ExplainSelectionRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=1000,
                           description="用户针对该片段提出的问题")
     paper_title: Optional[str] = Field(default="", max_length=300)
+    model: Optional[str] = Field(default="", max_length=64,
+                                 description="用哪个模型回答：'' = 跟随默认, "
+                                             "'agnes' = 备用模型, 'custom:xxx' = 自定义模型")
     surrounding_context: Optional[str] = Field(default="", max_length=50000,
                                                 description="上下文背景 (如所在章节或页面文本)")
     source_type: Optional[str] = Field(default="pdf", max_length=50,
@@ -1346,6 +1404,26 @@ def _clean_table_markdown(raw: str) -> str:
     return text
 
 
+def _looks_like_markdown_table(text: str) -> bool:
+    """这段输出像不像一张 Markdown 表格。
+
+    为什么必须校验：模型有时会回一句"截图里没有表格"之类的说明（**成功返回，
+    不是异常**）。旧逻辑只判 `if not md.strip()`，于是这段说明被当成表格内容
+    拼进译文 —— 用户在正文里读到一句莫名其妙的话，还以为是自己看错了。
+
+    判据：正文里得有竖线（至少 2 个）且至少有一行含竖线。
+    不要求必须有 `|---|` 分隔行 —— 模型偶尔会漏掉它，但数据还是对的，
+    宁可放行也不要整张表丢掉。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
+    if not any("|" in ln for ln in lines):
+        return False
+    return t.count("|") >= 2
+
+
 async def _read_table_vision(pdf_path, page: int, rect: tuple,
                              model: str = "") -> str:
     """裁图 → 多模态模型抄表 → 返回 Markdown。失败抛异常（由调用方兜底）。
@@ -1375,7 +1453,15 @@ async def _read_table_vision(pdf_path, page: int, rect: tuple,
         model_name=m_name or llm.translation_model_name() or None,
         force_fallback=m_fallback,
     )
-    return _clean_table_markdown(raw)
+    md = _clean_table_markdown(raw)
+    # 模型有时会"成功"回一句"截图里没有表格"的说明 —— 那不是表格，
+    # 直接拼进译文会让用户读到一句莫名其妙的话。判失败 → 走兜底提示。
+    if not _looks_like_markdown_table(md):
+        raise RuntimeError(
+            f"模型没有抄出表格（返回 {len(md)} 字符，"
+            f"开头：{(md or '(空)')[:60]!r}）"
+        )
+    return md
 
 
 @app.post("/api/paper/read_table")
@@ -1402,12 +1488,17 @@ async def api_read_table(req: ReadTableRequest):
     return {"table": table}
 
 
-async def _prepare_tables(page_text: str, pdf_path, page: int) -> tuple[str, dict]:
+async def _prepare_tables(page_text: str, pdf_path, page: int, model: str = "") -> tuple[str, dict]:
     """把页面文本里的 ⟦TABLE:...⟧ 标记换成中性的 ⟦TABLE_n⟧，
     并把多模态抄出来的表格存起来（翻译完再按位置拼回去）。
 
     为什么走多模态：表格在 PDF 文本层是碎的（"d (pC/N) (cid:4)90 ..."），
     文本模型只能猜对齐 → 整行数值错位。截图给模型看，顺序和数值都对。
+
+    model：用户在前端选的模型。**必须跟着走** —— 正文用新模型、表格用旧模型
+    会让人以为"换模型没生效"（2026-10-25 独立审查）。之前只有独立接口
+    /api/paper/read_table 传了，整页翻译这条主路径漏了 → 手动选 Agnes 翻译时
+    表格还偷跑 M3，既不一致又烧 M3 的额度。
     """
     from .paper_text import TABLE_MARKER_RE
     tables: dict[str, str] = {}
@@ -1420,7 +1511,7 @@ async def _prepare_tables(page_text: str, pdf_path, page: int) -> tuple[str, dic
         rect = tuple(float(m.group(i)) for i in range(1, 5))
         token = f"⟦TABLE_{idx}⟧"
         try:
-            md = await _read_table_vision(pdf_path, page, rect)
+            md = await _read_table_vision(pdf_path, page, rect, model)
             if not md.strip():
                 raise RuntimeError("模型返回空内容")
             print(f"[MicroBench] 第 {page} 页表格已用多模态抄出 "
@@ -2000,6 +2091,8 @@ async def api_llm_status():
         "fallback": st["fallback"],
         "next_probe_in_seconds": st["next_probe_in_seconds"],
         "rate_limit": st["rate_limit"],
+        # 用户自己配的模型（.env LLM_CUSTOM_N_*）：前端按它算限流间隔
+        "custom_models": st.get("custom_models", []),
     }
 
 @app.post("/api/llm/probe")
@@ -2644,6 +2737,9 @@ class CrossQARequest(BaseModel):
                                                    description="用户勾选的章节索引列表; 为空则用全部")
     paper_title: Optional[str] = Field(default="", max_length=300)
     per_section_budget: Optional[int] = Field(default=6000, ge=1000, le=12000)
+    model: Optional[str] = Field(default="", max_length=64,
+                                 description="用哪个模型回答：'' = 跟随默认, "
+                                             "'agnes' = 备用模型, 'custom:xxx' = 自定义模型")
 
 
 # NOTE: /api/paper/explain and /api/paper/cross_qa non-streaming endpoints
@@ -2859,6 +2955,7 @@ async def api_explain_stream(req: ExplainRequest, request: Request):
                 ],
                 max_tokens=1200,
                 temperature=0.3,
+                **_qa_model_args(req.model),
             )
             async for chunk in _stream_llm_event_gen(chunk_iter):
                 yield chunk
@@ -2922,6 +3019,7 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
                 ],
                 max_tokens=4000,
                 temperature=0.3,
+                **_qa_model_args(req.model),
             )
             async for chunk in _stream_llm_event_gen(chunk_iter):
                 yield chunk
@@ -3015,7 +3113,8 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
     async def event_gen():
         try:
             st = llm.get_llm_status()
-            meta = {"model": st.get("active_model"), "is_degraded": st.get("is_degraded", False)}
+            meta = {"model": _effective_model_name(req.model),
+                    "is_degraded": st.get("is_degraded", False)}
             chunk_iter = llm.chat_stream_async(
                 messages=[
                     {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
@@ -3024,6 +3123,7 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
                 max_tokens=4000,
                 temperature=0.3,
                 timeout=120,
+                **_qa_model_args(req.model),
             )
             async for chunk in _stream_llm_event_gen(chunk_iter, meta=meta):
                 yield chunk
@@ -3116,12 +3216,15 @@ async def api_translate_page(req: TranslatePageRequest):
     # 模型逐格抄。抄好的表格在翻译完成后按位置拼回去。
     table_map: dict[str, str] = {}
     if pdf_path is not None and "⟦TABLE:" in page_text:
-        page_text, table_map = await _prepare_tables(page_text, pdf_path, req.page)
+        page_text, table_map = await _prepare_tables(page_text, pdf_path, req.page, req.model)
 
     # Translate the whole page in one shot (page text is already < 15K chars)
     # If somehow larger, chunk and translate parts.
     chunks = chunk_section_text(page_text)
     translated_parts = []
+    # 实际用了哪个模型（用户选的模型连不上时会自动退回主模型/备用模型，
+    # 这时必须报告实际那个，不能报告"用户选的"）
+    call_info: dict = {}
     # 单次翻译请求的总时限（见 api_translate_section 的同名逻辑）
     deadline = time.monotonic() + _translation_deadline_seconds(req.model)
     stopped_reason = ""
@@ -3159,6 +3262,8 @@ async def api_translate_page(req: TranslatePageRequest):
                     force_fallback=_m_fallback,
                     # 整条链路（重试 + 抬预算重试）都受这个时限约束
                     deadline=deadline,
+                    # 回填实际用的模型（自定义模型连不上会自动退回）
+                    ret=call_info,
                 )
             except llm.LLMError:
                 # 前面已经翻完了几段 -> 返回部分结果
@@ -3262,7 +3367,9 @@ async def api_translate_page(req: TranslatePageRequest):
         "page": req.page,
         "chunk_count": len(chunks),
         "from_cache": False,
-        "model": model,
+        # 实际用的模型（用户选的模型连不上时会自动退回 → 这里显示实际那个）
+        "model": call_info.get("model") or model,
+        "model_fell_back": bool(call_info.get("fallback_used")),
         "is_degraded": curr_st["is_degraded"],
         # 残留未翻译的英文段数（完整性校验的结果，正常应为 0）
         "untranslated_runs": len(leaked),
