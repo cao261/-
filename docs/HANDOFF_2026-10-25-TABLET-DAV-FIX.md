@@ -10,11 +10,17 @@
 
 ## 0. 一句话
 
-**平板端 WebDAV 的 vault 前缀（「我的坚果云/MicroBench工作台」）是空的，
+**平板端 WebDAV 的 vault 前缀探错了 —— 探到了「我的坚果云/MicroBench同步」
+（同步根），而不是「我的坚果云/MicroBench工作台」（vault）。
 于是 24 篇原文 PDF 全部 404、笔记同步永远是「0 篇」，
 而界面显示「已连接坚果云」—— 因为它只看账号密码对不对。**
 
-已修：**原生自愈 + 网页不再沉默 + 界面说真话**。
+> ⚠ 前两轮都修错了地方：前两轮修的是「前缀为空」和「前缀配错」，
+> 但**探测本身**就会选错 —— 因为 vault 和同步根是**兄弟目录、名字都含 MicroBench**，
+> 而坚果云按名字排序，「同」永远排在「工」前面。
+> 真凶见 [§5](#5-第三轮才找到的真凶探测选中了同步根2026-10-25-深夜)。
+
+已修：**探测靠内容不靠名字 + 原生自愈 + 网页不再沉默 + 界面说真话**。
 
 ---
 
@@ -181,7 +187,7 @@ if (entriesSeen === 0) {
 | 文件 | 钉住什么 |
 |---|---|
 | `android/_test_dav.py` + `TestDav.java` [14] | 用**真实 Java 客户端**对 mock WebDAV **复现故障**（列目录空 + 下载 404），再验自愈路径 |
-| `android/TestDavPath.java` [15]-[19] | **真正跑 `DavPathHandler`**（靠 `_stub/` 垫 Android 类）：空前缀自愈 / 错前缀自愈 / PDF 404 自愈 / 空目录不误报 / 节流 / 没配账号给可读错误 |
+| `android/TestDavPath.java` [15]-[20] | **真正跑 `DavPathHandler`**（靠 `_stub/` 垫 Android 类）：空前缀自愈 / 错前缀自愈 / PDF 404 自愈 / 空目录不误报 / 节流 / 没配账号给可读错误 / **兄弟目录陷阱** |
 | `microbench/_test_tablet_dav.js` | 网页侧三条护栏（0 条目报错 / 界面显示位置 / 文献库不谎报）|
 | `android/_test_apk_contract.py` [20][21][22] | 原生接线（探测 / 存回 / 只探一次 / davInfo 存在）+ 错前缀自愈接在**两条路径**上 + 桩类没混进 APK |
 
@@ -214,7 +220,85 @@ PASS  空目录只触发了 1 次重探测（之后被节流）
 
 ---
 
-## 5. 给对方的两条提醒
+## 5. 第三轮才找到的真凶：探测选中了**同步根**（2026-10-25 深夜）
+
+用户装完前两版还是不行，截图里有一行是决定性的：
+
+> 当前 vault 位置：**我的坚果云/MicroBench同步**
+
+**那不是 vault，那是同步根**（放译文快照 / 批注的那个兄弟目录）。
+
+### 真实云盘结构（本机 Nutstore 实测）
+
+```
+我的坚果云/
+  ├── MicroBench工作台/      ← vault（PDF 原文、笔记）
+  │     00_Dashboard  01_Literature  02_Reproduction
+  │     03_Knowledge  04_Weekly_Reports  _Templates  .obsidian  assets
+  └── MicroBench同步/        ← 同步根（译文快照、批注）
+        snapshots  annotations  files  progress
+```
+
+**两个是同一层的兄弟目录，名字共享 `MicroBench` 前缀。**
+
+### 为什么 100% 必错（不是偶发）
+
+老实现的判据是**名字**：`isLikelyVaultName()` = 名字含 "microbench" 或 "工作台"。
+
+而坚果云的 PROPFIND **按名字排序**：
+「同」= U+540C < 「工」= U+5DE5 →
+**「MicroBench同步」永远排在「MicroBench工作台」前面 → 永远先被选中。**
+
+于是：
+- 自愈把 `我的坚果云/MicroBench同步` 存成了 vault 位置；
+- 列 `…/MicroBench同步/01_Literature` → 207 + 0 条 → 「0 篇」；
+- 取 PDF → 404 → 「云盘里没找到这个文件」；
+- 而界面显示「已连接」（只看账号密码）。
+
+### 修法：名字只用来"值得一看"，必须验证内容
+
+```java
+// 名字像的候选 → 列它，看里面有没有 vault 的标志目录
+for (DavEntry e : dirs) {
+    if (!isLikelyVaultName(e.name)) continue;
+    if (isVaultDir(e.path)) return e.path;     // ← 内容校验
+}
+```
+
+判据要**成对**定义（只判「像 vault」会认错方向）：
+
+| 类别 | 标志目录 | 用途 |
+|---|---|---|
+| vault | `00_Dashboard` `01_Literature` `02_Reproduction` `03_Knowledge` `04_Weekly_Reports` `_Templates` | 认它 |
+| 同步根 | `snapshots` `annotations` | **排除**它 |
+
+⚠ 同步根里全是 .md（译文快照就是 .md）→ 「有没有 .md」**不能**当 vault 判据；
+递归进同步根之前要先按「含 snapshots/annotations」挡掉，
+否则会返回 `…/MicroBench同步/snapshots` 这种更离谱的路径。
+
+### ⚠⚠ 这一轮真正的教训：**mock 太善良 = 假绿**
+
+前两轮的 mock 树里**只有 vault、没有同步根**，
+而且 PROPFIND 按 `FILES` 字典的**插入顺序**返回条目
+→ 恰好把对的那个排在前面 → 测试全绿 → 真机全坏。
+
+改成真实结构（加同步根兄弟目录 + **按名字排序**）之后，
+**旧代码立刻从 `48 PASS / 22 PASS` 变成 `40 PASS / 8 FAIL` + `12 PASS / 10 FAIL`**，
+红的正是：
+
+```
+FAIL  探测到的是正确位置: 我的坚果云/MicroBench同步     ← 和用户截图一模一样
+FAIL  取文件返回 200（不是 404）: 404                    ← 24 篇 PDF 全挂
+FAIL  自愈后能列出 vault 里的条目: []                     ← 同步 0 篇
+```
+
+> **mock 必须照抄真实结构**：目录层级、兄弟关系、**排序规则**都要一样。
+> 少一样，测试就是假绿。
+
+---
+
+## 6. 给对方的两条提醒
+
 
 1. **桌面端别改 `android/`**（除非你也在改平板侧）——
    这套原生代码两台设备共用，但**只有 30461 这台负责重打 APK**。
@@ -233,7 +317,7 @@ PASS  空目录只触发了 1 次重探测（之后被节流）
 
 ---
 
-## 6. 通用教训（值得抄进你自己的代码）
+## 7. 通用教训（值得抄进你自己的代码）
 
 1. **「HTTP 200」和「有东西」是两回事** —— 空数组 / 空列表 / 0 条目，
    在 WebDAV、搜索、分页接口里**都是失败**。

@@ -155,6 +155,28 @@ public class TestDavPath {
         check(r5.statusCode == 503, "没配账号返回 503: " + r5.statusCode);
         check(b5.contains("坚果云"), "错误信息说人话: " + b5);
 
+        System.out.println("[20] 兄弟目录陷阱：vault 和同步根名字都含 MicroBench");
+        // 真实云盘：
+        //   我的坚果云/
+        //     ├── MicroBench工作台/   ← vault
+        //     └── MicroBench同步/     ← 同步根
+        // 坚果云按名字排序 → 「同」在「工」前面 → 同步根**永远**先被遍历到。
+        // 只按名字判断的实现，100% 会选错（用户真机就是这么坏的）。
+        CountingPrefs p6 = newPrefs(root, null, null);
+        DavPathHandler h6 = new DavPathHandler(p6);
+        WebResourceResponse r6 = h6.handle("/dav/list/01_Literature");
+        String b6 = body(r6);
+        check("我的坚果云/MicroBench工作台".equals(p6.davVaultRoot()),
+                "自愈选的是 vault，不是它的兄弟目录: " + p6.davVaultRoot());
+        check(b6.startsWith("[") && !b6.equals("[]"),
+                "自愈后能列出 vault 里的条目: " + b6);
+        check("我的坚果云/MicroBench同步".equals(p6.davSyncRoot()),
+                "同步根单独定位（译文快照要靠它）: " + p6.davSyncRoot());
+        // 同步根里当然没有 01_Literature —— 选错了就必然 0 条
+        check(p6.davVaultRoot() != null && !p6.davVaultRoot().equals(p6.davSyncRoot()),
+                "vault 和同步根是两个不同的目录: "
+                        + p6.davVaultRoot() + " vs " + p6.davSyncRoot());
+
         System.out.println();
         System.out.println("PASS " + pass + "  FAIL " + fail);
         System.exit(fail == 0 ? 0 : 1);

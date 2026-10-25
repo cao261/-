@@ -883,15 +883,40 @@ public class DavClient {
             DavClient probe = new DavClient(user, pass, root, candidate);
             List<DavEntry> entries = probe.list("");
             for (DavEntry e : entries) {
-                if (e.isDir && ("snapshots".equals(e.name) || "annotations".equals(e.name))) {
+                if (e.isDir && isSyncMarkerDir(e.name)) {
                     return candidate;
                 }
             }
             // 目录在但还是空的 —— 也认（先存着，等 PC 那边产生内容）
-            return entries.isEmpty() ? candidate : "";
+            if (entries.isEmpty()) {
+                return candidate;
+            }
+        } catch (Exception e) {
+            // 继续走兄弟目录扫描
+        }
+        // ⚠ 兜底：同步根不一定叫「MicroBench同步」（用户可能改过名）。
+        //   在 vault 的**兄弟目录**里找那个含 snapshots/annotations 的。
+        try {
+            DavClient probe = new DavClient(user, pass, root, parent);
+            for (DavEntry e : probe.list("")) {
+                if (!e.isDir) {
+                    continue;
+                }
+                try {
+                    DavClient sub = new DavClient(user, pass, root, e.path);
+                    for (DavEntry s : sub.list("")) {
+                        if (s.isDir && isSyncMarkerDir(s.name)) {
+                            return e.path;
+                        }
+                    }
+                } catch (Exception ex) {
+                    // 跳过这个兄弟目录
+                }
+            }
         } catch (Exception e) {
             return "";
         }
+        return "";
     }
 
     /**
@@ -909,7 +934,22 @@ public class DavClient {
 
     /**
      * 递归找 vault 位置。
-     * 优先返回带 01_Literature 的目录 —— 那是最强的信号。
+     *
+     * ⚠⚠ **名字不能用来区分 vault 和同步根**（2026-10-25 用户真机故障）：
+     *   真实云盘长这样 —— 两个**兄弟**目录，名字共享前缀：
+     *       我的坚果云/
+     *         ├── MicroBench工作台/   ← vault（PDF 原文、笔记）
+     *         └── MicroBench同步/     ← 同步根（译文快照、批注）
+     *   老实现只按名字判断（"含 microbench 就算"），
+     *   而坚果云按名字排序，「同」(U+540C) 排在「工」(U+5DE5) **前面**
+     *   → 「MicroBench同步」**永远**先被选中 → 自愈把**错的位置**存了下来。
+     *   → 症状：界面显示"已连接"、vault 位置亮出「我的坚果云/MicroBench同步」，
+     *     但列目录 0 条、PDF 全 404（同步根里当然没有 01_Literature）。
+     *
+     *   **正确判据是内容**：
+     *     - vault 里有 00_Dashboard / 01_Literature / …；
+     *     - 同步根里有 snapshots / annotations。
+     *   所以：名字只用来"值得一看"，**必须验证内容**才能认。
      */
     private String detectVaultAt(String dir, int depth) {
         // 探测是要发 PROPFIND 的, 每一次都是一次完整的 TLS 握手。
@@ -927,19 +967,28 @@ public class DavClient {
         }
         boolean hasLit = false;
         boolean hasMd = false;
+        boolean isSyncRoot = false;
         List<DavEntry> dirs = new ArrayList<>();
         for (DavEntry e : entries) {
             if (e.isDir) {
                 dirs.add(e);
-                if ("01_Literature".equals(e.name) || "00_Dashboard".equals(e.name)) {
+                if (isVaultMarkerDir(e.name)) {
                     hasLit = true;
+                } else if (isSyncMarkerDir(e.name)) {
+                    isSyncRoot = true;
                 }
             } else if (e.name.toLowerCase().endsWith(".md")) {
                 hasMd = true;
             }
         }
         if (hasLit) {
-            return dir;                     // 最强信号
+            return dir;                     // 最强信号：这一层就有 vault 的标志目录
+        }
+        if (isSyncRoot) {
+            // 这一层是**同步根** → 绝对不是 vault。
+            // 必须在往下钻之前拦住：同步根里 snapshots/ 下全是 .md，
+            // 不拦的话会返回「…/MicroBench同步/snapshots」这种更离谱的路径。
+            return null;
         }
         if (depth <= 1) {
             return hasMd ? dir : null;
@@ -950,16 +999,20 @@ public class DavClient {
                 return e.path;
             }
         }
-        // ⚠ 优先看像不像我们的 vault（名字里有 microbench / 工作台）。
-        //   这一步是关键：常见布局是
+        // ⚠ 名字像我们的 vault → **但必须验证内容**。
+        //   常见布局是
         //       我的坚果云/            <- dav 根
         //         MicroBench工作台/    <- vault
-        //   命中它只要**两次** PROPFIND；不命中的话，
+        //         MicroBench同步/      <- 同步根（名字也会命中！）
+        //   命中它只要几次 PROPFIND；不命中的话，
         //   后面那个「把整朵云盘递归一遍」的兜底会发几十个请求 ——
         //   坚果云会直接回 503 BlockedTemporarily 把我们限流。
         for (DavEntry e : dirs) {
-            if (isLikelyVaultName(e.name)) {
-                return e.path;
+            if (!isLikelyVaultName(e.name)) {
+                continue;
+            }
+            if (isVaultDir(e.path)) {
+                return e.path;              // 验证通过：这才是 vault
             }
         }
         for (DavEntry e : dirs) {
@@ -969,6 +1022,50 @@ public class DavClient {
             }
         }
         return hasMd ? dir : null;
+    }
+
+    /**
+     * vault 的标志目录 —— 只有 vault 里才有这些。
+     *
+     * ⚠ 不能用「有没有 .md」当判据：同步根的 snapshots/ 里也全是 .md。
+     */
+    private static boolean isVaultMarkerDir(String name) {
+        if (name == null) {
+            return false;
+        }
+        return "00_Dashboard".equals(name) || "01_Literature".equals(name)
+                || "02_Reproduction".equals(name) || "03_Knowledge".equals(name)
+                || "04_Weekly_Reports".equals(name) || "_Templates".equals(name);
+    }
+
+    /** 同步根的标志目录 —— 只有同步根里才有这些。 */
+    private static boolean isSyncMarkerDir(String name) {
+        if (name == null) {
+            return false;
+        }
+        return "snapshots".equals(name) || "annotations".equals(name);
+    }
+
+    /**
+     * 验证一个目录**确实是 vault**（里面有没有 vault 的标志目录）。
+     *
+     * 名字会撞车（vault 和同步根都叫 MicroBenchxxx）→ 只能靠内容分辨。
+     */
+    private boolean isVaultDir(String path) {
+        if (probeCalls >= MAX_PROPFIND_CALLS) {
+            return false;
+        }
+        probeCalls++;
+        try {
+            for (DavEntry e : listRaw(path)) {
+                if (e.isDir && isVaultMarkerDir(e.name)) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
     }
 
     /** 目录名像不像我们的 vault（省得在别人的文件夹里瞎逛）。 */

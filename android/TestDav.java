@@ -245,6 +245,15 @@ public class TestDav {
         String auto = bare.detectVaultRoot();
         check(auto != null && auto.contains("MicroBench工作台"),
                 "能自动探测出 vault 位置: " + auto);
+        // ⚠⚠ 2026-10-25 用户真机故障：vault 和同步根是**兄弟目录**，
+        //   名字共享 "MicroBench" 前缀，而坚果云按名字排序，
+        //   「同」(U+540C) 排在「工」(U+5DE5) 前面
+        //   → 老实现（只按名字判断）**永远**会选中「MicroBench同步」，
+        //     于是列目录 0 条、PDF 全 404，而界面显示「已连接」。
+        check(auto != null && !auto.contains("MicroBench同步"),
+                "不会误选同步根（兄弟目录，名字都含 MicroBench）: " + auto);
+        check(auto != null && auto.endsWith("MicroBench工作台"),
+                "探测到的是 vault 本体，不是它里面的子目录: " + auto);
         bare.setVaultRoot(auto);
         List<DavClient.DavEntry> fixedList = bare.list("01_Literature");
         check(fixedList != null && !fixedList.isEmpty(),

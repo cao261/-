@@ -351,6 +351,31 @@ def main() -> int:
     check((HERE / "TestDavPath.java").is_file(),
           "有 TestDavPath（自愈链路的回归测试）")
 
+    print("\n[23] 探测 vault 必须靠**内容**，不能靠名字（2026-10-25 真机故障·第三轮）")
+    # 用户真机截图：界面亮出「当前 vault 位置: 我的坚果云/MicroBench同步」。
+    # 根因：真实云盘里 vault 和同步根是**兄弟目录**，名字共享前缀：
+    #     我的坚果云/MicroBench工作台/   ← vault
+    #     我的坚果云/MicroBench同步/     ← 同步根
+    # 坚果云按名字排序，「同」(U+540C) 在「工」(U+5DE5) 前面
+    # → 只按名字判断的实现 **100% 选错**，不是偶发。
+    client_java = read(JAVA / "DavClient.java")
+    code_client = code_only(client_java)
+    check("isVaultMarkerDir" in code_client,
+          "有「vault 标志目录」判据（00_Dashboard / 01_Literature …）")
+    check("isSyncMarkerDir" in code_client,
+          "有「同步根标志目录」判据（snapshots / annotations）")
+    check(re.search(r"if \(isVaultDir\(e\.path\)\)", code_client) is not None,
+          "名字像的候选**必须验证内容**才认（不能只看名字）")
+    check("isVaultDir" in code_client and "listRaw" in code_client,
+          "内容验证是真的列目录去看，不是空壳")
+    # ⚠ mock 必须忠实：兄弟目录 + 按名字排序。
+    #   少了任一条，这个 bug 就测不出来（还给人「已经修好了」的错觉）。
+    dav_py = read(HERE / "_test_dav.py")
+    check("我的坚果云/MicroBench同步/snapshots" in dav_py,
+          "mock 里有同步根（vault 的兄弟目录）")
+    check(re.search(r"items\.sort\(", dav_py) is not None,
+          "mock 的 PROPFIND 按名字排序（真实服务器都这样）")
+
     print(f"\n{'=' * 60}")
     print(f"PASS {len(PASS)}  FAIL {len(FAIL)}")
     for f in FAIL:

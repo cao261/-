@@ -40,11 +40,35 @@ public class Prefs {
 
     /** vault 在云盘里的位置（相对 WebDAV 根），如「我的坚果云/MicroBench工作台」。 */
     public String davVaultRoot() {
-        return sp.getString(K_DAV_VAULT, "");
+        // 读的时候也归一化 —— 旧版本存进去的可能带尾斜杠
+        return normalizeRoot(sp.getString(K_DAV_VAULT, ""));
     }
 
     public void setDavVaultRoot(String p) {
-        sp.edit().putString(K_DAV_VAULT, p == null ? "" : p.trim()).apply();
+        sp.edit().putString(K_DAV_VAULT, normalizeRoot(p)).apply();
+    }
+
+    /**
+     * 统一路径写法：去首尾空白、去首尾斜杠、反斜杠转正斜杠。
+     *
+     * ⚠ 为什么必须归一化（不是洁癖）：
+     *   手填路径可能带尾斜杠「我的坚果云/MicroBench工作台/」，
+     *   而探测出来的「我的坚果云/MicroBench工作台」不带。
+     *   两者字符串不等 → {@link #redetectVaultRoot()} 每次都认为
+     *   「位置变了」→ 每 5 分钟就全盘重探一次 → 白白消耗坚果云配额。
+     */
+    private static String normalizeRoot(String p) {
+        if (p == null) {
+            return "";
+        }
+        String s = p.trim().replace('\\', '/');
+        while (s.startsWith("/")) {
+            s = s.substring(1);
+        }
+        while (s.endsWith("/")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        return s;
     }
 
     /**
@@ -55,11 +79,11 @@ public class Prefs {
      *   平板要拿到译文，就必须能读到这个目录。
      */
     public String davSyncRoot() {
-        return sp.getString(K_DAV_SYNC, "");
+        return normalizeRoot(sp.getString(K_DAV_SYNC, ""));
     }
 
     public void setDavSyncRoot(String p) {
-        sp.edit().putString(K_DAV_SYNC, p == null ? "" : p.trim()).apply();
+        sp.edit().putString(K_DAV_SYNC, normalizeRoot(p)).apply();
     }
 
     /** 同步根的客户端（读译文快照 / 批注）。没配或没配账号时返回 null。 */

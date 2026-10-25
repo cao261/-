@@ -24,6 +24,15 @@ ROOT = HERE / "_davtest_root"
 PORT = 8765
 
 # 假服务器上的文件树
+#
+# ⚠⚠ **必须照抄真实云盘的结构**（2026-10-25 用户真机故障的教训）：
+#   真实布局里 vault 和同步根是**同一层的兄弟目录**，名字共享前缀：
+#       我的坚果云/
+#         ├── MicroBench工作台/   ← vault（PDF 原文、笔记）
+#         └── MicroBench同步/     ← 同步根（译文快照、批注）
+#   之前这个 mock **只有工作台** → 探测永远选得对 → 测试测不出问题，
+#   而真机上「MicroBench同步」按名字序排在前面，**永远**被误选。
+#   mock 太善良 = 假绿。
 FILES = {
     "我的坚果云/MicroBench工作台/00_Dashboard/主工作台看板.md": "# 看板\n\n内容\n",
     "我的坚果云/MicroBench工作台/01_Literature/01_论文原文_PDF/a paper.pdf": "PDF-BYTES",
@@ -32,6 +41,11 @@ FILES = {
     # form 编码规则, 会把 "+" 解成空格 —— 「C++入门.pdf」就变成
     # 「C 入门.pdf」, 那个文件永远打不开。
     "我的坚果云/MicroBench工作台/01_Literature/C++入门.pdf": "PDF-PLUS",
+    # ↓ 同步根：vault 的**兄弟**目录，名字同样含 "MicroBench"。
+    #   有了它，探测逻辑必须靠**内容**（00_Dashboard/01_Literature）
+    #   才能认出 vault，而不是靠名字。
+    "我的坚果云/MicroBench同步/snapshots/p1.md": "# 译文快照\n",
+    "我的坚果云/MicroBench同步/annotations/a1.json": '{"notes":[]}',
 }
 
 
@@ -115,6 +129,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if d not in seen:
                     seen.add(d)
                     items.append((d, True, 0))
+        # ⚠⚠ **必须按名字排序**（真实 WebDAV 服务器都这样，坚果云也一样）。
+        #   这一条不是洁癖 —— 它正是用户真机故障的**决定性因素**：
+        #   「MicroBench同步」按 Unicode 码位排在「MicroBench工作台」前面
+        #   （同 = U+540C < 工 = U+5DE5），
+        #   所以真机上同步根**永远**先被遍历到。
+        #   mock 不排序 = 遍历顺序由 FILES 的插入顺序决定 = 恰好把对的放前面
+        #   → 测不出来，还给人「已经修好了」的错觉。
+        items.sort(key=lambda it: it[0])
         body = ['<?xml version="1.0" encoding="utf-8"?>',
                  '<D:multistatus xmlns:D="DAV:">']
         for name, is_dir, size in items:
