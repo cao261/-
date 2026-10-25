@@ -6163,6 +6163,55 @@
     let _sessionQAList = [];
     let _currentQAPreset = "通俗解释";
 
+    // 判断选区属于哪一侧（PDF 原文 / 译文 / 章节视图）以及第几页。
+    //
+    // 关键：**不能只看鼠标松开的位置**。
+    // 拖选一整行、拖到行尾、拖进右边距时，mouseup 的 e.target 常常是
+    // .page-text 或面板留白 —— 不在任何块里 → 旧逻辑判成
+    // source="general"、pageNum=null → 批注落到"章节视图"（第 0 页），
+    // 用户在自己正在看的那一页上根本找不到这条批注。
+    // 所以：先用 e.target，判不出来就用选区 range 的公共祖先兜底。
+    //
+    // 返回 { source, pageNum, sectionIdx }；判不出来返回 null。
+    function _resolveSelectionOrigin(targetEl, range, activeSection) {
+      const pick = (el) => {
+        if (!el || !el.closest) return null;
+        const pdfBlock = el.closest(".pdf-page-block");
+        if (pdfBlock) {
+          const m = pdfBlock.id.match(/\d+/);
+          return {
+            source: "pdf",
+            pageNum: m ? parseInt(m[0], 10) : null,
+            sectionIdx: null,
+          };
+        }
+        if (el.closest("#pdf-translations-list") || el.closest(".pdf-translation-block")) {
+          const transBlock = el.closest(".pdf-translation-block");
+          let pageNum = null;
+          if (transBlock) {
+            const m = transBlock.id.match(/\d+/);
+            if (m) pageNum = parseInt(m[0], 10);
+          }
+          return { source: "translation", pageNum, sectionIdx: null };
+        }
+        if (el.closest("#reader-original")) {
+          return { source: "original", pageNum: null, sectionIdx: activeSection };
+        }
+        if (el.closest("#reader-translation")) {
+          return { source: "translation", pageNum: null, sectionIdx: activeSection };
+        }
+        return null;
+      };
+
+      let info = pick(targetEl);
+      if (!info && range) {
+        const node = range.commonAncestorContainer;
+        const el = node && (node.nodeType === 1 ? node : node.parentElement);
+        info = pick(el);
+      }
+      return info;
+    }
+
     function initReaderSelectionListener() {
       document.addEventListener("mouseup", (e) => {
         // If selection happened inside textarea or input, ignore
@@ -6203,24 +6252,19 @@
           let pageNum = null;
           let sectionIdx = null;
 
-          const pdfBlock = e.target.closest(".pdf-page-block");
-          if (pdfBlock) {
-            source = "pdf";
-            const m = pdfBlock.id.match(/\d+/);
-            if (m) pageNum = parseInt(m[0], 10);
-          } else if (e.target.closest("#pdf-translations-list") || e.target.closest(".pdf-translation-block")) {
-            source = "translation";
-            const transBlock = e.target.closest(".pdf-translation-block");
-            if (transBlock) {
-              const m = transBlock.id.match(/\d+/);
-              if (m) pageNum = parseInt(m[0], 10);
-            }
-          } else if (e.target.closest("#reader-original")) {
-            source = "original";
-            sectionIdx = _readerState.activeSection;
-          } else if (e.target.closest("#reader-translation")) {
-            source = "translation";
-            sectionIdx = _readerState.activeSection;
+          // 选区落在哪：优先按**鼠标松开的位置**判断，位置在文字外面时
+          // 回退到**选区本身**（range 的公共祖先）。
+          // 为什么必须回退：拖选一整行时很容易把鼠标松在行尾 / 右边距上，
+          // 那时 e.target 不是文字元素（可能是 .page-text 或面板留白），
+          // 判定链全部落空 → source="general"、pageNum=null →
+          // 批注被存成"章节视图"（第 0 页），用户在 PDF 页上根本找不到它。
+          const range = sel.rangeCount ? sel.getRangeAt(0) : null;
+          const origin = _resolveSelectionOrigin(
+            e.target, range, _readerState ? _readerState.activeSection : null);
+          if (origin) {
+            source = origin.source;
+            pageNum = origin.pageNum;
+            sectionIdx = origin.sectionIdx;
           }
 
           _readerSelState = { text, source, pageNum, sectionIdx, rects: [] };

@@ -305,7 +305,21 @@ JACERS 综述第 2 页 Table I：文本层抽出来是 `B700 16.5`、
 2. 本页没有 → 落在**下一页的第一条**
 3. 超出范围 → 回退到第一条
 
-### 8.4 改这块时必须跑
+### 8.4 选区归属：不能只看鼠标松开的位置
+
+**踩坑（2026-10-25 浏览器实测）**：在译文里拖选一整行，**把鼠标松在行尾的留白上**
+（这是很自然的动作）→ `mouseup` 的 `e.target` 不是文字元素
+（可能是 `.page-text` 或面板留白）→ 判定链全部落空 → `source="general"`、
+`pageNum=null` → 批注被存成 **page=0（章节视图）**。
+
+后果：用户在**正在看的那一页**上根本找不到这条批注（它躺在章节视图里），
+PDF 侧同理 → `rects` 收不到 → 原文高亮也没了。
+
+**修法**：`_resolveSelectionOrigin(targetEl, range, activeSection)`
+—— 先按 `e.target` 判断，**判不出来就用选区 `range.commonAncestorContainer` 兜底**。
+DOM 里是元素就用元素本身，是文本节点就取 `parentElement`。
+
+### 8.5 改这块时必须跑
 
 ```bash
 node microbench/_test_reader_annotations.js     # 21 项

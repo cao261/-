@@ -59,3 +59,17 @@ def test_annotation_record_is_never_dropped_on_save():
     assert "_annoState.items = " not in body, "保存时整体覆盖了 items"
     assert ".filter(" not in body, "保存时把某些批注过滤掉了"
     assert "existing.note = note" in body, "保存没有写回笔记"
+
+
+def test_selection_origin_falls_back_to_range():
+    """松手位置在文字外面时，要按选区本身定位（否则页码丢失 → 批注跑到章节视图）。"""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert "function _resolveSelectionOrigin(" in html, "缺少选区归属解析函数"
+    # 函数内部必须有"range 兜底"这一路
+    start = html.index("function _resolveSelectionOrigin(")
+    end = html.index("\n    }\n", start)
+    body = html[start:end]
+    assert "commonAncestorContainer" in body, "选区归属没有用 range 兜底"
+    assert "pick(el)" in body, "选区归属没有回退到选区公共祖先"
+    # mouseup 处理器必须走这个函数，而不是自己判断 e.target
+    assert "_resolveSelectionOrigin(" in html, "mouseup 处理器没有调用 _resolveSelectionOrigin"
