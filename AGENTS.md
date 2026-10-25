@@ -546,6 +546,12 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
    必须变红，否则说明断言恒真、测了个寂寞。
 3. **前端单文件里的函数可以被切片出来单测**：`sliceFn()` 切源码 + `new Function` 注入桩
    → 测的是**发布出去的那份代码**，不是抄一份（见 `microbench/_test_reader_annotations.js`）。
+4. **别用"鼠标松开的位置"判断选区属于哪一块** —— 拖选一整行时用户常把鼠标松在
+   行尾留白上，`e.target` 不是文字元素 → 页码丢失 → 批注被存成"章节视图"，
+   用户在自己正在看的那页上找不到它。
+   → 用 `_resolveSelectionOrigin(e.target, range, activeSection)`：
+   先按 `e.target` 判，判不出来就用 `range.commonAncestorContainer` 兜底。
+   （PDF 侧同理：判不出来就收不到 `rects` → 原文高亮也没了。）
 
 
 

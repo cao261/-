@@ -44,6 +44,7 @@ const escapeHtml = (s) => String(s)
 function makeEl(tag) {
   const el = {
     tagName: String(tag || "div").toUpperCase(),
+    nodeType: 1,          // 真实 DOM 里元素是 1、文本节点是 3
     className: "",
     dataset: {},
     style: {},
@@ -87,6 +88,24 @@ function makeEl(tag) {
     },
     querySelector(sel) { return el.querySelectorAll(sel)[0] || null; },
     scrollIntoView(opts) { el.scrolled = opts || {}; },
+    // closest(sel)：sel 可以是 "#id" / ".cls" / "TAG" 的逗号组合
+    closest(sel) {
+      const parts = String(sel).split(",").map(s => s.trim()).filter(Boolean);
+      let node = el;
+      while (node) {
+        for (const s of parts) {
+          if (s.charAt(0) === "#") {
+            if (node.id === s.slice(1)) return node;
+          } else if (s.charAt(0) === ".") {
+            if (node.className.split(/\s+/).includes(s.slice(1))) return node;
+          } else if (node.tagName === s.toUpperCase()) {
+            return node;
+          }
+        }
+        node = node.parentNode;
+      }
+      return null;
+    },
   };
   Object.defineProperty(el, "innerHTML", {
     get() { return el._html; },
@@ -120,6 +139,9 @@ const applyFactory = new Function(
 const drawerFactory = new Function(
   "document", "escapeHtml", "_ANNO_COLORS", "_annoState",
   sliceFn("openAnnoDrawer") + "\nreturn openAnnoDrawer;");
+const originFactory = new Function(
+  sliceFn("_resolveSelectionOrigin") + "\nreturn _resolveSelectionOrigin;");
+const resolveOrigin = originFactory();
 
 let pass = 0, fail = 0;
 function check(name, cond, extra) {
@@ -232,5 +254,64 @@ const threePages = [
   check("引文里的 HTML 被转义", !list.children[0].innerHTML.includes("<img src=x"), list.children[0].innerHTML.slice(0, 160));
 }
 
+// ---------------------------------------------------------------------------
+// 3) 选区归属：松手位置在文字外面，也不能丢页码
+// ---------------------------------------------------------------------------
+console.log("== 选区归属（松手在文字外也不丢页码） ==");
+
+{
+  // 搭一棵假的阅读器 DOM
+  const modal = makeEl("div"); modal.id = "reader-modal";
+  const list = makeEl("div"); list.id = "pdf-translations-list";
+  const block = makeEl("div");
+  block.className = "pdf-translation-block"; block.id = "pdf-trans-block-1";
+  const pageText = makeEl("div"); pageText.className = "page-text";
+  const p = makeEl("p");
+  pageText.appendChild(p);
+  block.appendChild(pageText);
+  list.appendChild(block);
+  modal.appendChild(list);
+
+  const orig = makeEl("div"); orig.id = "reader-original";
+  modal.appendChild(orig);
+  const pdfBlock = makeEl("div");
+  pdfBlock.className = "pdf-page-block"; pdfBlock.id = "pdf-page-block-3";
+  modal.appendChild(pdfBlock);
+  const blank = makeEl("div"); blank.className = "pane-blank";  // 面板留白
+  modal.appendChild(blank);
+
+  const o1 = resolveOrigin(p, null, 2);
+  check("译文里的选区 → translation + 页码 1",
+    o1 && o1.source === "translation" && o1.pageNum === 1, JSON.stringify(o1));
+
+  const o2 = resolveOrigin(pageText, null, 2);
+  check("点在 .page-text 上也算译文", o2 && o2.pageNum === 1, JSON.stringify(o2));
+
+  // ★ 关键回归：拖选一行后把鼠标松在行尾留白上 → 旧逻辑会判成 general/page=null
+  const o3 = resolveOrigin(blank, { commonAncestorContainer: p }, 2);
+  check("松手在文字外 → 用选区兜底，仍拿到第 1 页",
+    o3 && o3.source === "translation" && o3.pageNum === 1, JSON.stringify(o3));
+
+  const o4 = resolveOrigin(blank, { commonAncestorContainer: { nodeType: 3, parentElement: p } }, 2);
+  check("选区锚点是文本节点时也能兜底",
+    o4 && o4.source === "translation" && o4.pageNum === 1, JSON.stringify(o4));
+
+  const o5 = resolveOrigin(pdfBlock, null, 2);
+  check("PDF 原文侧 → pdf + 页码 3",
+    o5 && o5.source === "pdf" && o5.pageNum === 3, JSON.stringify(o5));
+
+  const o6 = resolveOrigin(blank, { commonAncestorContainer: pdfBlock }, 2);
+  check("PDF 侧松手在文字外也兜底（否则高亮矩形会丢）",
+    o6 && o6.source === "pdf" && o6.pageNum === 3, JSON.stringify(o6));
+
+  const o7 = resolveOrigin(orig, null, 2);
+  check("章节原文区 → original + 章节号",
+    o7 && o7.source === "original" && o7.sectionIdx === 2, JSON.stringify(o7));
+
+  const o8 = resolveOrigin(blank, null, 2);
+  check("实在判不出来 → null（不硬凑页码）", o8 === null, JSON.stringify(o8));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
+
