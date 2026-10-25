@@ -201,6 +201,88 @@ def test_stream_path_no_loose_429_degrade():
         "流式路径还在用宽松的 429 判定（网络错误会被当成配额耗尽 → 全局降格）"
 
 
+def test_real_429_keeps_status_code():
+    """真 429 时 LLMError 必须带 status_code=429。
+
+    这是上面那条收紧判定的**前提**：如果 status 丢了，
+    `getattr(e, "status_code", None)` 是 None → 走"不降格"分支 →
+    **真配额耗尽就永远不再降格**（用户会一直卡在失败的请求上）。
+    """
+    import asyncio
+
+    class _Resp:
+        status_code = 429
+
+        async def aread(self):
+            return b'{"base_resp":{"status_code":2056,' \
+                   b'"status_msg":"Token Plan limit exceeded"}}'
+
+        async def aiter_lines(self):
+            return
+            yield  # pragma: no cover
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Client:
+        def stream(self, method, url, json=None, headers=None):
+            return _Resp()
+
+    orig_client = llm._get_async_client
+    orig_acquire = llm._acquire_limiter_async
+
+    async def _noop(*a, **k):
+        return None
+
+    llm._get_async_client = lambda timeout=60: _Client()
+    llm._acquire_limiter_async = _noop
+    try:
+        async def run():
+            cfg = {"api_key": "k", "base_url": "http://x", "model": "m"}
+            try:
+                async for _ in llm._stream_model(
+                    cfg, [{"role": "user", "content": "hi"}], 100, 0.3, 30, None
+                ):
+                    pass
+            except llm.LLMError as exc:
+                return exc
+            return None
+
+        exc = asyncio.run(run())
+    finally:
+        llm._get_async_client = orig_client
+        llm._acquire_limiter_async = orig_acquire
+
+    assert exc is not None, "429 应该抛 LLMError"
+    assert getattr(exc, "status_code", None) == 429, \
+        f"429 的 LLMError 没带 status_code: {exc}"
+    # 带得上 → 精确判定能认出"配额耗尽" → 仍会正确降格
+    assert llm.model_manager.is_quota_exhausted_error(429, str(exc)) is True, \
+        "配额耗尽的报文没被认出来（会导致真配额耗尽不降格）"
+
+
+def test_rate_limit_messages_are_not_treated_as_quota():
+    """限流报文不能被当成配额耗尽（否则一次限流就全局降格 15 分钟）。"""
+    rate_msgs = [
+        '{"base_resp":{"status_code":1008,"status_msg":"Too many requests"}}',
+        '{"base_resp":{"status_code":1008,"status_msg":"rate limit exceeded"}}',
+        '{"base_resp":{"status_code":1008,"status_msg":"requests per minute exceeded"}}',
+    ]
+    for msg in rate_msgs:
+        assert llm.model_manager.is_quota_exhausted_error(429, msg) is False, \
+            f"限流报文被误判成配额耗尽: {msg}"
+
+
+def test_quota_message_is_still_detected():
+    """真配额耗尽仍要认得出来（别把降格功能改没了）。"""
+    quota_msg = ('{"base_resp":{"status_code":2056,'
+                 '"status_msg":"Token Plan limit exceeded"}}')
+    assert llm.model_manager.is_quota_exhausted_error(429, quota_msg) is True
+
+
 def test_frontend_does_not_hardcode_quota_message():
     """界面不能写死"额度用完了" —— 要照后端给的分类说人话。"""
     src = (ROOT / "microbench" / "static" / "index.html").read_text(encoding="utf-8")
