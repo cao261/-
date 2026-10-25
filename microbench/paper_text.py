@@ -605,7 +605,20 @@ def _crop_lines(page, bbox, margin: float = 16.0) -> list[dict]:
     再按「行的 top 属于哪一带」过滤 → 每行只归属一带，不重不漏。
     """
     x0, y0, x1, y1 = bbox
-    box = (x0, max(0.0, y0 - margin), x1, y1 + margin)
+    # 裁剪框必须**完全落在页面内** —— pdfplumber 的 crop() 越界会直接抛
+    # ValueError（"Bounding box ... is not fully within parent page"）。
+    # 而"向外扩 margin"很容易把框推出页面下沿（实测 JACERS 第 4~6 页：
+    # 最后一组扩到 784 > 页高 782.986 → 整组文字全丢，那三页正文少了
+    # 83~148 个词，页面上却看不出任何报错）。
+    ph = float(getattr(page, "height", 0) or 0)
+    pw = float(getattr(page, "width", 0) or 0)
+    cy0 = max(0.0, y0 - margin)
+    cy1 = (y1 + margin) if not ph else min(ph, y1 + margin)
+    cx0 = max(0.0, x0)
+    cx1 = (x1) if not pw else min(pw, x1)
+    if cy1 <= cy0 or cx1 <= cx0:
+        return []
+    box = (cx0, cy0, cx1, cy1)
     try:
         cropped = page.crop(box)
     except Exception:
@@ -953,7 +966,13 @@ def _extract_top_region(page, words, width, height, y_split, x_mid):
                     if st.strip():
                         front.append(st.strip())
             except Exception:
-                pass
+                # 原来这里是 except: pass —— 一带抽取失败就静默跳过，
+                # 结果整页的图注/正文凭空消失（2026-10-25 实测 JACERS 第 4~6 页：
+                # 顶部区域的每一带都失败 → 整页正文少了 83~148 个词，
+                # 而且没有任何报错）。静默兜底必须留痕。
+                import traceback
+                print(f"[MicroBench] 顶部区域一带抽取失败: "
+                      f"{traceback.format_exc()}", file=sys.stderr)
         y = y1
     return front, left_parts, right_parts
 
@@ -1176,6 +1195,12 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
             if rt.strip():
                 right_parts.append(rt.strip())
     except Exception:
+        # 静默兜底会把"整页正文丢失"藏起来（实测 2026-10-25：某个异常导致
+        # 整页退回 plain 文本，正文少了 83~148 个词，却没有任何报错）。
+        # 这里把堆栈打出来，别再"看不见"。
+        import traceback
+        print(f"[MicroBench] 抽取分带失败（退回 plain 文本）: "
+              f"{traceback.format_exc()}", file=sys.stderr)
         return [], [], []
     if table_rows:
         pending.extend(table_rows)

@@ -76,6 +76,42 @@ def test_trim_keeps_markers_intact():
         assert marker in out, f"{marker} 被截尾切坏了: {out!r}"
 
 
+# ---------------------------------------------------------------------------
+# 图形页：整页正文不能凭空消失
+# ---------------------------------------------------------------------------
+# 2026-10-25 独立审查发现的阻断级回归：
+#   裁剪时为了避开切字，向外扩了 16pt —— 但框一旦推出页面下沿，
+#   pdfplumber 的 crop() 直接抛 ValueError（"not fully within parent page"），
+#   而当时的 except 把异常吞成空结果 → **整组文字全丢**。
+#   表现：JACERS 第 4~6 页（图形页）正文只剩 1/4（少 83~148 个词），
+#   页面上却看不到任何报错，只是"翻译少了一大截"。
+
+def test_figure_page_keeps_its_content():
+    """第 4 页（图形页）的图注、坐标轴标签、正文都必须在。"""
+    text = _page_text(4)
+    assert "Magnetic field (Oe)" in text, "图 4 的坐标轴标签丢了"
+    assert "Fig.4." in text, "图 4 的图注丢了"
+    assert len(text) > 2500, f"第 4 页正文过短（{len(text)} 字符），疑似整块丢失"
+
+
+def test_figure_page_5_keeps_its_content():
+    text = _page_text(5)
+    assert "Frequency" in text, "图 5/6 的频率轴标签丢了"
+    assert len(text) > 3000, f"第 5 页正文过短（{len(text)} 字符），疑似整块丢失"
+
+
+def test_every_page_of_the_sample_keeps_a_sane_length():
+    """整篇 8 页都不能短得离谱（相对页面的纯文本抽取）。"""
+    import pdfplumber
+    from microbench import paper_text as pt
+    with pdfplumber.open(str(JACERS)) as pdf:
+        for idx, page in enumerate(pdf.pages, start=1):
+            plain = page.extract_text(x_tolerance=pt.PDF_X_TOLERANCE) or ""
+            text = pt._extract_page_text_raw(page)
+            assert len(text) >= len(plain) * 0.8, (
+                f"第 {idx} 页正文异常短：新 {len(text)} vs 纯文本 {len(plain)}")
+
+
 def test_read_table_endpoint_validates_input(client, sandbox):
     """裁表接口的入参校验（路径越界 / 坐标非法）。"""
     r = client.post("/api/paper/read_table", json={
