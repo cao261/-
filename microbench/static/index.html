@@ -5992,10 +5992,16 @@
 
 
     async function askPaperQuestion() {
-      const question = document.getElementById("ask-paper-question").value.trim();
+      const qEl = document.getElementById("ask-paper-question");
+      const question = (qEl ? qEl.value.trim() : "");
       if (!question) {
         showToast("请输入问题", true);
         return;
+      }
+      // 发出即清空：问下一题不用先手动删掉上一个问题
+      if (qEl) {
+        qEl.value = "";
+        try { qEl.focus(); } catch (e) { /* 忽略 */ }
       }
       const askBtn = document.querySelector('[onclick="askPaperQuestion()"]');
       const el = document.getElementById("ask-paper-result");
@@ -6039,7 +6045,8 @@
     }
 
     async function crossSectionQA() {
-      const question = document.getElementById("cross-qa-question").value.trim();
+      const qEl = document.getElementById("cross-qa-question");
+      const question = (qEl ? qEl.value.trim() : "");
       if (!question) {
         showToast("请输入跨章节问题", true);
         return;
@@ -6047,6 +6054,11 @@
       if (_readerState.sections.length < 2) {
         showToast("跨章节问答需要至少 2 个章节 (本论文章节不足)", true);
         return;
+      }
+      // 同样：发出去就清空输入框，问下一题不用先手动删。
+      if (qEl) {
+        qEl.value = "";
+        try { qEl.focus(); } catch (e) { /* 忽略 */ }
       }
       // Collect selected sections (default: all non-references sections)
       const checked = Array.from(document.querySelectorAll(".cross-qa-section-cb:checked"))
@@ -7785,6 +7797,12 @@
       if (!question) {
         showToast("请输入您想问的问题", true);
         return;
+      }
+      // 发出去就把输入框清空（和常见 AI 软件一样）：
+      // 问完一题想接着问下一题，不用先手动把上一个问题删掉。
+      if (qInput) {
+        qInput.value = "";
+        try { qInput.focus(); } catch (e) { /* 面板收起时忽略 */ }
       }
 
       const welcome = document.getElementById("qa-welcome-placeholder");
