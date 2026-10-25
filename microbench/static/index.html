@@ -2888,7 +2888,8 @@
           state: "running",
           error: "",
           controller: opts.controller || null,
-          onStage: opts.onStage || null,
+          onStage: opts.onStage || null,   // 运行中：只更新"进度"显示
+          onEnd: opts.onEnd || null,       // 收尾：把"进度"显示改成最终状态
         };
         _AI_TASKS.set(id, task);
         _aiTick();
@@ -2916,7 +2917,10 @@
         // 刻意**不**在这里调 t.onStage：收尾不是"阶段更新"。
         // 之前调了 → translateSection 的 onStage 把 #reader-translation 整个
         // 覆盖成 "done · 0s" → 翻完章节译文消失（独立审查抓到的阻断 bug）。
-        // 各入口的收尾显示都由自己的成功/失败分支负责。
+        //
+        // 收尾要走**另一个回调** onEnd：它只负责"把进度显示改成最终状态"
+        // （✅ 完成 / ❌ 失败 / ✕ 已取消），不许碰正文区。
+        if (t.onEnd) { try { t.onEnd(t.state, t); } catch (e) { /* 忽略 */ } }
         _renderAiActivity();
       }
 
@@ -8029,8 +8033,8 @@
         scopeBadge.textContent = `🔁 重新回答 · ${newScope.label} · 实际 ${actualChars.toLocaleString()} 字`;
       }
       if (modelBadge) modelBadge.textContent = "⏳ 解答中...";
-      // 实时状态：模型在思考时（首个 token 之前）也能看到"等了多久"
-      const _qaStageBadge = modelBadge;
+      // 实时状态单独一个徽标（不能写进模型徽标：进度会把它覆盖掉）
+      const _qaStageBadge = answerBody.querySelector("[data-qa-stage-badge]");
 
       // 4. Re-issue the streaming call. payload carries the prior answer
       //    + feedback so the LLM can avoid repeating the same content
@@ -8058,6 +8062,11 @@
           const danger = el > 90000;
           _qaStageBadge.innerHTML = `<span class="ai-inline-status" data-warn="${danger ? "1" : "0"}">`
             + `<span class="ai-beat"></span>${escapeHtml(stage)} · ${_aiFormatMs(el)}</span>`;
+        },
+        onEnd: (state) => {
+          if (!_qaStageBadge) return;
+          _qaStageBadge.textContent = state === "done" ? "✅ 完成"
+            : state === "cancelled" ? "✕ 已取消" : "❌ 失败";
         },
         onMeta: (meta) => {
           if (modelBadge && meta && meta.model) {
@@ -8314,10 +8323,11 @@
         // question to add keywords like "创新点" / "术语" / "整体").
         answerBody.innerHTML = `
           <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--card-border-subtle); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
-            <div style="font-weight:600; font-size:13px; color:var(--text-main); flex:1; min-width:0;">❓ ${escapeHtml(question)}</div>
-            <div style="display:flex; gap:6px; align-items:center;">
+            <div style="font-weight:600; font-size:13px; color:var(--text-main); flex:1 1 240px; min-width:180px; line-height:1.5; word-break:break-word;">❓ ${escapeHtml(question)}</div>
+            <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-width:0;">
               <span data-qa-scope-badge style="font-size:10.5px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">⏳ 上下文测算中</span>
               <span data-qa-model-badge style="font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg-canvas-subtle); color:var(--text-muted); border:1px solid var(--card-border);">⏳ 解答中...</span>
+              <span data-qa-stage-badge style="font-size:10.5px; padding:2px 8px; border-radius:10px; background:transparent; color:var(--text-muted); border:1px solid transparent;"></span>
             </div>
           </div>
           <div data-stream-target style="font-size:13px; line-height:1.65; color:var(--text-main); margin-bottom:14px; white-space:pre-wrap; min-height:1.4em;">⏳ AI 正在深度剖析所选内容与半导体物理机制...</div>
@@ -8378,13 +8388,23 @@
       await askLLMStream(submitBtn, "/api/paper/explain_selection_stream", payload, {
         label: "划词答疑",
         onStage: (stage, t) => {
-          // 模型在思考时（首个 token 之前）也能看到"等了多久、卡在哪一步"
-          const badge = answerBody.querySelector("[data-qa-model-badge]");
+          // 模型在思考时（首个 token 之前）也能看到"等了多久、卡在哪一步"。
+          // ⚠️ 必须写进**独立的**进度徽标，不能写进模型徽标 ——
+          //    写同一个元素的话，进度每 500ms 刷一次就把模型名吃掉了，
+          //    而且收尾后没人恢复 → 徽标永远停在"还在想"（2026-10-25 浏览器实测）。
+          const badge = answerBody.querySelector("[data-qa-stage-badge]");
           if (!badge) return;
           const el = t.startedAt ? (Date.now() - t.startedAt) : 0;
           const danger = el > 90000;
           badge.innerHTML = `<span class="ai-inline-status" data-warn="${danger ? "1" : "0"}">`
             + `<span class="ai-beat"></span>${escapeHtml(stage)} · ${_aiFormatMs(el)}</span>`;
+        },
+        onEnd: (state) => {
+          const badge = answerBody.querySelector("[data-qa-stage-badge]");
+          if (!badge) return;
+          badge.textContent = state === "done" ? "✅ 完成"
+            : state === "cancelled" ? "✕ 已取消"
+            : "❌ 失败";
         },
         onMeta: (meta) => {
           const badge = answerBody.querySelector("[data-qa-model-badge]");

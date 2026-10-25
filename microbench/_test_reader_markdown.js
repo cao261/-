@@ -77,10 +77,12 @@ check("标记不被转义破坏", !html4.includes("&lt;") || !html4.includes("�
 
 // 导出成 .md 时不能残留坐标标记（坐标换个 PDF 就失效了）
 const un = factory(escapeHtml);
-const src = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+// ⚠️ 必须用上面已归一化行尾的 SRC，不能再 readFileSync 一遍：
+//    原始文件可能是 CRLF，下面按 "\n    }\n" 找函数结尾就找不到 →
+//    切出空串 → new Function 里 "_unrenderMathPlaceholders is not defined"。
 const unrender = new Function("escapeHtml",
-  src.slice(src.indexOf("function _unrenderMathPlaceholders("),
-            src.indexOf("\n    }\n", src.indexOf("function _unrenderMathPlaceholders(")) + 7)
+  SRC.slice(SRC.indexOf("function _unrenderMathPlaceholders("),
+            SRC.indexOf("\n    }\n", SRC.indexOf("function _unrenderMathPlaceholders(")) + 7)
   + "\nreturn _unrenderMathPlaceholders;")(escapeHtml);
 const outMd = unrender("<p>x ⟦FORMULA:45.1,138.3,272.3,169.5⟧ y</p>");
 check("导出 .md 时公式标记被换成人话", !outMd.includes("⟦FORMULA") && outMd.includes("见 PDF 原文"), outMd);

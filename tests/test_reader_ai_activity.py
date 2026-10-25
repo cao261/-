@@ -98,6 +98,31 @@ def test_task_end_does_not_touch_ui():
     body = html[start:end]
     assert ".onStage(" not in body, \
         "_aiTaskEnd 收尾时还在调 onStage → 会覆盖章节译文"
+    assert ".onEnd(" in body, \
+        "_aiTaskEnd 应该调 onEnd 收尾回调（把进度显示改成最终状态）"
+
+
+def test_qa_progress_and_model_badge_are_separate():
+    """进度提示与模型名必须**分居两个元素**。
+
+    回归（2026-10-25 浏览器实测）：答疑早就完成了，模型徽标却停在
+    「模型还在想（未产出内容）· 29s」—— 根因是进度文字写进了模型徽标，
+    每 500ms 刷一次就把模型名吃掉，收尾后也没人恢复。
+    """
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert 'data-qa-stage-badge' in html, "缺少独立的进度徽标"
+    # onStage 里不许再查模型徽标
+    idx = 0
+    bad = []
+    while True:
+        i = html.find("onStage: (stage, t) => {", idx)
+        if i < 0:
+            break
+        chunk = html[i:i + 700]
+        if '[data-qa-model-badge]' in chunk:
+            bad.append(i)
+        idx = i + 10
+    assert not bad, "onStage 还在写模型徽标（会把模型名覆盖成进度文字）"
 
 
 def test_section_translation_cancel_is_real():

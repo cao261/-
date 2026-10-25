@@ -140,6 +140,90 @@ class LLMError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# 错误人话化
+# ---------------------------------------------------------------------------
+# 上游返回的是英文机器话（HTTP 429: {"base_resp":{"status_msg":"..."}}），
+# 直接甩到界面上用户看不懂，只会觉得"程序坏了"。这里把它翻译成一句
+# 能照着做的中文，同时把原始报文写进 stderr（排查用），界面不再出现
+# 英文原文 + 技术栈。
+#
+# ⚠️ 关键：翻译只发生在**给人看的那一层**（friendly_error_text）。
+#    内部判定（配额耗尽 vs 限流、要不要降格）必须继续看原始报文，
+#    所以 is_quota_exhausted_error() 吃的仍然是原始 text，不是这里的中文。
+
+_HTTP_CODE_RE = re.compile(r"HTTP\s+(\d{3})\s*[:：]\s*(.*)", re.S)
+
+
+def _friendly_http_error(code: int, quota_probe_text: str) -> str:
+    """把一个上游 HTTP 错误翻译成一句能照着做的中文。
+
+    quota_probe_text：用于判定"配额耗尽 vs 速率限制"的文本。
+    传整条错误消息（而不是只有响应体）是有意的 —— 像
+    "降格模型调用失败: HTTP 429: Too Many Requests (原主模型报错: HTTP 429: Token Plan limit exceeded)"
+    这种，主模型那半句才是"额度用完"的证据，只看响应体会误判成限流。
+    """
+    if code == 429:
+        # 配额耗尽（5 小时窗口 / 余额）和 速率限制（每分钟上限）是两回事：
+        # 前者只能等额度恢复，后者等几十秒就行 —— 提示必须分开。
+        try:
+            is_quota = model_manager.is_quota_exhausted_error(429, quota_probe_text or "")
+        except Exception:
+            is_quota = False
+        if is_quota:
+            return (
+                "模型额度用完了（HTTP 429 · 配额耗尽）：套餐/余额额度已用尽，"
+                "现在重试也一样。等额度恢复再试，或在 .env 里配一个你自己的模型。"
+            )
+        return (
+            "请求太频繁（HTTP 429 · 限流）：刚发出的请求超过了该模型的每分钟上限。"
+            "等几十秒再试，或换一个模型/拉长间隔。"
+        )
+    if code == 401:
+        return (
+            "鉴权失败（HTTP 401）：API Key 无效或没有权限，"
+            "检查 .env 里的 LLM_API_KEY / AGNES_API_KEY。"
+        )
+    if code == 403:
+        return "鉴权被拒（HTTP 403）：API Key 没有这个模型的权限，换一个 key 或模型。"
+    if code == 404:
+        return "接口或模型不存在（HTTP 404）：检查 .env 里的 base_url 和模型名是否写错。"
+    if code == 400:
+        return "请求被上游拒绝（HTTP 400）：模型名或参数不对，检查 .env 里的模型配置。"
+    if 500 <= code < 600:
+        return f"上游模型服务暂时不可用（HTTP {code}）：稍后重试；一直失败就换个模型。"
+    return f"模型接口返回错误（HTTP {code}）。"
+
+
+def friendly_error_text(exc: BaseException) -> str:
+    """把内部异常翻译成**给用户看**的中文。
+
+    设计约束（重要）：
+    - 内部判定（配额 vs 限流、要不要降格、TRUNCATED 标记）继续吃原始报文，
+      这里只负责"给人看的那一句"，所以不改 str(exc) 的语义。
+    - 已经是中文的错误（超时 / 降格模型调用失败 …）原样返回，
+      不做二次包装。
+    """
+    msg = str(exc)
+    m = _HTTP_CODE_RE.search(msg)
+    if not m:
+        return msg
+    code = int(m.group(1))
+    raw = m.group(2)
+    # 原始报文只进日志，不进界面
+    print(
+        f"[MicroBench] 上游返回 HTTP {code}: {raw[:400]}",
+        file=sys.stderr,
+    )
+    friendly = _friendly_http_error(code, msg)
+    # 保留前面那段中文上下文（例如「主模型 (MiniMax-M3) 调用失败:」），
+    # 它告诉用户是**哪条链路**挂了，比光一句"限流"有用。
+    prefix = msg[:m.start()].strip().rstrip(":：").strip()
+    if prefix:
+        return f"{prefix}：{friendly}"
+    return friendly
+
+
+# ---------------------------------------------------------------------------
 # Sliding-window Rate Limiter (shared by both providers)
 # ---------------------------------------------------------------------------
 # One generic class replaces the previously copy-pasted AgnesRateLimiter
@@ -1873,6 +1957,12 @@ async def _stream_model(
                     f"max_tokens={max_tokens})"
                 )
     except asyncio.CancelledError:
+        raise
+    except LLMError:
+        # 本函数自己抛出的 LLMError（例如上游返回 HTTP 429）必须**原样**上抛。
+        # 以前这里没有这个分支 → 下面那个 `except Exception` 会把它再包一层，
+        # 用户看到的是「流式响应异常: LLMError: HTTP 429: {...}」：
+        # 一层无意义的"流式响应异常"前缀 + 一层重复的 "LLMError:" 类名。
         raise
     except httpx.ConnectError as e:
         raise LLMError(f"网络连接失败: {e}")

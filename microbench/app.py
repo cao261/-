@@ -554,7 +554,7 @@ async def _stream_llm_event_gen(chunk_iter, meta=None):
         # Swallow without emitting (writing more would just buffer/throw).
         return
     except llm.LLMError as e:
-        yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
+        yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
 
 
 # ---------------------------------------------------------------------------
@@ -2171,7 +2171,7 @@ def api_summarize_paper(req: SummarizeRequest):
         result = llm.summarize_paper(req.model_dump())
         return {"status": "success", "summary": result}
     except llm.LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM 调用失败: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"LLM 调用失败: {llm.friendly_error_text(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成摘要失败: {str(e)}")
 
@@ -2227,11 +2227,11 @@ def api_ask_question(req: AskRequest):
             "status": "partial",
             "answer": (
                 f"⚠️ LLM 调用失败, 但 RAG 检索到 {len(chunks)} 条相关文献片段。"
-                f"请检查 .env 中 LLM_BASE_URL / LLM_MODEL_NAME 配置。错误: {str(e)[:200]}"
+                f"请检查 .env 中 LLM_BASE_URL / LLM_MODEL_NAME 配置。错误: {llm.friendly_error_text(e)}"
             ),
             "chunks": chunks,
             "llm_used": False,
-            "llm_error": str(e),
+            "llm_error": llm.friendly_error_text(e),
         }
     except Exception as e:
         return {
@@ -2664,7 +2664,7 @@ async def api_translate_section(req: TranslateRequest):
                     f"可以调大 .env 的 LLM_TRANSLATION_DEADLINE，或换更快的翻译模型。"
                 ),
             )
-        raise HTTPException(status_code=502, detail=f"LLM 翻译失败: {msg}")
+        raise HTTPException(status_code=502, detail=f"LLM 翻译失败: {llm.friendly_error_text(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"翻译失败: {str(e)}")
 
@@ -3013,7 +3013,7 @@ async def api_explain_stream(req: ExplainRequest, request: Request):
             # swallow without emitting (the connection is gone).
             return
         except llm.LLMError as e:
-            yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
+            yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -3075,7 +3075,7 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
         except asyncio.CancelledError:
             return
         except llm.LLMError as e:
-            yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
+            yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -3179,7 +3179,7 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
         except asyncio.CancelledError:
             return
         except llm.LLMError as e:
-            yield f'data: {json.dumps({"error": str(e)}, ensure_ascii=False)}\n\n'
+            yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -3338,7 +3338,7 @@ async def api_translate_page(req: TranslatePageRequest):
                     f"可以调大 .env 的 LLM_TRANSLATION_DEADLINE，或换更快的翻译模型。"
                 ),
             )
-        raise HTTPException(status_code=502, detail=f"按页翻译失败: {msg}")
+        raise HTTPException(status_code=502, detail=f"按页翻译失败: {llm.friendly_error_text(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"按页翻译失败: {str(e)}")
 
@@ -3562,7 +3562,7 @@ async def api_paste_analyze(req: PasteTextRequest):
             )
             response["ai_answer"] = answer.strip()
         except llm.LLMError as e:
-            response["ai_error"] = f"LLM 调用失败: {str(e)}"
+            response["ai_error"] = f"LLM 调用失败: {llm.friendly_error_text(e)}"
     return response
 
 
