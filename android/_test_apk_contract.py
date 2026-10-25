@@ -277,6 +277,35 @@ def main() -> int:
     check("collectSelectionRects" in app_js, "选区矩形归一化（跟电脑端同一套）")
     check("data-pdf-anno" in app_js, "划词气泡上有「标注」按钮")
 
+    print("\n[20] vault 前缀没配时必须能自愈（2026-10-25 用户真机故障）")
+    # 故障现场：网页显示「已连接坚果云」，同步结果是「已连接 0 篇」，
+    # 24 篇原文 PDF 全部 404。
+    # 根因：vault 前缀（「我的坚果云/MicroBench工作台」，两段）是空的 ——
+    #   它只有原生设置页的「测试并保存」会写，用户没跑过就是空的。
+    # ⚠ 最阴的地方：前缀错时 PROPFIND **不报 404**，回的是 207 + 0 个条目
+    #   → 页面看到「目录是空的」→ 界面显示「已连接 0 篇」，一点错都看不出来。
+    prefs_java2 = read(JAVA / "Prefs.java")
+    handler_java2 = read(JAVA / "DavPathHandler.java")
+    check("resolveRootsIfMissing" in prefs_java2,
+          "Prefs 有「运行时就地探测 vault 位置」的兜底")
+    check("detectVaultRoot" in code_only(prefs_java2),
+          "兜底真的调用了 detectVaultRoot（不是空壳）")
+    check("setDavVaultRoot" in code_only(prefs_java2),
+          "探测到的位置会被存下来（下次不用再探）")
+    check("resolveRootsIfMissing" in code_only(handler_java2),
+          "DavPathHandler 处理请求前会先兜底")
+    check("rootsResolved" in handler_java2,
+          "兜底只做一次（探测要发好几次 PROPFIND，不能每个请求都探）")
+    check("davInfo" in bridge,
+          "DavBridge 暴露 davInfo（网页能问出 vault 的真实位置）")
+    check("davInfo" in app_js and "davVaultRootLabel" in app_js,
+          "网页侧会问出并显示 vault 的真实位置")
+    check("entriesSeen" in app_js,
+          "列目录 0 条目会被当成「路径不对」报错（不再静默显示 0 篇）")
+    # ⚠ 界面不能再只看 dirHandle —— APK 走 WebDAV，dirHandle 永远是 null
+    check("const backendNow = currentBackend()" in app_js,
+          "文献库按 currentBackend() 判断（DAV 模式下不再谎报「还没连接文件夹」）")
+
     print(f"\n{'=' * 60}")
     print(f"PASS {len(PASS)}  FAIL {len(FAIL)}")
     for f in FAIL:

@@ -58,6 +58,22 @@ public class DavBridge {
         return prefs.davConfigured();
     }
 
+    /**
+     * 真实状态：账号配了没、vault 在云盘的哪个位置、同步根在哪。
+     *
+     * ⚠ 网页光看「账号密码齐了没」会得出「已连接」的结论 ——
+     *   但**账号齐了 ≠ 路径对了**。少了 vault 前缀，列目录返回空、
+     *   下载全部 404，而界面显示「已连接」（2026-10-25 用户真机故障）。
+     * → 网页要能问出「vault 到底在哪」，才能把真话告诉用户。
+     */
+    @JavascriptInterface
+    public String davInfo() {
+        return "{\"configured\":" + (prefs.davConfigured() ? "true" : "false")
+                + ",\"vaultRoot\":" + jsonEscape(prefs.davVaultRoot())
+                + ",\"syncRoot\":" + jsonEscape(prefs.davSyncRoot())
+                + "}";
+    }
+
     /** 打开原生设置页（填坚果云账号 / 应用密码）。 */
     @JavascriptInterface
     public void openSettings() {

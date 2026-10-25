@@ -1168,6 +1168,28 @@
   }
 
   /**
+   * 问原生要「vault 在云盘里的位置」（相对 WebDAV 根）。
+   *
+   * ⚠ 为什么网页必须知道这个（2026-10-25 用户真机故障）：
+   *   「账号密码齐了」**不等于**「连上了」——
+   *   少了 vault 前缀（我的坚果云/MicroBench工作台），
+   *   列目录返回**空**、下载全部 404，而界面照样显示「已连接」。
+   *   → 界面必须能显示「vault 到底在哪」，才能说真话。
+   */
+  function davVaultRootLabel() {
+    if (!nativeBridge) return "";
+    try {
+      if (typeof nativeBridge.davInfo !== "function") return "";
+      const raw = nativeBridge.davInfo();
+      if (!raw) return "";
+      const info = JSON.parse(raw);
+      return (info && info.vaultRoot) || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  /**
    * 原生设置页保存完凭证后, 由 Android 调这个 —— 重新探测同步状态并刷新界面。
    * (之前用 location.reload() 会把页面状态整个丢掉, 而且 onActivityResult
    *  根本不会触发: startActivity 拿不到 result。)
@@ -1197,8 +1219,12 @@
     if (nativeBridge) {
       if (state.syncMode === "dav") {
         mode.textContent = "坚果云 WebDAV（真双向）";
+        const vr = davVaultRootLabel();
         detail.textContent = "已连接坚果云。笔记改动直接写回云盘里的 vault 目录；" +
-          "原文 PDF 点开时从云盘按需下载。";
+          "原文 PDF 点开时从云盘按需下载。" +
+          // ⚠ 把 vault 的真实位置亮出来 —— 「已连接」但路径不对，
+          //   是最难查的一类故障（2026-10-25 用户真机故障）。
+          (vr ? "当前 vault 位置：" + vr + "。" : "⚠ vault 位置还没定，正在自动探测…");
       } else {
         mode.textContent = "未连接坚果云";
         detail.textContent = "点「配置坚果云」填邮箱和应用密码，" +
@@ -1294,6 +1320,7 @@
     }
 
     // WebDAV: 递归列目录
+    let entriesSeen = 0;
     const walk = async (dir) => {
       let entries;
       try {
@@ -1308,6 +1335,7 @@
         }
         return;
       }
+      entriesSeen += (entries || []).length;
       for (const e of entries) {
         if (e.isDir) {
           if (SKIP_DIRS.has(e.name)) continue;
@@ -1337,6 +1365,18 @@
       }
     };
     await walk("");
+    // ⚠⚠ 一个条目都没列出来 = **路径不对**，不是「云盘里还没东西」。
+    //   这正是 2026-10-25 用户真机故障的表现：vault 前缀没配，
+    //   PROPFIND 打到「我的坚果云/01_Literature」→ 服务器回 **207 + 0 个条目**
+    //   （**不是 404**）→ 以前这里直接返回空数组 →
+    //   界面显示「已连接 0 篇 · 新增 0」，**一点错都看不出来**。
+    //   → 现在必须报错，让用户知道「路径没找对」而不是「云盘是空的」。
+    if (entriesSeen === 0) {
+      const vr = davVaultRootLabel();
+      throw new Error("云盘里没找到 vault 目录" +
+        (vr ? "（当前 vault 位置：" + vr + "）" : "（vault 位置没定）") +
+        "。请点设置里的「配置坚果云」重新测一次并保存。");
+    }
     return { notes, pdfs };
   }
 
@@ -2427,8 +2467,10 @@
     const t0 = Date.now();
     const file = await getVaultFile(pdfId);
     if (!file) {
+      const vr = davVaultRootLabel();
       pdfStatus("云盘里找不到这个文件：" + meta.name);
       toast("打不开原文：云盘里没找到这个文件。\n" +
+            (vr ? "当前 vault 位置：" + vr + "\n" : "⚠ vault 位置没定（正在自动探测）\n") +
             "检查一下坚果云是不是同步完了，或者路径对不对。", true);
       return;
     }
@@ -3075,10 +3117,17 @@
       $("pdf-lib").hidden = false;
       return;
     }
-    note.textContent = state.dirHandle
+    // ⚠ 用 currentBackend() 判断，**不能只看 state.dirHandle** ——
+    //   APK 走的是坚果云 WebDAV，dirHandle 永远是 null，
+    //   照旧判断的话会一直显示「⚠ 还没连接文件夹」——
+    //   哪怕坚果云连得好好的（2026-10-25 用户真机截图就是这个）。
+    const backendNow = currentBackend();
+    note.textContent = backendNow
       ? `共 ${ids.length} 篇原文。PDF 直接从已连接的云盘目录读取。`
-      : `共 ${ids.length} 篇原文。⚠ 还没连接文件夹 —— 点开会提示你先连接云盘里的 vault 目录。` +
-        `（在安卓平板上就是坚果云同步下来的「我的坚果云\\MicroBench工作台」那个文件夹）`;
+      : (nativeBridge
+        ? `共 ${ids.length} 篇原文。⚠ 还没连上坚果云 —— 点开时会提示你先「配置坚果云」。`
+        : `共 ${ids.length} 篇原文。⚠ 还没连接文件夹 —— 点开会提示你先连接云盘里的 vault 目录。` +
+          `（在安卓平板上就是坚果云同步下来的「我的坚果云\\MicroBench工作台」那个文件夹）`);
 
     // 反查：PDF -> 关联笔记
     const byPdf = {};
@@ -3480,6 +3529,12 @@
       rpmFor: rpmFor,
       throttleModel: throttleModel,
       resetThrottle: function () { _lastReqAt.clear(); },
+      // 同步链路 —— 「路径不对却显示已连接」这类故障只能靠单测钉住
+      scanRemote: scanRemote,
+      pullFromDir: pullFromDir,
+      currentBackend: currentBackend,
+      refreshSyncUi: refreshSyncUi,
+      davVaultRootLabel: davVaultRootLabel,
       // AI 面板（输入栏清空、多轮上下文这些行为必须有护栏）
       runAI: runAI,
       aiOnKeyDown: aiOnKeyDown,

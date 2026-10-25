@@ -31,14 +31,60 @@ import java.util.Map;
  */
 public class DavPathHandler {
 
+    /** 两次自动探测之间的最小间隔（毫秒）。 */
+    private static final long PROBE_RETRY_INTERVAL_MS = 5 * 60 * 1000L;
+
     private final Prefs prefs;
+    /**
+     * vault 前缀有没有**探到过**。
+     *
+     * ⚠ 探测要发好几次 PROPFIND（每次都是一次 TLS 握手）——
+     *   探测失败时不能每个请求都重试一遍（会把坚果云打到限流）。
+     *   探到了就记下来，后面的请求走「快路径」。
+     */
+    private boolean rootsResolved = false;
+    /** 上次尝试探测的时刻。 */
+    private long lastProbeAt = 0;
 
     public DavPathHandler(Prefs prefs) {
         this.prefs = prefs;
     }
 
+    /**
+     * 确保 vault 前缀是有的。
+     *
+     * 没配就地探测一次（见 {@link Prefs#resolveRootsIfMissing()}）——
+     * 用户没跑过原生设置页的「测试并保存」时，这是唯一的出路。
+     *
+     * ⚠ 探测**失败**不置位：网络抖一下不代表 vault 找不着了，
+     *   过几分钟还能再试（间隔由 PROBE_RETRY_INTERVAL_MS 控制）。
+     */
+    private void ensureRoots() {
+        if (rootsResolved) {
+            return;
+        }
+        if (!prefs.davVaultRoot().isEmpty()) {
+            rootsResolved = true;
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastProbeAt < PROBE_RETRY_INTERVAL_MS) {
+            return;
+        }
+        lastProbeAt = now;
+        try {
+            prefs.resolveRootsIfMissing();
+            if (!prefs.davVaultRoot().isEmpty()) {
+                rootsResolved = true;
+            }
+        } catch (Exception e) {
+            // 探测失败就当没配 —— 下面的请求会给出可读的错误
+        }
+    }
+
     public WebResourceResponse handle(String path) {
         try {
+            ensureRoots();
             if (path.startsWith("/dav/sync/list/")) {
                 return listResponse(decode(path.substring("/dav/sync/list/".length())), true);
             }

@@ -17,14 +17,20 @@
 4. [`READER_CONTRACT.md`](READER_CONTRACT.md) —— 改阅读器前必读（页内顺序/公式/批注）。
 
 ### 我负责平板端（Android/iPad 那台）
-1. **[`HANDOFF_2026-10-25-TABLET-ADAPT.md`](HANDOFF_2026-10-25-TABLET-ADAPT.md)** ← **先看这份**
+1. **[`HANDOFF_2026-10-25-TABLET-DAV-FIX.md`](HANDOFF_2026-10-25-TABLET-DAV-FIX.md)** ← **最新，先看这份**
+   平板端「同步 0 篇 / 24 篇 PDF 全 404」的**根因与修法**：
+   vault 前缀是空的，而界面只看账号密码，所以显示「已连接」。
+   **空结果必须当成错误** —— 这条最值得抄。
+2. [`HANDOFF_2026-10-25-TABLET-ADAPT.md`](HANDOFF_2026-10-25-TABLET-ADAPT.md)
    桌面端这轮做的哪些事**平板端要抄、哪些抄不了、哪些不用抄**。
-2. [`HANDOFF_TABLET_2026-10-25.md`](HANDOFF_TABLET_2026-10-25.md) +
+3. [`HANDOFF_TABLET_2026-10-25.md`](HANDOFF_TABLET_2026-10-25.md) +
    [`HANDOFF_TABLET_2026-10-25-B.md`](HANDOFF_TABLET_2026-10-25-B.md) —— 平板端此前的两轮交接。
-3. [`AUDIT_2026-10-25.md`](AUDIT_2026-10-25.md) —— 第二轮全面审计报告。
-4. **平板端必须自查的两件事**（在 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` §8）：
+4. [`AUDIT_2026-10-25.md`](AUDIT_2026-10-25.md) —— 第二轮全面审计报告。
+5. **平板端必须自查的两件事**（在 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` §8）：
    - 离线导出 HTML 的 XSS 面（平板走**另一套** JS 消毒器，桌面端的修复不过去）；
    - 密钥脱敏的盲区（JSON 形态的 key、裸 `Authorization`、URL userinfo…）。
+   → **这两条已在 30461 上修完**（见 `HANDOFF_2026-10-25-TABLET-DAV-FIX.md`
+     同期的提交与 AGENTS.md §4.29）。
 
 ### 跨设备同步（谁都要看）
 - [`SYNC_CONTRACT.md`](SYNC_CONTRACT.md) —— **红线清单，改动即破坏**。
@@ -35,7 +41,8 @@
 
 | 文档 | 日期 | 解决什么问题 | 状态 |
 |---|---|---|---|
-| `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` | 10-25 晚 | 浏览器实测抓出的 5 个 bug + 安全 5 项 + 降格分类 | ✅ **当前最新** |
+| `HANDOFF_2026-10-25-TABLET-DAV-FIX.md` | 10-25 深夜 | 平板端同步 0 篇 / PDF 全 404 的根因与修法 | ✅ **当前最新** |
+| `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` | 10-25 晚 | 浏览器实测抓出的 5 个 bug + 安全 5 项 + 降格分类 | ✅ 有效 |
 | `HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md` | 10-25 | AI 活动可视化、符号认字 | ✅ 有效 |
 | `HANDOFF_2026-10-25-TABLET-ADAPT.md` | 10-25 | 桌面端 → 平板端的移植清单 | ✅ 有效 |
 | `HANDOFF_TABLET_2026-10-25.md` | 10-25 | 平板端第一轮交接 | ⚠️ 部分已被上面那份覆盖 |

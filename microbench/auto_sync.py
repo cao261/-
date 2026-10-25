@@ -79,6 +79,7 @@ EXTRA_SUITES = [
     ("js", "microbench/_test_tablet_ai.js"),
     ("js", "microbench/_test_tablet_hardening.js"),
     ("js", "microbench/_test_tablet_xss.js"),
+    ("js", "microbench/_test_tablet_dav.js"),
     ("js", "microbench/_test_reader_annotations.js"),
     ("js", "microbench/_test_reader_markdown.js"),
 ]

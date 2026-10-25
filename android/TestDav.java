@@ -220,6 +220,44 @@ public class TestDav {
         String j = entries.isEmpty() ? "" : entries.get(0).toJson();
         check(j.contains("\"mtime\""), "DavEntry.toJson 带 mtime 字段");
 
+        System.out.println("[14] 用户真机故障复现：vault 前缀没配");
+        // 现象（2026-10-25 用户真机截图）：
+        //   - 界面显示「已连接坚果云」（网页只看账号密码对不对）
+        //   - 同步结果是「已连接 0 篇 · 新增 0 · 更新 0」
+        //   - 24 篇原文 PDF 全部 404
+        // 根因：vault 前缀（「我的坚果云/MicroBench工作台」，**两段**）是空的。
+        //
+        // ⚠⚠ 最阴的地方：前缀错时 PROPFIND **不报 404** ——
+        //   服务器回 **207 + 0 个条目**（那个目录本来就不存在，
+        //   但 WebDAV 对「不存在的目录」就是这么回）。
+        //   → 网页看到的是「目录是空的」，于是显示「已连接 0 篇」，
+        //     **一点错都看不出来**，用户只会以为「云盘没同步完」。
+        DavClient bare = new DavClient("me@example.com", "app-pass-123", root);
+        List<DavClient.DavEntry> wrongList = bare.list("01_Literature");
+        check(wrongList != null && wrongList.isEmpty(),
+                "前缀为空时列目录**不报错、返回空**（用户看到的「0 篇」）");
+        byte[] missing = bare.get("01_Literature/01_论文原文_PDF/a paper.pdf");
+        check(missing == null,
+                "前缀为空时下载拿不到文件（404）—— 24 篇原文全挂在这里");
+
+        // 自愈路径：探测 → 设前缀 → 重来一次。
+        // 这就是原生侧 DavPathHandler 现在做的事（Prefs.resolveRootsIfMissing）。
+        String auto = bare.detectVaultRoot();
+        check(auto != null && auto.contains("MicroBench工作台"),
+                "能自动探测出 vault 位置: " + auto);
+        bare.setVaultRoot(auto);
+        List<DavClient.DavEntry> fixedList = bare.list("01_Literature");
+        check(fixedList != null && !fixedList.isEmpty(),
+                "自愈后能列出 vault 内的条目: "
+                        + (fixedList == null || fixedList.isEmpty()
+                                ? "(空)" : fixedList.get(0).path));
+        byte[] okPdf = bare.get("01_Literature/01_论文原文_PDF/a paper.pdf");
+        check(okPdf != null && new String(okPdf, "UTF-8").contains("PDF-BYTES"),
+                "自愈后能下载 vault 内的 PDF");
+        check(fixedList != null && !fixedList.isEmpty()
+                        && !fixedList.get(0).path.contains("我的坚果云"),
+                "返回的仍是 vault 相对路径（网页传的就是相对路径）");
+
         System.out.println();
         System.out.println("PASS " + pass + "  FAIL " + fail);
         System.exit(fail == 0 ? 0 : 1);
