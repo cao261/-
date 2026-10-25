@@ -93,19 +93,55 @@ PDF 模式：reader-body display:none / pdf-view 1576×1004 block / topbar 1576�
 而 PDF 双栏模式下 topbar 被隐藏（就是 §2 那个 bug）→ 徽标被连带隐藏 →
 `getBoundingClientRect()` 宽高都是 0 → 用户点不开浮层 → **「✕ 取消」永远够不着**。
 
-**修法（三处一起）**：
+**最终修法**（经过独立审查又改了一次，见 §3.1）：
 
-1. `#ai-panel` 和 `#ai-activity-pill` 一起从 topbar 移到
-   **child 3 之后的浮动区块**（`.reader-shell` 内），两边都 `position: fixed`
-   → 不受 topbar 隐藏影响，也不占 flex 位（否则会被排到屏幕最下面）；
-2. 徽标 `fixed; right: var(--s-5); top: 56px`（在 topbar 之下，避免叠字）；
-   浮层 `top: 90px`；
-3. **有任务时浮层自动展开一次**（`_aiPanelAutoOpened` 标志位，任务结束后复位）：
-   徽标只是入口，用户不会想到去点它；"正在跑 + 跑了多久 + 能取消"是用户此刻最需要的信息。
+1. `#ai-panel` 留在**浮动区块**（child 3 之后，`position: fixed`）
+   → 不受 topbar 隐藏影响，也不占 flex 位；
+2. **徽标放回 `.reader-topbar-actions`**（正常流里，`position: static`）
+   → 位置自然、不压任何控件；
+3. **有任务时浮层自动展开一次**（按任务 id 记录，任务全部结束后清空）
+   → 徽标只是入口，用户不会想到去点它；"正在跑 + 跑了多久 + 能取消"
+   是用户此刻最需要的信息。
+
+### 3.1 独立审查抓到的坑（**别再犯**）
+
+**第一次的修法是错的**：把徽标做成 `position: fixed; top:56px; right:16px`。
+独立审查用 CDP 实测发现：
+
+- PDF 模式下 topbar 会**折行**到 ~104px（缩放条 / 导出 / 同步 / 批量翻译排到第二行），
+  「关闭」按钮正好落在 56~92px → **被徽标压住 61×28px**；
+- `document.elementsFromPoint(关闭按钮中心)` 返回
+  `["SPAN", "#ai-activity-pill", "SPAN", "BUTTON.btn-pill", …]`
+  → 徽标排在按钮之前，**真人点击点不动**（1440/1576/1920 三种宽度全中招）。
+
+**教训**：`position: fixed` 的浮层放在屏幕某个角落时，
+**必须实测那个位置有没有别的东西**（topbar 折行后的实际高度、按钮区范围），
+不能按"topbar 大概 50px"拍脑袋。
+
+**另一个坑**：AI 浮层 z-index 1400 > QA 面板 1060 → 浮层盖住 QA 面板标题栏
+（模型徽标 / 最小化），而 QA 面板要靠标题栏拖动 → 既点不动也拖不动。
+→ `.reader-qa-panel` z-index 提到 **1460**。
 
 **平板端要不要改？** 平板端有独立的 AI 停止按钮（`btn-ai-stop` / `aiAbort`），
 **不受影响**。但如果平板端以后加"AI 活动"浮层，注意同样的坑：
-**别把入口挂在"按场景会整块隐藏"的容器里**。
+**别把入口挂在"按场景会整块隐藏"的容器里**，也**别用 fixed 浮层压住别的按钮**。
+
+---
+
+## 3.2 审查抓到的其它几条（都已修）
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 🟠 | 3 处错误出口漏了人话化：`read_table`、`QA 路由`、`summarize_paper`（后者**内部吞掉** LLMError，app.py 根本看不到） | 统一 `llm.friendly_error_text(e) if isinstance(e, llm.LLMError) else str(e)` |
+| 🟠 | `friendly_error_text` 往 stderr 打原始报文**没脱敏** | 打印前先过 `_redact_secrets` |
+| 🟡 | 自动展开的复位语义与注释不符（PDF 队列连续翻译时，手动关一次就整个队列不再弹） | 改成**按任务 id** 记录，每个新任务展开一次，全部结束后清空 |
+| 🟡 | `if (panel.classList)` 是为迁就 node 测试桩加的死代码 | 删掉（桩已补 classList；桩坏了就该让测试红） |
+
+**护栏本身也有假通过**（审查指出，已改）：
+- `_code_only()` 用正则剥 `//` 会被字符串里的 `"http://x"` 骗过
+  → 改成真正的注释剥离器（只取 `<script>` 块 + 自己识别字符串/注释）；
+- app.py 出口检查的块边界正则被**块内空行**截断（9 个分支只匹配到 1 个）
+  → 改成按行号切块，并覆盖多行写法。
 
 ---
 
