@@ -83,3 +83,47 @@ def test_slow_tasks_get_warned():
     html = INDEX_HTML.read_text(encoding="utf-8")
     assert "_AI_WARN_MS" in html and "_AI_DANGER_MS" in html, "缺少慢任务预警阈值"
     assert "很慢" in html or "没有动静" in html, "缺少慢任务提示文案"
+
+
+def test_task_end_does_not_touch_ui():
+    """收尾时**不能**再调 onStage。
+
+    回归（2026-10-25 独立审查抓到的阻断 bug）：_aiTaskEnd 收尾时调 onStage
+    → translateSection 的 onStage 把 #reader-translation 整个覆盖成
+    "done · 0s" → 用户看到 toast 说"翻译完成"，右侧译文却是空的。
+    """
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    start = html.index("function _aiTaskEnd(")
+    end = html.index("\n      }\n", start)
+    body = html[start:end]
+    assert ".onStage(" not in body, \
+        "_aiTaskEnd 收尾时还在调 onStage → 会覆盖章节译文"
+
+
+def test_section_translation_cancel_is_real():
+    """章节翻译的「✕ 取消」必须真能中止请求（不能只弹一句 toast）。"""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    start = html.index("async function translateSection(")
+    end = html.index("\n    }\n", start)
+    body = html[start:end]
+    assert "new AbortController()" in body, "章节翻译没有 AbortController"
+    assert "controller: _aiSecAbort" in body, "章节任务没有把 controller 登记进去"
+    assert "signal: _aiSecAbort.signal" in body, "请求没有带上 signal → 取消不掉"
+    assert "AbortError" in body, "取消被当成失败了"
+
+
+def test_async_llm_paths_honor_model_choice():
+    """答疑走的是异步/流式路径 —— 换模型必须在这两条路径上生效。
+
+    回归（2026-10-25 独立审查）：chat_async / chat_stream_async 漏了
+    "把 model_name 覆盖到 primary"这一步 → 用户选了 M3.1-Flash，
+    实际发出去的仍是 M3，徽标还显示用户选的那个 → 换模型在答疑入口完全落空。
+    """
+    src = (Path(__file__).resolve().parents[1] / "microbench" / "llm.py").read_text(
+        encoding="utf-8")
+    for fn in ("async def chat_async(", "async def chat_stream_async("):
+        start = src.index(fn)
+        end = src.index("\ndef ", start + 10)
+        body = src[start:end]
+        assert 'primary = dict(primary, model=model_name)' in body, \
+            f"{fn} 没有把 model_name 覆盖到 primary"

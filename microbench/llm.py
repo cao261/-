@@ -1622,6 +1622,11 @@ async def chat_async(
     fallback = model_manager.get_fallback_config()
     custom_cfg = resolve_model_config(model_name) if model_name else None
     is_custom = bool(custom_cfg and custom_cfg.get("is_custom"))
+    # 换模型（同一套 key/base_url 下的另一个模型名）—— 同步 chat() 一直有这步，
+    # 异步路径漏了 → 答疑时选了 M3.1-Flash 实际发出去的还是 M3
+    # （2026-10-25 独立审查发现：用户"换模型"的诉求在答疑入口全部落空）
+    if model_name and not is_custom and model_name != primary["model"]:
+        primary = dict(primary, model=model_name)
 
     if not primary["configured"] and not fallback["configured"] and not is_custom:
         raise LLMError(
@@ -1937,6 +1942,11 @@ async def chat_stream_async(
     fallback = model_manager.get_fallback_config()
     custom_cfg = resolve_model_config(model_name) if model_name else None
     is_custom = bool(custom_cfg and custom_cfg.get("is_custom"))
+    # 换模型：与同步 chat() / chat_async() 保持一致
+    # （漏了这步 → 答疑时选了别的模型，实际发出去的仍是主模型，
+    #   而界面徽标还显示"用户选的那个" → 骗人）
+    if model_name and not is_custom and model_name != primary["model"]:
+        primary = dict(primary, model=model_name)
 
     if not primary["configured"] and not fallback["configured"] and not is_custom:
         raise LLMError(

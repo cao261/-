@@ -10,6 +10,7 @@
 词典读写、抽取层的标记规则。
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -234,3 +235,37 @@ def test_unmatched_cid_falls_back_to_placeholder():
 def test_marker_regex_and_version():
     assert pt.GLYPH_MARKER_RE.search("⟦G:12⟧")
     assert pt.EXTRACTOR_VERSION >= 5, "抽取算法改了就必须 +1（否则旧快照不作废）"
+
+
+# ---------------------------------------------------------------------------
+# 6) 章节文本里绝不能出现内部标记（会原样进 prompt）
+# ---------------------------------------------------------------------------
+
+def test_sections_never_leak_internal_markers():
+    """回归（2026-10-25 独立审查）：/api/paper/fetch_full 走的是
+    fetch_full_text() → extract_text_from_pdf()，那条路径以前**没有**解析符号
+    → ⟦G:n⟧ 原样进 section_text → 原样进 prompt → 模型会照抄或瞎编。
+
+    这里直接验"解析后再切章节"的结果里没有内部标记。
+    """
+    import glob
+    from microbench import glyphs as gl
+    from microbench import paper_text as pt
+    root = Path(__file__).resolve().parents[1]
+    hits = list((root / "01_Literature").rglob("2008-JACERS-*.pdf"))
+    if not hits:
+        pytest.skip("vault 里没有 JACERS 综述，跳过")
+    pdf_bytes = hits[0].read_bytes()
+    pages = pt.extract_text_from_pdf(pdf_bytes)
+    assert any(p.get("glyphs") for p in pages), "这一页本该有解不出的符号"
+
+    for p in pages:
+        if p.get("glyphs"):
+            p["text"] = gl.resolve_glyphs_sync(
+                p["text"], p["glyphs"], pdf_bytes, p["page"],
+                dict_path=None)
+    sections = pt.split_into_sections(pages)
+    blob = "".join(s.get("text", "") for s in sections)
+    assert "⟦G:" not in blob, "章节文本里漏出了内部标记 ⟦G:n⟧"
+    assert "×" in blob or "≈" in blob or "≥" in blob, \
+        "符号没有被认出来（应当至少有一个真符号）"

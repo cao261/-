@@ -2913,7 +2913,10 @@
         _AI_TASKS.delete(id);
         _AI_TASK_HISTORY.unshift(t);
         if (_AI_TASK_HISTORY.length > 12) _AI_TASK_HISTORY.length = 12;
-        if (t.onStage) { try { t.onStage(t.state, t); } catch (e) { /* 忽略 */ } }
+        // 刻意**不**在这里调 t.onStage：收尾不是"阶段更新"。
+        // 之前调了 → translateSection 的 onStage 把 #reader-translation 整个
+        // 覆盖成 "done · 0s" → 翻完章节译文消失（独立审查抓到的阻断 bug）。
+        // 各入口的收尾显示都由自己的成功/失败分支负责。
         _renderAiActivity();
       }
 
@@ -6012,13 +6015,19 @@
         return;
       }
       transEl.innerHTML = `<div style="padding:14px; color:var(--text-muted);">⏳ 翻译中${estChunks > 1 ? ` (大章节, 约拆 ${estChunks} 段)` : ""}...</div>`;
+      // 章节翻译也可能跑好几分钟 → 给它一个 AbortController，
+      // 「AI 活动」面板里的 ✕ 取消要**真的**中止请求，
+      // 不能只弹一句"已取消"然后让任务在后台继续跑完（独立审查抓到的）。
+      const _aiSecAbort = new AbortController();
       // 登记到「AI 活动」（大章节可能要几分钟，更需要看得见）
       const _aiSecTaskId = _aiTaskStart({
         kind: "section",
         label: "翻译章节：" + ((sec.title || sec.section || ("第 " + (idx + 1) + " 节")).slice(0, 24)),
         model: (_pdfTransModel || "") || "跟随默认",
+        controller: _aiSecAbort,
         onStage: (stage, t) => {
           if (!transEl) return;
+          if (t.state !== "running") return;   // 收尾后不再改这里（译文由 renderSection 写）
           const el = t.startedAt ? (Date.now() - t.startedAt) : 0;
           transEl.innerHTML = `<div style="padding:14px; color:var(--text-muted);">`
             + `<span class="ai-inline-status"><span class="ai-beat"></span>`
@@ -6039,6 +6048,7 @@
             // 换模型翻译：空 = 跟随默认设置
             model: (_pdfTransModel || ""),
           }),
+          signal: _aiSecAbort.signal,
         });
         const result = await res.json();
         if (!res.ok) {
@@ -6071,6 +6081,15 @@
         }
         _aiTaskEnd(_aiSecTaskId, "done");
       } catch (err) {
+        // 用户自己取消的 → 标"已取消"，不该显示成"翻译失败"
+        const _isAbort = err && (err.name === "AbortError" || /aborted/i.test(err.message || ""));
+        if (_isAbort) {
+          _aiTaskEnd(_aiSecTaskId, "cancelled");
+          if (transEl) {
+            transEl.innerHTML = `<div style="padding:14px; color:var(--text-muted);">✕ 已取消本次翻译</div>`;
+          }
+          return;
+        }
         _aiTaskEnd(_aiSecTaskId, "error", err && (err.message || String(err)));
         transEl.innerHTML = `<div style="padding:18px; color:var(--accent-terracotta);">
           <div style="font-weight:600; margin-bottom:6px;">❌ 翻译失败: ${escapeHtml(err.message)}</div>

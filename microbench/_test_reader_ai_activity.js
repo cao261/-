@@ -15,7 +15,10 @@
 const fs = require("fs");
 const path = require("path");
 
-const SRC = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
+// 归一化行尾：仓库约定 LF，但 Windows 上的脚本可能写成 CRLF，
+// 而下面按 "\n    }\n" 找函数结尾 —— CRLF 会让它找不到。
+const SRC = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8")
+  .replace(/\r\n/g, "\n");
 
 // 切出「AI 活动登记处」整段：从横幅注释到 window._aiFormatMs 赋值。
 function sliceSection(startMarker, endMarker) {
@@ -143,6 +146,28 @@ console.log("== 多任务并存 ==");
     JSON.stringify(api._AI_TASK_HISTORY.map(h => h.state)));
   api._renderAiActivity();
   check("面板显示失败原因", /上游 500/.test(bodyEl.innerHTML), bodyEl.innerHTML.slice(0, 400));
+}
+
+console.log("== 收尾不许再动界面 ==");
+{
+  // 回归：2026-10-25 独立审查抓到的阻断 bug ——
+  // _aiTaskEnd 收尾时调 onStage → translateSection 的 onStage 把
+  // #reader-translation 整个覆盖成 "done · 0s" → 翻完章节译文消失。
+  let stageCalls = [];
+  const state = {
+    items: [],
+    _AI_TASKS: new Map(),
+    _AI_TASK_HISTORY: [],
+  };
+  const id = api._aiTaskStart({
+    kind: "section", label: "翻译章节：测试",
+    onStage: (stage) => { stageCalls.push(stage); },
+  });
+  api._aiTaskStage(id, "等待模型响应");
+  check("运行中会更新阶段", stageCalls.length === 1, JSON.stringify(stageCalls));
+  api._aiTaskEnd(id, "done");
+  check("收尾时**不再**调 onStage（否则会覆盖译文）",
+    stageCalls.length === 1, JSON.stringify(stageCalls));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

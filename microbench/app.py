@@ -2361,7 +2361,13 @@ def api_fetch_full_text(req: FetchFullRequest):
     try:
         # 全文抓取 = 外网下载 + PDF 解析。本端点是同步 def，FastAPI 已把它放进
         # anyio 线程池执行，慢任务不会冻结事件循环，直接调用即可。
-        result = fetch_full_text(req.identifier)
+        # 符号认字：⟦G:n⟧ 绝不能原样进模型（内部标记 → 照抄/瞎编）
+        def _glyph_resolver(text, glyphs, pdf_bytes, page_no):
+            return glyphs_mod.resolve_glyphs_sync(
+                text, glyphs, pdf_bytes, page_no,
+                dict_path=GLYPH_DICT_PATH)
+
+        result = fetch_full_text(req.identifier, glyph_resolver=_glyph_resolver)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:

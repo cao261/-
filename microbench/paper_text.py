@@ -1683,7 +1683,8 @@ def _find_page(char_offset: int, page_boundaries: list[tuple[int, int]]) -> int:
 # Public entry points
 # ---------------------------------------------------------------------------
 
-def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None) -> dict:
+def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
+                    glyph_resolver=None) -> dict:
     """
     Fetch the full text of a paper given an arXiv ID, DOI, or URL.
 
@@ -1911,6 +1912,19 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None) -> dict
 
     # Extract text
     pages = extract_text_from_pdf(pdf_bytes)
+    # 解不出的数学符号（× ≈ ≥ …）必须在**切章节之前**解析掉：
+    # 标记里的下标是"本页"的，章节是跨页拼的，切完就再也对不回具体字形了；
+    # 而且 ⟦G:n⟧ 是内部标记，**绝不能**原样进 prompt（模型会照抄或瞎编）。
+    if glyph_resolver:
+        for _p in pages:
+            if _p.get("glyphs"):
+                try:
+                    _p["text"] = glyph_resolver(
+                        _p["text"], _p["glyphs"], pdf_bytes, _p["page"])
+                except Exception:
+                    # 解析不了就退回 "[?]"，但不能把内部标记漏给模型
+                    from .glyphs import strip_markers
+                    _p["text"] = strip_markers(_p["text"])
     sections = split_into_sections(pages)
 
     return {

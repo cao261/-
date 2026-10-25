@@ -273,7 +273,7 @@ def _parse_recognition(raw: str, n: int) -> dict[int, str]:
 _BATCH = 20
 
 
-async def resolve_glyphs(text: str, glyphs: list, pdf_source, page_no: int,
+def resolve_glyphs_sync(text: str, glyphs: list, pdf_source, page_no: int,
                          model_name: str = "", force_fallback: bool = False,
                          dict_path=None) -> str:
     """把文本里的 ⟦G:n⟧ 换成真实符号。
@@ -341,8 +341,7 @@ async def resolve_glyphs(text: str, glyphs: list, pdf_source, page_no: int,
                      "image_url": {"url": "data:image/png;base64,"
                                   + base64.b64encode(strip).decode("ascii")}},
                 ]
-                raw = await asyncio.to_thread(
-                    llm.chat,
+                raw = llm.chat(
                     messages=[
                         {"role": "system",
                          "content": "你是符号识别助手，只回答符号本身。"},
@@ -393,10 +392,20 @@ async def resolve_glyphs(text: str, glyphs: list, pdf_source, page_no: int,
     return GLYPH_MARKER_RE.sub(_repl, text)
 
 
+async def resolve_glyphs(text: str, glyphs: list, pdf_source, page_no: int,
+                         model_name: str = "", force_fallback: bool = False,
+                         dict_path=None) -> str:
+    """异步包装：同步实现放到线程里跑（不阻塞事件循环）。"""
+    return await asyncio.to_thread(
+        resolve_glyphs_sync, text, glyphs, pdf_source, page_no,
+        model_name, force_fallback, dict_path)
+
+
 __all__ = [
     "ALLOWED_SYMBOLS",
     "GLYPH_MARKER_RE",
     "GlyphDictionary",
     "resolve_glyphs",
+    "resolve_glyphs_sync",
     "strip_markers",
 ]
