@@ -139,4 +139,20 @@ Step "完成"
 & "$Jdk\bin\java.exe" -cp "$Bt\lib\apksigner.jar" com.android.apksigner.ApkSignerTool verify --print-certs $Out | Select-Object -First 3
 $finalMB = [math]::Round((Get-Item $Out).Length / 1MB, 2)
 Write-Host "  APK: $Out  ($finalMB MB)" -ForegroundColor Green
+
+# ---------------------------------------------------------------------
+# 交付前最后一道关：逐条核对 APK 里有没有用户要的每个功能。
+#
+# 为什么放在构建里：APK 是构建产物、不进版本库。
+# 如果只在提交前跑一次，验的是**上一个** APK —— 看着绿，装到手机上
+# 却是旧版。放在构建的最后一步，保证「刚构建出来的这个」被验过。
+# ---------------------------------------------------------------------
+Step "交付验收（逐条核对 APK 里的功能）"
+& python -m pytest (Join-Path $Repo "tests\test_apk_delivery.py") -q
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  交付验收没过 —— 这个 APK 不要发出去" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  交付验收通过" -ForegroundColor Green
+
 Write-Host "  装到平板: 把这个文件传过去 -> 点它 -> 允许「安装未知来源应用」"
