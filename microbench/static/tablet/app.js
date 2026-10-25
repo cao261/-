@@ -954,7 +954,13 @@
       mode: "dav",
       async list(dir) {
         const r = await fetch(davUrl("list", dir));
-        if (!r.ok) throw new Error("列目录失败 HTTP " + r.status);
+        if (!r.ok) {
+          // ⚠ 把服务端说的原因带上来 —— 否则「HTTP 500」这种话
+          //   用户完全看不懂（限流时的提示是「请求太频繁」）。
+          let detail = "";
+          try { detail = (await r.text()).slice(0, 200); } catch (e) { /* ignore */ }
+          throw new Error("列目录失败 HTTP " + r.status + (detail ? " " + detail : ""));
+        }
         const arr = await r.json();
         return Array.isArray(arr) ? arr : [];
       },
@@ -1119,6 +1125,13 @@
       try {
         entries = await backend.list(dir);
       } catch (e) {
+        // ⚠ 限流要**明确报出来** —— 静默跳过的话，
+        //   用户会以为「同步成功了」，其实一篇都没拉下来。
+        //   别的错误（某个目录没权限）跳过就行。
+        const msg = String((e && e.message) || e);
+        if (msg.indexOf("限流") >= 0) {
+          throw e;
+        }
         return;
       }
       for (const e of entries) {
@@ -1128,6 +1141,17 @@
         } else {
           const lower = e.name.toLowerCase();
           if (lower.endsWith(".md")) {
+            // ⚠⚠ 没变过的笔记**不要重新下载**。
+            //   坚果云对请求频率很敏感：一次同步 30 篇笔记 = 30 个 GET，
+            //   加上每个目录一次 PROPFIND 就是 50+ 个请求 —— 必被限流
+            //   （503 BlockedTemporarily「Too many requests are received recently」）。
+            //   PROPFIND 里带了 getlastmodified，用它判断有没有变。
+            //   ⚠ 本地改过（dirty）的**仍然要拉** —— 不拉就没法发现冲突。
+            const local = state.notes.get(e.path);
+            if (local && !local.dirty && local.mtime && e.mtime
+                && local.mtime === e.mtime) {
+              continue;   // 没变 —— 本地那份就是最新的，不用再下
+            }
             const text = await backend.readText(e.path);
             if (text == null) continue;
             notes.push({ path: e.path, text, mtime: e.mtime || 0 });
@@ -1145,7 +1169,17 @@
   async function pullFromDir(quiet) {
     const backend = currentBackend();
     if (!backend) return;
-    const scan = await scanRemote(backend, quiet);
+    let scan;
+    try {
+      scan = await scanRemote(backend, quiet);
+    } catch (e) {
+      // ⚠ 同步失败要**说出来** —— 静默失败的话，用户会以为同步好了，
+      //   其实一篇都没拉下来（限流时最容易发生）。
+      if (!quiet) {
+        toast("同步失败：" + ((e && e.message) || e), true);
+      }
+      return;
+    }
     if (!scan) return;
     const files = scan.notes;
     let added = 0, updated = 0, conflicts = 0;
@@ -1194,6 +1228,11 @@
         cur.mtime = f.mtime || cur.mtime;
         await DB.putNote(cur);
         updated++;
+      } else if (f.mtime && cur.mtime !== f.mtime) {
+        // 内容没变、只是时间戳变了（文件被 touch 过）—— 只更新 mtime。
+        // 不更新的话，下次同步又会把这一篇重新下载一遍。
+        cur.mtime = f.mtime;
+        await DB.putNote(cur);
       }
     }
     buildNav();

@@ -232,6 +232,25 @@ def main() -> int:
     check("saveInk" in app_js, "手写笔迹能存回共享目录")
     check("pdfFitScale" in app_js, "PDF 按容器宽度缩放（别再只显示一半）")
 
+    print("\n[17] 坚果云限流要有防护（503 BlockedTemporarily）")
+    # 一次完整同步是 50+ 个请求（每个目录一次 PROPFIND、每篇笔记一次 GET）。
+    # 坚果云限流后返回 503「Too many requests are received recently」——
+    # 不节流 + 不退避的话，用户点几次「测试并保存」就必然失败。
+    check("MIN_INTERVAL_MS" in dav, "有请求间隔节流")
+    check("throttle()" in dav, "请求前会过节流闸门")
+    check("isRateLimited" in dav, "认得出 BlockedTemporarily")
+    check("backoff" in dav, "限流后退避重试")
+    check("RATE_LIMIT_MSG" in dav, "限流时给的是人话提示，不是甩一段 XML")
+    check("MAX_PROPFIND_CALLS = 12" in dav,
+          "探测预算收紧（原来 24 次能把坚果云打到限流）")
+    check("findSmallestNote" in dav,
+          "下载链路自检用小文件（不再为了找 PDF 发一串请求）")
+    check("mtime" in dav, "目录项带 mtime（用来跳过没变的笔记）")
+    check("local.mtime === e.mtime" in app_js,
+          "页面侧按 mtime 跳过没变的笔记（同步请求数 50+ -> 20）")
+    check('msg.indexOf("限流")' in app_js,
+          "限流错误不会被静默吞掉（否则用户以为同步成功了）")
+
     print(f"\n{'=' * 60}")
     print(f"PASS {len(PASS)}  FAIL {len(FAIL)}")
     for f in FAIL:

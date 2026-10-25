@@ -192,6 +192,34 @@ public class TestDav {
         int tiny = c.getPartial("我的坚果云/MicroBench工作台/00_Dashboard/主工作台看板.md", 4);
         check(tiny == 4, "getPartial 遵守上限: " + tiny);
 
+        System.out.println("[12] 限流退避（坚果云 503 BlockedTemporarily）");
+        // 假服务器对 __ratelimit__ 路径第一次回 503，之后正常 ——
+        // 客户端必须退避重试，而不是把 503 直接甩给用户。
+        boolean rlThrew = false;
+        List<DavClient.DavEntry> rl = null;
+        long t0 = System.currentTimeMillis();
+        try {
+            rl = c.list("__ratelimit__");
+        } catch (Exception e) {
+            rlThrew = true;
+            System.out.println("       异常: " + e.getMessage());
+        }
+        check(!rlThrew, "限流后退避重试成功（没把 503 甩给用户）");
+        check(rl != null, "限流重试后拿到了结果");
+        long took = System.currentTimeMillis() - t0;
+        check(took >= 1000, "重试前确实等了退避时间（" + took + " ms）");
+
+        System.out.println("[13] 目录项带 mtime（用来跳过没变的文件）");
+        boolean hasMtime = false;
+        for (DavClient.DavEntry e : entries) {
+            if (e.mtime > 0) {
+                hasMtime = true;
+            }
+        }
+        check(hasMtime, "PROPFIND 的 getlastmodified 被解析成 mtime");
+        String j = entries.isEmpty() ? "" : entries.get(0).toJson();
+        check(j.contains("\"mtime\""), "DavEntry.toJson 带 mtime 字段");
+
         System.out.println();
         System.out.println("PASS " + pass + "  FAIL " + fail);
         System.exit(fail == 0 ? 0 : 1);

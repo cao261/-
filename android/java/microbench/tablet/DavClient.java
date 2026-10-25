@@ -5,6 +5,9 @@ import java.nio.charset.StandardCharsets;
 import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.text.SimpleDateFormat;
+import java.util.Locale;
+import java.util.TimeZone;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
@@ -53,6 +56,65 @@ public class DavClient {
      */
     private static final long MAX_DOWNLOAD_BYTES = 128L * 1024 * 1024;
 
+    // ------------------------------------------------------------------
+    // 限流
+    //
+    // 坚果云对请求频率很敏感，超了会返回：
+    //   HTTP 503
+    //   <s:exception>BlockedTemporarily</s:exception>
+    //   <s:message>Too many requests are received recently</s:message>
+    //
+    // 而一次完整同步是**几十个**请求：列目录每个目录一次 PROPFIND，
+    // 拉正文每篇笔记一次 GET。30 篇笔记 + 25 个目录 = 50+ 个请求 ——
+    // 不节流必然被限流，用户看到的���是「刚才还好好的，这会儿又失败了」。
+    // ------------------------------------------------------------------
+
+    /** 两个请求之间的最小间隔（毫秒）。 */
+    private static final long MIN_INTERVAL_MS = 200;
+    /** 遇到限流时的最大重试次数。 */
+    private static final int MAX_RETRY = 3;
+    /** 限流时给用户的提示。 */
+    private static final String RATE_LIMIT_MSG =
+            "坚果云暂时限流了（请求太频繁）。等 1 分钟再试 —— "
+            + "同步一整本 vault 有几十个请求，慢一点反而更快。";
+
+    private static final Object THROTTLE_LOCK = new Object();
+    private static long lastRequestAt = 0L;
+
+    /** 全局节流：所有 WebDAV 请求共用一个闸门。 */
+    private static void throttle() {
+        synchronized (THROTTLE_LOCK) {
+            long now = System.currentTimeMillis();
+            long wait = lastRequestAt + MIN_INTERVAL_MS - now;
+            if (wait > 0) {
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            lastRequestAt = System.currentTimeMillis();
+        }
+    }
+
+    /** 判断是不是坚果云的限流。 */
+    private static boolean isRateLimited(int code, String body) {
+        if (code != 503 || body == null) {
+            return false;
+        }
+        return body.contains("BlockedTemporarily")
+                || body.contains("Too many requests");
+    }
+
+    /** 限流后的退避等待。 */
+    private static void backoff(int attempt) {
+        try {
+            Thread.sleep(1500L * (1L << attempt));   // 1.5s / 3s / 6s
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private final String user;
     private final String pass;
     private String root;
@@ -67,7 +129,7 @@ public class DavClient {
     private String vaultRoot;
 
     /** 探测 vault 位置时的 PROPFIND 预算（每发一次都是一次 TLS 握手）。 */
-    private static final int MAX_PROPFIND_CALLS = 24;
+    private static final int MAX_PROPFIND_CALLS = 12;
     private int probeCalls = 0;
 
     public DavClient(String user, String pass) {
@@ -195,6 +257,7 @@ public class DavClient {
 
     private HttpURLConnection open(String method, String path, String depth)
             throws IOException {
+        throttle();
         URL u = new URL(urlFor(path));
         HttpURLConnection c = (HttpURLConnection) u.openConnection();
         c.setRequestMethod(method);
@@ -302,6 +365,7 @@ public class DavClient {
     private Resp rawRequest(String method, String path, byte[] body,
                              String contentType, String depth,
                              boolean vaultRelative) throws IOException {
+        throttle();
         URL u = new URL(vaultRelative ? urlFor(path) : rawUrlFor(path));
         String proto = u.getProtocol();
         int port = u.getPort() > 0 ? u.getPort() : ("https".equals(proto) ? 443 : 80);
@@ -549,37 +613,54 @@ public class DavClient {
 
     /** 下载一个文件。返回 null 表示不存在（404）。 */
     public byte[] get(String path) throws IOException {
-        HttpURLConnection c = open("GET", path, null);
-        int code = c.getResponseCode();
-        if (code == 404) {
-            c.disconnect();
-            return null;
-        }
-        if (code != 200) {
-            String err = readAll(c.getErrorStream());
-            c.disconnect();
-            throw new IOException("WebDAV GET " + path + " -> HTTP " + code
-                    + (err.isEmpty() ? "" : " " + err));
-        }
-        // 先看 Content-Length —— 太大的直接拒掉, 别把内存吃光。
-        // 原文 PDF 最大的 9.3 MB, 128 MB 的上限绰绰有余。
-        String cl = c.getHeaderField("Content-Length");
-        long expect = 0;
-        if (cl != null) {
-            try {
-                expect = Long.parseLong(cl.trim());
-            } catch (NumberFormatException ignored) {
+        // ⚠ 限流退避（跟 list 一样）
+        for (int attempt = 0; attempt <= MAX_RETRY; attempt++) {
+            HttpURLConnection c = open("GET", path, null);
+            int code = c.getResponseCode();
+            if (code == 404) {
+                c.disconnect();
+                return null;
+            }
+            if (code == 503) {
+                String err = readAll(c.getErrorStream());
+                c.disconnect();
+                if (isRateLimited(code, err)) {
+                    if (attempt == MAX_RETRY) {
+                        throw new IOException(RATE_LIMIT_MSG);
+                    }
+                    backoff(attempt);
+                    continue;
+                }
+                throw new IOException("WebDAV GET " + path + " -> HTTP " + code
+                        + (err.isEmpty() ? "" : " " + err));
+            }
+            if (code != 200) {
+                String err = readAll(c.getErrorStream());
+                c.disconnect();
+                throw new IOException("WebDAV GET " + path + " -> HTTP " + code
+                        + (err.isEmpty() ? "" : " " + err));
+            }
+            // Content-Length 预检：太大的直接拒掉, 别把内存吃光。
+            // 原文 PDF 最大的 9.3 MB, 128 MB 的上限绰绰有余。
+            String cl = c.getHeaderField("Content-Length");
+            long expect = 0;
+            if (cl != null) {
+                try {
+                    expect = Long.parseLong(cl.trim());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (expect > MAX_DOWNLOAD_BYTES) {
+                c.disconnect();
+                throw new IOException("文件太大（" + (expect / 1048576) + " MB），超过上限");
+            }
+            try (InputStream in = new BufferedInputStream(c.getInputStream(), 32 * 1024)) {
+                return readAllBytes(in, MAX_DOWNLOAD_BYTES, (int) Math.min(expect, 8L * 1024 * 1024));
+            } finally {
+                c.disconnect();
             }
         }
-        if (expect > MAX_DOWNLOAD_BYTES) {
-            c.disconnect();
-            throw new IOException("文件太大（" + (expect / 1048576) + " MB），超过上限");
-        }
-        try (InputStream in = new BufferedInputStream(c.getInputStream(), 32 * 1024)) {
-            return readAllBytes(in, MAX_DOWNLOAD_BYTES, (int) Math.min(expect, 8L * 1024 * 1024));
-        } finally {
-            c.disconnect();
-        }
+        throw new IOException(RATE_LIMIT_MSG);
     }
 
     /**
@@ -621,11 +702,25 @@ public class DavClient {
                 + "<D:resourcetype/><D:getcontentlength/><D:getlastmodified/>"
                 + "</D:prop></D:propfind>";
         // PROPFIND 不是标准方法, HttpURLConnection 不认 -> 走裸 socket
-        Resp r = rawRequest("PROPFIND", dir, body.getBytes(StandardCharsets.UTF_8),
-                "application/xml; charset=utf-8", "1");
-        if (r.code != 207 && r.code != 200) {
-            throw new IOException("WebDAV PROPFIND " + dir + " -> HTTP " + r.code
-                    + (r.body.length > 0 ? " " + new String(r.body, StandardCharsets.UTF_8) : ""));
+        // ⚠ 限流退避：坚果云返回 503 BlockedTemporarily 时等一下再试，
+        //   而不是直接把 503 甩给用户（用户会以为「配置错了」）。
+        Resp r = null;
+        for (int attempt = 0; attempt <= MAX_RETRY; attempt++) {
+            r = rawRequest("PROPFIND", dir, body.getBytes(StandardCharsets.UTF_8),
+                    "application/xml; charset=utf-8", "1");
+            String text = new String(r.body, StandardCharsets.UTF_8);
+            if (isRateLimited(r.code, text)) {
+                if (attempt == MAX_RETRY) {
+                    throw new IOException(RATE_LIMIT_MSG);
+                }
+                backoff(attempt);
+                continue;
+            }
+            if (r.code != 207 && r.code != 200) {
+                throw new IOException("WebDAV PROPFIND " + dir + " -> HTTP " + r.code
+                        + (r.body.length > 0 ? " " + text : ""));
+            }
+            break;
         }
         return parseMultiStatus(new String(r.body, StandardCharsets.UTF_8), dir);
     }
@@ -667,6 +762,7 @@ public class DavClient {
             e.name = rel.substring(rel.lastIndexOf('/') + 1);
             e.isDir = isDir;
             e.size = size;
+            e.mtime = parseHttpDate(textOf(resp, "DAV:", "getlastmodified"));
             out.add(e);
         }
         return out;
@@ -693,6 +789,26 @@ public class DavClient {
         try {
             return Long.parseLong(t.trim());
         } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /**
+     * 解析 WebDAV 的 getlastmodified（RFC 1123，例如
+     * "Tue, 25 Oct 2026 03:14:15 GMT"）→ epoch 毫秒。
+     *
+     * ⚠ 不用 java.time（API 26 才有），用 SimpleDateFormat（API 1）。
+     */
+    private static long parseHttpDate(String s) {
+        if (s == null) {
+            return 0;
+        }
+        try {
+            SimpleDateFormat f =
+                    new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US);
+            f.setTimeZone(TimeZone.getTimeZone("GMT"));
+            return f.parse(s.trim()).getTime();
+        } catch (Exception e) {
             return 0;
         }
     }
@@ -834,13 +950,16 @@ public class DavClient {
                 return e.path;
             }
         }
-        // 常见 vault 目录名 —— 命中就直接进去, 不用在整朵云盘里瞎逛
+        // ⚠ 优先看像不像我们的 vault（名字里有 microbench / 工作台）。
+        //   这一步是关键：常见布局是
+        //       我的坚果云/            <- dav 根
+        //         MicroBench工作台/    <- vault
+        //   命中它只要**两次** PROPFIND；不命中的话，
+        //   后面那个「把整朵云盘递归一遍」的兜底会发几十个请求 ——
+        //   坚果云会直接回 503 BlockedTemporarily 把我们限流。
         for (DavEntry e : dirs) {
             if (isLikelyVaultName(e.name)) {
-                String found = detectVaultAt(e.path, depth - 1);
-                if (found != null) {
-                    return found;
-                }
+                return e.path;
             }
         }
         for (DavEntry e : dirs) {
@@ -876,6 +995,46 @@ public class DavClient {
     }
 
     /**
+     * 找一个**小文件**来验证下载链路。
+     *
+     * ⚠ 原来找的是 PDF —— 但 PDF 在 vault 里深达 3 层，为找它要发好几个
+     *   PROPFIND，最后还要 GET 9 MB。验「下载链路通不通」只需要一个小文件：
+     *   几 KB 的 .md 就够（同一个 GET 通道），代价小两个数量级，
+     *   也不会那么容易把坚果云打到限流。
+     */
+    public String findSmallestNote(String dir, int maxDepth) {
+        List<DavEntry> entries;
+        try {
+            entries = list(dir);
+        } catch (Exception e) {
+            return null;
+        }
+        String best = null;
+        long bestSize = Long.MAX_VALUE;
+        for (DavEntry e : entries) {
+            if (!e.isDir && e.name.toLowerCase().endsWith(".md") && e.size < bestSize) {
+                bestSize = e.size;
+                best = e.path;
+            }
+        }
+        if (best != null) {
+            return best;
+        }
+        if (maxDepth <= 1) {
+            return null;
+        }
+        for (DavEntry e : entries) {
+            if (e.isDir) {
+                String found = findSmallestNote(e.path, maxDepth - 1);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
      * 递归找一个 PDF（最多 maxDepth 层），用来做「下载链路」自检。
      * 根目录下面通常只有目录, PDF 在 MicroBench工作台/01_Literature/... 里。
      */
@@ -884,8 +1043,9 @@ public class DavClient {
     }
 
     private String findFirstPdf(String dir, int maxDepth, int[] budget) {
-        // 同样有预算 —— 否则在云盘里能逛到天荒地老
-        if (budget[0]++ >= 20) {
+        // 同样有预算 —— 否则在云盘里能逛到天荒地老，
+        // 而且每个目录一次 PROPFIND，会把坚果云打到限流。
+        if (budget[0]++ >= 6) {
             return null;
         }
         List<DavEntry> entries;
@@ -1037,6 +1197,8 @@ public class DavClient {
         public String name;
         public boolean isDir;
         public long size;
+        /** 云端的最后修改时间（epoch 毫秒）。用来跳过没变的文件，省请求。 */
+        public long mtime;
 
         /** 转成 JSON（字段名与网页端约定一致）。 */
         public String toJson() {
@@ -1045,7 +1207,8 @@ public class DavClient {
             sb.append("\"path\":").append(jsonStr(path)).append(',');
             sb.append("\"name\":").append(jsonStr(name)).append(',');
             sb.append("\"isDir\":").append(isDir).append(',');
-            sb.append("\"size\":").append(size);
+            sb.append("\"size\":").append(size).append(',');
+            sb.append("\"mtime\":").append(mtime);
             sb.append('}');
             return sb.toString();
         }

@@ -119,9 +119,63 @@ microbench/export_offline.py :: collect_translations()
 
 ---
 
-## 5. 验收
+## 5. 坚果云限流（503 BlockedTemporarily）
 
-### 5.1 自动化（11 个套件全绿）
+### 5.1 现象
+
+用户反馈「刚刚是好的，能同步能看到，这会儿又看不到了」，设置页报：
+
+```
+失败：WebDAV PROPFIND -> HTTP 503
+<d:error xmlns:d="DAV:" xmlns:s="http://ns.jianguoyun.com">
+<s:exception>BlockedTemporarily</s:exception>
+<s:message>Too many requests are received recently</s:message>
+</d:error>
+```
+
+**这不是配置错了，是坚果云在限流。**
+
+### 5.2 根因：我们自己发的请求太多
+
+| 场景 | 修复前的请求数 |
+|---|---|
+| 点一次「测试并保存」 | `detectVaultRoot` 递归最多 24 次 PROPFIND + `detectSyncRoot` 1 次 + `list` 1 次 + `findFirstPdf` 递归最多 20 次 + 下载 1 次 ≈ **47 个** |
+| 一次完整同步 | 每个目录 1 次 PROPFIND（~18 个）+ **每篇笔记 1 次 GET（30+ 篇）** ≈ **50 个** |
+
+坚果云的限流阈值远低于这个数。用户**反复点「测试并保存」**就必然踩到。
+
+### 5.3 修法（4 层）
+
+| 层 | 做法 |
+|---|---|
+| **节流** | `DavClient` 全局闸门：两个请求之间至少隔 **200 ms**（所有客户端实例共用） |
+| **退避重试** | 认得 `BlockedTemporarily` / `Too many requests` → 退避 **1.5s / 3s / 6s** 重试 3 次 |
+| **少发请求** | ① `detectVaultRoot` 优先命中名字像 vault 的目录（`MicroBench工作台`）→ 常见布局只要 **2 次** PROPFIND；② 探测预算 24 → **12**；③ 下载链路自检改用**小文件**（几 KB 的 .md）而不是深达 3 层的 9 MB PDF |
+| **少下载** | `PROPFIND` 的 `getlastmodified` 解析成 `mtime`，页面侧**跳过没变的笔记** → 重复同步从 50+ 个请求降到 ~18 个（只有列目录） |
+
+### 5.4 不再静默失败
+
+原来 `scanRemote` 里 `catch { return; }` 会把限流**悄悄吞掉** —— 用户以为「同步成功了」，
+其实一篇都没拉下来。现在：
+
+- 服务端的错误正文会带上来（不再只有「HTTP 500」这种看不懂的话）；
+- 限流的错误**明确抛出**，界面弹「同步失败：坚果云暂时限流了…」；
+- 限流提示是**人话**：「等 1 分钟再试 —— 同步一整本 vault 有几十个请求，慢一点反而更快」。
+
+### 5.5 护栏
+
+`android/_test_dav.py` 里加了**真的限流模拟**：假服务器对 `__ratelimit__` 路径第一次
+回 503 BlockedTemporarily，之后正常 —— 验证客户端确实退避重试成功（实测等了 1.7 秒），
+而不是把 503 甩给用户。
+
+`android/_test_apk_contract.py` [17] 钉死：节流、退避、限流提示、探测预算、
+小文件自检、mtime 跳过、限流不吞 —— 少一样就红。
+
+---
+
+## 6. 验收
+
+### 6.1 自动化（11 个套件全绿）
 
 | 套件 | 结果 |
 |---|---|
@@ -143,12 +197,12 @@ microbench/export_offline.py :: collect_translations()
 - 译文里的公式必须渲染成 KaTeX 且不残留 `$`（拿真实译文对拍，24 页）
 - 同步根的读写路由、探测、写桥必须都在
 
-### 5.2 浏览器实测
+### 6.2 浏览器实测
 
 - 主界面、文献库（24 篇原文，大小与关联笔记都对）渲染正常
 - 译文已确认烤进单文件（`__DATA__.trans` 有 3 篇 / 24 页）
 
-### 5.3 仍需真机实测
+### 6.3 仍需真机实测
 
 1. **同步根探测**：这台机器的坚果云里到底是不是 `我的坚果云/MicroBench同步`
    （`.env` 的 `ANNOTATIONS_DIR` 是这么写的，但要确认 WebDAV 侧同名）
@@ -170,7 +224,7 @@ microbench/export_offline.py :: collect_translations()
 
 ---
 
-## 6. 相关文件
+## 7. 相关文件
 
 | 文件 | 作用 |
 |---|---|

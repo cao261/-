@@ -407,6 +407,13 @@ vault 里的 `_Templates/` 被 gitignore，是**用户可自由改写**的；
 - **跨线程改 View = `CalledFromWrongThreadException`**：后台线程里
   `setText()` → 抛异常 → 被 `catch (Exception)` 吞掉 → 判定成「失败」。
   表现是「测试并保存永远失败、凭证存不进去」。**UI 只能在主线程上改。**
+- **坚果云会限流**：请求多了返回 `503 BlockedTemporarily`
+  「Too many requests are received recently」——
+  **这不是配置错了，是请求太频繁**。
+  一次完整同步是 50+ 个请求（每个目录一次 PROPFIND、每篇笔记一次 GET），
+  点几次「测试并保存」就必然踩到。
+  → 必须**节流 + 退避重试 + 少发请求**（按 `getlastmodified` 跳过没变的文件）。
+  护栏：`android/_test_dav.py` 里有真的 503 模拟。
 - **`HttpURLConnection` 只放行标准方法**，PROPFIND/MKCOL 只能裸 socket；
   裸 socket 默认**不做主机名验证**，要手动开。
 - **`URLDecoder` 走 form 编码规则**，`+` 会被解成空格 → 文件名带 `+` 的论文

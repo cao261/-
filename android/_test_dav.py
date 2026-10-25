@@ -39,6 +39,10 @@ def xml_escape(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+# 已经「限流」过的路径 —— 每个路径只限流一次
+_RATELIMIT_SEEN = set()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -79,6 +83,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/dav/"):
             path = path[4:]
         path = path.lstrip("/")
+        # ⚠ 限流模拟：路径里带 __ratelimit__ 的，第一次回 503
+        #   BlockedTemporarily（坚果云限流时的原样响应），
+        #   之后正常返回 —— 用来验证客户端的退避重试。
+        if "__ratelimit__" in path and path not in _RATELIMIT_SEEN:
+            _RATELIMIT_SEEN.add(path)
+            data = (b'<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+                    b'<d:error xmlns:d="DAV:" xmlns:s="http://ns.jianguoyun.com">'
+                    b'<s:exception>BlockedTemporarily</s:exception>'
+                    b'<s:message>Too many requests are received recently</s:message>'
+                    b'</d:error>')
+            self.send_response(503)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path and not path.endswith("/"):
             path += "/"
         prefix = path
@@ -110,6 +130,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 body.append("<D:resourcetype/>")
                 body.append(f"<D:getcontentlength>{size}</D:getcontentlength>")
+            # getlastmodified —— 客户端靠它判断文件有没有变（省请求）
+            body.append("<D:getlastmodified>Tue, 25 Oct 2026 03:14:15 GMT</D:getlastmodified>")
             body.append("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>")
             body.append("</D:response>")
         body.append("</D:multistatus>")

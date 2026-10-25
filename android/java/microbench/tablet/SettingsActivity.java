@@ -275,21 +275,23 @@ public class SettingsActivity extends Activity {
                 }
 
                 // ④ 下载链路也得验 —— 只验列目录等于没验下载。
-                //    但只取文件头 64 KB 就够: 整篇 PDF 拉下来既慢
-                //    （9 MB 走公网）又占内存, 而验链路只需要证明 GET 通。
+                //    但只取**小文件**的头 64 KB 就够：整篇 PDF 拉下来既慢
+                //    （9 MB 走公网）又占内存，还会多发好几个 PROPFIND
+                //    （PDF 在 vault 里深达 3 层）—— 那正是把坚果云打到
+                //    限流的原因。验链路用几 KB 的 .md 就够。
                 String probe;
                 boolean dlOk = true;
-                String pdf = c.findFirstPdf("", 3);
-                if (pdf != null) {
-                    int got = c.getPartial(pdf, 64 * 1024);
+                String small = c.findSmallestNote("", 2);
+                if (small != null) {
+                    int got = c.getPartial(small, 64 * 1024);
                     if (got > 4) {
-                        probe = "，并成功读到了原文 PDF 的开头（" + got + " 字节）";
+                        probe = "，并成功读到了文件开头（" + got + " 字节）";
                     } else {
                         probe = "；但下载测试没通过（GET 返回空）";
                         dlOk = false;
                     }
                 } else {
-                    probe = "（没找到 PDF，跳过下载测试）";
+                    probe = "（没找到 .md，跳过下载测试）";
                 }
 
                 ok = dlOk;
