@@ -9,10 +9,16 @@
 > - [`docs/LLM_CONTRACT.md`](docs/LLM_CONTRACT.md) —— 模型层：换模型/降级/速率/表格读图
 >
 > **另一台设备上的 agent 先看这个**：
-> [`docs/HANDOFF_2026-10-23.md`](docs/HANDOFF_2026-10-23.md) —— 跨设备交接记录。
+> [`docs/HANDOFF_INDEX.md`](docs/HANDOFF_INDEX.md) —— **交接索引**（按你负责的设备选文档）。
 > 两台设备（25353 / 30461）之间**没有会话通道**（`session send` 只能投本机会话），
-> 交接一律走仓库：对方 `git pull` 就能拿到本文件。
-> ⚠️ 它是**某个时点的快照**，不是长期状态 —— 以 §4.4 和各机实测为准。
+> 交接一律走仓库：对方 `git pull` 就能拿到（`auto_sync.py` 每 2 小时也会自动同步，§4.19）。
+>
+> ⚠️ **别只读 `docs/` 目录**：交接文档有 5 份，散在目录里很容易漏读。
+> 索引里按「桌面端 / 平板端 / 同步契约」分好了组，也标了哪份已过时。
+> **当前最新且最重要**的是
+> [`docs/HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md`](docs/HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md)
+> （浏览器实测抓出的 5 个真 bug + 安全审计 5 项 + 降格提示改造）。
+> ⚠️ 交接文档是**某个时点的快照**，不是长期状态 —— 以 §4.4 和各机实测为准。
 
 ---
 
@@ -814,6 +820,8 @@ if str(REPO) not in sys.path:      # ← 脚本模式必须有这一步
 > `MB_SYNC_RESULT: {json}`，按 `action` 决定怎么汇报。
 > **另一台设备上的 agent 看到这段就知道：对方推的东西会自动跟过来，
 > 不用等人工同步**；反过来，这台机也会自动同步对方推的东西。
+> 自动同步只搬**代码** —— 对方的新交接文档要自己看：
+> 索引在 [`docs/HANDOFF_INDEX.md`](docs/HANDOFF_INDEX.md)（仓库顶部也有指路）。
 
 ```powershell
 python microbench/auto_sync.py              # 正常同步
