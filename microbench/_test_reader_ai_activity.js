@@ -139,7 +139,7 @@ console.log("== 任务登记 / 收尾 ==");
   api._renderAiActivity();
   check("徽标回到空闲态", pillEl.dataset.active === "0", JSON.stringify(pillEl.dataset));
   check("历史条目仍在面板里", /翻译第 3 页/.test(bodyEl.innerHTML), bodyEl.innerHTML.slice(0, 300));
-  // 任务结束后自动展开的标志要复位 —— 下一次任务还得能自动弹出来
+  // 任务结束后自动展开的记录要清空 —— 下一批任务还能自动弹出来
   // （否则用户手动关过一次面板后，就再也看不到进度和取消按钮了）。
   panelEl.classList.remove("open");
   api._aiTaskStart({ kind: "translate", label: "翻译第 5 页", model: "MiniMax-M3" });

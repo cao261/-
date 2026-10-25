@@ -1515,7 +1515,9 @@ async def api_read_table(req: ReadTableRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"表格读取失败: {e}")
+        # 可能是 LLMError（上游 429/401…）→ 走人话化，别把英文原文甩给界面
+        msg = llm.friendly_error_text(e) if isinstance(e, llm.LLMError) else str(e)
+        raise HTTPException(status_code=502, detail=f"表格读取失败: {msg}")
     return {"table": table}
 
 
@@ -2897,7 +2899,9 @@ async def api_classify_qa_scope(req: ClassifyQAScopeRequest):
         )
     except Exception as e:
         # Stage 1 failure is non-fatal — caller will fall back to keywords.
-        raise HTTPException(status_code=502, detail=f"router LLM 调用失败: {e}")
+        # LLMError（上游 429/401…）要人话化，别把英文原文甩给界面。
+        msg = llm.friendly_error_text(e) if isinstance(e, llm.LLMError) else str(e)
+        raise HTTPException(status_code=502, detail=f"router LLM 调用失败: {msg}")
 
     # Strip any leading <think>...</think> block (M2.7 always emits one
     # even when response_format=json_object is set). Without this the

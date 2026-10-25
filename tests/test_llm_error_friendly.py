@@ -165,33 +165,106 @@ def test_stream_model_error_prefix_is_not_leaked_to_user():
 # 3) 接口出口必须走人话化
 # ---------------------------------------------------------------------------
 
+def _except_blocks(src, marker):
+    r"""按行切出每个 `except ... as e:` 块。
+
+    不能用正则 `(?=\n\s*except |\n\s*\n)` 切：块内一个空行就会把块截断
+    （独立审查实测：块边界正则只匹配到 1 个分支，其余全漏检）。
+    这里用行号法：每块从 except 行到下一个 except / 顶层定义为止。
+    """
+    lines = src.split("\n")
+    starts = [i for i, ln in enumerate(lines) if marker in ln]
+    blocks = []
+    for k, i in enumerate(starts):
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            s = lines[j]
+            if re.match(r"\s*except\b", s) or re.match(r"(def |async def |@app\.|class )", s):
+                end = j
+                break
+        blocks.append("\n".join(lines[i:end]))
+    return blocks
+
+
 def test_app_error_exits_use_friendly_text():
-    """所有给用户看的出口都要过 friendly_error_text，不能直接 str(e)。"""
+    """所有给用户看的 LLMError 出口都要过 friendly_error_text。
+
+    ⚠️ 检查方式不能只扫单行 `detail=f"..."` —— 独立审查实测：
+    新增一个**多行**写法的 `except llm.LLMError` 出口时，单行正则查不到，
+    断言会**假通过**。所以这里按"except 块"切分，再在块内找所有
+    `{str(e)}` / `{e}` 的插值（允许 isinstance 判断后再人话化的三元式）。
+    """
     src = APP_PATH.read_text(encoding="utf-8")
-    # SSE 出口
+
+    # 1) except llm.LLMError 的块：任何把异常原样插值的写法都要人话化
+    blocks = _except_blocks(src, "except llm.LLMError as e:")
+    assert len(blocks) >= 6, \
+        f"只匹配到 {len(blocks)} 个 llm.LLMError 分支，正则/切块可能失效了"
+
+    # 计数口径：**覆盖到的出口数**（块数 + SSE 数），
+    # 不是"可疑插值数" —— 全部块都正确人话化时后者会很小，门槛会误报。
+    checked = len(blocks)
+
+    for blk in blocks:
+        for m in re.finditer(r"\{(str\(e\)|e)\}", blk):
+            snippet = blk[max(0, m.start() - 260):m.end() + 20]
+            assert "friendly_error_text" in snippet, (
+                "LLMError 的出口把原始异常插值给了用户，没有走人话化: "
+                f"...{snippet[-180:]}"
+            )
+        # 直接把异常塞进响应字段的写法（如 llm_error）也要人话化
+        for m in re.finditer(r'"llm_error":\s*([^,\n]+)', blk):
+            assert "friendly_error_text" in m.group(1), \
+                f"LLMError 的 llm_error 字段没有走人话化: {m.group(1)}"
+
+    # 2) except Exception 里如果判了 LLMError，同样不能原样插值
+    for blk in _except_blocks(src, "except Exception as e:"):
+        if "llm.LLMError" not in blk:
+            continue          # 普通异常不必人话化
+        checked += 1
+        if "friendly_error_text" in blk:
+            continue          # 已做转换
+        for m in re.finditer(r"\{(str\(e\)|e)\}", blk):
+            assert False, (
+                "except Exception 分支处理了 LLMError，却把原始异常插值给了用户: "
+                f"...{blk[max(0, m.start() - 160):m.end() + 20][-180:]}"
+            )
+
+    # 3) SSE 出口：单独查（它们不在 except 块里）
     sse = re.findall(r'yield f\'data: \{json\.dumps\(\{"error": ([^}]+)\}', src)
     assert sse, "没找到 SSE 错误出口"
     for expr in sse:
         assert "friendly_error_text" in expr, \
             f"SSE 错误出口没有走人话化: {expr}"
-    # HTTPException 出口：只看 **except llm.LLMError** 分支里的
-    # （通用 `except Exception` 分支拿到的不是 LLMError，
-    #   str(e) 是普通异常，不该被这条断言管）
-    blocks = re.findall(r"except llm\.LLMError as e:(.*?)(?=\n    except |\n\n)", src, re.S)
-    assert blocks, "没找到 llm.LLMError 的 except 分支"
-    checked = 0
-    for blk in blocks:
-        for expr in re.findall(r"detail=f?\"[^\"]*\{([^}]*)\}", blk):
-            checked += 1
-            assert "friendly_error_text" in expr, \
-                f"LLMError 的 HTTPException 出口没有走人话化: {expr}"
-    # llm_error 字段同理
-    for blk in blocks:
-        for expr in re.findall(r"\"llm_error\":\s*([^,\n]+)", blk):
-            checked += 1
-            assert "friendly_error_text" in expr, \
-                f"LLMError 的 llm_error 字段没有走人话化: {expr}"
-    assert checked, "没有可检查的 LLMError 出口"
+    checked += len(sse)
+    assert checked >= 10, f"检查到的出口太少（{checked}），可能匹配失效了"
+
+
+def test_llm_module_own_error_outputs_are_friendly():
+    """llm.py 内部自己吞掉 LLMError 的地方也要人话化。
+
+    独立审查抓到：summarize_paper 把 LLMError 吞掉返回 partial，
+    app.py 的 `except llm.LLMError` 根本看不到它 → 英文原文直接进 API 响应。
+    """
+    src = LLM_PATH.read_text(encoding="utf-8")
+    start = src.index("def summarize_paper(")
+    end = src.index("\ndef ", start + 10)
+    body = src[start:end]
+    assert "friendly_error_text" in body, \
+        "summarize_paper() 内部吞掉 LLMError 时没有走人话化"
+
+
+def test_stderr_log_redacts_secrets():
+    """原始报文进 stderr 前必须脱敏（不能把 key 写进日志）。"""
+    src = LLM_PATH.read_text(encoding="utf-8")
+    start = src.index("def friendly_error_text(")
+    end = src.index("\ndef ", start + 10)
+    body = src[start:end]
+    assert "上游返回 HTTP" in body, "找不到打印上游原始报文的日志行"
+    idx = body.index("上游返回 HTTP")
+    window = body[max(0, idx - 260):idx + 260]
+    assert "_redact_secrets" in window, \
+        "打印原始报文前没有脱敏（可能把 API key 写进日志）"
 
 
 def test_friendly_error_text_is_exported():

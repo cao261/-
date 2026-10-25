@@ -1332,7 +1332,11 @@
       position: fixed;
       right: var(--s-5);
       bottom: var(--s-5);
-      z-index: 1060;
+      /* ⚠️ 必须高于 .ai-panel（1400）：AI 活动浮层自动展开时会盖住 QA 面板
+         标题栏（模型徽标 / 最小化按钮），而 QA 面板要靠标题栏拖动 ——
+         盖住了就既点不动也拖不动（2026-10-25 独立审查 CDP 实测，
+         重叠 415×55px）。 */
+      z-index: 1460;
       display: none;
       flex-direction: column;
       width: 460px;
@@ -1522,13 +1526,9 @@
     /* 用户原话（2026-10-25）："他有可能等了半天然后什么也没输出" ——
        一个不动的转圈 = 用户不知道是在跑还是卡了。 */
     .ai-activity-pill {
-      /* ⚠️ 必须是 fixed：
-         1) 它不在 .reader-topbar 里（在浮动区块），所以 topbar 被隐藏也不
-            连带隐藏它 —— PDF 双栏模式下照样能看见"AI 运行中"；
-         2) 必须是 fixed，否则它会作为 .reader-shell 的 flex item 被排到
-            屏幕最下面（.reader-shell 是 height:100% 的 column flex）。
-         top 放在 topbar 之下，避免和工具条叠在一起。 */
-      position: fixed; right: var(--s-5); top: 56px; z-index: 1401;
+      /* ⚠️ 不要 fixed：PDF 模式下 topbar 会折行到 ~104px，fixed 在右上角
+         会压住「关闭」按钮（真人点击点不动，2026-10-25 独立审查 CDP 实测）。
+         放回 topbar 的正常流里，两种模式都可见、也不压任何控件。 */
       display: inline-flex; align-items: center; gap: 6px;
       padding: 4px 10px; border-radius: 999px; cursor: pointer;
       border: 1px solid var(--card-border); background: var(--bg-canvas-subtle);
@@ -2869,8 +2869,8 @@
       const _AI_TASK_HISTORY = [];      // 已结束的（最近 12 条）
       let _aiTaskSeq = 0;
       let _aiTickTimer = null;
-      // 浮层是否已经"自动展开"过（每个任务自动弹一次；用户手动关掉后不再弹）
-      let _aiPanelAutoOpened = false;
+      // 浮层是否已经为这些任务自动展开过（每个任务 id 一条；任务全部结束后清空）
+      const _aiPanelOpenedFor = new Set();
 
       function _aiFormatMs(ms) {
         const s = Math.max(0, Math.floor(ms / 1000));
@@ -2984,16 +2984,20 @@
         const running = Array.from(_AI_TASKS.values());
         const n = running.length;
 
-        // 有任务时**自动展开一次**浮层。
+        // 有任务时**自动展开**浮层。
         // 为什么必须自动展开：徽标只是入口，用户不会想到去点它；
         // 而"正在跑 + 跑了多久 + 能取消"是用户此刻最需要的信息
         // （用户原话："他有可能等了半天然后什么也没输出"）。
-        // 用户手动关掉后不再自动弹（尊重用户），下一个任务重新自动展开。
-        if (n > 0 && !_aiPanelAutoOpened) {
-          if (panel.classList) panel.classList.add("open");
-          _aiPanelAutoOpened = true;
-        } else if (n === 0) {
-          _aiPanelAutoOpened = false;
+        // 语义：**每个新任务展开一次**（记录已展开的任务 id）。
+        // 之前用"是否有任务"的标志位 → PDF 队列连续翻译时，用户手动关一次，
+        // 整个队列期间都不再自动弹（与注释不符，独立审查抓到的）。
+        if (n > 0 && !running.every((t) => _aiPanelOpenedFor.has(t.id))) {
+          panel.classList.add("open");
+          running.forEach((t) => _aiPanelOpenedFor.add(t.id));
+        }
+        // 任务全部结束后清空记录 —— 下一批任务还能自动展开
+        if (n === 0 && _aiPanelOpenedFor.size) {
+          _aiPanelOpenedFor.clear();
         }
 
         // 工具栏上的徽标
@@ -8762,7 +8766,17 @@
                     title="探测可用的更强模型" onclick="event.stopPropagation(); probeModelNow();">探测升格</button>
           </div>
 
-          <!-- AI 活动徽标已移到 #reader-modal 顶层（PDF 模式下 topbar 会被隐藏） -->
+          <!-- AI 活动：进行中的 AI 任务（翻译 / 答疑），可点开看进度与取消。
+               ⚠️ 放回 topbar 里（不是 fixed）：PDF 模式下 topbar 会折行到
+               ~104px，徽标如果 fixed 在右上角会**压住「关闭」按钮**，
+               真人点击点不动（2026-10-25 独立审查用 CDP 实测抓到：
+               elementsFromPoint 里徽标排在按钮之前）。
+               放回 topbar 后两种模式都能看见、也不压任何控件；
+               万一 topbar 被隐藏，浮层仍会自动展开兜底（见 _renderAiActivity）。 -->
+          <div id="ai-activity-pill" class="ai-activity-pill" data-active="0"
+               onclick="toggleAiPanel()" title="AI 活动：正在跑什么、跑了多久、卡在哪一步">
+            <span style="opacity:.6">🤖 AI 活动</span>
+          </div>
 
           <!-- View mode -->
           <div class="seg-group">
@@ -8889,15 +8903,13 @@
       </div>
 
       <!-- ---------------------- Floating affordances ---------------------- -->
-      <!-- AI 活动浮层 + 徽标。
+      <!-- AI 活动浮层。
            ⚠️ 必须放在 child 3（PDF 视图）**之后**：
            1) 页面有结构契约 —— JS 用 nth-child 定位章节视图区，浮动元素插在
               前面会把它挤偏；
-           2) 更不能挂在 .reader-topbar 里 —— PDF 双栏模式下 topbar 会被
-              switchReaderMode 隐藏（见下），挂在里面的徽标会被连带隐藏
-              → 用户点不开浮层 → 「✕ 取消」永远够不着
-              （2026-10-25 浏览器实测抓到：徽标 rect 宽高都是 0）。
-           两者都用 fixed 定位 → 不占 flex 位，章节视图区与 PDF 视图都不受牵连。 -->
+           2) 更不能挂在 .reader-topbar 里 —— 浮层是 fixed 且比 topbar 高，
+              挂在里面会被 topbar 的高度裁掉。
+           fixed 定位 → 不占 flex 位，章节视图区与 PDF 视图都不受牵连。 -->
       <div id="ai-panel" class="ai-panel">
         <div class="ai-panel-head">
           <span>🤖 AI 活动</span>
@@ -8905,11 +8917,6 @@
                   onclick="toggleAiPanel()">×</button>
         </div>
         <div class="ai-panel-body"></div>
-      </div>
-
-      <div id="ai-activity-pill" class="ai-activity-pill" data-active="0"
-           onclick="toggleAiPanel()" title="AI 活动：正在跑什么、跑了多久、卡在哪一步">
-        <span style="opacity:.6">🤖 AI 活动</span>
       </div>
 
       <div id="reader-selection-bubble" class="reader-selection-bubble">

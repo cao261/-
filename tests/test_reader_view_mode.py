@@ -18,16 +18,53 @@ def _src():
 
 
 def _code_only():
-    """剥掉注释，只留代码。
+    """取**脚本代码**（剥掉注释，但保留字符串字面量）。
 
-    必须剥：修这个 bug 时我在注释里写了旧写法（nth-child），
-    直接全文搜会把注释当成"还在用位置型选择器"。
+    三层过滤，缺一不可：
+    1) 只取 `<script>` 块 —— HTML 注释（结构契约说明、修复说明）里
+       写着旧写法（nth-child），不排除就会误判"还在用位置型选择器"；
+    2) 剥 JS 注释（// 和 /* */）；
+    3) **保留字符串字面量** —— 剥字符串会把
+       `getElementById("reader-body")` 变成 `getElementById("")`，
+       断言全废；而用正则直接剥 `//` 又会把 `"http://x"` 里的 `//`
+       当注释起点，把后面整行吃掉（独立审查实测能骗过断言）。
+    所以这里用一个简易扫描器，自己识别字符串 / 行注释 / 块注释。
     """
     src = _src()
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-    src = re.sub(r"<!--.*?-->", "", src, flags=re.S)
-    src = re.sub(r"//[^\n]*", "", src)
-    return src
+    blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", src, re.S)
+    assert blocks, "没找到 <script> 块"
+    js = "\n".join(blocks)
+
+    out = []
+    i, n = 0, len(js)
+    while i < n:
+        c = js[i]
+        if c in "\"'`":
+            q = c
+            out.append(c)
+            i += 1
+            while i < n:
+                if js[i] == "\\":
+                    out.append(js[i:i + 2])
+                    i += 2
+                    continue
+                out.append(js[i])
+                if js[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if js.startswith("//", i):
+            j = js.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if js.startswith("/*", i):
+            j = js.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def test_reader_body_has_id_anchor():
@@ -58,48 +95,77 @@ def test_nth_child_is_not_used_anywhere_in_reader_modal():
 
 
 def test_ai_activity_widgets_live_after_pdf_view():
-    """AI 活动浮层和徽标必须挂在浮动区块（child 3 之后），不能塞进 topbar。
+    """AI 活动浮层必须在浮动区块（child 3 之后）；徽标在 topbar 里。
 
-    塞进 topbar 的话，PDF 模式下 topbar 一藏，徽标也跟着藏 →
-    用户点不开浮层 → 「✕ 取消」永远够不着。
+    两者位置不同，理由不同：
+    - 浮层是 fixed 且比 topbar 高 → 放 topbar 里会被 topbar 裁掉，
+      必须放浮动区块（child 3 之后，符合结构契约）。
+    - 徽标是 inline（跟随工具条流）→ **不能 fixed 在右上角**：
+      PDF 模式下 topbar 会折行到 ~104px，fixed 在右上会压住「关闭」按钮，
+      真人点击点不动（2026-10-25 独立审查用 CDP 实测：
+      elementsFromPoint 里徽标排在按钮之前）。
+      放回 topbar 的正常流里，两种模式都可见、也不压任何控件。
     """
     src = _src()
-    # topbar 区间
-    tb_start = src.index('<div class="reader-topbar">')
-    tb_end = src.index("<!-- ------- child 2: section view")
-    topbar = src[tb_start:tb_end]
-    assert "ai-activity-pill" not in topbar, \
-        "AI 活动徽标又回到 topbar 里了（PDF 模式会被连带隐藏）"
+    topbar = src[src.index('<div class="reader-topbar">'):src.index("<!-- ------- child 2: section view")]
+    assert "ai-activity-pill" in topbar, \
+        "AI 活动徽标不在 topbar 里（fixed 定位会压住「关闭」按钮）"
 
-    # 浮动区块里必须有它
     float_start = src.index("<!-- ---------------------- Floating affordances")
-    float_end = src.index("</div>", src.index('id="reader-qa-floating-btn"'))
-    floating = src[float_start:float_end + 200]
-    assert "id=\"ai-activity-pill\"" in floating, \
-        "AI 活动徽标不在浮动区块里"
-    assert "id=\"ai-panel\"" in floating, \
-        "AI 活动浮层不在浮动区块里"
+    float_end = src.index('id="reader-qa-floating-btn"')
+    floating = src[float_start:float_end]
+    assert 'id="ai-panel"' in floating, \
+        "AI 活动浮层不在浮动区块里（child 3 之后）"
+    assert 'id="ai-activity-pill"' not in floating, \
+        "AI 活动徽标不该放浮动区块（会脱离工具条流、且 fixed 会压控件）"
 
 
-def test_ai_activity_pill_is_fixed_positioned():
-    """徽标必须 fixed —— 否则它是 .reader-shell 的 flex item，会被排到屏幕最下面。"""
+def test_ai_activity_pill_is_not_fixed():
+    """徽标不能是 fixed —— fixed 在右上角会压住 topbar 最右的「关闭」按钮。"""
     src = _src()
     m = re.search(r"\.ai-activity-pill\s*\{(.*?)\}", src, re.S)
     assert m, "找不到 .ai-activity-pill 的 CSS"
-    assert "position: fixed" in m.group(1), \
-        ".ai-activity-pill 不是 fixed 定位（会被 flex 布局排到屏幕底部）"
+    assert "position: fixed" not in m.group(1), \
+        ".ai-activity-pill 不能 fixed（会压住 PDF 模式的「关闭」按钮）"
+
+
+def test_qa_panel_zindex_is_above_ai_panel():
+    """QA 面板要盖在 AI 活动浮层之上。
+
+    AI 浮层自动展开时会压住 QA 面板标题栏（模型徽标 / 最小化按钮），
+    而 QA 面板要靠标题栏拖动 —— 盖住了就既点不动也拖不动。
+    """
+    src = _src()
+    qa = re.search(r"\.reader-qa-panel\s*\{(.*?)\}", src, re.S)
+    ai = re.search(r"\.ai-panel\s*\{(.*?)\}", src, re.S)
+    assert qa and ai, "找不到 .reader-qa-panel / .ai-panel 的 CSS"
+
+    def _z(block):
+        m = re.search(r"z-index:\s*(\d+)", block)
+        return int(m.group(1)) if m else 0
+
+    assert _z(qa.group(1)) > _z(ai.group(1)), \
+        (f"QA 面板 z-index({_z(qa.group(1))}) 必须高于 AI 浮层"
+         f"({_z(ai.group(1))})，否则标题栏会被盖住、面板拖不动")
 
 
 def test_ai_panel_auto_opens_when_task_starts():
-    """有任务时浮层要自动展开 —— 徽标只是入口，用户不会想到去点它。"""
+    """有任务时浮层要自动展开 —— 徽标只是入口，用户不会想到去点它。
+
+    语义：**每个新任务展开一次**（按任务 id 记）。
+    独立审查抓到：用"是否有任务"的单一标志位时，PDF 队列连续翻译期间
+    用户手动关一次，整个队列都不再自动弹（与注释不符）。
+    """
     src = _src()
     start = src.index("function _renderAiActivity(")
     end = src.index("\n    function ", start + 10)
     body = src[start:end]
-    assert "_aiPanelAutoOpened" in body, \
+    assert "_aiPanelOpenedFor" in body, \
         "浮层没有「有任务自动展开」的逻辑"
     assert 'classList.add("open")' in body, \
         "有任务时没有自动展开浮层"
+    assert "_aiPanelOpenedFor.clear()" in body, \
+        "任务结束后没有清空「已展开」记录 → 下一批任务不会自动弹"
 
 
 if __name__ == "__main__":

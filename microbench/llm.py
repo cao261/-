@@ -209,9 +209,11 @@ def friendly_error_text(exc: BaseException) -> str:
         return msg
     code = int(m.group(1))
     raw = m.group(2)
-    # 原始报文只进日志，不进界面
+    # 原始报文只进日志，不进界面。
+    # ⚠️ 打印前必须脱敏：上游报文里可能带 key-like 字段
+    #    （实测 {"api_key":"sk-..."} 会原样进 stderr）。
     print(
-        f"[MicroBench] 上游返回 HTTP {code}: {raw[:400]}",
+        f"[MicroBench] 上游返回 HTTP {code}: {_redact_secrets(raw)[:400]}",
         file=sys.stderr,
     )
     friendly = _friendly_http_error(code, msg)
@@ -2260,14 +2262,18 @@ def summarize_paper(meta: dict) -> dict:
         }
     except (LLMError, json.JSONDecodeError, KeyError) as e:
         title = meta.get("title", "(未知标题)")
+        # LLMError 要人话化（上游 429/401…）；别的异常保持原样。
+        # ⚠️ 这里把错误**吞掉**了（返回 partial），所以外层 app.py 的
+        # `except llm.LLMError` 根本看不到它 —— 人话化必须在这里做。
+        detail = friendly_error_text(e) if isinstance(e, LLMError) else _redact_secrets(str(e))
         return {
-            "tldr": f"({title[:30]}... — LLM 未配置或调用失败: {_redact_secrets(str(e))[:80]})",
+            "tldr": f"({title[:30]}... — LLM 未配置或调用失败: {detail[:80]})",
             "key_points": [
                 "⚠️ 请检查 .env 中的 LLM_API_KEY 或 AGNES_API_KEY 配置",
                 f"原文摘要 ({len(meta.get('abstract') or '')} 字) 可手动阅读",
             ],
             "takeaway": "提示: 降级到 Agnes 3.0 Flash 后，在 20 RPM 限制下可稳定完成自动摘要。",
-            "error": _redact_secrets(str(e)),
+            "error": detail,
         }
 
 
