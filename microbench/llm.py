@@ -74,6 +74,14 @@ DEFAULT_TIMEOUT = 60
 # trip the very per-minute cap the rate limiter exists to protect.
 MAX_UPSTREAM_CALLS_PER_REQUEST = 6
 
+# 「这次没产出正文」导致的**短 TTL 降格**时长（秒）。
+# 为什么是短 TTL 而不是 0 或 900：
+#   - 0（不降格）：主模型每次都会被重试 2 次（escalation + 抬预算重试），
+#     每次白烧一次思考额度（独立审查实测：连续 3 次调用，主模型每次 2 次）；
+#   - 900（通用降格）：一次任务的毛病让后面 15 分钟全走备用模型，太重。
+# 60 秒刚好：这一波请求走备用模型，下一波自动回主模型。
+NO_OUTPUT_DEGRADE_TTL_SECONDS = 60
+
 # 标记：本次响应因为 max_tokens 被截断（思考模型把额度全花在 reasoning 上），
 # 还没产出正文。上层据此抬高预算重试，或降级到非思考型备用模型。
 TRUNCATED_MARKER = "__TRUNCATED_BY_MAX_TOKENS__"
@@ -488,22 +496,26 @@ def is_agnes_config(cfg: dict) -> bool:
 # readable while still removing the credential.
 _SECRET_PATTERNS = (
     (re.compile(r"sk-[A-Za-z0-9_\-]{4,}"), None),
-    (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]{8,}"), 1),
-    # ⚠️ Basic 必须排在"关键词+分隔符"那条**前面**：
+    # ⚠️ 必须 (?i)：RFC 7235 里 header 名大小写不敏感，
+    #    上游报错常小写回显 "authorization: bearer <key>" → 大小写敏感会漏。
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{8,}"), 1),
+    # ⚠️ Basic 也必须排在"关键词+分隔符"那条**前面**：
     #    否则 authorization 那条会先把 "Basic" 当成值替换掉，
     #    后面的 base64 载荷就漏了（实测）。
     (re.compile(r"(?i)\b(basic\s+)[A-Za-z0-9+/=]{8,}"), 1),
     # 关键词 + 分隔符（允许中间有引号/空白）+ 值。
-    # 覆盖 api_key / apiKey / api-key / access_token / refresh_token /
-    #      token / secret / password / authorization / cookie。
+    # 覆盖 api_key / apiKey / api-key / api_secret / access_token /
+    #     refresh_token / client_secret / private_key / token / secret /
+    #     password / authorization / cookie。
     # ⚠️ 旧版只有一条 `(?:api[_-]?key|token|secret|password)\s*[=:]\s*`，
     #    JSON 形态 `{"api_key":"<hex>"}` 因关键词和分隔符之间隔了一个引号
     #    而不匹配 → key 明文进 logs/desktop.log（安全审计实测 24 种形态）。
     (re.compile(
         r"""(?ix)
         ( ["']? \b (?:
-              api[_-]?keys? | apikey
+              api[_-]?keys? | apikey | api[_-]?secrets?
             | access[_-]?tokens? | refresh[_-]?tokens? | id[_-]?tokens?
+            | client[_-]?secrets? | private[_-]?keys?
             | tokens? | secrets? | passwords? | passwd
             | authorization | cookie
         ) \b ["']? \s* [:=] \s* )
@@ -513,15 +525,24 @@ _SECRET_PATTERNS = (
     ), 1),
     # URL 里的 userinfo：scheme://user:pass@host
     (re.compile(r"(://[^:/\s@]+:)[^@/\s]+(@)"), 1),
-    # 裸 Authorization / Basic（没有 Bearer 前缀）
-    (re.compile(r"(?i)\b(basic\s+)[A-Za-z0-9+/=]{8,}"), 1),    # PEM 私钥块
+    # 厂商 key 前缀（本项目主要用 sk-，这些是顺手补的通用性）
+    (re.compile(r"\b(?:gh[pousr]_|AKIA|AIza|xox[baprs]-|sk_live_|sk_test_)"
+                r"[A-Za-z0-9_\-]{8,}"), None),
+    # JWT（三段式）
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"), None),
+    # PEM 私钥块
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?"
                 r"-----END [A-Z ]*PRIVATE KEY-----"), None),
 )
 
 
 def _mask_paths(text: str) -> str:
-    """抹掉文本里的本机绝对路径。
+    """抹掉文本里的本机绝对路径（内部别名，见 mask_paths）。"""
+    return mask_paths(text)
+
+
+def mask_paths(text: str) -> str:
+    """公开入口：抹掉本机绝对路径（app.py 等模块要用，别跨模块调私有名）。
 
     OSError / FileNotFoundError 的消息里带着本机绝对路径
     （'E:\\zaiwu\\个人工作台\\logs\\xxx.json'），原样送到浏览器
@@ -529,13 +550,23 @@ def _mask_paths(text: str) -> str:
     """
     if not text:
         return text
-    out = re.sub(r"[A-Za-z]:\\[^\s'\"]+", "<本机路径>", text)
+    # ⚠️ Windows 路径要按"路径段"匹配，不能用 `[^\s'"]+`：
+    #    带空格的路径（C:\Program Files (x86)\...\msedge.exe）
+    #    会在第一个空格处停下 → 只遮一半，后半截照样泄露（独立审查实测）。
+    out = re.sub(r"[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n]+\\)*[^\\/:*?\"<>|\r\n]*",
+                 "<本机路径>", text)
+    # POSIX 绝对路径（/opt/... /home/...）
     out = re.sub(r"(?<![\w<])/(?:[^\s'\"]+/)+[^\s'\"]*", "<本机路径>", out)
     return out
 
 
 def _redact_secrets(text: str) -> str:
     """Strip credential-shaped substrings from text that will be displayed."""
+    return redact_secrets(text)
+
+
+def redact_secrets(text: str) -> str:
+    """公开入口：脱敏（app.py 等模块要用，别跨模块调私有名）。"""
     if not text:
         return text
     out = text
@@ -612,6 +643,7 @@ class DualModelManager:
         self.is_degraded: bool = False
         self.degraded_reason: str = ""
         self.degraded_kind: str = ""   # quota / rate_limit / no_output
+        self.degraded_until: float = 0.0   # 短 TTL 降格的到期时间（0 = 不自动恢复）
         self.degraded_at: float = 0.0
         self.last_primary_probe: float = 0.0
 
@@ -650,7 +682,8 @@ class DualModelManager:
             "is_fallback": True,
         }
 
-    def mark_degraded(self, reason: str, sticky: bool = False, kind: str = ""):
+    def mark_degraded(self, reason: str, sticky: bool = False, kind: str = "",
+                       ttl_seconds: float = 0.0):
         """
         标记主模型降格。
 
@@ -665,16 +698,16 @@ class DualModelManager:
         而真实原因可能是限流或空正文 → 用户一看自己的额度明明还有，
         只会觉得"这程序在瞎说"。
 
-        sticky=True 用于「主模型不是不可用，而是对当前任务产不出有效正文」
-        这类情况（例如思考模型遇到乱序 PDF 文本陷入无限思考）：这种降格
-        不能靠 15 分钟一次的通用探针自动恢复——探针只是发个 "1"，必然成功，
-        但真正的翻译任务还是会失败，来回升格/降格只会白白多等几十秒。
-        这类情况需要用户手动点「探测升格」。
+        ttl_seconds：**短 TTL 降格**（默认 0 = 不自动恢复）。
+        用途：no_output 这类"这次任务的问题"不该永久压着主模型
+        （那会让后续每个请求都白烧一次主模型调用），
+        但也完全不该永久降格（15 分钟）→ 压 60 秒刚好。
         """
         with self._lock:
             self.is_degraded = True
             self.degraded_reason = reason
             self.degraded_kind = kind
+            self.degraded_until = (time.time() + ttl_seconds) if ttl_seconds else 0.0
             self.degraded_at = time.time()
             self.last_primary_probe = time.time()
             self.sticky_degraded = sticky
@@ -682,14 +715,28 @@ class DualModelManager:
                 f"[MicroBench] ⚠️ 主模型触发降格 ({kind or 'unknown'}): "
                 f"{_redact_secrets(str(reason))[:300]}. "
                 f"已自动切换至备用模型 (Agnes 3.0 Flash, 20 RPM 保护)."
+                + (f" [{int(ttl_seconds)}s 后自动恢复]" if ttl_seconds else "")
                 + (" [需手动探测升格]" if sticky else ""),
                 file=sys.stderr,
             )
+
+    def _ttl_expired(self) -> bool:
+        """短 TTL 降格是否已到期（不持锁调用，避免死锁）。"""
+        with self._lock:
+            if not self.is_degraded or not self.degraded_until:
+                return False
+            return time.time() >= self.degraded_until
 
     def mark_recovered(self):
         with self._lock:
             self.is_degraded = False
             self.degraded_reason = ""
+            # ⚠️ kind 也要清：否则 is_degraded=False 但 status 仍返回
+            #    degraded_kind='quota' + degraded_text="主模型配额用完了…"
+            #    → 任何不同时检查 is_degraded 的客户端都会显示"额度用完了"
+            #    （独立审查 I-3）。
+            self.degraded_kind = ""
+            self.degraded_until = 0.0
             self.sticky_degraded = False
             self.last_primary_probe = time.time()
             print(
@@ -699,6 +746,9 @@ class DualModelManager:
 
     def should_opportunistic_probe(self) -> bool:
         """Return True if degraded and probe cooldown interval has elapsed."""
+        # 短 TTL 降格到期 → 自动恢复（不用等 15 分钟的通用探针）
+        if self._ttl_expired():
+            self.mark_recovered()
         with self._lock:
             if not self.is_degraded:
                 return False
@@ -1466,6 +1516,14 @@ def chat(
         is_quota = model_manager.is_quota_exhausted_error(status_code or 0, res)
         if fallback["configured"] and is_quota:
             model_manager.mark_degraded(res, kind="quota")
+        elif fallback["configured"] and no_usable_output:
+            # ⚠️ 空正文是**这次任务**的问题（思考烧光预算等），
+            #    不该永久压着主模型（15 分钟太重），但也完全不该不降格 ——
+            #    不降格的话主模型每次都会被重试 2 次（escalation + 抬预算），
+            #    每次白烧一次思考额度（独立审查实测量化过）。
+            #    → 短 TTL 降格：压 60 秒，之后自动恢复。
+            model_manager.mark_degraded(res, kind="no_output",
+                                       ttl_seconds=NO_OUTPUT_DEGRADE_TTL_SECONDS)
         if fallback["configured"] and (is_quota or no_usable_output):
             # Seamlessly fail over to fallback!
             fb_success, fb_res, _ = _invoke_with_budget_escalation(

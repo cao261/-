@@ -140,6 +140,58 @@ def test_export_sanitizer_blocks_dangerous_urls():
 
 
 # ---------------------------------------------------------------------------
+# 2b) 消毒器的绕过与保真（独立审查实测在真实 Edge 里会执行）
+# ---------------------------------------------------------------------------
+
+CDATA_CONTAINER_PAYLOADS = [
+    "<xmp><img src=x onerror=alert(1)></xmp>",
+    "<noembed><img src=x onerror=alert(1)></noembed>",
+    "<noframes><img src=x onerror=alert(1)></noframes>",
+    "<plaintext><img src=x onerror=alert(1)>",
+    "<title><img src=x onerror=alert(1)></title>",
+    "<textarea><img src=x onerror=alert(1)></textarea>",
+]
+
+
+@pytest.mark.parametrize("payload", CDATA_CONTAINER_PAYLOADS,
+                         ids=[p.split(">")[0][1:] for p in CDATA_CONTAINER_PAYLOADS])
+def test_export_sanitizer_blocks_cdata_container_bypass(payload):
+    """CDATA/RCDATA 容器标签（<xmp>/<noembed>/<noframes>/<plaintext>/<title>）
+
+    Python 3.13 的 HTMLParser 把它们当 CDATA/RCDATA 容器 →
+    容器里的内容被当**纯文本**交给 handle_data → 如果不转义就原样透传，
+    绕过全部标签/属性/协议过滤。
+
+    独立审查用真实 Edge 实测：`<xmp><img src=x onerror=...></xmp>`
+    在打开导出物的瞬间就执行了（无需用户交互）。
+    """
+    from microbench import export_offline
+    out = export_offline.markdown_to_html(payload)
+    low = out.lower()
+    assert "onerror" not in low, f"事件属性存活: {out}"
+    assert "<img" not in low, f"img 标签存活: {out}"
+    assert "alert" not in low, f"载荷内容存活: {out}"
+
+
+def test_export_sanitizer_preserves_html_entities():
+    """实体必须保真 —— 丢掉的话 'AT&T' 会变成 'ATT'（英文论文里很常见）。"""
+    from microbench import export_offline
+    for src, want in [("AT&T 增长", "AT&amp;T"), ("x &lt; y", "&lt;"),
+                      ("&nbsp;空格", "&nbsp;"), ("&#65; 大写", "&#65;")]:
+        out = export_offline.markdown_to_html(src)
+        assert want in out, f"实体丢失: {src!r} -> {out}"
+
+
+def test_export_sanitizer_keeps_code_blocks():
+    """代码块要保留（<pre><code class=...>）。"""
+    from microbench import export_offline
+    out = export_offline.markdown_to_html("```py\nprint(1)\n```")
+    assert "<pre>" in out, out
+    assert "<code" in out, out
+    assert "print(1)" in out, out
+
+
+# ---------------------------------------------------------------------------
 # 3) M1：download_pdf 不能是 GET
 # ---------------------------------------------------------------------------
 
@@ -175,19 +227,81 @@ def test_status_exposes_degrade_kind_and_text():
     assert "degraded_text" in st, sorted(st)
 
 
-def test_no_output_does_not_globally_degrade():
-    """「这次没产出正文」是单次任务的问题，不该改全局状态。
+def test_no_output_does_not_globally_degrade_permanently():
+    """「这次没产出正文」不能永久压着主模型。
 
-    否则用户会看到"降格"却不知道自己额度明明还有（真实反馈）。
+    ⚠️ 这条护栏原来是用**源码正则匹配**写的 → 双向失效（独立审查实测）：
+      - 把原 bug 原样接回去 → 护栏仍绿（假阴性，没保护它声称保护的行为）
+      - 只把变量 `is_quota` 改名 → 护栏变红（假阳性，无害重构也报）
+    现在改成**行为级断言**：mock 主模型返回"未产出正文" → 调 chat() →
+    断言降格是**短 TTL**（会自己到期），而不是永久。
     """
-    src = (ROOT / "microbench" / "llm.py").read_text(encoding="utf-8")
-    # 同步路径：no_usable_output 只做本次 failover，不能触发 mark_degraded
-    assert re.search(
-        r"is_quota\s*=\s*model_manager\.is_quota_exhausted_error\([^)]*\)\s*\n"
-        r"\s*if fallback\[.configured.\] and is_quota:\s*\n"
-        r"\s*model_manager\.mark_degraded\(res, kind=\"quota\"\)",
-        src,
-    ), "同步路径的 mark_degraded 仍然被 no_usable_output 牵连"
+    from microbench import llm as llm_mod
+
+    calls = {"n": 0}
+
+    def fake_invoke(cfg, messages, max_tokens, temperature, timeout, json_mode,
+                    max_retries=2, disable_thinking=False, budget=None,
+                    deadline=None, **kw):
+        calls["n"] += 1
+        if cfg.get("is_fallback"):
+            return True, "备用模型答出来了", 200
+        # 主模型：永远"未产出正文"
+        return False, "模型返回空内容", 200
+
+    orig = llm_mod._invoke_with_budget_escalation
+    orig_async = llm_mod._invoke_model_async
+    orig_invoke = llm_mod._invoke_model
+    llm_mod._invoke_with_budget_escalation = fake_invoke
+    llm_mod._invoke_model_async = fake_invoke
+    # ⚠️ _invoke_model 也要 mock：chat() 内部"空正文 → 抬预算重试"走的是它，
+    #    不 mock 就会**真的发一次网络请求**（可能还真成功 → 断言假失败）。
+    llm_mod._invoke_model = fake_invoke
+    llm_mod.model_manager.mark_recovered()
+    try:
+        try:
+            llm_mod.chat([{"role": "user", "content": "hi"}], max_tokens=100)
+        except Exception:
+            pass
+        st = llm_mod.model_manager.get_status()
+        assert st["is_degraded"] is True, \
+            "空正文时应该临时降格（否则主模型每次都被重试、白烧思考额度）"
+        assert st.get("degraded_kind") == "no_output", \
+            f"降格分类不对: {st.get('degraded_kind')}"
+        # 短 TTL：不能是永久的（永久 = 15 分钟通用探针才恢复）
+        assert getattr(llm_mod.model_manager, "degraded_until", 0) > 0, \
+            "空正文的降格必须有 TTL（否则一次任务的毛病压 15 分钟）"
+    finally:
+        llm_mod._invoke_with_budget_escalation = orig
+        llm_mod._invoke_model_async = orig_async
+        llm_mod._invoke_model = orig_invoke
+        llm_mod.model_manager.mark_recovered()
+
+
+def test_no_output_degrade_expires_on_its_own():
+    """短 TTL 降格到期后自动恢复主模型。"""
+    from microbench import llm as llm_mod
+
+    llm_mod.model_manager.mark_recovered()
+    llm_mod.model_manager.mark_degraded("空正文", kind="no_output", ttl_seconds=0.05)
+    assert llm_mod.model_manager.get_status()["is_degraded"] is True
+    import time as _t
+    _t.sleep(0.2)
+    llm_mod.model_manager.should_opportunistic_probe()
+    assert llm_mod.model_manager.get_status()["is_degraded"] is False, \
+        "TTL 到期没有自动恢复"
+    llm_mod.model_manager.mark_recovered()
+
+
+def test_mark_recovered_clears_degrade_kind():
+    """恢复后不能还带着旧的降格分类（否则 API 会说'额度用完了'但已恢复）。"""
+    from microbench import llm as llm_mod
+    llm_mod.model_manager.mark_degraded("x", kind="quota")
+    llm_mod.model_manager.mark_recovered()
+    st = llm_mod.model_manager.get_status()
+    assert st["is_degraded"] is False
+    assert not st.get("degraded_kind"), \
+        f"恢复后 degraded_kind 没清: {st.get('degraded_kind')!r}"
 
 
 def test_stream_path_no_loose_429_degrade():

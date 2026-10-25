@@ -287,12 +287,49 @@ Python-Markdown 不是消毒器 → `<script>` / `onclick` / `javascript:` 全�
 桌面端加了白名单消毒器（不引第三方库：跨设备同步，一方少装包就起不来）。
 **平板端的单文件导出（`export_tablet`）也要查一遍**。
 
+⚠️ **平板端要补的测试（桌面端已补，抄这个思路）**：
+桌面端加的 `tests/test_security_guards.py` 里有 6 条针对
+CDATA/RCDATA 容器标签（`<xmp>` / `<noembed>` / `<noframes>` /
+`<plaintext>` / `<title>`）的载荷断言 —— 独立审查实测这 5 个载体在
+**真实 Edge 里加载即执行**。
+
+平板端的 `static/tablet/app.js` 里是**另一套** JS 消毒器（正则式，
+白名单标签/属性 + `DROP_WITH_CONTENT`）。它没有 Python `HTMLParser`
+那个 CDATA 洞（不在白名单的标签会整段转义），但**正则式消毒器有自己
+的一类绕过**（畸形闭合、缺 `>` 的标签、属性值引号异常等），**目前零载荷测试**。
+
+→ 请在平板端补一个 node 载荷测试，切的是**发布出去的那份代码**
+（`microbench/_test_reader_*.js` 那种 `sliceFn` 做法），
+载荷至少覆盖上面 5 个容器标签 + `onerror` / `onload` / `javascript:` /
+`<iframe>` / `style=` 注入，并**同时断言正常内容没被误伤**
+（表格 / 代码块 / `class="katex"` / `&` 实体）。
+
+**另外**：桌面端第一版消毒器还踩了个坑 —— 没实现 `handle_entityref` /
+`handle_charref`，导致 `AT&T` 变成 `ATT`（英文论文里很常见的字符串）。
+平板端如果也有正则替换，注意别把实体吃掉。
+
 ### 8.4 GET 带写副作用
 
 `GET /api/paper/download_pdf` 会建目录 + 写 PDF 文件，而 CSRF 守卫
 只查非安全方法 → 恶意网页一个 `<img src="http://127.0.0.1:5000/...">`
 就能让用户机器凭空多出文件（`<img>` 不带 Origin，守卫直接放行）。
-已改成 POST。**平板端有没有同类 GET 写接口？**
+已改成 POST。
+
+⚠️ **这是 breaking change**：桌面前端**没有**调用这个端点（它是给外部
+脚本 / 手工 API 调用用的），所以前端不受影响；**但你自己的脚本要改成 POST**：
+
+```bash
+# 旧
+curl "http://127.0.0.1:5000/api/paper/download_pdf?identifier=2303.15982&title=xx&year=2024"
+# 新
+curl -X POST "http://127.0.0.1:5000/api/paper/download_pdf?identifier=2303.15982&title=xx&year=2024"
+```
+
+**为什么不能用"给 GET 单独加 Origin 检查"来替代**：
+顶层导航 / `<img>` 引发的 GET **不带 Origin**，所以 GET 无法用 Origin
+可靠防护 —— 有写副作用的端点就该是 POST。
+
+**平板端有没有同类 GET 写接口？**（建目录、落盘、发外网请求的都算）
 
 ### 8.5 内部路径泄露
 

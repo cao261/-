@@ -50,7 +50,7 @@ from .generator import (
     record_troubleshoot,
     generate_weekly_report,
     search_vault,
-ALLOWED_TOPIC_CATEGORIES,
+    ALLOWED_TOPIC_CATEGORIES,
     sanitize_filename,
     ensure_vault_templates,
     _safe_path,             # exported once; used by all vault-file endpoints
@@ -83,7 +83,7 @@ def _safe_err(exc: BaseException) -> str:
     = 内部路径泄露；而 requests 的异常消息里可能带带凭据的 URL
     （base_url 里的 user:pass@host）。
     """
-    return llm._mask_paths(llm._redact_secrets(str(exc)))[:200]
+    return llm.mask_paths(llm.redact_secrets(str(exc)))[:200]
 
 
 @asynccontextmanager
@@ -2948,7 +2948,7 @@ async def api_classify_qa_scope(req: ClassifyQAScopeRequest):
     except Exception as e:
         raise HTTPException(
             status_code=502,
-            detail=f"router 返回非 JSON: {cleaned[:200]} (parse err: {e})",
+            detail=f"router 返回非 JSON: {cleaned[:200]} (parse err: {_safe_err(e)})",
         )
 
     mode = str(data.get("mode", "")).strip().lower()

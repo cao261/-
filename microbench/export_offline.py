@@ -443,6 +443,14 @@ _DROP_TAGS = {
     "script", "style", "iframe", "object", "embed", "applet",
     "form", "input", "button", "textarea", "select", "option",
     "link", "meta", "base", "frame", "frameset", "noscript", "svg", "math",
+    # ⚠️ 必须连内容一起丢的"容器标签"（CDATA/RCDATA）：
+    #    Python 3.13 的 HTMLParser 把 xmp/iframe/noembed/noframes 当 CDATA
+    #    容器、textarea/title 当 RCDATA 容器 → 进入容器后，**里面的内容被
+    #    当纯文本交给 handle_data**，标签被丢掉而内容原样透传 →
+    #    绕过全部标签/属性/协议过滤。
+    #    实测：<xmp><img src=x onerror=alert(1)></xmp> 在真实 Edge 里
+    #    加载即执行（独立审查用 CDP 实测确认）。
+    "xmp", "noembed", "noframes", "plaintext", "title",
 }
 
 # 全局允许的属性
@@ -549,7 +557,24 @@ def sanitize_html(html: str) -> str:
         def handle_data(self, data):
             if self.skip_depth:
                 return
-            self.out.append(data)
+            # ⚠️ 数据就是**文本**，必须转义后再输出。
+            #    不转义的话，CDATA/RCDATA 容器（<xmp>/<noembed>/<noframes>/
+            #    <plaintext>/<title>）里的内容会被 HTMLParser 当纯文本交过来，
+            #    原样透传 → 绕过全部标签/属性/协议过滤
+            #    （实测 <xmp><img src=x onerror=alert(1)></xmp> 在真实 Edge
+            #    加载即执行 —— 独立审查用 CDP 实测确认）。
+            self.out.append(_html_escape_text(data))
+
+        def handle_entityref(self, name):
+            # 实体要**原样保留**：markdown 已经把正文里的 & 转成 &amp;、
+            # < 转成 &lt;，这里再吐回去；丢掉的话 "AT&T" 会变成 "ATT"
+            # （独立审查实测：实体丢失是本消毒器的一个副作用）。
+            if not self.skip_depth:
+                self.out.append(f"&{name};")
+
+        def handle_charref(self, name):
+            if not self.skip_depth:
+                self.out.append(f"&#{name};")
 
         def handle_comment(self, data):
             pass
@@ -869,11 +894,12 @@ JS = r"""
   function show(id){
     var n = byId[id];
     if(!n) return;
-    // ⚠️ n.html 来自 markdown_to_html（已消毒），但这里再加一道兜底：
-    //    任何未经消毒的路径都不该把 HTML 直接塞进 innerHTML。
+    // n.html 已经过服务端消毒（markdown_to_html → sanitize_html，白名单标签/属性/协议）。
+    // 不要再加"未经消毒就转义"的分支 —— 那个分支从来没被激活过（payload 里
+    // 从来没有 safe 字段），留着只会让人以为有第二道防线（独立审查 I-4）。
     elContent.innerHTML =
       '<div class="doc-meta">' + esc(n.rel) + '</div>' +
-      '<article class="doc">' + (n.safe === false ? esc(n.html) : n.html) + '</article>';
+      '<article class="doc">' + n.html + '</article>';
     window.scrollTo(0, 0);
     highlightActive();
     elSidebar.classList.remove('open');
