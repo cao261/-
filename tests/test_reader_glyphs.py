@@ -241,12 +241,16 @@ def test_marker_regex_and_version():
 # 6) 章节文本里绝不能出现内部标记（会原样进 prompt）
 # ---------------------------------------------------------------------------
 
-def test_sections_never_leak_internal_markers():
+def test_sections_never_leak_internal_markers(tmp_path):
     """回归（2026-10-25 独立审查）：/api/paper/fetch_full 走的是
     fetch_full_text() → extract_text_from_pdf()，那条路径以前**没有**解析符号
     → ⟦G:n⟧ 原样进 section_text → 原样进 prompt → 模型会照抄或瞎编。
 
     这里直接验"解析后再切章节"的结果里没有内部标记。
+
+    ⚠️ 词典必须写到 tmp_path，不能用 dict_path=None ——
+    None 会落到**用户真实的** logs/glyph_dict.json（默认路径是相对的），
+    测试会把用户的词典改写掉。
     """
     import glob
     from microbench import glyphs as gl
@@ -263,7 +267,7 @@ def test_sections_never_leak_internal_markers():
         if p.get("glyphs"):
             p["text"] = gl.resolve_glyphs_sync(
                 p["text"], p["glyphs"], pdf_bytes, p["page"],
-                dict_path=None)
+                dict_path=tmp_path / "glyph_dict.json")
     sections = pt.split_into_sections(pages)
     blob = "".join(s.get("text", "") for s in sections)
     assert "⟦G:" not in blob, "章节文本里漏出了内部标记 ⟦G:n⟧"

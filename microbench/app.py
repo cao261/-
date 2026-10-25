@@ -737,7 +737,7 @@ def translation_model_choices() -> list[dict]:
 
 async def _resolve_page_glyphs(text: str, glyphs: list, pdf_source, page_no: int,
                                model: str = "") -> str:
-    """把文本里的 ⟦G:n⟧ 换成真实符号（× ≈ ≥ …），认不出来的退回 "[?]"。
+    """把文本里的 ⟦G:n⟧ 换成真实符号（× ≈ ≥ …），认不出来的退回 "[?]"
 
     为什么需要：TeX 数学字体在 PDF 里没有 ToUnicode 映射，pdfplumber 解不出来
     （2026-10-25 用户反馈："有 × 的它都显示成个？"）。
@@ -745,19 +745,121 @@ async def _resolve_page_glyphs(text: str, glyphs: list, pdf_source, page_no: int
     之后查表即可（零成本、跨论文复用）。
 
     词典放 vault/logs/glyph_dict.json → 两台设备通过坚果云共用一份。
+
+    ⚠️ 本函数只用于「按页翻译」那条路径（一次一页，天然只有一个符号集）。
+    **打开/上传论文走 _resolve_document_glyphs**（整篇一次）——
+    逐页调用会让长论文的打开耗时 8 分钟以上。
+
+    ⚠️ 这里**只查词典、不调模型**：
+    翻译请求本身就要等几十秒，再叠一次 30~90s 的认字会让用户以为卡死；
+    而且认字失败会触发**全局降格**，连累后续所有翻译。
+    词典由「打开论文」时的后台补齐任务慢慢填满
+    （见 _schedule_glyph_backfill）—— 打开一次，之后翻译都是真符号。
     """
     if not text or not glyphs:
         return text
-    m_name, m_fallback, _cache_key = _resolve_translation_model(model)
     try:
-        return await glyphs_mod.resolve_glyphs(
-            text, glyphs, pdf_source, page_no,
-            model_name=m_name or None, force_fallback=m_fallback,
-            dict_path=GLYPH_DICT_PATH,
-        )
+        pages = [{"page": page_no, "text": text, "glyphs": glyphs}]
+        await glyphs_mod.resolve_document_glyphs_async(
+            pages, pdf_source, dict_path=GLYPH_DICT_PATH, recognize=False)
+        return pages[0]["text"]
     except Exception as e:
         print(f"[MicroBench] 符号解析失败（退回 [?]）: {e}", file=sys.stderr)
         return glyphs_mod.strip_markers(text)
+
+
+# 整篇符号解析的**总时间预算**（秒）。
+# 为什么要有硬上限：多模态认字实测 29~48s/次，而模型降格/限流时会更慢。
+# 用户要的是"能打开论文"，符号只是锦上添花 —— 超时就退回 "[?]",
+# 绝不让用户对着一个转圈的界面等好几分钟。
+GLYPH_RESOLVE_BUDGET_SEC = 90
+
+# 后台补齐词典的预算（秒）——比前台宽松，因为它不挡着用户。
+GLYPH_BACKFILL_BUDGET_SEC = 180
+
+
+async def _resolve_document_glyphs(pages: list, pdf_source,
+                                   recognize: bool = False) -> dict:
+    """整篇一次性解析解不出的数学符号（× ≈ ≥ …）。
+
+    修的是「上传本地 pdf / 从论文库打开 半天没反应」：
+    旧代码逐页调用认字 → 36 页的论文发 35 次**串行**多模态请求 → 8 分钟以上。
+    现在按语义键全局去重（6184 个实例 → 101 个不同符号），
+    整篇通常 1~3 次批量调用；词典命中时**零模型调用**。
+
+    **recognize=False（默认，打开/上传走这条）= 只查词典、不调模型**：
+    用户要的是"能打开看全文"，符号认不出来显示 [?] 完全可接受
+    （契约：宁可空着也不能指错）。调模型认字是锦上添花，不该挡住打开；
+    而且认字失败会触发**全局降格**，连累后续所有翻译
+    （AGENTS.md：一次任务的毛病不该让别的请求都改走备用模型）。
+    """
+    has_glyphs = any(p.get("glyphs") for p in pages)
+    if not has_glyphs:
+        return {}
+    import time as _time
+    deadline = _time.monotonic() + GLYPH_RESOLVE_BUDGET_SEC
+    try:
+        stats = await glyphs_mod.resolve_document_glyphs_async(
+            pages, pdf_source, dict_path=GLYPH_DICT_PATH, deadline=deadline,
+            recognize=recognize)
+    except Exception as e:
+        print(f"[MicroBench] 整篇符号解析失败（退回 [?]）: {e}", file=sys.stderr)
+        # 出错也要保证内部标记不外泄（模型绝不能看见 ⟦G:n⟧）
+        for _p in pages:
+            if _p.get("glyphs"):
+                _p["text"] = glyphs_mod.strip_markers(_p.get("text") or "")
+        return {}
+    if stats.get("model_calls"):
+        print(f"[MicroBench] 符号认字：{stats.get('unique', 0)} 个不同符号 / "
+              f"{stats.get('model_calls', 0)} 次模型调用 / "
+              f"识别成功 {stats.get('resolved', 0)}", file=sys.stderr)
+    return stats
+
+
+def _schedule_glyph_backfill(pdf_bytes: bytes) -> None:
+    """**后台**补齐符号词典（不阻塞用户的打开操作）。
+
+    为什么需要：打开时只查词典（亚秒级），所以新论文的符号一开始是 [?]；
+    但这些符号认一次就能进词典（跨论文复用）→ 后台慢慢认，
+    下次打开 / 翻译时就是真符号了。
+
+    在**后台线程**里跑（不占事件循环），并且**不触发全局降格** ——
+    认字失败只影响这一次，不该连累用户的翻译。
+
+    守卫：词典已经覆盖这篇论文的全部符号时**不重复认** ——
+    每次打开都去问模型既浪费配额，又可能触发降格连累翻译。
+    """
+    def _worker():
+        try:
+            from microbench.paper_text import extract_text_from_pdf
+            pages = extract_text_from_pdf(pdf_bytes)
+            if not any(p.get("glyphs") for p in pages):
+                return
+            # 守卫：这篇论文的符号是不是都已经在词典里了
+            dictionary = glyphs_mod.GlyphDictionary(GLYPH_DICT_PATH).load()
+            need = set()
+            for _p in pages:
+                for _g in _p.get("glyphs") or []:
+                    need.add("s:" + glyphs_mod.semantic_key(
+                        _g.get("font", ""), _g.get("cid", "")))
+            if need and all(dictionary.get(k) for k in need):
+                return      # 全都认过了 → 不用再问模型
+            import time as _time
+            stats = glyphs_mod.resolve_document_glyphs(
+                pages, pdf_bytes, dict_path=GLYPH_DICT_PATH,
+                deadline=_time.monotonic() + GLYPH_BACKFILL_BUDGET_SEC,
+                recognize=True, isolated=True)
+            print(f"[MicroBench] 后台补齐符号词典：{stats.get('resolved', 0)} 个符号 "
+                  f"（{stats.get('model_calls', 0)} 次模型调用）", file=sys.stderr)
+        except Exception as e:
+            print(f"[MicroBench] 后台补齐符号词典失败: {e}", file=sys.stderr)
+
+    try:
+        import threading
+        t = threading.Thread(target=_worker, daemon=True, name="glyph-backfill")
+        t.start()
+    except Exception as e:
+        print(f"[MicroBench] 后台补齐符号词典启动失败: {e}", file=sys.stderr)
 
 
 # 符号词典：字形 → 符号 的缓存。放 vault/logs 下（坚果云会同步，两台设备共用）
@@ -1912,10 +2014,14 @@ async def api_upload_pdf(
         raise HTTPException(status_code=400, detail="未能从 PDF 中识别出有效文字 (可能是扫描图片版 PDF)")
 
     # 解不出的数学符号（× ≈ ≥ …）：裁图让多模态认字，章节视图也能看到真符号
-    for _p in pages:
-        if _p.get("glyphs"):
-            _p["text"] = await _resolve_page_glyphs(
-                _p["text"], _p["glyphs"], pdf_bytes, _p["page"])
+    #
+    # ⚠️ 必须是**整篇一次**（resolve_document_glyphs），不能逐页调
+    # _resolve_page_glyphs：逐页 = 36 页的论文发 35 次串行多模态请求
+    # （实测 8 分钟以上，用户看到的就是"半天没反应"）。整篇做则全局按语义键
+    # 去重（6184 个实例 → 101 个不同符号），通常 1~3 次批量调用就够。
+    await _resolve_document_glyphs(pages, pdf_bytes)
+    # 后台慢慢把符号认进词典（不挡着用户打开；下次打开/翻译就是真符号）
+    _schedule_glyph_backfill(pdf_bytes)
 
     sections = split_into_sections(pages)
     if not sections:
@@ -2041,10 +2147,10 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
         raise HTTPException(status_code=400, detail="未能从 PDF 中识别出有效文字 (可能是扫描图片版 PDF)")
 
     # 解不出的数学符号（× ≈ ≥ …）：裁图让多模态认字，章节视图也能看到真符号
-    for _p in pages:
-        if _p.get("glyphs"):
-            _p["text"] = await _resolve_page_glyphs(
-                _p["text"], _p["glyphs"], pdf_bytes, _p["page"])
+    # ⚠️ 整篇一次（不是逐页）—— 逐页会让 36 页的论文发 35 次串行多模态请求
+    await _resolve_document_glyphs(pages, pdf_bytes)
+    # 后台慢慢把符号认进词典（不挡着用户打开；下次打开/翻译就是真符号）
+    _schedule_glyph_backfill(pdf_bytes)
 
     sections = split_into_sections(pages)
     if not sections:
@@ -2386,13 +2492,12 @@ def api_fetch_full_text(req: FetchFullRequest):
     try:
         # 全文抓取 = 外网下载 + PDF 解析。本端点是同步 def，FastAPI 已把它放进
         # anyio 线程池执行，慢任务不会冻结事件循环，直接调用即可。
-        # 符号认字：⟦G:n⟧ 绝不能原样进模型（内部标记 → 照抄/瞎编）
-        def _glyph_resolver(text, glyphs, pdf_bytes, page_no):
-            return glyphs_mod.resolve_glyphs_sync(
-                text, glyphs, pdf_bytes, page_no,
-                dict_path=GLYPH_DICT_PATH)
-
-        result = fetch_full_text(req.identifier, glyph_resolver=_glyph_resolver)
+        # 符号：⟦G:n⟧ 绝不能原样进模型（内部标记 → 照抄/瞎编）。
+        # fetch_full_text 内部只查词典（不调模型）→ 拉取不会被认字拖慢。
+        result = fetch_full_text(req.identifier)
+        # 后台慢慢把符号认进词典（不挡着用户）
+        if result.get("pdf_bytes"):
+            _schedule_glyph_backfill(result["pdf_bytes"])
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:

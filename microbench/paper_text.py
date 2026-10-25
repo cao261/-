@@ -1915,16 +1915,20 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
     # 解不出的数学符号（× ≈ ≥ …）必须在**切章节之前**解析掉：
     # 标记里的下标是"本页"的，章节是跨页拼的，切完就再也对不回具体字形了；
     # 而且 ⟦G:n⟧ 是内部标记，**绝不能**原样进 prompt（模型会照抄或瞎编）。
-    if glyph_resolver:
+    #
+    # ⚠️ 这里只查词典、**不调模型**（recognize=False）：
+    # 拉取全文要等外网下载 + PDF 解析，再叠一次多模态认字（29~90s）
+    # 会让用户以为卡死。符号由服务端的后台补齐任务慢慢填进词典。
+    # glyph_resolver 是旧的单页接口，保留兼容（不再走它）。
+    try:
+        from .glyphs import resolve_document_glyphs
+        resolve_document_glyphs(pages, pdf_bytes, recognize=False)
+    except Exception:
+        # 解析不了也要保证内部标记不外泄
+        from .glyphs import strip_markers
         for _p in pages:
             if _p.get("glyphs"):
-                try:
-                    _p["text"] = glyph_resolver(
-                        _p["text"], _p["glyphs"], pdf_bytes, _p["page"])
-                except Exception:
-                    # 解析不了就退回 "[?]"，但不能把内部标记漏给模型
-                    from .glyphs import strip_markers
-                    _p["text"] = strip_markers(_p["text"])
+                _p["text"] = strip_markers(_p.get("text") or "")
     sections = split_into_sections(pages)
 
     return {

@@ -5394,6 +5394,10 @@
         return;
       }
       showToast("正在拉取全文并拆分章节...");
+      const startedAt = Date.now();
+      const ticker = setInterval(() => {
+        showToast(`正在拉取全文并拆分章节…（${Math.round((Date.now() - startedAt) / 1000)}s）`);
+      }, 3000);
       try {
         const res = await fetch("/api/paper/fetch_full", {
           method: "POST",
@@ -5417,9 +5421,11 @@
         _persistReaderState();
         _restoreTranslationsFromCache();
         openReaderModal();
-        showToast(`✅ 已加载 ${result.sections.length} 个章节 (${result.total_pages} 页, ${result.char_count.toLocaleString()} 字)`);
+        showToast(`✅ 已加载 ${result.sections.length} 个章节 (${result.total_pages} 页, ${result.char_count.toLocaleString()} 字, ${Math.round((Date.now() - startedAt) / 1000)}s)`);
       } catch (err) {
         showToast("拉取失败: " + err.message, true);
+      } finally {
+        clearInterval(ticker);
       }
     }
 
@@ -5466,6 +5472,13 @@
       const mark = (s) => { console.log("[vault-pdf]", s); };
       mark("OPENING: " + relativePath);
       showToast("正在解析 PDF 全文并拆分章节…");
+      // 长任务要让用户看见"在动"：每 3 秒更新一次阶段提示 + 已耗时，
+      // 否则一次几十秒的解析看起来就像卡死（2026-10-25 用户反馈）。
+      const startedAt = Date.now();
+      const ticker = setInterval(() => {
+        const sec = Math.round((Date.now() - startedAt) / 1000);
+        showToast(`正在解析 PDF 全文并拆分章节…（${sec}s）`);
+      }, 3000);
       try {
         const res = await fetch("/api/paper/open_vault_pdf", {
           method: "POST",
@@ -5497,11 +5510,14 @@
         // （switchReaderMode 内部会调用 loadPdfDualColumn）
         switchReaderMode("pdf");
         mark(`OK: ${result.total_pages} 页 / ${result.sections.length} 章节`);
-        showToast(`✅ 已打开 ${result.total_pages} 页 / ${result.sections.length} 章节（${result.char_count.toLocaleString()} 字）`);
+        const sec = Math.round((Date.now() - startedAt) / 1000);
+        showToast(`✅ 已打开 ${result.total_pages} 页 / ${result.sections.length} 章节（${result.char_count.toLocaleString()} 字，${sec}s）`);
         loadStats();
       } catch (err) {
         mark("ERROR: " + (err && err.message ? err.message : err));
         showToast("打开失败: " + (err && err.message ? err.message : err), true);
+      } finally {
+        clearInterval(ticker);
       }
     }
 
@@ -5516,6 +5532,11 @@
       }
 
       showToast(`正在上传并解析本地 PDF (${file.name})...`);
+      const startedAt = Date.now();
+      const ticker = setInterval(() => {
+        const sec = Math.round((Date.now() - startedAt) / 1000);
+        showToast(`正在上传并解析本地 PDF (${file.name})…（${sec}s）`);
+      }, 3000);
       const category = document.getElementById("paper-category") ? document.getElementById("paper-category").value : "01_Device_TCAD_器件仿真";
       const titleInput = document.getElementById("paper-title") ? document.getElementById("paper-title").value.trim() : "";
 
@@ -5570,11 +5591,12 @@
           loadPdfDualColumn();
         }
 
-        showToast(`✅ 本地 PDF 已归档至 [${result.pdf_path}], 解析就绪: ${result.sections.length} 个章节 (${result.total_pages} 页, ${result.char_count.toLocaleString()} 字)`);
+        showToast(`✅ 本地 PDF 已归档至 [${result.pdf_path}], 解析就绪: ${result.sections.length} 个章节 (${result.total_pages} 页, ${result.char_count.toLocaleString()} 字, ${Math.round((Date.now() - startedAt) / 1000)}s)`);
         loadStats();
       } catch (err) {
         showToast("上传解析失败: " + err.message, true);
       } finally {
+        clearInterval(ticker);
         input.value = "";
       }
     }

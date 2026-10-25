@@ -1562,6 +1562,44 @@ def chat(
     raise LLMError("无可用的大模型配置")
 
 
+def chat_isolated(messages: list[dict], max_tokens: int = DEFAULT_MAX_TOKENS,
+                  temperature: float = DEFAULT_TEMPERATURE,
+                  timeout: int = DEFAULT_TIMEOUT,
+                  disable_thinking: bool = False,
+                  model_name: Optional[str] = None) -> str:
+    """**不改变全局降格状态**的单次调用（只打主模型）。
+
+    为什么需要（2026-10-25）：「符号认字」是**后台补齐**任务，
+    它的失败是**这一小任务**的问题 —— 但走 chat() 时，"没产出正文"
+    会触发 60 秒的全局降格（mark_degraded kind=no_output），
+    于是用户的**翻译**也被迫改走备用模型 60 秒。
+    → 一个后台小任务不该连累用户正在做的事。
+
+    与 chat() 的差别：
+      - 只调主模型，**不** failover 到 Agnes（Agnes 不支持关思考，
+        认字这种"看图说符号"的活它做不好，实测答非所问）
+      - **不**改任何全局状态（不 mark_degraded、不升格）
+      - 失败就抛异常，调用方自己决定怎么降级
+    """
+    if requests is None:
+        raise LLMError("requests 包未安装, 无法调用模型")
+    primary = model_manager.get_primary_config()
+    if model_name:
+        cfg = resolve_model_config(model_name)
+        if cfg and cfg.get("configured"):
+            primary = dict(primary, model=model_name)
+    if not primary.get("configured"):
+        raise LLMError("主模型未配置 API Key")
+    success, res, _status = _invoke_model(
+        primary, messages, max_tokens, temperature, timeout, False,
+        max_retries=1, disable_thinking=disable_thinking,
+        budget=[2], deadline=None,
+    )
+    if success:
+        return res
+    raise LLMError(f"主模型 ({primary['model']}) 调用失败: {res}")
+
+
 # ---------------------------------------------------------------------------
 # Async variants (Stage 1 of async llm refactor)
 #
