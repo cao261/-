@@ -4775,20 +4775,51 @@
     }
 
     // ---------------------------------------------------------------
-    // 当前 RPM 保护信息 (按当前 provider 动态返回)
+    // 当前 RPM 保护信息 (按**当前选中的模型**动态返回)
     // ---------------------------------------------------------------
+    // 为什么要按"选中的模型"算：换了模型，请求就发到那个模型的服务器上，
+    // 间隔必须跟着那个模型的限流走。原来只有 primary/agnes 两档，
+    // 自定义模型一律按主模型的 30 RPM / 2 秒算 —— 对方的限流更紧时会被打爆。
     function _getCurrentRpmInfo() {
-      const isAgnes = !_llmStatus || _llmStatus.is_degraded;
-      if (!_llmStatus || !_llmStatus.rate_limit) {
-        return isAgnes ? { rpm: 11, interval: 6, label: "Agnes (降格·10 RPM)" }
-                       : { rpm: 30, interval: 2, label: "Primary (~28 RPM)" };
+      const sel = (_pdfTransModel || "");
+      const status = _llmStatus;
+      const isAgnes = !status || status.is_degraded;
+      const rl = status && status.rate_limit;
+
+      // 自定义模型（用户自己的 API 模型）：用服务端下发的它自己的档
+      if (sel && sel.indexOf("custom:") === 0) {
+        const cm = (status && status.custom_models || []).find(c => c.id === sel);
+        if (cm) {
+          return {
+            rpm: cm.rpm || 30,
+            interval: cm.min_interval || 2,
+            label: `${cm.label}（${cm.rpm || 30} RPM）`,
+          };
+        }
       }
-      const lim = isAgnes ? _llmStatus.rate_limit.agnes : _llmStatus.rate_limit.primary;
+      // 显式选了 Agnes
+      if (sel === "agnes") {
+        const lim = rl && rl.agnes;
+        return {
+          rpm: (lim && lim.rpm_limit) || 11,
+          interval: 6,
+          label: `Agnes (免费版·${(lim && lim.rpm_limit) || 11} RPM)`,
+        };
+      }
+      // 跟随默认：降级了就走 Agnes，否则走主模型
+      if (isAgnes) {
+        const lim = rl && rl.agnes;
+        return {
+          rpm: (lim && lim.rpm_limit) || 11,
+          interval: 6,
+          label: `Agnes (降格·${(lim && lim.rpm_limit) || 11} RPM)`,
+        };
+      }
+      const lim = rl && rl.primary;
       return {
-        rpm: lim?.rpm_limit ?? (isAgnes ? 11 : 30),
-        interval: isAgnes ? 6 : 2,
-        label: isAgnes ? `Agnes (降格·${lim?.rpm_limit ?? 11} RPM)`
-                       : `Primary (~${lim?.rpm_limit ?? 30} RPM)`,
+        rpm: (lim && lim.rpm_limit) || 30,
+        interval: 2,
+        label: `Primary (~${(lim && lim.rpm_limit) || 30} RPM)`,
       };
     }
 
@@ -4910,7 +4941,10 @@
         applyAnnotationsToPage(pageNum, textEl);
         if (typeof renderMathIn === "function") renderMathIn(textEl);
 
-        const modelTag = data.model ? ` · ${data.model}` : "";
+        // 服务端报的是**实际**用的模型：用户选的模型连不上时会自动退回主模型，
+        // 这时显示实际那个，并明确告诉用户"已退回"，免得以为选模型没生效。
+        const fellBack = !!data.model_fell_back;
+        const modelTag = data.model ? ` · ${data.model}${fellBack ? "（已自动退回）" : ""}` : "";
         if (tagEl) {
           if (data.partial) {
             // 服务端超出了单次翻译的总时限，只翻完了前面的分段
@@ -4920,6 +4954,9 @@
           } else {
             tagEl.textContent = `✅ 已翻译${modelTag}`;
           }
+        }
+        if (fellBack && typeof showToast === "function") {
+          showToast(`⚠️ 选中的模型连不上，已自动退回「${data.model}」翻译`, true, 5200);
         }
 
         if (_pdfState && _pdfState.pages) {
@@ -5932,6 +5969,8 @@
 
     // ----- Model Status & Probing -----
     let _llmStatus = null;
+    // 降级提示只弹一次（额度恢复后允许再弹）
+    let _degradeToastShown = false;
 
     async function fetchModelStatus() {
       try {
@@ -5970,7 +6009,19 @@
         if (headerText) headerText.textContent = badgeText;
         if (readerText) readerText.textContent = badgeText;
         if (readerProbeBtn) readerProbeBtn.style.display = "inline-block";
+        // 降级是"静默"的：用户只会觉得变慢了，不知道为什么。提示一次。
+        if (!_degradeToastShown) {
+          _degradeToastShown = true;
+          if (typeof showToast === "function") {
+            showToast(
+              "⚠️ 主模型额度用完了 → 已自动降级到免费备用模型：还能用，但慢一些"
+              + "（表格读图尤其慢，8 倍左右）",
+              true, 6500
+            );
+          }
+        }
       } else {
+        _degradeToastShown = false;   // 额度恢复后允许再提示一次
         const badgeText = modelName;
         setDot(headerDot, "ok"); setDot(readerDot, "ok");
         if (headerText) headerText.textContent = badgeText;
@@ -6031,6 +6082,7 @@
         question: (question || "").slice(0, 500),
         sections: _readerState.sections.slice(0, 20).map(s => ({ section: s.section, title: s.title, text: s.text })),
         paper_title: (_readerState.title || "").slice(0, 300),
+        model: _pdfTransModel || "",
       }, {
         onChunk: (chunk, full) => {
           // Live typing effect: append raw text (no markdown formatting
@@ -6102,6 +6154,7 @@
         sections: cappedSections.map(s => ({ section: s.section, title: s.title, text: s.text })),
         selected_indices: sections,
         paper_title: (_readerState.title || "").slice(0, 300),
+        model: _pdfTransModel || "",
       }, {
         onChunk: (chunk, full) => {
           streamTarget.textContent = full;
@@ -6803,7 +6856,12 @@
         (d.models || []).forEach(m => {
           const o = document.createElement("option");
           o.value = m.id;
-          o.textContent = m.label + (m.id ? (m.active ? "（当前）" : "") : "");
+          let label = m.label;
+          // 降格状态要说清楚：用户只会觉得"变慢了"，不知道为什么
+          if (m.id === "" && _llmStatus && _llmStatus.is_degraded) {
+            label += "（已降格到备用模型）";
+          }
+          o.textContent = label + (m.id ? (m.active ? "（当前）" : "") : "");
           o.title = m.hint || "";
           sel.appendChild(o);
         });
@@ -7651,6 +7709,9 @@
         feedback: (feedbackText || "").slice(0, 2000),
         prior_answer: (priorAnswer || "").slice(0, 8000),
         force_scope: newScope.mode,
+        // 用工具栏当前选中的模型回答（'' = 跟随默认 / 'agnes' = 备用 /
+        // 'custom:xxx' = 用户自己的 API 模型）
+        model: _pdfTransModel || "",
       }, {
         onMeta: (meta) => {
           if (modelBadge && meta && meta.model) {
@@ -7963,6 +8024,9 @@
         // falls back to the mid cap (8000) and silently truncates the
         // wide (20K) / full (50K) contexts.
         force_scope: scope.mode,
+        // 用工具栏当前选中的模型回答（'' = 跟随默认 / 'agnes' = 备用 /
+        // 'custom:xxx' = 用户自己的 API 模型）
+        model: _pdfTransModel || "",
       };
 
       await askLLMStream(submitBtn, "/api/paper/explain_selection_stream", payload, {
