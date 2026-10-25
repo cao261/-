@@ -1078,6 +1078,46 @@ Python-Markdown 不是消毒器 → `<script>`/onclick/`javascript:` 全部保�
 2. **写盘前先问：这份内容会到别人手里吗**（日志 / 导出物 / 前端）。
    三条路都要过同一道闸。
 
+### 4.28 自己写的消毒器也会被绕过（2026-10-25，二轮审查实测）
+
+第一版白名单消毒器（`export_offline.sanitize_html`）自认为够用，
+**独立审查用真实 Edge 实测打穿了**：
+
+```
+markdown_to_html("<xmp><img src=x onerror=alert(1)></xmp>")
+  → '<p><img src=x onerror=alert(1)></p>'      ← 存活
+  → 真实 Edge 打开导出物：window.__XSS_FIRED === True（加载即执行）
+```
+
+**根因**：Python 3.13 的 `HTMLParser` 把
+`xmp/iframe/noembed/noframes` 当 **CDATA 容器**、`textarea/title` 当
+**RCDATA 容器** → 进入容器后，里面的内容被当**纯文本**交给 `handle_data`
+→ 而我第一版的 `handle_data` 是 `self.out.append(data)`（原样透传）
+→ 标签被丢掉（不在白名单）、内容却原样留下 → **绕过全部过滤**。
+
+**修法**（一个改动同时修掉绕过和实体丢失）：
+```python
+def handle_data(self, data):
+    if self.skip_depth: return
+    self.out.append(_html_escape_text(data))   # ★ 数据就是文本，必须转义
+def handle_entityref(self, name):              # ★ 不实现就会把
+    if not self.skip_depth: self.out.append(f"&{name};")   #   AT&T 变成 ATT
+def handle_charref(self, name):
+    if not self.skip_depth: self.out.append(f"&#{name};")
+```
+另外把 `xmp/noembed/noframes/plaintext/title` 加进 `_DROP_TAGS`（双保险）。
+
+**通用教训**：
+1. **"不在白名单就丢掉标签"不等于安全** —— 解析器可能把内容当**纯文本**
+   交给你，而你如果不转义就等于放行。**白名单必须作用在"文本"上**。
+2. **解析器差异要实测**：Python `HTMLParser` 与浏览器 HTML5 解析规则不同，
+   容器标签（CDATA/RCDATA）是经典差异点。护栏要按"浏览器能不能执行"写，
+   不是按"字符串里有没有 `<script>`"写。
+3. **验证要端到端**：造**真实结构的导出物** → 真实浏览器打开 → 查
+   `window.__XSS_FIRED`。只测 `sanitize_html()` 的返回值会漏掉
+   "innerHTML 里事件属性照样执行"这类问题（`<script>` 在 innerHTML 里
+   不执行，但 `onerror` 会）。
+
 ## 5. 通用教训（从上面提炼的原则）
 
 1. **先定位根因，再改代码。** 拿不准就在可疑位置加 `console.log` 探针 + 用浏览器的
