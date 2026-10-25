@@ -1397,21 +1397,26 @@ async def _prepare_tables(page_text: str, pdf_path, page: int) -> tuple[str, dic
     if not matches:
         return page_text, tables
 
-    for idx, m in enumerate(matches):
+    # 多张表并行读（每张一次多模态调用；一页通常 1~2 张）
+    async def _read(idx: int, m) -> tuple[str, str]:
         rect = tuple(float(m.group(i)) for i in range(1, 5))
         token = f"⟦TABLE_{idx}⟧"
         try:
             md = await _read_table_vision(pdf_path, page, rect)
             if not md.strip():
                 raise RuntimeError("模型返回空内容")
-            tables[token] = md
             print(f"[MicroBench] 第 {page} 页表格已用多模态抄出 "
                   f"({len(md)} 字符, rect={['%.0f' % v for v in rect]})",
                   file=sys.stderr)
+            return token, md
         except Exception as e:
             print(f"[MicroBench] 第 {page} 页表格读取失败 ({rect}): {e}",
                   file=sys.stderr)
-            tables[token] = "【表格未能读出，请对照左侧 PDF 原文】"
+            return token, "【表格未能读出，请对照左侧 PDF 原文】"
+
+    results = await asyncio.gather(*[_read(i, m) for i, m in enumerate(matches)])
+    for token, md in results:
+        tables[token] = md
 
     counter = {"i": 0}
 
