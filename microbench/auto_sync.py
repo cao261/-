@@ -83,8 +83,32 @@ EXTRA_SUITES = [
 ]
 
 
+_LOG_FH = None
+
+
 def log(msg: str) -> None:
     print(msg, flush=True)
+    if _LOG_FH is not None:
+        try:
+            _LOG_FH.write(msg + "\n")
+            _LOG_FH.flush()
+        except (OSError, ValueError):
+            pass
+
+
+def open_log():
+    """日志落盘：logs/auto_sync.log（追加）。
+
+    为什么要落盘：定时任务在后台跑，出问题时用户不会盯着屏幕。
+    有一份历史记录，才能回答「上周三那次同步到底拉了什么」。
+    """
+    global _LOG_FH
+    try:
+        d = REPO / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        _LOG_FH = open(d / "auto_sync.log", "a", encoding="utf-8", buffering=1)
+    except OSError:
+        _LOG_FH = None
 
 
 def run(cmd, timeout=1800, env=None):
@@ -204,6 +228,8 @@ def main() -> int:
     args = ap.parse_args()
 
     started = datetime.now()
+    open_log()
+    log("=== MicroBench 自动同步 · %s ===" % started.strftime("%Y-%m-%d %H:%M:%S"))
     result = {
         "ok": False, "action": "none", "at": started.isoformat(timespec="seconds"),
         "head_before": head_short(), "pushed": False, "apk": {},
@@ -215,8 +241,6 @@ def main() -> int:
         result["ok"] = bool(result.get("ok"))
         print("MB_SYNC_RESULT: " + json.dumps(result, ensure_ascii=False), flush=True)
         return 0 if result["ok"] else 1
-
-    log("=== MicroBench 自动同步 · %s ===" % started.strftime("%Y-%m-%d %H:%M:%S"))
 
     # 1) 工作区必须干净
     clean, detail = workspace_clean()
