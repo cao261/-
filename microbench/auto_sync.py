@@ -78,6 +78,7 @@ EXTRA_SUITES = [
     ("js", "microbench/_test_tablet_renderer.js"),
     ("js", "microbench/_test_tablet_ai.js"),
     ("js", "microbench/_test_tablet_hardening.js"),
+    ("js", "microbench/_test_tablet_xss.js"),
     ("js", "microbench/_test_reader_annotations.js"),
     ("js", "microbench/_test_reader_markdown.js"),
 ]
@@ -227,6 +228,19 @@ def main() -> int:
     ap.add_argument("--no-apk", action="store_true", help="不重打 APK")
     args = ap.parse_args()
 
+    # ⚠ 控制台编码：Windows 上 stdout 默认按 GBK(936) 编码，
+    #   遇到「⚠」这种 GBK 编不出来的字符会抛 UnicodeEncodeError ——
+    #   而这里抛的时机**最坏**：同步已经全部做完（测试绿、APK 好、push 成功），
+    #   结果最后一行 `MB_SYNC_RESULT` 打不出来 → 脚本 exit 1 →
+    #   定时任务的 agent 以为同步失败了。
+    #   （实测踩过：2026-10-25 那轮 push 成功了，脚本却报失败。）
+    # → 兜底：errors="replace"，编不出来的字符换成 '?'，**绝不崩**。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     started = datetime.now()
     open_log()
     log("=== MicroBench 自动同步 · %s ===" % started.strftime("%Y-%m-%d %H:%M:%S"))
@@ -371,7 +385,7 @@ def main() -> int:
             "平板 APK 已重打（%d KB，SHA-256 %s…）"
             % (result["apk"]["bytes"] // 1024, result["apk"]["sha256"][:16]))
     result["messages"].append(
-        "⚠ 后端服务仍是**旧进程**：要生效需重启工作台窗口（合入的代码只影响重启后的运行态）")
+        "注意：后端服务仍是**旧进程**：要生效需重启工作台窗口（合入的代码只影响重启后的运行态）")
     return finish()
 
 

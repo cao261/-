@@ -24,18 +24,20 @@
   // 啃成裸的 & " < >，直接把 JS 语法弄坏（曾因此报 missing ) after
   // argument list）。用码点构造就没有这个风险。
   const E_AMP = String.fromCharCode(38);
-  const E_LT = String.fromCharCode(60);
-  const E_GT = String.fromCharCode(62);
-  const E_QUOT = String.fromCharCode(34);
+  // ⚠⚠⚠ 只留 E_AMP 一个码点常量。以前还有 E_LT / E_GT / E_QUOT，**已删** ——
+  //   它们正是这个 bug 的源头：E_LT 就是字符 '<' 本身，
+  //   `E_LT + "lt;"` 产出的是 `<lt;` 而不是 `&lt;`，**等于什么都没转义**。
+  //   （引号那次已经踩过并修好了：E_QUOT + "quot;" 产出的是 `"quot;"` 而不是
+  //     `&quot;`，于是 `![x" onerror="alert(1)](a.png)` 能注入 onerror。）
+  //   ⚠ 当时**只修了引号**，`<` / `>` 一直漏着 —— 后果：
+  //     ① 代码块（<pre><code>）里的 `<script>` 会真的执行；
+  //     ② 白名单外的标签（details/ontoggle、marquee/onstart…）
+  //        原样进 DOM，事件属性照样触发。
+  //   → 码点常量只留一个，错的写法就再也拼不出来了。
   const esc = (s) => String(s == null ? "" : s)
     .replace(/&/g, E_AMP + "amp;")
-    .replace(/</g, E_LT + "lt;")
-    .replace(/>/g, E_GT + "gt;")
-    // ⚠⚠ 这里必须是 **E_AMP**，不是 E_QUOT。
-    //   原来写成了 E_QUOT + "quot;" —— 产出的是 `"quot;` 而不是 `&quot;`，
-    //   于是「引号转义」根本没生效：属性值里的引号照样能闭合属性，
-    //   `![x" onerror="alert(1)](a.png)` 照样能注入 onerror。
-    //   这就是 XSS 能打通的真正根因 —— esc() 从上线起就没转义过引号。
+    .replace(/</g, E_AMP + "lt;")
+    .replace(/>/g, E_AMP + "gt;")
     .replace(/"/g, E_AMP + "quot;");
 
   /* ------------------------------------------------------------------
@@ -73,12 +75,25 @@
   function sanitizeHtml(s) {
     let out = String(s == null ? "" : s);
     out = out.replace(DROP_WITH_CONTENT, "").replace(DROP_SELF_CLOSING, "");
-    out = out.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g,
-      (m, rawTag, attrs) => {
+    // ⚠ 结尾的 `(>|$)` 不能省。
+    //   浏览器对**没闭合**的标签会在 EOF 处隐式闭合它 ——
+    //   `<img src=x onerror=alert(1)`（没有 `>`）照样会变成一个带 onerror
+    //   的 img 元素并触发。原来这条正则要求必须有 `>`，
+    //   于是这种标签**整段原样保留** → 就是一个现成的 XSS 入口。
+    out = out.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)((?:"[^"]*"|'[^']*'|[^>"'])*)(>|$)/g,
+      (m, rawTag, attrs, closer) => {
         const tag = String(rawTag).toLowerCase();
+        if (!closer) {
+          // 未闭合（一直吃到字符串末尾）→ 整段当纯文本。
+          // 只转义开头的 '<'：既堵住执行，又不丢后面的内容。
+          return m.replace(/</, E_AMP + "lt;");
+        }
         if (!ALLOWED_TAGS.has(tag)) {
           // 不在白名单 -> 当普通文本显示
-          return m.replace(/</g, E_LT).replace(/>/g, E_GT);
+          // ⚠ 必须是 E_AMP + "lt;" —— 码点常量只留 E_AMP 一个，
+          //   拼不出「字符 '<' 本身」那种空转义的写法了
+          //   （白名单外的标签能原样进 DOM、事件属性能执行的根因）。
+          return m.replace(/</g, E_AMP + "lt;").replace(/>/g, E_AMP + "gt;");
         }
         if (m.charAt(1) === "/") {
           return "</" + tag + ">";
@@ -130,6 +145,70 @@
     if (/^(javascript|vbscript|data):/i.test(probe)) return "#";
     if (/^[a-z][a-z0-9+.-]*:/i.test(probe) && !/^(https?|mailto|tel):/i.test(probe)) return "#";
     return raw;
+  }
+
+  /**
+   * 给用户看的错误文案 —— 先脱敏，再限长。
+   *
+   * ⚠ 三件事必须在这里做掉（交接文档 §8.1 / §8.2 / §8.5）：
+   *   ① 抹掉 URL 里的 userinfo（https://user:pass@host）；
+   *   ② 抹掉 API key —— 上游报文 / 异常消息里可能带出来
+   *      （平板的 key 存在 IndexedDB 的 meta/ai 里，同源脚本读得到，
+   *        所以任何一条能执行的 XSS 都等于「密钥外泄」）；
+   *   ③ 抹掉绝对路径 —— 异常消息里的本机路径不该出现在界面上。
+   */
+  function safeErr(msg) {
+    let s = String(msg == null ? "" : msg);
+    // ① URL userinfo
+    s = s.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/g, "$1***:***@");
+    // ② API key：先抹用户自己填的那一把（最准），再抹常见形态
+    const key = (state && state.ai && state.ai.key) || "";
+    if (key.length >= 6) s = s.split(key).join("***");
+    s = s.replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-***");
+    s = s.replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*"?)[^"\s,}]+/gi, "$1***");
+    // ③ 绝对路径（Windows / 安卓 / Linux / macOS）
+    s = s.replace(/[A-Za-z]:\\[^\s"'<>|]*/g, "<路径>");
+    s = s.replace(/\/(?:data|storage|sdcard|Users|home)\/[^\s"'<>|]*/g, "<路径>");
+    s = s.replace(/file:\/\/\/[^\s"'<>|]*/g, "<路径>");
+    return s.length > 400 ? s.slice(0, 400) + "…" : s;
+  }
+
+  /**
+   * 上游 HTTP 错误 → 给用户看的中文。
+   *
+   * ⚠ 「配额耗尽」和「速率限制」必须分开说（交接文档 §4）：
+   *   前者只能等额度恢复，后者等几十秒就行 —— 说错用户就会一直干等。
+   *   用户原话：「M3 额度没耗尽啊，你这肯定又有什么问题出现了」。
+   *
+   * ⚠ 配额判定必须看**整条**报文：像
+   *   「降格模型调用失败: HTTP 429: ... (原主模型报错: HTTP 429: Token Plan
+   *   limit exceeded)」这种，主模型那半句才是「额度用完」的证据，
+   *   只看响应体会误判成限流。
+   */
+  function friendlyHttpError(status, body) {
+    const raw = String(body == null ? "" : body);
+    const code = Number(status) || 0;
+    if (code === 429) {
+      if (/quota|limit exceeded|insufficient|billing|credit|余额|额度|配额/i.test(raw)) {
+        return "模型额度用完了（HTTP 429 · 配额耗尽）：套餐/余额额度已用尽，现在重试也一样。"
+          + "等额度恢复再试，或在设置里配一个你自己的模型。";
+      }
+      return "请求太频繁（HTTP 429 · 限流）：刚发出的请求超过了该模型的每分钟上限。"
+        + "等几十秒再试，或换一个模型/拉长间隔。";
+    }
+    if (code === 401 || code === 403) {
+      return "鉴权没过（HTTP " + code + "）：API key 不对或没有权限，回设置里核对一下 key。";
+    }
+    if (code === 404) {
+      return "接口地址不对（HTTP 404）：检查设置里的 API 地址（base）有没有填全。";
+    }
+    if (code >= 500) {
+      return "上游服务自己出错了（HTTP " + code + "）：稍等几分钟再试。";
+    }
+    if (code) {
+      return "上游返回了 HTTP " + code + "：" + safeErr(raw).slice(0, 160);
+    }
+    return safeErr(raw).slice(0, 200);
   }
 
   /** djb2 — 用来判断一份内容有没有变过。刻意不用 crypto.subtle：
@@ -1024,7 +1103,7 @@
           //   用户完全看不懂（限流时的提示是「请求太频繁」）。
           let detail = "";
           try { detail = (await r.text()).slice(0, 200); } catch (e) { /* ignore */ }
-          throw new Error("列目录失败 HTTP " + r.status + (detail ? " " + detail : ""));
+          throw new Error("列目录失败 HTTP " + r.status + (detail ? " " + safeErr(detail) : ""));
         }
         const arr = await r.json();
         return Array.isArray(arr) ? arr : [];
@@ -1660,8 +1739,8 @@
         return { content: "", reasoning: "", aborted: true };
       }
       if (!r || !r.ok) {
-        throw new Error("HTTP " + ((r && r.status) || "?") + " "
-          + String((r && (r.error || r.body)) || "").slice(0, 200));
+        throw new Error(friendlyHttpError((r && r.status) || 0,
+          String((r && (r.error || r.body)) || "")));
       }
       const parsed = parseSse(r.body);
       if (parsed.content && onDelta) onDelta(parsed.content);
@@ -1679,7 +1758,7 @@
     });
     if (!res.ok) {
       const t = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status} ${t.slice(0, 200)}`);
+      throw new Error(friendlyHttpError(res.status, t));
     }
     const reader = res.body.getReader();
     const dec = new TextDecoder();
@@ -1895,7 +1974,7 @@
     } catch (e) {
       if (e.name === "AbortError") status.textContent = "已停止";
       else {
-        status.textContent = "失败：" + e.message;
+        status.textContent = "失败：" + safeErr(e && e.message ? e.message : e);
         status.setAttribute("data-error", "1");
       }
     } finally {
@@ -1931,8 +2010,8 @@
           hint.textContent = "连接正常";
           hint.removeAttribute("data-error");
         } else {
-          hint.textContent = `HTTP ${(r && r.status) || "?"} `
-            + String((r && (r.error || r.body)) || "").slice(0, 160);
+          hint.textContent = friendlyHttpError((r && r.status) || 0,
+            String((r && (r.error || r.body)) || ""));
           hint.setAttribute("data-error", "1");
         }
         return;
@@ -1948,11 +2027,12 @@
       if (res.ok) { hint.textContent = "连接正常"; hint.removeAttribute("data-error"); }
       else {
         const t = await res.text().catch(() => "");
-        hint.textContent = `HTTP ${res.status} ${t.slice(0, 160)}`;
+        hint.textContent = friendlyHttpError(res.status, t);
         hint.setAttribute("data-error", "1");
       }
     } catch (e) {
-      hint.textContent = "连不上：" + e.message + "（可能是浏览器跨域限制）";
+      hint.textContent = "连不上：" + safeErr(e && e.message ? e.message : e)
+        + "（可能是浏览器跨域限制）";
       hint.setAttribute("data-error", "1");
     }
   }
@@ -3285,7 +3365,7 @@
       if (doc) {
         doc.innerHTML =
           '<div class="tb-empty" style="color:var(--bad)">启动失败：' +
-          esc(err && err.message ? err.message : String(err)) +
+          esc(safeErr(err && err.message ? err.message : String(err))) +
           '<br><br><span style="font-size:13px">如果是第一次打开，可能是浏览器版本太旧；' +
           '请换 Chrome 最新版试试。</span></div>';
       }
@@ -3310,6 +3390,12 @@
       hash: hash,
       firstHeading: firstHeading,
       stripFrontmatter: stripFrontmatter,
+      // 消毒 / 脱敏 —— 必须能脱离浏览器单测（XSS 护栏不能只靠肉眼）
+      sanitizeHtml: sanitizeHtml,
+      safeHref: safeHref,
+      safeErr: safeErr,
+      friendlyHttpError: friendlyHttpError,
+      esc: esc,
       // AI 面板（输入栏清空、多轮上下文这些行为必须有护栏）
       runAI: runAI,
       aiOnKeyDown: aiOnKeyDown,
