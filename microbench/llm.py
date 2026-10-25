@@ -620,13 +620,27 @@ def _safe_base_url(url: str) -> str:
         from urllib.parse import urlsplit, urlunsplit
         parts = urlsplit(url)
         if not parts.hostname:
-            return url
+            # ⚠ 没有 hostname 也不能原样返回 —— 那条 URL 可能长成
+            #   "https://user:sk-xxx@"，凭据就在里面。
+            return redact_secrets(url)
         netloc = parts.hostname
         if parts.port:
             netloc = f"{netloc}:{parts.port}"
         return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
     except Exception:
-        return url
+        # ⚠⚠ 这里原来是 `return url` —— 兜底分支等于「把秘密原样吐回去」。
+        #
+        # 什么时候会走到这？urlsplit 本身不抛，但 `parts.port` 在**端口不是
+        # 数字**时会抛 ValueError（"Port could not be cast to integer"）；
+        # IPv6 括号不配对同样会炸。而「端口写错」恰恰是用户手写 base_url 时
+        # 最常见的错误 —— 于是畸形 URL 正好命中这条兜底。
+        #
+        # 实测（2026-10-26 审计）：
+        #   _safe_base_url("https://user:sk-SECRET@gw.internal:notaport/v1")
+        #   → 旧写法原样返回 → 凭据进 /api/llm/status 响应体。
+        #
+        # 修法：兜底也走脱敏，绝不原样返回。
+        return redact_secrets(url)
 
 
 # ---------------------------------------------------------------------------
@@ -875,7 +889,16 @@ class DualModelManager:
         except Exception as e:
             with self._lock:
                 self.last_primary_probe = time.time()
-            return {"success": False, "message": f"探针网络请求异常: {e}"}
+            # ⚠⚠ requests 的 InvalidURL / InvalidSchema 异常消息里含**完整 URL**
+            #   （实测："Failed to parse: https://user:sk-xxx@gw.internal:notaport/
+            #   v1/chat/completions"），而这条 message 由 /api/llm/probe
+            #   **原样返回浏览器** → 点一次「探测升格」就把 base_url 里的
+            #   凭据送到页面上。
+            #
+            #   同步调用路径（llm.chat → friendly_error_text）是脱敏的，
+            #   探针这条分支漏了。这里补上，行为与同步路径对齐。
+            msg = _mask_paths(_redact_secrets(str(e)))
+            return {"success": False, "message": f"探针网络请求异常: {msg}"}
 
     def get_status(self) -> dict:
         # 短 TTL 到期 → 顺手恢复，别让 API 继续返回陈旧的降格状态

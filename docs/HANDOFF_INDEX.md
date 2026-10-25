@@ -39,6 +39,17 @@
 
 ### 跨设备同步（谁都要看）
 - [`SYNC_CONTRACT.md`](SYNC_CONTRACT.md) —— **红线清单，改动即破坏**。
+- **[`AUDIT_2026-10-26.md`](AUDIT_2026-10-26.md)** —— ⚠ **这台设备上最重要的两条**：
+  1. **H-1：pytest 会写进共享的坚果云同步目录**（已实测复现）。
+     `tests/conftest.py` 的沙箱只挡了 `BASE_DIR`，漏了**同步根**，
+     而 `auto_sync.py` 每 2 小时自动跑一次 pytest → **这台设备也会往共享目录写测试产物**。
+     修复已在本 commit 里（`tests/conftest.py` 的 `_pin_sync_root` autouse fixture），
+     `git pull` 之后自动生效 —— **不要自己再改一遍**。
+  2. **M-1：`/api/vault/file` 的作用域从「整个仓库」收窄到「vault 内容目录」**
+     （`generator.VAULT_CONTENT_DIRS`）。这是**行为变更**：
+     原来能读 `logs/` `docs/` 根目录 `.md`，现在 400。
+     桌面端前端只用 `01_Literature/...`，不受影响；
+     **但如果这台设备上有自写脚本在读 vault 根目录的 .md，需要自己改路径。**
 
 ---
 
@@ -46,6 +57,7 @@
 
 | 文档 | 日期 | 解决什么问题 | 状态 |
 |---|---|---|---|
+| `AUDIT_2026-10-26.md` | 10-26 | 第三轮审计（后端/模型层/前端）+ **P0 五处已修** | ✅ **当前最新，先看这份** |
 | `HANDOFF_2026-10-25-GLYPH-PERF.md` | 10-25 深夜 | **桌面端**：打开/上传论文卡 8 分钟（逐页串行认字 → 整篇批量 + 语义键词典） | ✅ 最新（桌面端） |
 | `HANDOFF_2026-10-25-TABLET-DAV-FIX.md` | 10-25 深夜 | **平板端**：同步 0 篇 / PDF 全 404 的根因与修法 | ✅ 最新（平板端） |
 | `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` | 10-25 晚 | 浏览器实测抓出的 5 个 bug + 安全 5 项 + 降格分类 | ✅ 有效 |
@@ -69,9 +81,13 @@
 
 ## 想快速知道"我这轮要干什么"
 
-- 桌面端 agent → 先读 `HANDOFF_2026-10-25-GLYPH-PERF.md`（最新那份，含剩余待办），
-  再读 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` 的
+- **桌面端 agent** → 先读 `AUDIT_2026-10-26.md` 的 §0（修复状态）+ §10（结论与下一步），
+  再读 `HANDOFF_2026-10-25-GLYPH-PERF.md`（最新那份，含剩余待办），
+  以及 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` 的
   §0（三个最该知道的）、§2（PDF 模式工具条消失）、§3（AI 活动可见性）、
   §4（429 人话化）、§8（安全自查）、§9（降格要说真话）。
-- 平板端 agent → 读 `HANDOFF_2026-10-25-TABLET-ADAPT.md` 全文 +
+- **平板端 agent** → 读 `HANDOFF_2026-10-25-TABLET-ADAPT.md` 全文 +
   `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` 的 §8（安全自查清单）。
+- **两台设备都要看** → `AUDIT_2026-10-26.md` 的 §3.1（H-1 测试碰真数据）
+  —— **那台设备上 `auto_sync.py` 同样在每 2 小时往共享目录写测试产物**，
+  `git pull` 本次提交即自动修好，**不要各自改一遍**。

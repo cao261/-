@@ -60,7 +60,7 @@ ALLOWED_PROJECT_TYPES = ("TCAD", "EDA")
 # ---------------------------------------------------------------------------
 
 def _safe_path(base_dir: Path, *parts) -> Path:
-    """
+    r"""
     把 *parts 拼到 base_dir 下，并确保结果仍在 base_dir 内。
     Raises ValueError on path-traversal attempts (e.g. parts containing '..' or absolute paths).
 
@@ -95,6 +95,45 @@ def _safe_path(base_dir: Path, *parts) -> Path:
             f"非法路径: '{parts}' 解析后位于 base 目录之外 (拒绝遍历攻击)"
         )
     return Path(joined)
+
+
+# vault 的「内容目录」—— 只有这些子树是用户真正的产出（笔记卡片 / 复现工程 /
+# 知识库 / 周报 / 看板 / 模板）。
+#
+# 为什么需要它：BASE_DIR 既是仓库根、又是 vault 根，但仓库里还住着代码、
+# 文档、tests/，以及 logs/ —— **logs/lan_token.txt 存着局域网共享口令**。
+# `_safe_path` 只保证「不出 BASE_DIR」，挡不住「读仓库里的任何 .md/.txt」。
+# /api/vault/file 的语义是「读一篇笔记」，那就必须把范围收回这些子树。
+VAULT_CONTENT_DIRS = (
+    "01_Literature",
+    "02_Reproduction",
+    "03_Knowledge",
+    "04_Weekly_Reports",
+    "00_Dashboard",
+    "_Templates",
+)
+
+
+def _rel_to_base(base_dir: Path, path: Path) -> str:
+    """绝对路径 → 相对 base 的 POSIX 风格路径；不在 base 下则返回 ""。"""
+    try:
+        return str(path.relative_to(base_dir)).replace("\\", "/").strip("/")
+    except ValueError:
+        return ""
+
+
+def is_vault_content_path(base_dir: Path, path: Path) -> bool:
+    """True 表示 `path` 落在 vault 的内容子树里（见 VAULT_CONTENT_DIRS）。
+
+    审计 2026-10-26 M-1：/api/vault/file 的作用域曾经是「整个仓库」，
+    实测 `GET /api/vault/file?relative_path=logs/lan_token.txt` 会
+    **明文吐出局域网共享口令**，DELETE 同样放行（删掉口令 → LAN 访问
+    静默关闭）。根因就是缺这一层「是不是 vault 内容」的判定。
+    """
+    rel = _rel_to_base(base_dir, path)
+    if not rel:
+        return False
+    return rel.split("/", 1)[0] in VAULT_CONTENT_DIRS
 
 def sanitize_filename(name: str) -> str:
     """Make string safe for Windows filesystem while preserving meaning."""

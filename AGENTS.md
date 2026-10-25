@@ -1528,6 +1528,105 @@ for (DavEntry e : dirs) {
 >    全靠上一轮加的「显示 vault 真实位置」。
 >    → 报错时**把内部状态原样显示**，比给一句「同步失败」有用一百倍。
 
+### 4.34 沙箱只挡住 `BASE_DIR` 是不够的：同步根也要钉死（2026-10-26 审计实测）
+
+> 完整报告：[`docs/AUDIT_2026-10-26.md`](docs/AUDIT_2026-10-26.md)
+
+**症状**：跑完 `pytest tests -m "not slow"`，用户**真实的坚果云同步目录**里
+`files/demo.json` 的内容被改写了（sha256 变了）。
+文件是 `{"paper_id": "demo", ...}` —— 明显是测试产物，但躺在**两台设备共享的云端目录**里。
+
+**根因（三层叠加，少一层就漏）**
+
+1. `microbench/llm.py` 在 import 时 `load_dotenv(..., override=False)`
+   → `.env` 里的 `ANNOTATIONS_DIR` 被灌进 `os.environ`。
+   `tests/conftest.py` 只钉了 `SYNC_PDF_BODY`，**没钉 `ANNOTATIONS_DIR`**。
+2. `app.py` 的 `_sync_root()` 有**三个**分支：
+   ① `ANNOTATIONS_DIR` 环境变量
+   ② **坚果云云端沙箱自动探测** ← 这个也指向真实云端数据
+   ③ vault 内的 `01_Literature/_同步`
+   ⇒ **只钉环境变量挡不住 ②**，必须钉**函数本身**。
+3. `sandbox` fixture 只 `monkeypatch.setattr(..., "BASE_DIR", tmp_path)`，
+   **没管 `_sync_root`** → 整个同步层漏在沙箱外。
+
+**为什么"测试全绿"完全掩盖了它**：测试碰真数据不会报错，
+只会在同步目录里多一个文件 / 改一个时间戳。
+
+**放大器**：`microbench/auto_sync.py` 每 2 小时自动跑一次 pytest
+→ **无人值守地**反复写。
+
+**修法**（`tests/conftest.py`）：
+
+```python
+@pytest.fixture(autouse=True)
+def _pin_sync_root(tmp_path, monkeypatch):
+    """把同步根钉到临时目录 —— 测试绝不碰用户的跨设备同步数据。"""
+    from microbench import app as app_mod
+    shared = tmp_path / "_sync_shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(app_mod, "_sync_root", lambda: shared)   # ← 函数本身
+    monkeypatch.setenv("ANNOTATIONS_DIR", str(shared))            # ← 环境变量
+```
+
+**护栏**（`tests/test_audit_2026_10_26.py`）：4 条，
+其中最关键的是 `test_sync_root_ignores_nutstore_autodetect` ——
+它**把环境变量拿掉**再断言同步根不许指向真实云端，
+专门守"只钉环境变量"这种半吊子修法。
+（破坏性验证：把 `monkeypatch.setattr` 改回 `pass` → 立刻 2 failed。）
+
+> **通用纪律**：**沙箱要覆盖"所有能指到用户真实数据的位置"，不是覆盖你以为的那一个。**
+> 这个项目里 BASE_DIR（vault 根）和 `_sync_root()`（同步根）是**两个**独立入口，
+> 只挡一个 = 没挡。写完护栏后**必须做破坏性验证**：把修复改回去，确认测试真的会红。
+
+### 4.35 「读一篇笔记」的端点，作用域必须是 vault 而不是仓库（2026-10-26 审计实测）
+
+**症状**：`GET /api/vault/file?relative_path=logs/lan_token.txt` → **200 + 明文局域网口令**。
+同一个端点的 DELETE 还能把它删掉 —— 删掉之后 LAN 访问 fail-closed 关闭，
+用户只会觉得「平板突然连不上了」，查起来极费劲。
+
+**根因**：`BASE_DIR` 既是**仓库根**又是 **vault 根**，
+但仓库里还住着代码、文档、tests/，以及 `logs/`（存着局域网共享口令）。
+`_safe_path` 只保证「不出 BASE_DIR」，**挡不住「读仓库里的任何 .md/.txt」**。
+
+**修法**：`generator.py` 加 `VAULT_CONTENT_DIRS` + `is_vault_content_path()`，
+`app.py` 的 GET / DELETE / reveal 三个端点都在 `_safe_path` 之后加这道判定。
+判定放在**存在性检查之前** —— 不在范围内的路径一律 400，
+不告诉调用方「这个文件存不存在」。
+
+**连带要改的**：已有测试里用了仓库根路径（`"nope/missing.md"`、`"x.bin"`），
+口径变了就得跟着改 —— 改成 `01_Literature/...`，**断言的意图保持不变**
+（一个测 404、一个测后缀白名单）。
+
+> **通用纪律**：端点的语义决定了它的作用域。「读一篇笔记」≠「读仓库里的文本文件」。
+> 凡是 `BASE_DIR` 同时承担多个角色（仓库根 + 数据根）的地方，
+> **都要显式列出允许的子树**，别靠"文件类型白名单"兜底。
+
+### 4.36 异常处理里最后一个「凭据形状」的细节：脱敏要盖住 URL 的 userinfo（2026-10-26 审计实测）
+
+**症状（两条，都实测复现）**
+
+1. `probe_primary()` 的 `except Exception as e: return {"message": f"探针网络请求异常: {e}"}`
+   → `/api/llm/probe` **原样**返回给浏览器。
+   而 `requests` 的 `InvalidURL` 异常消息实测含**完整 URL（含 userinfo）**：
+   `Failed to parse: https://user:sk-xxx@gw.internal:notaport/v1/chat/completions`
+2. `_safe_base_url()` 的兜底分支 `except Exception: return url`
+   → 畸形 URL（端口写成 `notaport`、IPv6 括号不配对）正好命中兜底
+   → **带凭据的 base_url 进 `/api/llm/status` 响应体**。
+
+**为什么这两条特别阴**
+
+- 第 1 条：同步调用路径（`llm.chat` → `friendly_error_text`）**是**脱敏的，
+  只有探针这条分支漏了 → 读代码时很容易以为"整个 llm.py 都脱敏了"。
+- 第 2 条：**兜底分支天然是"出问题的那条路"**，而它偏偏是唯一没防护的那条。
+  「URL 畸形」不是罕见输入 —— 手写 base_url 时最常犯的错就是端口写错。
+
+**修法**：异常出口统一 `_mask_paths(_redact_secrets(str(e)))`；
+兜底分支**绝不能原样返回** —— 走 `redact_secrets(url)`。
+
+> **通用纪律**：**脱敏要放在"最后一公里"，不能靠下游兜底**。
+> 而且**兜底分支要单独审一遍** —— 它是"出错了才走"的路径，
+> 正常路径上测不出来（本轮就是靠"把端口写成 notaport"才测出来的）。
+
 
 
 ---

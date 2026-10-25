@@ -188,10 +188,12 @@ def test_api_paper_save_rejects_null_optional_fields(client):
 
 
 def test_api_vault_file_missing_and_bad_type(client, sandbox):
+    # 路径必须落在 vault 的内容目录里 —— 审计 2026-10-26 M-1 把作用域
+    # 从「整个仓库」收窄到「vault 内容目录」（logs/ 里存着局域网口令）。
     assert client.get("/api/vault/file",
-                      params={"relative_path": "nope/missing.md"}).status_code == 404
-    (sandbox / "x.bin").write_bytes(b"\x00")
-    r = client.get("/api/vault/file", params={"relative_path": "x.bin"})
+                      params={"relative_path": "01_Literature/nope/missing.md"}).status_code == 404
+    (sandbox / "01_Literature" / "x.bin").write_bytes(b"\x00")
+    r = client.get("/api/vault/file", params={"relative_path": "01_Literature/x.bin"})
     assert r.status_code == 400, "非 .md/.txt 文件必须被拒绝"
 
 

@@ -39,6 +39,32 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("SYNC_PDF_BODY", "1")
 
 # ---------------------------------------------------------------------------
+# ⚠️ 同步根也必须沙箱化 —— 而且**光钉环境变量不够**。
+#
+# 审计 2026-10-26 H-1（已实测复现）：
+#   `microbench.llm` 在 import 时 `load_dotenv(..., override=False)`，把 .env 里的
+#   ANNOTATIONS_DIR 灌进 os.environ → `app._sync_root()` 的**第一个**分支命中 →
+#   测试进程解析到**真实**的坚果云同步目录（annotations / snapshots / progress /
+#   files 全是用户真实的跨设备数据）。
+#
+#   实测：`pytest tests -m "not slow"` 跑一遍后，真实目录里 files/demo.json 的
+#   sha256 被改写（元凶：test_sync_regressions_2026_10_25.py 里那个漏了 patch
+#   的用例）。auto_sync.py 每 2 小时自动跑一次 pytest → 无人值守地反复写。
+#
+# 为什么不能只靠 setenv("ANNOTATIONS_DIR", tmp)：
+#   `_sync_root()` 有**三个**分支（app.py:3941）：
+#     ① ANNOTATIONS_DIR 环境变量
+#     ② 坚果云**云端沙箱**自动探测   ← 这个也指向真实云端数据
+#     ③ vault 内的 01_Literature/_同步
+#   钉死 ① 之后 ② 仍然会命中 → **必须钉函数本身**。
+#
+# 这条护栏的立意跟上面 sandbox 那句注释一样：
+#   "The user's real vault holds real research notes; a test that writes to it
+#    is a test that can destroy work." —— 同步目录里的东西更贵（是两台设备
+#   共享的译文快照与划词批注），删一次就是重翻一次。
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # ⚠️ LLM 的 key **不能**在这里 setdefault。
 #
 # `microbench.llm` 在 import 时 `load_dotenv(..., override=False)` —— 如果
@@ -80,6 +106,25 @@ def _pin_sync_pdf_body(monkeypatch):
     两道都要：fixture 只在测试执行期生效，模块级那道才挡得住 import 期泄漏。
     """
     monkeypatch.setenv("SYNC_PDF_BODY", "1")
+
+
+@pytest.fixture(autouse=True)
+def _pin_sync_root(tmp_path, monkeypatch):
+    """把**同步根**钉到临时目录 —— 测试绝不碰用户的跨设备同步数据。
+
+    为什么必须钉函数而不是只钉环境变量：`_sync_root()` 除了读
+    `ANNOTATIONS_DIR`，还会**自动探测坚果云云端沙箱**（app.py:3954）。
+    那个分支指向的同样是真实的云端目录 —— 只钉环境变量挡不住它。
+
+    显式请求了 `_sync_root` 的测试（例如 tests/test_sync_files.py 的 `env`
+    fixture）会覆盖这里 —— autouse 先跑，显式 fixture 后跑，后者赢。
+    """
+    from microbench import app as app_mod
+
+    shared = tmp_path / "_sync_shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(app_mod, "_sync_root", lambda: shared)
+    monkeypatch.setenv("ANNOTATIONS_DIR", str(shared))
 
 
 @pytest.fixture()

@@ -54,6 +54,7 @@ from .generator import (
     sanitize_filename,
     ensure_vault_templates,
     _safe_path,             # exported once; used by all vault-file endpoints
+    is_vault_content_path,  # vault 内容目录白名单（审计 2026-10-26 M-1）
 )
 from .translation import (
     chunk_section_text,
@@ -1759,11 +1760,26 @@ async def api_vault_file(
     Used by the dashboard feed to open literature / QA / bilingual notes
     in a new browser tab. Only .md / .txt files inside BASE_DIR are
     served; PDFs and other binaries must use /api/paper/serve_pdf.
+
+    ⚠ 作用域 = **vault 的内容目录**（见 generator.VAULT_CONTENT_DIRS），
+      不是整个 BASE_DIR。BASE_DIR 既是仓库根又是 vault 根，仓库里还住着
+      代码、文档和 logs/ —— **logs/lan_token.txt 存着局域网共享口令**。
+      审计 2026-10-26 M-1 实测：旧写法 `GET ?relative_path=logs/lan_token.txt`
+      会明文吐出那个口令。
     """
     try:
         file_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    # 范围判定放在存在性检查**之前**：不在范围内的路径一律 400，
+    # 不告诉调用方「这个文件存不存在」。
+    if not is_vault_content_path(BASE_DIR, file_path):
+        raise HTTPException(
+            status_code=400,
+            detail="只能读取 vault 内容目录下的文件 (01_Literature / "
+                   "02_Reproduction / 03_Knowledge / 04_Weekly_Reports / "
+                   "00_Dashboard / _Templates)",
+        )
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
     suffix = file_path.suffix.lower()
@@ -1797,11 +1813,23 @@ async def api_vault_delete_file(
     .md/.txt/.markdown suffix are deletable. PDFs and other binaries are
     deliberately rejected — those should be managed through the Obsidian
     app or file manager.
+
+    ⚠ 作用域同样锁在 vault 的内容目录上（generator.VAULT_CONTENT_DIRS）。
+      审计 2026-10-26 M-1 实测：旧写法能删掉 logs/lan_token.txt ——
+      删掉之后 LAN 访问会被**静默关闭**（fail-closed），用户只会觉得
+      「平板突然连不上了」，查起来很费劲。
     """
     try:
         file_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    if not is_vault_content_path(BASE_DIR, file_path):
+        raise HTTPException(
+            status_code=400,
+            detail="只能删除 vault 内容目录下的文件 (01_Literature / "
+                   "02_Reproduction / 03_Knowledge / 04_Weekly_Reports / "
+                   "00_Dashboard / _Templates)",
+        )
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
     suffix = file_path.suffix.lower()
@@ -1857,12 +1885,23 @@ async def api_vault_reveal(
       - Linux:   best-effort `xdg-open` on the parent folder
 
     Returns the command that was executed (best-effort, may differ by OS).
+
+    ⚠ 作用域同 GET/DELETE /api/vault/file：只允许 vault 的内容目录。
+      否则它能被用来「在文件管理器里打开仓库里的任何文件」（包括
+      logs/lan_token.txt 这种不该被点开的），也会让前面的 scope 收口形同虚设。
     """
     import sys, subprocess
     try:
         file_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    if not is_vault_content_path(BASE_DIR, file_path):
+        raise HTTPException(
+            status_code=400,
+            detail="只能定位 vault 内容目录下的文件 (01_Literature / "
+                   "02_Reproduction / 03_Knowledge / 04_Weekly_Reports / "
+                   "00_Dashboard / _Templates)",
+        )
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
 
