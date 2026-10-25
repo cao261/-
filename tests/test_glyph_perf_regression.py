@@ -184,7 +184,7 @@ def test_document_resolution_makes_one_model_call_for_all_pages(monkeypatch, tmp
     """
     calls = []
 
-    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None):
+    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None, isolated=False):
         calls.append(count)
         # 认 1 个符号 = ×
         return "1=×"
@@ -210,7 +210,7 @@ def test_document_resolution_uses_dictionary_without_model_call(monkeypatch, tmp
     """词典命中 → 零模型调用（跨论文复用的收益）。"""
     calls = []
 
-    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None):
+    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None, isolated=False):
         calls.append(count)
         return "1=×"
 
@@ -270,7 +270,7 @@ def test_document_resolution_respects_deadline(monkeypatch, tmp_path):
 
     calls = []
 
-    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None):
+    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None, isolated=False):
         calls.append(count)
         return "1=×"
 
@@ -297,7 +297,7 @@ def test_recognize_false_does_not_call_model(monkeypatch, tmp_path):
     """
     calls = []
 
-    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None):
+    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None, isolated=False):
         calls.append(count)
         return "1=×"
 
@@ -319,7 +319,7 @@ def test_recognize_false_uses_dictionary(monkeypatch, tmp_path):
     """recognize=False 时，词典命中的符号**照常替换**（不用等模型）。"""
     calls = []
 
-    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None):
+    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None, isolated=False):
         calls.append(count)
         return "1=×"
 
@@ -454,7 +454,7 @@ def test_open_endpoint_does_not_call_model(monkeypatch):
 
     calls = []
 
-    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None):
+    def fake_recognize(strip, count, model_name="", force_fallback=False, deadline=None, isolated=False):
         calls.append(count)
         return "1=×"
 

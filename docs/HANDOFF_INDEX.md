@@ -7,14 +7,19 @@
 ## 阅读顺序（按你的角色选）
 
 ### 我负责桌面端（另一台电脑的 agent）
-1. **[`HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md`](HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md)** ← **最新、最重要**
+1. **[`HANDOFF_2026-10-25-GLYPH-PERF.md`](HANDOFF_2026-10-25-GLYPH-PERF.md)** ← **最新**
+   「打开/上传论文卡 8 分钟」的取证与修复：符号认字从**逐页串行**改成**整篇批量**，
+   词典主键从**形状指纹**换成**语义键**（字体基名|字符码），打开路径**不调模型**
+   （5.5s 打开）。含剩余待办（裁图带邻居 → 部分符号认不出）。
+2. **[`HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md`](HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md)**
    浏览器实测（真人级点击）抓出的 5 个真 bug + 安全审计的 5 个问题 + 降格提示改造。
    含：PDF 模式整条工具条消失、AI 活动「取消」够不着、429 报错说人话、
    密钥脱敏盲区、离线导出 XSS。
-2. [`HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md`](HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md)
+3. [`HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md`](HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md)
    AI 活动可视化（徽标/浮层/取消）+ 符号认字（× ≈ ≥）的实现要点。
-3. [`LLM_CONTRACT.md`](LLM_CONTRACT.md) —— 改模型层前必读（换模型/降级/速率/表格读图）。
-4. [`READER_CONTRACT.md`](READER_CONTRACT.md) —— 改阅读器前必读（页内顺序/公式/批注）。
+   ⚠️ 其中「符号认字」那节的**形状指纹方案已被上面第 1 份取代**（误判率 26~41%）。
+4. [`LLM_CONTRACT.md`](LLM_CONTRACT.md) —— 改模型层前必读（换模型/降级/速率/表格读图）。
+5. [`READER_CONTRACT.md`](READER_CONTRACT.md) —— 改阅读器前必读（页内顺序/公式/批注）。
 
 ### 我负责平板端（Android/iPad 那台）
 1. **[`HANDOFF_2026-10-25-TABLET-DAV-FIX.md`](HANDOFF_2026-10-25-TABLET-DAV-FIX.md)** ← **最新，先看这份**
@@ -41,7 +46,8 @@
 
 | 文档 | 日期 | 解决什么问题 | 状态 |
 |---|---|---|---|
-| `HANDOFF_2026-10-25-TABLET-DAV-FIX.md` | 10-25 深夜 | 平板端同步 0 篇 / PDF 全 404 的根因与修法 | ✅ **当前最新** |
+| `HANDOFF_2026-10-25-GLYPH-PERF.md` | 10-25 深夜 | **桌面端**：打开/上传论文卡 8 分钟（逐页串行认字 → 整篇批量 + 语义键词典） | ✅ 最新（桌面端） |
+| `HANDOFF_2026-10-25-TABLET-DAV-FIX.md` | 10-25 深夜 | **平板端**：同步 0 篇 / PDF 全 404 的根因与修法 | ✅ 最新（平板端） |
 | `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` | 10-25 晚 | 浏览器实测抓出的 5 个 bug + 安全 5 项 + 降格分类 | ✅ 有效 |
 | `HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md` | 10-25 | AI 活动可视化、符号认字 | ✅ 有效 |
 | `HANDOFF_2026-10-25-TABLET-ADAPT.md` | 10-25 | 桌面端 → 平板端的移植清单 | ✅ 有效 |
@@ -63,7 +69,8 @@
 
 ## 想快速知道"我这轮要干什么"
 
-- 桌面端 agent → 读 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` 的
+- 桌面端 agent → 先读 `HANDOFF_2026-10-25-GLYPH-PERF.md`（最新那份，含剩余待办），
+  再读 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` 的
   §0（三个最该知道的）、§2（PDF 模式工具条消失）、§3（AI 活动可见性）、
   §4（429 人话化）、§8（安全自查）、§9（降格要说真话）。
 - 平板端 agent → 读 `HANDOFF_2026-10-25-TABLET-ADAPT.md` 全文 +
