@@ -1522,6 +1522,13 @@
     /* 用户原话（2026-10-25）："他有可能等了半天然后什么也没输出" ——
        一个不动的转圈 = 用户不知道是在跑还是卡了。 */
     .ai-activity-pill {
+      /* ⚠️ 必须是 fixed：
+         1) 它不在 .reader-topbar 里（在浮动区块），所以 topbar 被隐藏也不
+            连带隐藏它 —— PDF 双栏模式下照样能看见"AI 运行中"；
+         2) 必须是 fixed，否则它会作为 .reader-shell 的 flex item 被排到
+            屏幕最下面（.reader-shell 是 height:100% 的 column flex）。
+         top 放在 topbar 之下，避免和工具条叠在一起。 */
+      position: fixed; right: var(--s-5); top: 56px; z-index: 1401;
       display: inline-flex; align-items: center; gap: 6px;
       padding: 4px 10px; border-radius: 999px; cursor: pointer;
       border: 1px solid var(--card-border); background: var(--bg-canvas-subtle);
@@ -1534,7 +1541,7 @@
     }
     .ai-activity-pill[data-warn="1"] { color: var(--accent-terracotta); border-color: rgba(178,83,54,.45); background: rgba(178,83,54,.10); }
     .ai-panel {
-      position: fixed; right: var(--s-5); top: 74px; z-index: 1400;
+      position: fixed; right: var(--s-5); top: 90px; z-index: 1400;
       width: min(420px, 92vw); max-height: min(60vh, 560px);
       display: none; flex-direction: column;
       background: var(--bg-canvas); border: 1px solid var(--card-border);
@@ -2862,6 +2869,8 @@
       const _AI_TASK_HISTORY = [];      // 已结束的（最近 12 条）
       let _aiTaskSeq = 0;
       let _aiTickTimer = null;
+      // 浮层是否已经"自动展开"过（每个任务自动弹一次；用户手动关掉后不再弹）
+      let _aiPanelAutoOpened = false;
 
       function _aiFormatMs(ms) {
         const s = Math.max(0, Math.floor(ms / 1000));
@@ -2974,6 +2983,18 @@
         if (!pill || !panel) return;
         const running = Array.from(_AI_TASKS.values());
         const n = running.length;
+
+        // 有任务时**自动展开一次**浮层。
+        // 为什么必须自动展开：徽标只是入口，用户不会想到去点它；
+        // 而"正在跑 + 跑了多久 + 能取消"是用户此刻最需要的信息
+        // （用户原话："他有可能等了半天然后什么也没输出"）。
+        // 用户手动关掉后不再自动弹（尊重用户），下一个任务重新自动展开。
+        if (n > 0 && !_aiPanelAutoOpened) {
+          if (panel.classList) panel.classList.add("open");
+          _aiPanelAutoOpened = true;
+        } else if (n === 0) {
+          _aiPanelAutoOpened = false;
+        }
 
         // 工具栏上的徽标
         pill.dataset.active = n > 0 ? "1" : "0";
@@ -3973,7 +3994,13 @@
       _readerMode = mode;
       _persistLocalState();
       _persistReaderState();
-      const sectionView = document.querySelector("#reader-modal > div > div:nth-child(2)");
+      // ⚠️ 必须用 id 定位，不能用 "#reader-modal > div > div:nth-child(2)"。
+      //    那个位置**不是**章节视图区，而是 .reader-topbar（child 1）：
+      //    切到 PDF 模式时会把 topbar 藏掉，而章节视图区（reader-body）
+      //    继续盖在 PDF 上面 —— 后果是 PDF 模式下的缩放条 / 全篇重译 /
+      //    导出 / 同步 / 模型下拉框**整条工具条都不见了**（它们都在 topbar 里），
+      //    而且章节视图和 PDF 叠在一起（2026-10-25 浏览器实测抓到）。
+      const sectionView = document.getElementById("reader-body");
       const pdfView = document.getElementById("reader-pdf-view");
       const btnSection = document.getElementById("reader-mode-section");
       const btnPdf = document.getElementById("reader-mode-pdf");
@@ -8704,27 +8731,19 @@
 
     <!-- ===================================================================
        Reader modal (full-screen overlay).
-       STRUCTURE CONTRACT: JS does
-         document.querySelector("#reader-modal > div > div:nth-child(2)")
-       to locate the section-view pane. The inner wrapper must keep exactly
+       STRUCTURE CONTRACT: the inner wrapper (.reader-shell) must keep exactly
        this child order: [1] topbar, [2] body/section-view, [3] pdf-view.
        Floating elements must stay AFTER child 3.
+
+       ⚠️ 为什么不能用 nth-child 定位（2026-10-25 修）：
+       JS 原来用 `document.querySelector("#reader-modal > div > div:nth-child(2)")`
+       找章节视图区 —— 但那个位置是 .reader-topbar（child 1），不是章节区。
+       于是切到 PDF 模式时：topbar 被藏（PDF 模式的缩放条/全篇重译/导出/同步/
+       模型下拉框整条工具条消失），而章节区没被藏、叠在 PDF 上面。
+       现在 JS 直接用 id（#reader-body）定位，与子元素顺序无关。
        =================================================================== -->
   <div id="reader-modal" style="display:none;">
     <div class="reader-shell">
-
-      <!-- ---------------------------- AI 活动面板 ---------------------------- -->
-      <!-- 浮层：进行中的 AI 任务（翻译 / 章节翻译 / 划词答疑）。
-           每 500ms 刷新"已用时 + 阶段"，慢了就变色预警，每个任务可取消。
-           用户原话："他有可能等了半天然后什么也没输出" —— 不能让人干等。 -->
-      <div id="ai-panel" class="ai-panel">
-        <div class="ai-panel-head">
-          <span>🤖 AI 活动</span>
-          <button class="btn-zoom-toggle" title="关闭" aria-label="关闭"
-                  onclick="toggleAiPanel()">×</button>
-        </div>
-        <div class="ai-panel-body"></div>
-      </div>
 
       <!-- ---------------------------- Top bar ---------------------------- -->
       <div class="reader-topbar">
@@ -8743,11 +8762,7 @@
                     title="探测可用的更强模型" onclick="event.stopPropagation(); probeModelNow();">探测升格</button>
           </div>
 
-          <!-- AI 活动：进行中的 AI 任务（翻译 / 答疑），可点开看进度与取消 -->
-          <div id="ai-activity-pill" class="ai-activity-pill" data-active="0"
-               onclick="toggleAiPanel()" title="AI 活动：正在跑什么、跑了多久、卡在哪一步">
-            <span style="opacity:.6">🤖 AI 活动</span>
-          </div>
+          <!-- AI 活动徽标已移到 #reader-modal 顶层（PDF 模式下 topbar 会被隐藏） -->
 
           <!-- View mode -->
           <div class="seg-group">
@@ -8797,7 +8812,7 @@
       </div>
 
       <!-- ------- child 2: section view (JS contract — do not reorder) ------- -->
-      <div class="reader-body">
+      <div class="reader-body" id="reader-body">
         <div class="reader-nav" id="reader-nav"></div>
 
         <div class="reader-pane">
@@ -8874,6 +8889,29 @@
       </div>
 
       <!-- ---------------------- Floating affordances ---------------------- -->
+      <!-- AI 活动浮层 + 徽标。
+           ⚠️ 必须放在 child 3（PDF 视图）**之后**：
+           1) 页面有结构契约 —— JS 用 nth-child 定位章节视图区，浮动元素插在
+              前面会把它挤偏；
+           2) 更不能挂在 .reader-topbar 里 —— PDF 双栏模式下 topbar 会被
+              switchReaderMode 隐藏（见下），挂在里面的徽标会被连带隐藏
+              → 用户点不开浮层 → 「✕ 取消」永远够不着
+              （2026-10-25 浏览器实测抓到：徽标 rect 宽高都是 0）。
+           两者都用 fixed 定位 → 不占 flex 位，章节视图区与 PDF 视图都不受牵连。 -->
+      <div id="ai-panel" class="ai-panel">
+        <div class="ai-panel-head">
+          <span>🤖 AI 活动</span>
+          <button class="btn-zoom-toggle" title="关闭" aria-label="关闭"
+                  onclick="toggleAiPanel()">×</button>
+        </div>
+        <div class="ai-panel-body"></div>
+      </div>
+
+      <div id="ai-activity-pill" class="ai-activity-pill" data-active="0"
+           onclick="toggleAiPanel()" title="AI 活动：正在跑什么、跑了多久、卡在哪一步">
+        <span style="opacity:.6">🤖 AI 活动</span>
+      </div>
+
       <div id="reader-selection-bubble" class="reader-selection-bubble">
         <button class="bubble-act" onclick="openReaderQAPanel()">💬 问 AI 解答</button>
         <button class="bubble-act" onclick="openAnnotationEditor()">✍ 标注笔记</button>

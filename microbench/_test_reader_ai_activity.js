@@ -41,6 +41,13 @@ function makeEl() {
     dataset: {},
     style: {},
     _children: [],
+    _classes: new Set(),
+    classList: {
+      add(c) { el._classes.add(c); },
+      remove(c) { el._classes.delete(c); },
+      toggle(c) { el._classes.has(c) ? el._classes.delete(c) : el._classes.add(c); },
+      contains(c) { return el._classes.has(c); },
+    },
     querySelector(sel) { return el._children.find(c => c._sel === sel) || null; },
     appendChild(c) { el._children.push(c); return c; },
   };
@@ -113,6 +120,12 @@ console.log("== 任务登记 / 收尾 ==");
   check("面板渲染出该任务", /翻译第 3 页/.test(bodyEl.innerHTML), bodyEl.innerHTML.slice(0, 200));
   check("面板里有取消按钮", /_aiTaskCancel/.test(bodyEl.innerHTML));
 
+  // 回归（2026-10-25 浏览器实测）：PDF 双栏模式下 .reader-topbar 是
+  // display:none，AI 活动徽标被连带隐藏 → 浮层点不开 → 「✕ 取消」够不着。
+  // 修法之一是"有任务就自动展开浮层" → 这里锁住它。
+  check("有任务时浮层自动展开", panelEl.classList.contains("open"),
+    "classes=" + Array.from(panelEl._classes).join(","));
+
   // 取消
   api._aiTaskCancel(id);
   check("取消会 abort 上游请求", ac.aborted === true);
@@ -126,6 +139,14 @@ console.log("== 任务登记 / 收尾 ==");
   api._renderAiActivity();
   check("徽标回到空闲态", pillEl.dataset.active === "0", JSON.stringify(pillEl.dataset));
   check("历史条目仍在面板里", /翻译第 3 页/.test(bodyEl.innerHTML), bodyEl.innerHTML.slice(0, 300));
+  // 任务结束后自动展开的标志要复位 —— 下一次任务还得能自动弹出来
+  // （否则用户手动关过一次面板后，就再也看不到进度和取消按钮了）。
+  panelEl.classList.remove("open");
+  api._aiTaskStart({ kind: "translate", label: "翻译第 5 页", model: "MiniMax-M3" });
+  api._renderAiActivity();
+  check("新任务会再次自动展开浮层", panelEl.classList.contains("open"),
+    "classes=" + Array.from(panelEl._classes).join(","));
+  api._aiTaskEnd(Array.from(api._AI_TASKS.keys())[0], "done");
 }
 
 console.log("== 多任务并存 ==");

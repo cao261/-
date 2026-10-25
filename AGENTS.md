@@ -936,6 +936,78 @@ GitHub 访问**需要默认代理** `http://127.0.0.1:65532`；
 3. **能自动化的交互一定要自己跑一遍**。本轮就靠真人点击抓出了三个真 bug：
    标题被挤成竖排、进度徽标吃掉模型徽标、429 报错甩英文机器话。
 
+### 4.24 「隐藏整块」会连带藏掉刚加进去的东西（2026-10-25）
+
+**现象**：AI 活动可视化（工具栏徽标 + 浮层面板 + 每任务可取消）功能做完了，
+代码也在、DOM 也在、徽标文本还会在更新（"AI 运行中 10s"）—— 但**用户根本
+看不见**。
+
+**根因**：`#ai-activity-pill`（徽标）被放在 `.reader-topbar` 里，而
+**PDF 双栏模式下 `.reader-topbar` 是 `display:none`**（PDF 模式要全屏分屏，
+不需要章节视图那套工具栏）→ 徽标被连带隐藏 → rect 宽高都是 0 →
+用户点不开浮层 → **「✕ 取消」永远够不着**。
+
+也就是说：整个"让用户看得见 AI 在干什么、并且能取消"的功能，
+**在主使用场景（PDF 双栏）下等于没有**。
+
+**修法**（三处一起）：
+1. `#ai-panel` 和 `#ai-activity-pill` 一起移到 `#reader-modal` 顶层
+   （与 `.reader-shell` 平级），`position: fixed` → 不受 topbar 隐藏影响；
+2. 徽标改成 fixed 定位（`right: var(--s-5); top: 10px`），两种模式都看得见；
+3. **有任务时自动展开浮层**（`_aiPanelAutoOpened` 标志位，任务结束后复位）：
+   徽标只是入口，用户不会想到去点它；"正在跑 + 跑了多久 + 能取消"是用户
+   此刻最需要的信息。
+
+**通用教训**：
+1. **新加的元素不要塞进一块"按场景会整块隐藏"的容器里**。要么放外面，
+   要么确认所有场景下它都可见。
+2. **DOM 里有内容 ≠ 用户看得见**。判据要用**渲染后的尺寸**
+   （`getBoundingClientRect().width > 0`），不能只看"元素存在"或
+   "innerText 有内容"。
+3. **CSS display:none 的祖先会连坐子元素**：子元素自己的
+   `getComputedStyle().display` 仍然是 `flex`，但 rect 是 0 —— 只看
+   computed display 会误判成"可见"。
+
+### 4.25 用 `nth-child` 定位 = 把"位置"变成了隐式契约（2026-10-25）
+
+**症状**：PDF 双栏模式下，**整条工具条消失**（缩放 / 全篇重译 / 导出 /
+同步 / 模型下拉框全都不见了），而且章节视图区**叠在 PDF 上面**；
+切回章节视图才看得到工具条。
+
+**根因**：`switchReaderMode()` 原来这样定位章节视图区：
+
+```js
+const sectionView = document.querySelector("#reader-modal > div > div:nth-child(2)");
+```
+
+但 `nth-child(2)` 那个位置**不是**章节视图区，是 `.reader-topbar`
+（child 1）。于是切到 PDF 模式时：
+
+- `sectionView.style.display = "none"` → **藏掉的是 topbar**
+  （→ PDF 模式那条工具条整条消失）；
+- 真正的章节视图区 `.reader-body` **从来没被藏过**
+  → 章节视图继续盖在 PDF 上面。
+
+**修法**：用 id 定位，与子元素顺序彻底解耦。
+
+```js
+const sectionView = document.getElementById("reader-body");
+```
+
+**为什么这个 bug 藏了这么久**：页面里本来就写着结构契约注释
+（"The inner wrapper must keep exactly this child order…"），
+但**契约只约束了"别重排"，没约束"别用位置去定位"** ——
+顺序一改（哪怕只是加一个浮动元素），指向就悄悄变了。
+
+**通用教训**：
+1. **能用 id 定位就别用 `nth-child`**。位置型选择器把"结构"变成隐式契约，
+   任何人加一个元素都会静默改变指向。
+2. **要定位就用 id，但要给"顺序敏感"的地方留 id 锚点**
+   （本例里 `.reader-body` 之前没有 id，只能拿位置凑）。
+3. **"某块内容在某个模式下不见了"要先怀疑"谁在藏它"**：
+   用 CDP 量一遍祖先链的 `display` + `getBoundingClientRect()`，
+   一眼就能看出是谁把谁藏了（本例：topbar 被藏 → 连带藏掉里面的徽标）。
+
 ## 5. 通用教训（从上面提炼的原则）
 
 1. **先定位根因，再改代码。** 拿不准就在可疑位置加 `console.log` 探针 + 用浏览器的
