@@ -206,7 +206,12 @@ def friendly_error_text(exc: BaseException) -> str:
     msg = str(exc)
     m = _HTTP_CODE_RE.search(msg)
     if not m:
-        return msg
+        # ⚠️ 没有 HTTP 码的异常（网络/协议/URL 解析错误）**也必须脱敏+抹路径**：
+        #   实测 `https://user:sk-xxxx@gw.internal` 这种带凭据的 base_url
+        #   在 URL 畸形时会连着 key 一起进异常消息，原样送到浏览器 = 泄密；
+        #   OSError 的消息里还带着本机绝对路径。
+        #   （安全审计 H2 / M2）
+        return _mask_paths(_redact_secrets(msg))[:300]
     code = int(m.group(1))
     raw = m.group(2)
     # 原始报文只进日志，不进界面。
@@ -220,6 +225,8 @@ def friendly_error_text(exc: BaseException) -> str:
     # 保留前面那段中文上下文（例如「主模型 (MiniMax-M3) 调用失败:」），
     # 它告诉用户是**哪条链路**挂了，比光一句"限流"有用。
     prefix = msg[:m.start()].strip().rstrip(":：").strip()
+    # ⚠️ prefix 也要脱敏+抹路径：它来自异常消息，可能含带凭据的 URL 或本机路径。
+    prefix = _mask_paths(_redact_secrets(prefix))
     if prefix:
         return f"{prefix}：{friendly}"
     return friendly
@@ -482,8 +489,49 @@ def is_agnes_config(cfg: dict) -> bool:
 _SECRET_PATTERNS = (
     (re.compile(r"sk-[A-Za-z0-9_\-]{4,}"), None),
     (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]{8,}"), 1),
-    (re.compile(r"((?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+", re.IGNORECASE), 1),
+    # ⚠️ Basic 必须排在"关键词+分隔符"那条**前面**：
+    #    否则 authorization 那条会先把 "Basic" 当成值替换掉，
+    #    后面的 base64 载荷就漏了（实测）。
+    (re.compile(r"(?i)\b(basic\s+)[A-Za-z0-9+/=]{8,}"), 1),
+    # 关键词 + 分隔符（允许中间有引号/空白）+ 值。
+    # 覆盖 api_key / apiKey / api-key / access_token / refresh_token /
+    #      token / secret / password / authorization / cookie。
+    # ⚠️ 旧版只有一条 `(?:api[_-]?key|token|secret|password)\s*[=:]\s*`，
+    #    JSON 形态 `{"api_key":"<hex>"}` 因关键词和分隔符之间隔了一个引号
+    #    而不匹配 → key 明文进 logs/desktop.log（安全审计实测 24 种形态）。
+    (re.compile(
+        r"""(?ix)
+        ( ["']? \b (?:
+              api[_-]?keys? | apikey
+            | access[_-]?tokens? | refresh[_-]?tokens? | id[_-]?tokens?
+            | tokens? | secrets? | passwords? | passwd
+            | authorization | cookie
+        ) \b ["']? \s* [:=] \s* )
+        ( ["']? )                      # 值的可选引号
+        ( [^"',;\s}\]]+ )              # 值本身
+        """
+    ), 1),
+    # URL 里的 userinfo：scheme://user:pass@host
+    (re.compile(r"(://[^:/\s@]+:)[^@/\s]+(@)"), 1),
+    # 裸 Authorization / Basic（没有 Bearer 前缀）
+    (re.compile(r"(?i)\b(basic\s+)[A-Za-z0-9+/=]{8,}"), 1),    # PEM 私钥块
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?"
+                r"-----END [A-Z ]*PRIVATE KEY-----"), None),
 )
+
+
+def _mask_paths(text: str) -> str:
+    """抹掉文本里的本机绝对路径。
+
+    OSError / FileNotFoundError 的消息里带着本机绝对路径
+    （'E:\\zaiwu\\个人工作台\\logs\\xxx.json'），原样送到浏览器
+    = 内部路径泄露（安全审计 H2 / M2）。
+    """
+    if not text:
+        return text
+    out = re.sub(r"[A-Za-z]:\\[^\s'\"]+", "<本机路径>", text)
+    out = re.sub(r"(?<![\w<])/(?:[^\s'\"]+/)+[^\s'\"]*", "<本机路径>", out)
+    return out
 
 
 def _redact_secrets(text: str) -> str:
@@ -496,7 +544,29 @@ def _redact_secrets(text: str) -> str:
             out = pat.sub("***", out)
         else:
             out = pat.sub(lambda m, g=keep_group: m.group(g) + "***", out)
+    # URL 里的 userinfo 单独再处理一次（上面那条只覆盖"带密码"的形态；
+    # `http://user@host` 这种没有密码的也会暴露用户名）
+    out = re.sub(r"(://[^:/\s@]+)@", r"\1:***@", out)
     return out
+
+
+def _degrade_text(kind: str) -> str:
+    """降格原因的人话说明（给界面用）。
+
+    ⚠️ 以前界面上写死了「主模型额度用完了」，但降格有三种完全不同的原因，
+    处置方式也完全不同 —— 说错会让用户白等或白折腾：
+      quota      → 5 小时滚动窗口的额度真的用完了，要等窗口恢复
+      rate_limit → 每分钟请求数超限，等几十秒就好（不该说成额度用完）
+      no_output  → 主模型连上了但这次没吐出正文，跟额度没关系
+    """
+    return {
+        "quota": "主模型配额用完了（5 小时滚动窗口），要等窗口恢复；"
+                 "期间先用备用模型顶着用。",
+        "rate_limit": "主模型被限流了（每分钟请求数超限），等几十秒就好；"
+                      "如果频繁出现，请把 .env 的 LLM_TRANSLATION_DEADLINE 调大或换个模型。",
+        "no_output": "主模型这次没吐出正文（思考把 token 预算烧光了），"
+                     "已临时改用备用模型；这跟额度无关。",
+    }.get(kind, "主模型暂时不可用，已自动降级到备用模型。")
 
 
 def _safe_base_url(url: str) -> str:
@@ -532,6 +602,7 @@ class DualModelManager:
         self._lock = Lock()
         self.is_degraded: bool = False
         self.degraded_reason: str = ""
+        self.degraded_kind: str = ""   # quota / rate_limit / no_output
         self.degraded_at: float = 0.0
         self.last_primary_probe: float = 0.0
 
@@ -570,9 +641,20 @@ class DualModelManager:
             "is_fallback": True,
         }
 
-    def mark_degraded(self, reason: str, sticky: bool = False):
+    def mark_degraded(self, reason: str, sticky: bool = False, kind: str = ""):
         """
         标记主模型降格。
+
+        kind：降格的**分类**（界面要照它说人话，不能一律说"额度用完了"）：
+          "quota"      → 主模型配额/额度真的用完了（5 小时滚动窗口），
+                         要等窗口恢复；用户需要知道"等多久"
+          "rate_limit" → 主模型被限流了（每分钟请求数超限），等几十秒就好
+          "no_output"  → 主模型连上了但没吐出正文（思考烧光预算等），
+                         这是**这次任务**的问题，不代表额度没了
+
+        ⚠️ 不分类的后果（真实踩过）：界面 toast 写死了"主模型额度用完了"，
+        而真实原因可能是限流或空正文 → 用户一看自己的额度明明还有，
+        只会觉得"这程序在瞎说"。
 
         sticky=True 用于「主模型不是不可用，而是对当前任务产不出有效正文」
         这类情况（例如思考模型遇到乱序 PDF 文本陷入无限思考）：这种降格
@@ -583,11 +665,13 @@ class DualModelManager:
         with self._lock:
             self.is_degraded = True
             self.degraded_reason = reason
+            self.degraded_kind = kind
             self.degraded_at = time.time()
             self.last_primary_probe = time.time()
             self.sticky_degraded = sticky
             print(
-                f"[MicroBench] ⚠️ 主模型触发降格: {reason}. "
+                f"[MicroBench] ⚠️ 主模型触发降格 ({kind or 'unknown'}): "
+                f"{_redact_secrets(str(reason))[:300]}. "
                 f"已自动切换至备用模型 (Agnes 3.0 Flash, 20 RPM 保护)."
                 + (" [需手动探测升格]" if sticky else ""),
                 file=sys.stderr,
@@ -758,6 +842,11 @@ class DualModelManager:
             "active_provider": active_provider,
             "is_degraded": self.is_degraded,
             "degraded_reason": _redact_secrets(self.degraded_reason),
+            # 降格**分类** + **人话原因**：界面必须照它说，
+            # 不能一律说"额度用完了"（真实反馈：用户额度明明还有，
+            # 却被告知额度用完，只会觉得这程序在瞎说）。
+            "degraded_kind": self.degraded_kind,
+            "degraded_text": _degrade_text(self.degraded_kind),
             "degraded_at": self.degraded_at,
             "primary": {
                 "model": primary["model"],
@@ -1041,7 +1130,7 @@ def _invoke_model(
             if not netutil.proxy_bypassed():
                 _mark_proxy_dead(e)
                 continue
-            return False, f"代理连接失败: {e}", last_status
+            return False, f"代理连接失败: {_redact_secrets(str(e))}", last_status
         except RETRYABLE_EXC as e:
             last_err = str(e)
             if deadline is not None and (deadline - time.monotonic()) < 3:
@@ -1052,9 +1141,9 @@ def _invoke_model(
                 wait = 2 ** attempt
                 time.sleep(wait)
                 continue
-            return False, f"网络连接失败 (重试 {max_retries} 次): {e}", last_status
+            return False, f"网络连接失败 (重试 {max_retries} 次): {_redact_secrets(str(e))}", last_status
         except requests.RequestException as e:
-            return False, f"请求异常: {e}", last_status
+            return False, f"请求异常: {_redact_secrets(str(e))}", last_status
 
         if resp.status_code != 200:
             try:
@@ -1359,11 +1448,16 @@ def chat(
             or "返回空内容" in (res or "")
             or "响应格式异常" in (res or "")
         )
-        if fallback["configured"] and (
-            model_manager.is_quota_exhausted_error(status_code or 0, res)
-            or no_usable_output
-        ):
-            model_manager.mark_degraded(res)
+        # ⚠️ 只有**真的配额耗尽**才改全局状态（mark_degraded）。
+        #    "这次没产出正文"是**单次任务**的问题（思考烧光预算等），
+        #    不该让后面 15 分钟所有请求都改走备用模型 ——
+        #    用户会看到"降格"却不知道自己额度明明还有（真实反馈）。
+        #    这种情况下只做本次 failover（换备用模型把这一单做完），
+        #    全局状态不动。
+        is_quota = model_manager.is_quota_exhausted_error(status_code or 0, res)
+        if fallback["configured"] and is_quota:
+            model_manager.mark_degraded(res, kind="quota")
+        if fallback["configured"] and (is_quota or no_usable_output):
             # Seamlessly fail over to fallback!
             fb_success, fb_res, _ = _invoke_with_budget_escalation(
                 fallback, messages, max_tokens, temperature, timeout, json_mode,
@@ -1590,7 +1684,7 @@ async def _invoke_model_async(
             if not netutil.proxy_bypassed():
                 _mark_proxy_dead(e)
                 continue
-            return False, f"代理连接失败: {e}", last_status
+            return False, f"代理连接失败: {_redact_secrets(str(e))}", last_status
         except RETRYABLE_EXC as e:
             last_err = str(e)
             if _cancelled():
@@ -1599,13 +1693,13 @@ async def _invoke_model_async(
                 wait = 2 ** attempt
                 await asyncio.sleep(wait)
                 continue
-            return False, f"网络连接失败 (重试 {max_retries} 次): {e}", last_status
+            return False, f"网络连接失败 (重试 {max_retries} 次): {_redact_secrets(str(e))}", last_status
         except asyncio.CancelledError:
             # Propagate cleanly without retrying
             raise
         except Exception as e:
             # Non-retryable exception
-            return False, f"请求异常: {e}", last_status
+            return False, f"请求异常: {_redact_secrets(str(e))}", last_status
 
         if resp.status_code != 200:
             try:
@@ -1764,7 +1858,7 @@ async def chat_async(
             return res
 
         if fallback["configured"] and model_manager.is_quota_exhausted_error(status_code or 0, res):
-            model_manager.mark_degraded(res)
+            model_manager.mark_degraded(res, kind="quota")
             fb_success, fb_res, _ = await _invoke_model_async(
                 fallback, messages, max_tokens, temperature, timeout, json_mode,
                 max_retries=max_retries, cancel_event=cancel_event,
@@ -2148,13 +2242,19 @@ async def chat_stream_async(
                     yield chunk
                 return
             status = getattr(e, "status_code", None)
+            # ⚠️ status 为 None 表示这不是 HTTP 状态码错误（网络中断、协议错误、
+            #    URL 解析失败……）—— 那种情况**不能**当成配额耗尽。
+            #    旧的宽松分支（"429" in err_msg）会把这类错误也算成配额耗尽
+            #    → 永久降格 15 分钟 → 用户看到"降格"却不知道自己额度还有。
+            #    真正的 429 一定有 status_code（_stream_model 显式设了），
+            #    走 is_quota_exhausted_error 的精确判定（限流 vs 配额分开）。
             quota_hit = (
                 model_manager.is_quota_exhausted_error(status, err_msg)
                 if status is not None
-                else ("429" in err_msg or "quota" in err_msg.lower())
+                else False
             )
             if fallback["configured"] and quota_hit:
-                model_manager.mark_degraded(err_msg)
+                model_manager.mark_degraded(err_msg, kind="quota")
             else:
                 raise
 

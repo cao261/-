@@ -50,7 +50,7 @@ from .generator import (
     record_troubleshoot,
     generate_weekly_report,
     search_vault,
-    ALLOWED_TOPIC_CATEGORIES,
+ALLOWED_TOPIC_CATEGORIES,
     sanitize_filename,
     ensure_vault_templates,
     _safe_path,             # exported once; used by all vault-file endpoints
@@ -72,6 +72,18 @@ from .paper_text import (fetch_full_text, split_into_sections,
 from . import glyphs as glyphs_mod
 from . import lan as lan_helpers
 from .lan import resolve_token as _resolve_lan_token
+
+
+def _safe_err(exc: BaseException) -> str:
+    """给用户看的异常摘要：脱敏 + 抹掉本机绝对路径 + 限长。
+
+    为什么不能直接 str(e)（安全审计 M2）：
+    OSError / FileNotFoundError 的消息里带着本机绝对路径
+    （如 'E:\\zaiwu\\个人工作台\\logs\\xxx.json'），原样送到浏览器
+    = 内部路径泄露；而 requests 的异常消息里可能带带凭据的 URL
+    （base_url 里的 user:pass@host）。
+    """
+    return llm._mask_paths(llm._redact_secrets(str(exc)))[:200]
 
 
 @asynccontextmanager
@@ -1117,7 +1129,7 @@ def api_stats():
             **real,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"读取 vault 统计失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"读取 vault 统计失败: {_safe_err(e)}")
 
 
 @app.get("/api/vault/literature")
@@ -1161,7 +1173,7 @@ async def api_vault_literature(
             "has_more": (offset + len(page)) < len(filtered),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"读取文献列表失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"读取文献列表失败: {_safe_err(e)}")
 
 @app.post("/api/paper/fetch")
 def api_fetch_paper(req: FetchPaperRequest):
@@ -1187,9 +1199,9 @@ def api_fetch_paper(req: FetchPaperRequest):
                 data["landing_url"] = None
         return {"status": "success", "data": data}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"参数无效: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"参数无效: {_safe_err(e)}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"抓取文献失败: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"抓取文献失败: {_safe_err(e)}")
 
 @app.post("/api/paper/save")
 async def api_save_paper(req: SavePaperRequest):
@@ -1199,7 +1211,7 @@ async def api_save_paper(req: SavePaperRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"保存文献卡片失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"保存文献卡片失败: {_safe_err(e)}")
 
 
 @app.get("/api/paper/folders")
@@ -1247,7 +1259,7 @@ async def api_export_bilingual(req: ExportBilingualRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"导出双语卡片失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"导出双语卡片失败: {_safe_err(e)}")
 
 
 @app.post("/api/paper/export_qa")
@@ -1261,12 +1273,12 @@ async def api_export_qa(req: ExportQARequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"导出答疑笔记失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"导出答疑笔记失败: {_safe_err(e)}")
 
 
 
 
-@app.get("/api/paper/download_pdf")
+@app.post("/api/paper/download_pdf")
 async def api_download_pdf(
     identifier: str = Query(..., min_length=3, max_length=200, description="arXiv ID 或 DOI"),
     topic_category: str = Query(
@@ -1280,6 +1292,13 @@ async def api_download_pdf(
     Download a PDF to the appropriate literature folder.
     Only supports arXiv direct PDF. For DOI papers, returns landing_url
     so the frontend can prompt user to download manually.
+
+    ⚠️ 必须是 POST（安全审计 M1）：这个端点**有写副作用**
+    （mkdir + 写 PDF 文件 + 发起一次外网请求），而 CSRF 守卫只查
+    非安全方法（POST/DELETE/PUT/PATCH）→ 原来是 GET 的话，
+    恶意网页一个 `<img src="http://127.0.0.1:5000/api/paper/download_pdf?...">`
+    就能让用户机器凭空多出文件（且 `<img>` 不带 Origin，守卫直接放行）。
+    改成 POST 后，非浏览器客户端仍可正常调用。
     """
     if topic_category not in ALLOWED_TOPIC_CATEGORIES:
         raise HTTPException(
@@ -1301,11 +1320,11 @@ async def api_download_pdf(
             }
         except ValueError as e:
             # Bad DOI format → user error, not upstream error
-            raise HTTPException(status_code=400, detail=f"参数无效: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"参数无效: {_safe_err(e)}")
         except Exception as e:
             raise HTTPException(
                 status_code=502,
-                detail=f"无法解析 DOI 落地页: {str(e)}",
+                detail=f"无法解析 DOI 落地页: {_safe_err(e)}",
             )
 
     # arXiv path: build safe target path inside BASE_DIR
@@ -1331,7 +1350,7 @@ async def api_download_pdf(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"下载 PDF 失败: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"下载 PDF 失败: {_safe_err(e)}")
 
 
 @app.get("/api/paper/serve_pdf")
@@ -1349,7 +1368,7 @@ async def api_serve_pdf(
         # Defensive: _safe_path rejects '..' and absolute paths
         pdf_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
     if pdf_path.suffix.lower() != ".pdf":
@@ -1501,7 +1520,7 @@ async def api_read_table(req: ReadTableRequest):
     try:
         pdf_path = _safe_path(BASE_DIR, req.relative_path)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
     try:
@@ -1509,7 +1528,7 @@ async def api_read_table(req: ReadTableRequest):
         if len(rect) != 4:
             raise ValueError("rect 应为 x0,y0,x1,y1")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"rect 无效: {e}")
+        raise HTTPException(status_code=400, detail=f"rect 无效: {_safe_err(e)}")
     try:
         table = await _read_table_vision(pdf_path, req.page, rect, req.model)
     except HTTPException:
@@ -1591,7 +1610,7 @@ async def api_formula_image(
     try:
         pdf_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
 
@@ -1618,7 +1637,7 @@ async def api_formula_image(
         code = 404 if "页码越界" in msg else 400
         raise HTTPException(status_code=code, detail=msg)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"公式裁图失败: {e}")
+        raise HTTPException(status_code=500, detail=f"公式裁图失败: {_safe_err(e)}")
 
     return Response(
         content=png,
@@ -1642,7 +1661,7 @@ async def api_vault_file(
     try:
         file_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
     suffix = file_path.suffix.lower()
@@ -1680,7 +1699,7 @@ async def api_vault_delete_file(
     try:
         file_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
     suffix = file_path.suffix.lower()
@@ -1721,7 +1740,7 @@ async def api_vault_delete_file(
             deleted_to = "permanent"
         return {"status": "success", "path": rel_str, "deleted_to": deleted_to}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"删除失败: {e}")
+        raise HTTPException(status_code=500, detail=f"删除失败: {_safe_err(e)}")
 
 
 @app.post("/api/vault/reveal")
@@ -1741,7 +1760,7 @@ async def api_vault_reveal(
     try:
         file_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {relative_path}")
 
@@ -1776,9 +1795,9 @@ async def api_vault_reveal(
     except FileNotFoundError as e:
         # If explorer/open is not on PATH for some reason, surface the error
         # rather than silently failing.
-        raise HTTPException(status_code=500, detail=f"系统工具缺失: {e}")
+        raise HTTPException(status_code=500, detail=f"系统工具缺失: {_safe_err(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"打开失败: {e}")
+        raise HTTPException(status_code=500, detail=f"打开失败: {_safe_err(e)}")
 
     return {"status": "success", "command": cmd, "abs_path": abs_path}
 
@@ -1887,7 +1906,7 @@ async def api_upload_pdf(
         # paper — keep it off the event loop.
         pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF 文本提取失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"PDF 文本提取失败: {_safe_err(e)}")
 
     if not pages:
         raise HTTPException(status_code=400, detail="未能从 PDF 中识别出有效文字 (可能是扫描图片版 PDF)")
@@ -1991,7 +2010,7 @@ async def api_list_vault_pdfs():
                 "size_kb": size_kb,
             })
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"扫描 vault 失败: {e}")
+        raise HTTPException(status_code=500, detail=f"扫描 vault 失败: {_safe_err(e)}")
 
     items.sort(key=lambda x: (x["topic"], x["name"]))
     return {"status": "success", "count": len(items), "pdfs": items}
@@ -2016,7 +2035,7 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
         pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
         pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF 文本提取失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"PDF 文本提取失败: {_safe_err(e)}")
 
     if not pages:
         raise HTTPException(status_code=400, detail="未能从 PDF 中识别出有效文字 (可能是扫描图片版 PDF)")
@@ -2082,9 +2101,9 @@ def api_export_bibtex(
         bib = generate_bibtex(meta, bib_key=bib_key)
         return {"status": "success", "bibtex": bib}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"参数无效: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"参数无效: {_safe_err(e)}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"生成 BibTeX 失败: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"生成 BibTeX 失败: {_safe_err(e)}")
 
 @app.post("/api/reproduction/create")
 async def api_create_reproduction(req: CreateReproductionRequest):
@@ -2094,7 +2113,7 @@ async def api_create_reproduction(req: CreateReproductionRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"创建复现工程失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"创建复现工程失败: {_safe_err(e)}")
 
 @app.post("/api/troubleshoot/add")
 async def api_add_troubleshoot(req: TroubleshootRequest):
@@ -2104,7 +2123,7 @@ async def api_add_troubleshoot(req: TroubleshootRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"记录排错日志失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"记录排错日志失败: {_safe_err(e)}")
 
 @app.post("/api/weekly/generate")
 async def api_generate_weekly():
@@ -2112,7 +2131,7 @@ async def api_generate_weekly():
         res = generate_weekly_report()
         return res
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"生成周报失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"生成周报失败: {_safe_err(e)}")
 
 # ---------------------------------------------------------------------------
 # AI / RAG endpoints (require LLM_API_KEY or AGNES_API_KEY env var)
@@ -2131,6 +2150,10 @@ async def api_llm_status():
         "active_provider": st["active_provider"],
         "is_degraded": st["is_degraded"],
         "degraded_reason": st["degraded_reason"],
+        # 降格**分类** + **人话原因**：界面必须照它说，不能一律说"额度用完了"
+        # （真实反馈：用户额度明明还有，却被告知额度用完）。
+        "degraded_kind": st.get("degraded_kind", ""),
+        "degraded_text": st.get("degraded_text", ""),
         "degraded_at": st["degraded_at"],
         "primary": st["primary"],
         "fallback": st["fallback"],
@@ -2175,7 +2198,7 @@ def api_summarize_paper(req: SummarizeRequest):
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=f"LLM 调用失败: {llm.friendly_error_text(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"生成摘要失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"生成摘要失败: {_safe_err(e)}")
 
 @app.post("/api/ask")
 def api_ask_question(req: AskRequest):
@@ -2286,7 +2309,7 @@ async def api_plot_extract(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"图片解析失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"图片解析失败: {_safe_err(e)}")
 
 @app.post("/api/plot/calibrate")
 async def api_plot_calibrate(req: CalibrateRequest):
@@ -2300,7 +2323,7 @@ async def api_plot_calibrate(req: CalibrateRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"标定失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"标定失败: {_safe_err(e)}")
 
 @app.post("/api/plot/compare")
 async def api_plot_compare(req: CompareRequest):
@@ -2332,7 +2355,7 @@ async def api_plot_compare(req: CompareRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"对比计算失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"对比计算失败: {_safe_err(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -2375,7 +2398,7 @@ def api_fetch_full_text(req: FetchFullRequest):
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"全文获取失败: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"全文获取失败: {_safe_err(e)}")
 
     # Side-effect: also save the PDF to vault so the dual-column reader can find it.
     # Best-effort: failures here don't fail the overall request.
@@ -2668,7 +2691,7 @@ async def api_translate_section(req: TranslateRequest):
             )
         raise HTTPException(status_code=502, detail=f"LLM 翻译失败: {llm.friendly_error_text(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"翻译失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"翻译失败: {_safe_err(e)}")
 
     # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
     translation = sanitize_translation(merge_translation_parts(translated_parts))
@@ -3344,7 +3367,7 @@ async def api_translate_page(req: TranslatePageRequest):
             )
         raise HTTPException(status_code=502, detail=f"按页翻译失败: {llm.friendly_error_text(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"按页翻译失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"按页翻译失败: {_safe_err(e)}")
 
     # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
     translation = sanitize_translation(merge_translation_parts(translated_parts))
@@ -3768,7 +3791,7 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
                 tmp.unlink()
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=f"写盘失败: {e}")
+        raise HTTPException(status_code=500, detail=f"写盘失败: {_safe_err(e)}")
 
     return {
         "status": "success",
@@ -4873,7 +4896,7 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
                 tmp.unlink()
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=f"批注写盘失败: {e}")
+        raise HTTPException(status_code=500, detail=f"批注写盘失败: {_safe_err(e)}")
 
     return {
         "status": "success",
@@ -4909,7 +4932,7 @@ async def api_pdf_annotations_delete(
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
             os.replace(tmp, path)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"批注删除失败: {e}")
+            raise HTTPException(status_code=500, detail=f"批注删除失败: {_safe_err(e)}")
     return {"status": "success", "paper_id": paper_id, "deleted": deleted}
 
 
@@ -4927,7 +4950,7 @@ async def api_pdf_info(
     try:
         fp = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
     if not fp.exists() or not fp.is_file():
         raise HTTPException(status_code=404, detail="PDF 不存在")
     if fp.suffix.lower() != ".pdf":

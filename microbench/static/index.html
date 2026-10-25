@@ -6375,20 +6375,28 @@
       const modelName = _llmStatus.active_model || "LLM";
       const rpmInfo = _getCurrentRpmInfo();
       if (_llmStatus.is_degraded) {
+        const rpmInfo = _getCurrentRpmInfo();
         const badgeText = `${modelName} · 降格 ${rpmInfo.rpm} RPM`;
         setDot(headerDot, "warn"); setDot(readerDot, "warn");
         if (headerText) headerText.textContent = badgeText;
         if (readerText) readerText.textContent = badgeText;
         if (readerProbeBtn) readerProbeBtn.style.display = "inline-block";
-        // 降级是"静默"的：用户只会觉得变慢了，不知道为什么。提示一次。
+        // ⚠️ 必须说**真实原因**，不能一律说"额度用完了"：
+        //    降格有三种完全不同的原因（配额窗口 / 限流 / 这次没出正文），
+        //    处置方式也不同。以前写死"额度用完了"，用户一看自己额度明明还有，
+        //    只会觉得程序在瞎说（真实反馈）。
+        const why = _llmStatus.degraded_text
+          || "主模型暂时不可用，已自动降级到免费备用模型：还能用，但慢一些（表格读图尤其慢，8 倍左右）";
+        const probeHint = _llmStatus.degraded_kind === "quota"
+          ? "（额度恢复后会自动切回主模型，也可以点左侧「探测升格」立刻试）"
+          : "（点左侧「探测升格」可以立刻试主模型）";
+        if (headerText) headerText.title = why;
+        if (readerText) readerText.title = why;
+        // 降级提示只弹一次（额度恢复后允许再弹）
         if (!_degradeToastShown) {
           _degradeToastShown = true;
           if (typeof showToast === "function") {
-            showToast(
-              "⚠️ 主模型额度用完了 → 已自动降级到免费备用模型：还能用，但慢一些"
-              + "（表格读图尤其慢，8 倍左右）",
-              true, 6500
-            );
+            showToast("⚠️ " + why + probeHint, true, 7000);
           }
         }
       } else {

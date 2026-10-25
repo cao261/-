@@ -618,7 +618,9 @@ def test_api_paper_fetch_full_arxiv(client):
 @pytest.mark.slow
 @pytest.mark.network
 def test_api_paper_download_pdf(client, sandbox):
-    r = client.get("/api/paper/download_pdf", params={
+    # ⚠️ 必须是 POST：这个端点有写副作用（mkdir + 写文件），
+    # GET 的话 CSRF 守卫（只查非安全方法）拦不住跨站触发（安全审计 M1）。
+    r = client.post("/api/paper/download_pdf", params={
         "identifier": "2303.15982",
         "topic_category": "01_Device_TCAD_器件仿真",
         "title": "Arxiv Download Test", "year": 2024,

@@ -415,14 +415,180 @@ def build_katex_css() -> str:
 # 4. Markdown -> HTML
 # ---------------------------------------------------------------------------
 
+# ⚠️ 为什么要消毒（安全审计 H3）：
+#   离线阅读版是把 vault 里的 .md 转成**一个独立 HTML 文件**给用户双击打开。
+#   .md 里的内容可能来自**外部论文原文**（双语精读卡片会把英文原文原样写进去），
+#   而 Python-Markdown 不是消毒器 —— `<script>` 会原样保留，
+#   `attr_list` 扩展还能给任意元素加 onclick / javascript: 协议。
+#   → 恶意论文 → vault .md → 导出物变成活代码（file:// 下能读同目录文件）。
+#   所以这里在转 HTML 之后**必须**过一遍消毒。
+#
+# 不引第三方库（bleach）：本项目要跨设备同步，一方设备少装一个包就可能起不来。
+# 自己写一个保守的消毒器：白名单标签 + 白名单属性 + 协议白名单。
+
+_SAFE_TAGS = {
+    "p", "br", "hr", "span", "div", "section", "article",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "ul", "ol", "li", "dl", "dt", "dd",
+    "strong", "b", "em", "i", "u", "s", "sup", "sub", "small", "mark",
+    "code", "pre", "kbd", "samp", "var",
+    "blockquote", "q", "cite",
+    "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption",
+    "a", "img", "figure", "figcaption",
+    "details", "summary", "time",
+}
+
+# 会连内容一起丢掉的标签（脚本/样式/嵌入对象）
+_DROP_TAGS = {
+    "script", "style", "iframe", "object", "embed", "applet",
+    "form", "input", "button", "textarea", "select", "option",
+    "link", "meta", "base", "frame", "frameset", "noscript", "svg", "math",
+}
+
+# 全局允许的属性
+_SAFE_ATTRS = {
+    "class", "id", "title", "lang", "dir", "role", "alt", "width", "height",
+    "colspan", "rowspan", "align", "valign", "start", "type", "open",
+    "data-value", "aria-hidden", "aria-label",
+}
+
+# 允许带 URL 的属性（各自还要过协议白名单）
+_URL_ATTRS = {"href", "src", "cite", "poster", "xlink:href"}
+
+_SAFE_URL_SCHEMES = ("http://", "https://", "mailto:", "#", "/", "./", "../")
+
+
+def _safe_url(value: str) -> str:
+    """URL 属性白名单：只放行明确的协议，相对路径原样保留。"""
+    if value is None:
+        return ""
+    v = value.strip()
+    low = v.lower().replace("\t", "").replace("\n", "").replace("\r", "")
+    # javascript: / data: / vbscript: 一律拒绝
+    if low.startswith(("javascript:", "data:", "vbscript:", "file:")):
+        return "#"
+    if low.startswith(_SAFE_URL_SCHEMES):
+        return v
+    # 相对路径（没有协议前缀）
+    if "://" not in v and ":" not in v.split("/")[0]:
+        return v
+    return "#"
+
+
+def _safe_style(value: str) -> str:
+    """style 白名单：去掉 url() / expression() / javascript: 等可执行内容。"""
+    if not value:
+        return ""
+    low = value.lower()
+    if "url(" in low or "expression(" in low or "javascript:" in low or "@import" in low:
+        return ""
+    return value
+
+
+def sanitize_html(html: str) -> str:
+    """把不可信 HTML 收敛成安全子集（白名单标签/属性/协议）。"""
+    if not html:
+        return ""
+    try:
+        from html.parser import HTMLParser
+    except Exception:  # pragma: no cover
+        return ""
+
+    class _Sanitizer(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=False)
+            self.out = []
+            self.skip_depth = 0
+            self.skip_tag = ""
+
+        def handle_starttag(self, tag, attrs):
+            if self.skip_depth:
+                if tag == self.skip_tag:
+                    self.skip_depth += 1
+                return
+            if tag in _DROP_TAGS:
+                self.skip_depth = 1
+                self.skip_tag = tag
+                return
+            if tag not in _SAFE_TAGS:
+                # 不在白名单 → 整个标签丢掉，但保留其文字内容
+                return
+            kept = []
+            for k, v in attrs:
+                k = (k or "").lower()
+                if k.startswith("on"):
+                    continue                     # 事件属性
+                if k == "style":
+                    v = _safe_style(v)
+                    if v:
+                        kept.append((k, v))
+                    continue
+                if k in _URL_ATTRS:
+                    kept.append((k, _safe_url(v)))
+                    continue
+                if k in _SAFE_ATTRS:
+                    kept.append((k, v if v is not None else ""))
+            attr_s = "".join(f' {k}="{_html_escape_attr(v)}"' for k, v in kept)
+            self.out.append(f"<{tag}{attr_s}>")
+
+        def handle_startendtag(self, tag, attrs):
+            if self.skip_depth or tag in _DROP_TAGS or tag not in _SAFE_TAGS:
+                return
+            self.handle_starttag(tag, attrs)
+
+        def handle_endtag(self, tag):
+            if self.skip_depth:
+                if tag == self.skip_tag:
+                    self.skip_depth -= 1
+                    if self.skip_depth == 0:
+                        self.skip_tag = ""
+                return
+            if tag in _SAFE_TAGS:
+                self.out.append(f"</{tag}>")
+
+        def handle_data(self, data):
+            if self.skip_depth:
+                return
+            self.out.append(data)
+
+        def handle_comment(self, data):
+            pass
+
+        def handle_decl(self, decl):
+            pass
+
+        def unknown_decl(self, data):
+            pass
+
+    p = _Sanitizer()
+    try:
+        p.feed(html)
+        p.close()
+    except Exception:
+        # 解析失败宁可不输出内容，也不要输出未经消毒的原文
+        return _html_escape_text(html)
+    return "".join(p.out)
+
+
+def _html_escape_attr(value: str) -> str:
+    return (value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+def _html_escape_text(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def markdown_to_html(text: str) -> str:
     import markdown
 
-    return markdown.markdown(
+    raw = markdown.markdown(
         text,
         extensions=["tables", "fenced_code", "sane_lists", "attr_list"],
         output_format="html",
     )
+    # ⚠️ 必须消毒（见上面的说明）：raw 里可能带 <script> 和事件属性。
+    return sanitize_html(raw)
 
 
 def resolve_wiki_links(text: str, titles: dict[str, str]) -> str:
@@ -703,9 +869,11 @@ JS = r"""
   function show(id){
     var n = byId[id];
     if(!n) return;
+    // ⚠️ n.html 来自 markdown_to_html（已消毒），但这里再加一道兜底：
+    //    任何未经消毒的路径都不该把 HTML 直接塞进 innerHTML。
     elContent.innerHTML =
       '<div class="doc-meta">' + esc(n.rel) + '</div>' +
-      '<article class="doc">' + n.html + '</article>';
+      '<article class="doc">' + (n.safe === false ? esc(n.html) : n.html) + '</article>';
     window.scrollTo(0, 0);
     highlightActive();
     elSidebar.classList.remove('open');
