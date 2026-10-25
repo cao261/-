@@ -244,6 +244,8 @@ def extract_page_text_from_path(pdf_path, page_no: int) -> str:
 
 _PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
 _SENTENCE_END_RE = re.compile(r"[.!?。！？]")
+# 抽取层插入的标记（公式/表格）。页尾截断必须避开它们内部的小数点。
+_MARKER_RE = re.compile(r"⟦(?:FORMULA|TABLE):[^⟧\n]*⟧")
 # 末尾残片最多砍掉这么多字符，防止整页没有句号时把大半页都砍掉。
 _MAX_TAIL_TRIM_CHARS = 1500
 
@@ -307,9 +309,22 @@ def _trim_page_tail(text: str) -> str:
     text = "\n".join(lines).rstrip()
 
     # 2) 砍掉最后一个句末标点之后的残片
-    ends = list(_SENTENCE_END_RE.finditer(text))
-    if ends:
-        cut = ends[-1].end()
+    #
+    #    标记（⟦FORMULA:45.1,138.3,…⟧ / ⟦TABLE:28.2,494.6,…⟧）内部的小数点
+    #    也是"句末标点"，按标点切会把标记切成半截 —— 半个标记既匹配不上
+    #    也不会被多模态读图处理，整张表就废了（实测页尾的表格标记被切掉
+    #    "1⟧"，译文里留下半截标记 + 重复的表格）。
+    #    → 切点必须避开标记内部；标记自己的结束处 "⟧" 才是合法切点。
+    spans = [(m.start(), m.end()) for m in _MARKER_RE.finditer(text)]
+
+    def _in_marker(pos: int) -> bool:
+        return any(a < pos < b for a, b in spans)
+
+    cuts = [e.end() for e in _SENTENCE_END_RE.finditer(text) if not _in_marker(e.end())]
+    cuts.extend(b for _a, b in spans)      # 标记结束处也算切点
+    cuts = sorted(c for c in cuts if c > 0)
+    if cuts:
+        cut = cuts[-1]
         if cut < len(text) and (len(text) - cut) <= _MAX_TAIL_TRIM_CHARS:
             text = text[:cut]
 
@@ -339,7 +354,10 @@ _Y_BANDS = 60       # y 方向分带数（用于定位双栏起始位置）
 # 栏序修复甩在后面，读者照旧恢复旧快照，用户看到的还是"先翻译右边那栏"）。
 #
 # 版本对不上 → 快照里的页一律作废重翻。
-EXTRACTOR_VERSION = 2
+#
+# 2026-10-24: 2（公式改用坐标 + 边界吸附）
+# 2026-10-25: 3（表格整块改成"多模态读图"标记）
+EXTRACTOR_VERSION = 3
 
 # pdfplumber 无法解码的字符会输出成 "(cid:12)" 这种占位符。
 _CID_RE = re.compile(r"\(cid:\d+\)")
@@ -543,6 +561,21 @@ def _mark_broken_formulas(text: str) -> str:
 # 标记要原样穿过模型的翻译（提示词要求逐字照抄），前端再拿它去裁图。
 FORMULA_MARKER_BBOX_RE = re.compile(
     r"⟦FORMULA:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),"
+    r"(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧"
+)
+
+# ---------------------------------------------------------------------------
+# 表格标记：⟦TABLE:x0,y0,x1,y1⟧（PDF 页坐标，pt）
+# ---------------------------------------------------------------------------
+# 表格在 PDF 文本层是碎的："d (pC/N) (cid:4)90 (cid:4)175 (cid:4)109 B700 16.5"
+# —— 连负号都认不出，模型只能靠上下文猜对齐，结果是**整行数值错位**
+# （实测 JACERS Table I：d31 行的 16.5 跑到了 d33 行，7200 变成 B700）。
+#
+# 所以表格不交给文本模型猜：抽取层只记下表格在页面上的位置，
+# 由服务端把这一块**裁成图交给多模态模型抄**（app.py 的 _read_table_vision）。
+# 图上是什么样，表格就是什么样 —— 顺序和数值都不会错。
+TABLE_MARKER_RE = re.compile(
+    r"⟦TABLE:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),"
     r"(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧"
 )
 
@@ -1002,6 +1035,60 @@ def _looks_like_body_text(bw, x_mid: float) -> bool:
     return bodyish(left) and bodyish(right)
 
 
+def _band_is_table_like(bw, x_mid: float) -> bool:
+    """这一带像不像表格行：不是正文，而且含好几个数字。"""
+    if _looks_like_body_text(bw, x_mid):
+        return False
+    digits = sum(1 for w in bw if any(ch.isdigit() for ch in w["text"]))
+    return digits >= 3
+
+
+# 论文里的表格必有表题（"Table I. Properties of ..." / "TABLE 2" / "表 1"）。
+# **用表题定位表格**，而不是用"有很多数字"—— 公式行也全是数字
+# （"a ¼ 33 31 (2)"），按数字判会把公式当表格（实测 eq (2)/(3) 被误判）。
+_TABLE_CAPTION_RE = re.compile(
+    r"^\s*(table|tab\.|tabelle|tabelle|表)\s*"
+    r"([0-9]+|[ivxlc]+|[A-Z])?\s*[.):、]?", re.IGNORECASE)
+
+
+def _find_table_regions(bands, x_mid: float, max_gap: float = 16.0):
+    """找出页面上的表格区域。
+
+    返回 [[(y0, y1, bw), ...], ...]（每个区域 = 表题带 + 往下连续的表体带）。
+
+    判据：
+      - 起点是**表题带**（文本以 "Table N." / "表 N" 开头）；
+      - 往下收连续的「表状带」（不是正文 + 含好几个数字），
+        带之间的空隙不超过 max_gap；
+      - 区域里至少要有一行数字行（否则只是图注）。
+    """
+    regions: list[list] = []
+    i = 0
+    while i < len(bands):
+        kind, gy0, gy1, bw = bands[i]
+        txt = " ".join(w["text"] for w in bw)
+        if not _TABLE_CAPTION_RE.match(txt):
+            i += 1
+            continue
+        reg = [(gy0, gy1, bw)]
+        j = i + 1
+        prev = gy1
+        while j < len(bands):
+            k2, y0, y1, b2 = bands[j]
+            if _looks_like_body_text(b2, x_mid) or y0 - prev > max_gap:
+                break
+            reg.append((y0, y1, b2))
+            prev = y1
+            j += 1
+        numeric = sum(
+            1 for (_, _, b) in reg
+            if sum(1 for w in b if any(ch.isdigit() for ch in w["text"])) >= 3)
+        if len(reg) >= 2 and numeric >= 1:
+            regions.append(reg)
+        i = j
+    return regions
+
+
 def _extract_by_bands(page, words, width, height, y_split, x_mid):
     """按水平带分组切页。
 
@@ -1017,7 +1104,9 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
     band_h = max(8.0, height / 40.0)
     x_bin = int(round(x_mid / width * _X_BINS))
     intervals = _line_intervals(words)
-    groups = []   # [kind, y0, y1]
+    # 先算逐带（不合并）—— 表格区域要在**未合并**的分带上认，
+    # 合并后的组会把表题、表头、表体搅在一起，表格区域就认不出来了。
+    bands = []
     y = y_split
     while y < height:
         y1 = min(y + band_h, height)
@@ -1026,30 +1115,35 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
             y1 = min(y + band_h, height)
         bw = [w for w in words if y <= w["top"] < y1]
         if bw:
-            kind = _band_kind(bw, width, x_mid, x_bin)
-            if groups and groups[-1][0] == kind:
-                groups[-1][2] = y1
-            else:
-                groups.append([kind, y, y1])
+            bands.append((_band_kind(bw, width, x_mid, x_bin), y, y1, bw))
         y = y1
+
+    # 表格区域 → 整块换成"多模态读图"标记
+    table_regions = _find_table_regions(bands, x_mid)
+    table_bands = set()
+    for reg in table_regions:
+        for gy0, gy1, _bw in reg:
+            table_bands.add((round(gy0, 2), round(gy1, 2)))
+
+    groups = []   # [kind, y0, y1]
+    for kind, gy0, gy1, bw in bands:
+        if (round(gy0, 2), round(gy1, 2)) in table_bands:
+            continue
+        if groups and groups[-1][0] == kind:
+            groups[-1][2] = gy1
+        else:
+            groups.append([kind, gy0, gy1])
 
     left_parts: list[str] = []
     right_parts: list[str] = []
     units: list[list[str]] = []
     pending: list[str] = []
+    table_rows: list[str] = []     # 表格正文（整块换成"多模态读图"标记）
+    table_words: list = []         # 表格区域的词（用来算 bbox）
     table_mode = False
     try:
         for kind, gy0, gy1 in groups:
             bw = [w for w in words if gy0 <= w["top"] < gy1]
-            if kind == "span":
-                # 跨栏块多半是表格：表格行也长得像公式碎片（"d 31(pC/N) 90 ..."），
-                # 但表格必须保持文本形态交给模型排版，所以这里不标公式。
-                st = _lines_to_text(
-                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False)
-                if st.strip():
-                    pending.append(st.strip())
-                table_mode = True
-                continue
             if table_mode and not _looks_like_body_text(bw, x_mid):
                 # 表格的表体：整宽抽，行不被栏缝劈开。
                 # 为什么必须整宽：跨栏表格的行被栏缝切成两半后，
@@ -1059,31 +1153,89 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid):
                 st = _lines_to_text(
                     _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False)
                 if st.strip():
-                    pending.append(st.strip())
+                    table_rows.append(st.strip())
+                table_words.extend(bw)
                 continue
+            if table_rows:
+                # 没有表题的表格（少见）：保留整宽文本，让模型自己排
+                pending.extend(table_rows)
+                table_rows, table_words = [], []
             table_mode = False
+            if kind == "span":
+                # 跨栏块多半是表格：表格行也长得像公式碎片（"d 31(pC/N) 90 ..."），
+                # 但表格必须保持文本形态交给模型排版，所以这里不标公式。
+                st = _lines_to_text(
+                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False)
+                if st.strip():
+                    pending.append(st.strip())
+                table_mode = True
+                continue
             lt = _lines_to_text(_crop_lines(page, (0, gy0, x_mid, gy1)))
             rt = _lines_to_text(_crop_lines(page, (x_mid, gy0, width, gy1)))
             if pending:
-                # 上面紧挨着跨栏块 → 这一组是表格的表体，整块保留
+                # 跨栏块（表题之类）自己成一块，不把后面的正文拖进来 ——
+                # 正文必须留在它自己的栏位里（阅读顺序不能乱）。
                 unit = list(pending)
                 pending = []
-                if lt.strip():
-                    unit.append(lt.strip())
-                if rt.strip():
-                    unit.append(rt.strip())
                 units.append(unit)
-            else:
-                # 纯正文：两栏各自成段（后面再按「左栏读完再右栏」合并）
-                if lt.strip():
-                    left_parts.append(lt.strip())
-                if rt.strip():
-                    right_parts.append(rt.strip())
+            # 纯正文：两栏各自成段（后面再按「左栏读完再右栏」合并）
+            if lt.strip():
+                left_parts.append(lt.strip())
+            if rt.strip():
+                right_parts.append(rt.strip())
     except Exception:
         return [], [], []
+    if table_rows:
+        pending.extend(table_rows)
     if pending:
         units.append(pending)
+    # 表格区域（跨栏表格）→ 整块换成"多模态读图"标记
+    for reg in table_regions:
+        tw = [w for (_, _, bw) in reg for w in bw]
+        if not tw:
+            continue
+        units.append([_table_marker(tw, width, height)])
     return left_parts, right_parts, units
+
+
+def _table_marker(words: list, width: float, height: float) -> str:
+    """表格区域 → 「多模态读图」标记（带坐标）。"""
+    x0 = min(w["x0"] for w in words)
+    x1 = max(w["x1"] for w in words)
+    y0 = min(w["top"] for w in words)
+    y1 = max(w["bottom"] for w in words)
+    pad = 3.0
+    return "⟦TABLE:{:.1f},{:.1f},{:.1f},{:.1f}⟧".format(
+        max(0.0, x0 - pad), max(0.0, y0 - pad),
+        min(width, x1 + pad), min(height, y1 + pad))
+
+
+def _table_unit(rows: list[str], words: list, width: float,
+                height: float) -> list[str]:
+    """把一段表格正文换成「多模态读图」标记。
+
+    条件（都要满足才换）：
+      - 至少两行（单行不算表格）；
+      - 至少两行里有 3 个以上数字（数字多才像表格，图表标题不算）；
+      - 区域有实际宽度。
+
+    不满足就原样保留文本 —— 宁可给模型看碎片，也别把正文误当表格。
+    """
+    if len(rows) < 2 or not words:
+        return list(rows)
+    numeric_rows = sum(1 for r in rows if len(re.findall(r"\d", r)) >= 3)
+    if numeric_rows < 2:
+        return list(rows)
+    x0 = min(w["x0"] for w in words)
+    x1 = max(w["x1"] for w in words)
+    y0 = min(w["top"] for w in words)
+    y1 = max(w["bottom"] for w in words)
+    if x1 - x0 < 20 or y1 - y0 < 12:
+        return list(rows)
+    pad = 3.0
+    return ["⟦TABLE:{:.1f},{:.1f},{:.1f},{:.1f}⟧".format(
+        max(0.0, x0 - pad), max(0.0, y0 - pad),
+        min(width, x1 + pad), min(height, y1 + pad))]
 
 
 def _band_column_gap(band_words, width):

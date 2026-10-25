@@ -61,18 +61,25 @@ def test_span_tables_are_kept_whole_and_moved_after_body_text():
                 "跨栏表格的碎片还留在正文里（或排在正文之前）"
 
 
-def test_table_caption_stays_next_to_its_body():
-    """表标题必须排在它自己的表体前面（不能被甩到最后）。"""
+def test_table_region_becomes_vision_marker():
+    """跨栏表格整块变成「多模态读图」标记（表题和表体都在图里）。
+
+    2026-10-25：表格不再以碎片文本交给模型 —— 文本层抽出来的表格数值会
+    整行错位（实测 d31 行的 16.5 跑到 d33 行、7200 变成 B700），
+    现在抽取层只记下表格在页面上的坐标，由多模态模型看图抄。
+    """
     from microbench import paper_text as pt
     left, right, units = _bands(2)
     text = pt._join_reading_order(left, right, units, "")
-    caption = "Table I. Properties of Piezoelectric Materials"
-    assert caption in text, "没抽到 Table I 的标题"
-    # 表体（BaTiO3 那一半）必须跟在标题后面
-    body = "BaTiO3"
-    assert body in text
-    assert text.index(caption) < text.index(body), \
-        "表标题跑到表体后面去了"
+    marks = pt.TABLE_MARKER_RE.findall(text)
+    assert len(marks) == 2, f"应识别出 2 张表格（Table I / Table II），实际 {len(marks)}"
+    # 表格正文不再以碎片形式留在文本里（否则模型还是会去猜对齐）
+    assert "BaTiO3" not in text, "表头还留在文本里"
+    assert "d (pC/N) (cid:4)90 (cid:4)175" not in text, "表格数值碎片还留在文本里"
+    # 坐标必须落在页面内、且覆盖表格的实际位置（Table I 在页面下半部）
+    x0, y0, x1, y1 = (float(v) for v in marks[0])
+    assert 0 < x0 < x1 and 0 < y0 < y1, f"表格坐标无效: {marks[0]}"
+    assert 400 < y0 < 700, f"Table I 的坐标不对（应在页面下半部）: {y0}"
 
 
 def test_first_page_reads_left_then_right():

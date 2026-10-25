@@ -183,7 +183,55 @@ python -m pytest tests/test_reader_formula_table.py -v
 
 ---
 
-## 5. 表格：Markdown 表格必须渲染成真正的 `<table>`
+## 5. 表格：截图交给多模态模型逐格抄
+
+**用户原话（2026-10-25）**："对于表格的话个别单元他这个都抽错的话你也给我
+直接上这个多模态读图吧……我要的是这个阅读的……至少顺序要是很正常的"。
+
+### 5.1 为什么表格不能交给文本模型
+
+表格在 PDF 文本层是碎的：
+
+```
+d (pC/N) (cid:4)90 (cid:4)175 (cid:4)109 B700 16.5
+```
+
+连负号都认不出（`(cid:4)` 就是 `−`）。文本模型只能靠上下文猜对齐，
+结果是**整行数值错位**：实测 JACERS Table I，d31 行的 `16.5` 跑到了 d33 行、
+`7200` 变成 `B700`。
+
+### 5.2 现在的链路
+
+| 环节 | 位置 | 说明 |
+|---|---|---|
+| 识别 | `paper_text._find_table_regions()` | **用表题定位**（"Table N." / "表 N"），往下收连续的表状带 |
+| 记坐标 | `paper_text._table_marker()` | 输出 `⟦TABLE:x0,y0,x1,y1⟧`（PDF 页坐标，pt） |
+| 裁图 | `app.py` `_pdf_clip_png()` | PyMuPDF 裁 PNG，`scale=4`（≈288 DPI） |
+| 抄表 | `app.py` `_read_table_vision()` | 多模态模型逐格抄 → Markdown |
+| 拼接 | `app.py` `_prepare_tables()` | 标记换成中性的 `⟦TABLE_n⟧`，翻译后按位置拼回 |
+| 渲染 | `index.html` `formatMarkdownLite()` | Markdown 表格 → `<table class="md-table">` |
+
+### 5.3 判据的坑
+
+- **不能用"有很多数字"判表格**：公式行也全是数字（`a ¼ 33 31 (2)`），
+  按数字判会把公式当表格（实测 eq (2)/(3) 被误判成两张表）。
+  → 用**表题**定位。
+- **页尾截尾会切坏标记**：标记里有小数点，而截尾是按"最后一个句末标点"切的
+  → `⟦TABLE:28.2,639.4,536.3,754.1⟧` 被切成 `…754.`，半截匹配不上，
+  那张表就整张丢了。
+  → `_trim_page_tail()` 的切点必须避开标记内部，标记自己的 `⟧` 才是合法切点。
+- 主模型偶尔会把 `⟦TABLE_n⟧` 标记弄丢 → 服务端兜底：漏掉的表格追加到译文末尾。
+
+### 5.4 实测效果
+
+JACERS 综述第 2 页 Table I：文本层抽出来是 `B700 16.5`、
+`d (pC/N) (cid:4)90 (cid:4)175 (cid:4)109`；多模态抄出来是
+`−90 | −175 | −109 | | ∼700 | 16.5` —— **和论文里印的一模一样**，
+连论文自己把 2605 排进表头的排版毛病都照抄了。
+
+---
+
+## 6. 表格渲染：Markdown 表格必须渲染成真正的 `<table>`
 
 **用户原话（2026-10-24）**："表格的翻译，他都是很乱非常之乱……
 他这个原有的表格形式完全看不出来，而且占的篇幅非常大"。
@@ -200,7 +248,7 @@ python -m pytest tests/test_reader_formula_table.py -v
 
 ---
 
-## 6. 翻译快照必须带「抽取算法版本号」
+## 7. 翻译快照必须带「抽取算法版本号」
 
 **踩坑（2026-10-24）**：10-23 14:17 存的快照被 10-23 16:36 的栏序修复甩在
 后面 → 读者照旧恢复旧快照 → 用户看到的还是"先翻译右边那栏"，
@@ -214,7 +262,7 @@ python -m pytest tests/test_reader_formula_table.py -v
 
 ---
 
-## 7. 答疑面板最小化 = 收成侧边栏
+## 8. 答疑面板最小化 = 收成侧边栏
 
 **用户原话**："划线解答有点问题，最好点最小化能够缩小至侧边栏"。
 
@@ -224,7 +272,7 @@ python -m pytest tests/test_reader_formula_table.py -v
 
 ---
 
-## 8. 改完必跑
+## 9. 改完必跑
 
 ```bash
 python -m pytest tests -q
@@ -234,5 +282,6 @@ node microbench/_test_reader_markdown.js
 - `tests/test_column_order.py` —— 页内顺序契约
 - `tests/test_qa_fixes.py` —— 空正文检测 / 多模态 / 侧边栏契约
 - `tests/test_reader_formula_table.py` —— 公式坐标 / 表格渲染 / 快照版本化
+- `tests/test_reader_table_vision.py` —— 表格多模态读图契约
 
 仓库有 pre-commit 钩子，提交时会自动跑离线测试套件。

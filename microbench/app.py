@@ -12,6 +12,7 @@ V1.1 hardening:
 import os
 import json
 import re
+import sys
 import hmac
 import hashlib
 import ipaddress
@@ -728,6 +729,15 @@ class ExplainSelectionRequest(BaseModel):
                                                           "校验图片来源 (只允许 vault 内的 PDF)。")
 
 
+class ReadTableRequest(BaseModel):
+    """把 PDF 里的一个表格区域读成 Markdown（多模态抄表）。"""
+    relative_path: str = Field(..., min_length=3, max_length=500)
+    page: int = Field(..., ge=1, le=2000)
+    rect: str = Field(..., min_length=5, max_length=120,
+                      description="表格区域 x0,y0,x1,y1（PDF 点，左上角原点）")
+    model: str = Field(default="", max_length=64)
+
+
 class TranslatePageRequest(BaseModel):
     """Translate one page of a paper (used by PDF dual-column reader).
     `paper_id` is a stable identifier (e.g. arXiv ID or DOI) — used to
@@ -1259,6 +1269,159 @@ async def api_serve_pdf(
         media_type="application/pdf",
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+def _pdf_clip_png(pdf_path, page: int, rect: tuple, scale: float = 4.0) -> bytes:
+    """把 PDF 某一页的一块区域裁成 PNG 字节（PyMuPDF）。
+
+    公式原图、表格截图都走这里。rect = (x0, y0, x1, y1)（PDF 点）。
+    """
+    import fitz  # PyMuPDF
+    with fitz.open(str(pdf_path)) as doc:
+        if page < 1 or page > doc.page_count:
+            raise ValueError(f"页码越界: {page} (共 {doc.page_count} 页)")
+        pg = doc.load_page(page - 1)
+        pr = pg.rect
+        cx0 = max(pr.x0, min(rect[0], pr.x1))
+        cy0 = max(pr.y0, min(rect[1], pr.y1))
+        cx1 = min(pr.x1, max(rect[2], pr.x0))
+        cy1 = min(pr.y1, max(rect[3], pr.y0))
+        if cx1 - cx0 <= 0 or cy1 - cy0 <= 0:
+            raise ValueError("裁剪区域无效")
+        if (cx1 - cx0) > pr.width or (cy1 - cy0) > pr.height:
+            raise ValueError("裁剪区域超出页面")
+        pix = pg.get_pixmap(clip=fitz.Rect(cx0, cy0, cx1, cy1),
+                            matrix=fitz.Matrix(scale, scale), alpha=False)
+        return pix.tobytes("png")
+
+
+# ---------------------------------------------------------------------------
+# 表格：截图交给多模态模型抄
+# ---------------------------------------------------------------------------
+# 表格在 PDF 文本层是碎的："d (pC/N) (cid:4)90 (cid:4)175 (cid:4)109 B700 16.5"
+# —— 连负号都认不出，文本模型只能靠上下文猜对齐，结果是**整行数值错位**
+# （实测 JACERS Table I：d31 行的 16.5 跑到了 d33 行，7200 变成 B700）。
+#
+# 用户要求（2026-10-25）："个别单元都抽错的话你也给我直接上这个多模态读图吧。
+# 我要的是阅读的……至少顺序要是很正常的"。
+# → 表格整块裁成图，交给多模态模型逐格抄：图上什么样，表格就什么样。
+
+TABLE_VISION_PROMPT = """你是一个学术论文表格的抄录员。下面这张截图是一篇论文里的一个表格（可能带表题和表注）。
+
+请把它**逐格**抄下来，只输出抄录结果本身（不要解释、不要用代码块围栏）：
+
+1. 如果截图上方有表题（"Table I. ..."），先单独用一行输出它的中文翻译
+2. 然后输出 Markdown 表格：第一行是表头，第二行是 |---|---| 分隔行
+3. **行列顺序、每一个数值都必须和截图完全一致** —— 不要推算、不要补全、
+   不要"修正"你认为不对的数字、不要按常识改单位
+4. 单元格里的上下标写成 LaTeX：d$_{31}$、ε$_{33}$、T$_{c}$、ρ$_{v}$；
+   单位（pC/N、g/cm$^{3}$、°C、ppm、Ω·m）保持原样
+5. 表头和第一列（参数名）译成中文，其余内容保持原样
+6. 截图下方如果有表注，另起一段译成中文
+7. 看不清的单元格写 [?]，**不要猜**"""
+
+
+def _clean_table_markdown(raw: str) -> str:
+    """清掉模型可能加的代码块围栏和多余说明。"""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+async def _read_table_vision(pdf_path, page: int, rect: tuple,
+                             model: str = "") -> str:
+    """裁图 → 多模态模型抄表 → 返回 Markdown。失败抛异常（由调用方兜底）。"""
+    import base64
+    png = await asyncio.to_thread(_pdf_clip_png, pdf_path, page, rect, 4.0)
+    b64 = base64.b64encode(png).decode("ascii")
+    content = [
+        {"type": "text", "text": TABLE_VISION_PROMPT},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/png;base64,{b64}"}},
+    ]
+    raw = await asyncio.to_thread(
+        llm.chat,
+        messages=[
+            {"role": "system", "content": "你是表格抄录助手，只输出抄录结果。"},
+            {"role": "user", "content": content},
+        ],
+        max_tokens=4000,
+        temperature=0.0,
+        timeout=180,
+        disable_thinking=llm.translation_disable_thinking(),
+        model_name=llm.translation_model_name() or None,
+    )
+    return _clean_table_markdown(raw)
+
+
+@app.post("/api/paper/read_table")
+async def api_read_table(req: ReadTableRequest):
+    """把 PDF 里的一个表格区域读成 Markdown（多模态抄表）。"""
+    try:
+        pdf_path = _safe_path(BASE_DIR, req.relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {e}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
+    try:
+        rect = tuple(float(x) for x in req.rect.split(","))
+        if len(rect) != 4:
+            raise ValueError("rect 应为 x0,y0,x1,y1")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"rect 无效: {e}")
+    try:
+        table = await _read_table_vision(pdf_path, req.page, rect, req.model)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"表格读取失败: {e}")
+    return {"table": table}
+
+
+async def _prepare_tables(page_text: str, pdf_path, page: int) -> tuple[str, dict]:
+    """把页面文本里的 ⟦TABLE:...⟧ 标记换成中性的 ⟦TABLE_n⟧，
+    并把多模态抄出来的表格存起来（翻译完再按位置拼回去）。
+
+    为什么走多模态：表格在 PDF 文本层是碎的（"d (pC/N) (cid:4)90 ..."），
+    文本模型只能猜对齐 → 整行数值错位。截图给模型看，顺序和数值都对。
+    """
+    from .paper_text import TABLE_MARKER_RE
+    tables: dict[str, str] = {}
+    matches = list(TABLE_MARKER_RE.finditer(page_text))
+    if not matches:
+        return page_text, tables
+
+    for idx, m in enumerate(matches):
+        rect = tuple(float(m.group(i)) for i in range(1, 5))
+        token = f"⟦TABLE_{idx}⟧"
+        try:
+            md = await _read_table_vision(pdf_path, page, rect)
+            if not md.strip():
+                raise RuntimeError("模型返回空内容")
+            tables[token] = md
+            print(f"[MicroBench] 第 {page} 页表格已用多模态抄出 "
+                  f"({len(md)} 字符, rect={['%.0f' % v for v in rect]})",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"[MicroBench] 第 {page} 页表格读取失败 ({rect}): {e}",
+                  file=sys.stderr)
+            tables[token] = "【表格未能读出，请对照左侧 PDF 原文】"
+
+    counter = {"i": 0}
+
+    def _repl(_m) -> str:
+        token = f"⟦TABLE_{counter['i']}⟧"
+        counter["i"] += 1
+        return token
+
+    out = TABLE_MARKER_RE.sub(_repl, page_text)
+    return out, tables
 
 
 @app.get("/api/paper/formula_image")
@@ -2158,6 +2321,10 @@ TRANSLATION_SYSTEM_PROMPT = """你是学术论文翻译助手, 帮助硕博生�
     不要把表格摊成一行行的普通文字, 也不要自己加 "参数/单位" 之类的列。
 15. 表格里的量纲、单位、上下标保持原样 (如 "d31 (pC/N)"、"Tc (°C)"),
     不要翻译成中文单位, 也不要改写数值
+16. 原文里出现的 "⟦TABLE_0⟧"、"⟦TABLE_1⟧" 这类标记, 表示那里有一张表格
+    (系统已经用截图把表格逐格读好了, 翻译时会原样放回去)。
+    **请原样输出这个标记**, 不要改写、不要展开、不要自己编一张表、
+    也不要解释它是什么 —— 它的位置就是表格在原文里的位置。
 """
 
 
@@ -2900,6 +3067,7 @@ async def api_translate_page(req: TranslatePageRequest):
     # 的 PDF 上会丢掉单词空格（"compositestructureshavebeen"），而 pdfplumber
     # 用更小的 x_tolerance 能正确切词，并且能按左栏/右栏顺序输出。
     page_text = req.text
+    pdf_path = None
     if req.relative_path:
         try:
             from .generator import BASE_DIR, _safe_path
@@ -2909,7 +3077,14 @@ async def api_translate_page(req: TranslatePageRequest):
             if extracted and len(extracted.strip()) >= 100:
                 page_text = extracted
         except Exception:
+            pdf_path = None
             pass  # 取不到就用客户端传来的文本
+
+    # 表格：文本层抽出来的表格是碎的（数值会整行错位），改成裁图让多模态
+    # 模型逐格抄。抄好的表格在翻译完成后按位置拼回去。
+    table_map: dict[str, str] = {}
+    if pdf_path is not None and "⟦TABLE:" in page_text:
+        page_text, table_map = await _prepare_tables(page_text, pdf_path, req.page)
 
     # Cache key includes paper_id + page so each page is cached independently.
     # 缓存键里还带文本哈希（见 translation.TranslationCache._key_for），
@@ -2991,6 +3166,14 @@ async def api_translate_page(req: TranslatePageRequest):
 
     # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
     translation = sanitize_translation(merge_translation_parts(translated_parts))
+    # 把多模态抄好的表格拼回译文（位置由 ⟦TABLE_n⟧ 标记决定）
+    if table_map:
+        for token, md in table_map.items():
+            if token in translation:
+                translation = translation.replace(token, md)
+            elif md and "未能读出" not in md:
+                # 模型偶尔会把标记弄丢 → 兜底：漏掉的表格追加到译文末尾，绝不丢内容
+                translation = f"{translation}\n\n{md}" if translation else md
     if not translation:
         raise HTTPException(
             status_code=502,
