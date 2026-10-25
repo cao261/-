@@ -212,6 +212,26 @@ def main() -> int:
     check("parseSse" in app_js, "SSE 解析抽成了共用函数 (原生代理也用)")
     check("httpPost" in app_js, "AI 请求在 APK 里走原生代理")
 
+    print("\n[16] 译文 / 批注：必须能读到「同步根」")
+    # 同步根是 vault 根的**兄弟目录**（我的坚果云/MicroBench同步），
+    # 不在 vault 里面 —— 桌面端把译文快照和批注放在那儿。
+    # 没有它，平板就只剩「能看 PDF」，跟用微信直接打开没区别。
+    prefs_java = read(JAVA / "Prefs.java")
+    handler_java = read(JAVA / "DavPathHandler.java")
+    check("davSyncRoot" in prefs_java, "Prefs 存了同步根的位置")
+    check("syncClient" in prefs_java, "Prefs 能造一个同步根的客户端")
+    check("/dav/sync/list/" in handler_java,
+          "DavPathHandler 有同步根的列目录路由")
+    check("/dav/sync/file/" in handler_java,
+          "DavPathHandler 有同步根的读文件路由")
+    check("detectSyncRoot" in dav, "能自动探测同步根（vault 根的兄弟目录）")
+    check("putSync" in bridge, "有写同步根的桥（手写标注要存到共享目录）")
+    check("syncUrl" in app_js, "页面侧用 syncUrl 访问同步根")
+    check("loadTranslation" in app_js, "页面侧会拉译文快照")
+    check("renderTranslationInto" in app_js, "译文会渲染到 PDF 页卡里")
+    check("saveInk" in app_js, "手写笔迹能存回共享目录")
+    check("pdfFitScale" in app_js, "PDF 按容器宽度缩放（别再只显示一半）")
+
     print(f"\n{'=' * 60}")
     print(f"PASS {len(PASS)}  FAIL {len(FAIL)}")
     for f in FAIL:

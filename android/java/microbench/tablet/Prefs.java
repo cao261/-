@@ -12,6 +12,7 @@ public class Prefs {
     private static final String K_DAV_PASS = "dav_pass";
     private static final String K_DAV_ROOT = "dav_root";
     private static final String K_DAV_VAULT = "dav_vault_root";
+    private static final String K_DAV_SYNC = "dav_sync_root";
 
     private final SharedPreferences sp;
 
@@ -44,6 +45,33 @@ public class Prefs {
 
     public void setDavVaultRoot(String p) {
         sp.edit().putString(K_DAV_VAULT, p == null ? "" : p.trim()).apply();
+    }
+
+    /**
+     * 同步根在 WebDAV 里的位置（相对 dav 根），例如「我的坚果云/MicroBench同步」。
+     *
+     * ⚠ 它是 vault 根的**兄弟目录**，不在 vault 里面 ——
+     *   桌面端的译文快照和批注都存在这里（跟 PC 端共享的同一份数据）。
+     *   平板要拿到译文，就必须能读到这个目录。
+     */
+    public String davSyncRoot() {
+        return sp.getString(K_DAV_SYNC, "");
+    }
+
+    public void setDavSyncRoot(String p) {
+        sp.edit().putString(K_DAV_SYNC, p == null ? "" : p.trim()).apply();
+    }
+
+    /** 同步根的客户端（读译文快照 / 批注）。没配或没配账号时返回 null。 */
+    public DavClient syncClient() {
+        if (!davConfigured()) {
+            return null;
+        }
+        String sync = davSyncRoot();
+        if (sync == null || sync.isEmpty()) {
+            return null;
+        }
+        return new DavClient(davUser(), davPass(), davRoot(), sync);
     }
 
     public boolean davConfigured() {

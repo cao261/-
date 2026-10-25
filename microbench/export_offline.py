@@ -962,6 +962,42 @@ def detect_cloud_dir() -> Path | None:
     return None
 
 
+def collect_translations() -> dict:
+    """导出平板工作台时，把**译文快照**一起烤进去。
+
+    平板上能看译文，是它跟「用微信直接打开一个 PDF」的根本区别 ——
+    没译文就只是个 PDF 阅读器。电脑端翻好的译文存在
+    `logs/_pdf_snapshots/`（也在坚果云的同步根里），这里按
+    **同步目录里的文件名**（safe paper key）索引：
+
+        { "2008-JACERS-综述-..._pgghcp": {"1": "第 1 页的译文", ...} }
+
+    平板用 paper_id 算出同样的 key 就能对上（见 app.js 的 paperIdFor /
+    safePaperKey —— 必须与 app.py:_paper_id_for 逐字一致）。
+    """
+    out: dict = {}
+    snap_dir = REPO / "logs" / "_pdf_snapshots"
+    if not snap_dir.is_dir():
+        return out
+    for fp in sorted(snap_dir.glob("*.json")):
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        pages: dict = {}
+        for p in data.get("pages") or []:
+            try:
+                pn = int(p.get("page_num"))
+            except (TypeError, ValueError):
+                continue
+            t = p.get("translation") or ""
+            if t:
+                pages[str(pn)] = t
+        if pages:
+            out[fp.stem] = pages
+    return out
+
+
 def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = None) -> str:
     """把平板工作台打包成一个自包含的 HTML 文件。
 
@@ -1007,7 +1043,9 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
             "pdfs": getattr(n, "_pdfs", []),
         })
     pdfs = getattr(notes[0], "_pdfs_all", {}) if notes else {}
-    data_json = json.dumps({"notes": payload, "pdfs": pdfs}, ensure_ascii=False)
+    data_json = json.dumps({"notes": payload, "pdfs": pdfs,
+                            "trans": collect_translations()},
+                           ensure_ascii=False)
     data_json = data_json.replace("</", "<\\/")
 
     out = index

@@ -4253,6 +4253,9 @@ class AnnotationItem(BaseModel):
     rects: list = Field(default_factory=list, max_length=200,
                         description="原文侧高亮矩形（归一化 0~1：x/y/w/h），"
                                     "只在 PDF 原文划选时才有")
+    strokes: list = Field(default_factory=list, max_length=200,
+                          description="手写笔迹（归一化坐标的点序列 [[x,y,x,y,...],...]），"
+                                      "平板上手写标注用；与 rects 互斥")
     created_at: str = Field(default="", max_length=40)
     updated_at: str = Field(default="", max_length=40)
 

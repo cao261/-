@@ -280,6 +280,80 @@ function check(cond, label) {
   check(html.indexOf('id="pdf-textlayer"') < 0,
     "index.html 里没有静态的 #pdf-textlayer 占位");
 
+  console.log("\n[5] PDF 阅读器：竖排 + 适合宽度（别再横排只显示一半）");
+  const css = fs.readFileSync(path.join(__dirname, "static", "tablet", "styles.css"), "utf8");
+  // ⚠ 剥掉注释再查 —— 注释里会写「原来是 display:flex」这种说明，
+  //   正则会把它当成真代码。
+  const cssCode = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const bodyCss = (cssCode.split(".tb-pdf-body {")[1] || "").split("}")[0];
+  check(bodyCss.indexOf(".tb-pdf-body") < 0, "找到了 .tb-pdf-body 的规则");
+  check(!/display\s*:\s*flex/.test(bodyCss),
+    ".tb-pdf-body 不是 flex 横排了（横排在窄屏上只看得到一两页）");
+  check(!/justify-content\s*:\s*center/.test(bodyCss),
+    ".tb-pdf-body 没有 flex 居中（居中溢出让左半边永远滚不到）");
+  check(src.indexOf("pdfFitScale") >= 0, "有按容器宽度算的适合比例");
+  check(src.indexOf("pdfState.zoom") >= 0, "缩放走独立的倍数，不改死 scale");
+  check(src.indexOf("ratio * br.height") >= 0, "缩放后保留滚动锚点（不会被弹回第一页）");
+
+  console.log("\n[6] 译文：paper_id 必须和电脑端的快照文件名对得上");
+  const SNAP = path.join(__dirname, "..", "logs", "_pdf_snapshots");
+  if (!fs.existsSync(SNAP)) {
+    console.log("  SKIP  没有 logs/_pdf_snapshots（这台机器还没翻过论文）");
+  } else {
+    const stems = fs.readdirSync(SNAP).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5));
+    check(stems.length > 0, "找到了电脑端的译文快照");
+    stems.forEach((stem) => {
+      const data = JSON.parse(fs.readFileSync(path.join(SNAP, stem + ".json"), "utf8"));
+      const rel = data.relative_path;
+      const key = T.safePaperKey(T.paperIdFor(rel));
+      check(key === stem,
+        "平板算出的 key = 电脑端的文件名: " + key + (key === stem ? "" : " vs " + stem));
+    });
+  }
+  check(src.indexOf('syncUrl("file", "snapshots/"') >= 0,
+    "从同步根读译文快照");
+  check(src.indexOf("state.transSeed") >= 0,
+    "导出版里烤进来的译文也认（没连云盘时也有）");
+  check(src.indexOf("renderTranslationInto") >= 0, "译文会渲染到页卡里");
+
+  console.log("\n[7] 手写：笔迹要能存到共享目录");
+  check(src.indexOf("putSync") >= 0, "写同步根的原生桥");
+  check(src.indexOf("inkStrokes") >= 0, "笔迹按页存放");
+  check(src.indexOf('strokes: strokes') >= 0, "笔迹存进批注条目（跟电脑端共享同一份）");
+
+  console.log("\n[8] 译文里的公式要能渲染（这是论文阅读器的基本要求）");
+  const SNAP2 = path.join(__dirname, "..", "logs", "_pdf_snapshots");
+  if (!fs.existsSync(SNAP2)) {
+    console.log("  SKIP  没有译文快照");
+  } else {
+    const files = fs.readdirSync(SNAP2).filter((f) => f.endsWith(".json"));
+    let checked = 0, withMath = 0;
+    files.forEach((f) => {
+      const data = JSON.parse(fs.readFileSync(path.join(SNAP2, f), "utf8"));
+      (data.pages || []).forEach((p) => {
+        const t = p.translation || "";
+        if (!t) return;
+        checked++;
+        if (!/\$[^$\n]+\$/.test(t)) return;
+        withMath++;
+        const html = T.renderMarkdown(t);
+        if (html.indexOf("katex") < 0) {
+          check(false, "译文里的公式没渲染成 KaTeX（第 " + p.page_num + " 页）");
+          return;
+        }
+        // 渲染后不该还剩裸的 $…$
+        check(!/\$[^$\n]+\$/.test(html.replace(/<[^>]*>/g, "")),
+          "译文第 " + p.page_num + " 页的公式渲染后没有残留 $");
+      });
+    });
+    check(checked > 0, "检查了 " + checked + " 页译文");
+    if (withMath === 0) {
+      console.log("  （这批译文里没有公式，跳过公式检查）");
+    } else {
+      check(true, "含公式的译文都渲染成了 KaTeX");
+    }
+  }
+
   console.log("\n" + "=".repeat(60));
   console.log("PASS " + pass + "  FAIL " + fail);
   process.exit(fail === 0 ? 0 : 1);

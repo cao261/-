@@ -741,6 +741,44 @@ public class DavClient {
     }
 
     /**
+     * 自动找到**同步根**在 WebDAV 里的位置。
+     *
+     * 同步根是 vault 根的**兄弟目录**：
+     *   vault 根  「我的坚果云/MicroBench工作台」   —— 笔记与原文 PDF
+     *   同步根    「我的坚果云/MicroBench同步」     —— 译文快照 + 批注（两台设备共享）
+     *
+     * ⚠ 没有同步根，平板就只剩「能看 PDF」——
+     *   跟用微信直接打开一个 PDF 没区别。译文才是它跟电脑端对等的地方。
+     *
+     * 判据：兄弟目录存在，且里面能看到 snapshots/ 或 annotations/。
+     */
+    public String detectSyncRoot(String vaultRoot) {
+        String vr = normalizeVaultRoot(vaultRoot);
+        if (vr.isEmpty()) {
+            return "";
+        }
+        int i = vr.lastIndexOf('/');
+        if (i <= 0) {
+            return "";
+        }
+        String parent = vr.substring(0, i);
+        String candidate = parent + "/MicroBench同步";
+        try {
+            DavClient probe = new DavClient(user, pass, root, candidate);
+            List<DavEntry> entries = probe.list("");
+            for (DavEntry e : entries) {
+                if (e.isDir && ("snapshots".equals(e.name) || "annotations".equals(e.name))) {
+                    return candidate;
+                }
+            }
+            // 目录在但还是空的 —— 也认（先存着，等 PC 那边产生内容）
+            return entries.isEmpty() ? candidate : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
      * 自动找到 vault 在云盘里的位置。
      *
      * 判据: 哪个目录下面有 `01_Literature` / `00_Dashboard`，

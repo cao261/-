@@ -87,6 +87,21 @@ public class DavBridge {
     }
 
     /**
+     * 写到**同步根**（译文快照 / 批注所在），不是 vault。
+     *
+     * ⚠ 平板上手写标注要存到共享目录，跟电脑端看到的是同一份 ——
+     *   否则平板画的笔记电脑看不到，等于白画。
+     */
+    @JavascriptInterface
+    public void putSync(String path, String text, String callbackId) {
+        if (path == null || path.trim().isEmpty()) {
+            post(callbackId, false, "{\"ok\":false,\"error\":\"路径为空\"}");
+            return;
+        }
+        POOL.execute(new SyncPutTask(this, path, text == null ? "" : text, callbackId));
+    }
+
+    /**
      * 代理一次 HTTP POST（给 AI 接口用）。
      *
      * 只有 https 放行 —— 明文 HTTP 会把 API Key 裸奔出去。
@@ -179,6 +194,41 @@ public class DavBridge {
                 String msg = e.getMessage() == null ? e.toString() : e.getMessage();
                 result = "{\"ok\":false,\"error\":" + jsonEscape(msg) + "}";
                 ok = false;
+            }
+            bridge.post(callbackId, ok, result);
+        }
+    }
+
+    /** 写到同步根（译文快照 / 批注所在）。 */
+    private static class SyncPutTask implements Runnable {
+        private final DavBridge bridge;
+        private final String path;
+        private final String text;
+        private final String callbackId;
+
+        SyncPutTask(DavBridge bridge, String path, String text, String callbackId) {
+            this.bridge = bridge;
+            this.path = path;
+            this.text = text;
+            this.callbackId = callbackId;
+        }
+
+        @Override
+        public void run() {
+            boolean ok;
+            String result;
+            try {
+                DavClient c = bridge.prefs.syncClient();
+                if (c == null) {
+                    throw new IOException("还没配置同步目录（点设置里的「配置坚果云」重测一次）");
+                }
+                c.put(path, text.getBytes(StandardCharsets.UTF_8));
+                ok = true;
+                result = "{\"ok\":true}";
+            } catch (Exception e) {
+                String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+                ok = false;
+                result = "{\"ok\":false,\"error\":" + jsonEscape(msg) + "}";
             }
             bridge.post(callbackId, ok, result);
         }

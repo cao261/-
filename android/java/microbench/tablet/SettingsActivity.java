@@ -134,9 +134,12 @@ public class SettingsActivity extends Activity {
 
     /** 测通了就直接存 —— 之前「测试连接」只测不存, 用户以为配好了,
      *  退出去发现还是「未连接」。 */
-    void saveIfOk(String user, String pass, String vaultRoot) {
+    void saveIfOk(String user, String pass, String vaultRoot, String syncRoot) {
         prefs.setDav(user, pass);
         prefs.setDavVaultRoot(vaultRoot);
+        if (syncRoot != null && !syncRoot.isEmpty()) {
+            prefs.setDavSyncRoot(syncRoot);
+        }
     }
 
     TextView statusView() {
@@ -230,6 +233,9 @@ public class SettingsActivity extends Activity {
             boolean ok;
             // 用户手填的 vault 位置优先；没填就自动探测。
             String detected = vault;
+            // 同步根（译文快照 + 批注所在）—— vault 根的兄弟目录。
+            // 声明在 try 外面：try 里探测出来的值后面还要用。
+            String sync = vault;
             try {
                 // 用 prefs 里存的根，而不是写死的 DEFAULT_ROOT ——
                 // 否则自定义根根本没法治。
@@ -247,10 +253,28 @@ public class SettingsActivity extends Activity {
                 }
                 c.setVaultRoot(detected);
 
-                // ② 列目录
+                // ② 列 vault 目录
                 int n = c.list("").size();
 
-                // ③ 下载链路也得验 —— 只验列目录等于没验下载。
+                // ③ 同步根 —— 译文快照和批注都在那儿（vault 根的**兄弟目录**）。
+                //    ⚠ 没有它，平板就只剩「能看 PDF」，跟用微信直接打开一个 PDF
+                //      没有任何区别 —— 译文才是它跟电脑端对等的地方。
+                //    ⚠ 必须用**另一个 client**：同一个 client 切 vaultRoot
+                //      会把上面刚列好的 vault 目录也换掉。
+                if (sync == null || sync.isEmpty()) {
+                    sync = c.detectSyncRoot(detected);
+                }
+                int snaps = 0;
+                if (sync != null && !sync.isEmpty()) {
+                    try {
+                        DavClient sc = new DavClient(user, pass, act.prefs.davRoot(), sync);
+                        snaps = sc.list("snapshots").size();
+                    } catch (Exception e) {
+                        snaps = 0;
+                    }
+                }
+
+                // ④ 下载链路也得验 —— 只验列目录等于没验下载。
                 //    但只取文件头 64 KB 就够: 整篇 PDF 拉下来既慢
                 //    （9 MB 走公网）又占内存, 而验链路只需要证明 GET 通。
                 String probe;
@@ -270,7 +294,12 @@ public class SettingsActivity extends Activity {
 
                 ok = dlOk;
                 msg = "连接正常，vault 位于「" + (detected.isEmpty() ? "(根目录)" : detected)
-                        + "」，笔记 " + n + " 篇" + probe;
+                        + "」，笔记 " + n + " 篇"
+                        + (sync == null || sync.isEmpty()
+                           ? "；⚠ 没找到同步目录（译文/批注没法同步）"
+                           : "，同步目录在「" + sync + "」" + (snaps > 0
+                               ? "（" + snaps + " 篇译文快照）" : "（暂无译文快照）"))
+                        + probe;
             } catch (Exception e) {
                 ok = false;
                 String m = e.getMessage() == null ? e.toString() : e.getMessage();
@@ -279,7 +308,8 @@ public class SettingsActivity extends Activity {
             final String fm = msg;
             final boolean fok = ok;
             final String fvault = detected == null ? "" : detected;
-            act.runOnUiThread(new StatusTask(act, fm, fok, user, pass, fvault));
+            final String fsync = sync == null ? "" : sync;
+            act.runOnUiThread(new StatusTask(act, fm, fok, user, pass, fvault, fsync));
         }
     }
 
@@ -290,15 +320,17 @@ public class SettingsActivity extends Activity {
         private final String user;
         private final String pass;
         private final String vault;
+        private final String sync;
 
         StatusTask(SettingsActivity act, String msg, boolean ok,
-                   String user, String pass, String vault) {
+                   String user, String pass, String vault, String sync) {
             this.act = act;
             this.msg = msg;
             this.ok = ok;
             this.user = user;
             this.pass = pass;
             this.vault = vault;
+            this.sync = sync;
         }
 
         @Override
@@ -317,9 +349,9 @@ public class SettingsActivity extends Activity {
                 s.setTextColor(Color.parseColor(ok ? "#4F6046" : "#A8482C"));
             }
             if (ok) {
-                // 测通了就把凭证和 vault 位置都存下来, 并直接关掉设置页 ——
+                // 测通了就把凭证、vault 位置、同步根都存下来, 并直接关掉设置页 ——
                 // 用户不需要再点一次「保存」。
-                act.saveIfOk(user, pass, vault);
+                act.saveIfOk(user, pass, vault, sync);
                 Toast.makeText(act, "连接正常, 已保存", Toast.LENGTH_SHORT).show();
                 act.setResult(RESULT_OK);
                 act.finish();

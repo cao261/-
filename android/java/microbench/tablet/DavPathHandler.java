@@ -13,8 +13,16 @@ import java.util.Map;
  * 把网页里的 /dav/* 请求翻译成坚果云 WebDAV 请求。
  *
  * 约定（PathHandler 拿不到 query string，所以用路径前缀区分）：
- *   GET /dav/list/<dir>   ->  列目录，返回 JSON 数组
- *   GET /dav/file/<path>  ->  下载文件，原样返回字节
+ *   GET /dav/list/<dir>      ->  列 vault 目录，返回 JSON 数组
+ *   GET /dav/file/<path>     ->  读 vault 里的文件，原样返回字节
+ *   GET /dav/sync/list/<dir> ->  列**同步根**（译文快照 / 批注所在的目录）
+ *   GET /dav/sync/file/<path>->  读同步根里的文件
+ *
+ * ⚠ 同步根不是 vault 的一部分 —— 它是 vault 根的**兄弟目录**
+ *   （「我的坚果云/MicroBench同步」 vs 「我的坚果云/MicroBench工作台」）。
+ *   桌面端把译文快照和批注放在那里，两台设备共享同一份。
+ *   平板想拿到译文（这是它跟「直接用微信打开 PDF」的根本区别），
+ *   就必须能读到这个目录。
  *
  * 写操作走 JS 桥（{@link DavBridge}），因为这里只能处理 GET。
  *
@@ -31,11 +39,17 @@ public class DavPathHandler {
 
     public WebResourceResponse handle(String path) {
         try {
+            if (path.startsWith("/dav/sync/list/")) {
+                return listResponse(decode(path.substring("/dav/sync/list/".length())), true);
+            }
+            if (path.startsWith("/dav/sync/file/")) {
+                return fileResponse(decode(path.substring("/dav/sync/file/".length())), true);
+            }
             if (path.startsWith("/dav/list/")) {
-                return listResponse(decode(path.substring("/dav/list/".length())));
+                return listResponse(decode(path.substring("/dav/list/".length())), false);
             }
             if (path.startsWith("/dav/file/")) {
-                return fileResponse(decode(path.substring("/dav/file/".length())));
+                return fileResponse(decode(path.substring("/dav/file/".length())), false);
             }
             return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
                     new HashMap<String, String>(),
@@ -56,10 +70,12 @@ public class DavPathHandler {
         return s == null ? "" : s;
     }
 
-    private WebResourceResponse listResponse(String dir) throws Exception {
-        DavClient c = prefs.client();
+    private WebResourceResponse listResponse(String dir, boolean syncRoot) throws Exception {
+        DavClient c = syncRoot ? prefs.syncClient() : prefs.client();
         if (c == null) {
-            return json(503, "[{\"error\":\"坚果云账号还没配置\"}]");
+            return json(503, "[{\"error\":\"" + (syncRoot
+                    ? "还没配置同步目录（译文快照所在）"
+                    : "坚果云账号还没配置") + "\"}]");
         }
         List<DavClient.DavEntry> entries = c.list(dir);
         StringBuilder sb = new StringBuilder("[");
@@ -73,12 +89,14 @@ public class DavPathHandler {
         return json(200, sb.toString());
     }
 
-    private WebResourceResponse fileResponse(String path) throws Exception {
-        DavClient c = prefs.client();
+    private WebResourceResponse fileResponse(String path, boolean syncRoot) throws Exception {
+        DavClient c = syncRoot ? prefs.syncClient() : prefs.client();
         if (c == null) {
             return new WebResourceResponse("text/plain", "UTF-8", 503, "Not Configured",
                     new HashMap<String, String>(),
-                    new ByteArrayInputStream("坚果云账号还没配置".getBytes(StandardCharsets.UTF_8)));
+                    new ByteArrayInputStream(
+                            (syncRoot ? "还没配置同步目录" : "坚果云账号还没配置")
+                                    .getBytes(StandardCharsets.UTF_8)));
         }
         byte[] data = c.get(path);
         if (data == null) {

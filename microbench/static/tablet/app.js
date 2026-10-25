@@ -525,6 +525,9 @@
     dirtyCount: 0,
     pendingSelection: "",  // 从 PDF 里划词带过来的原文
     aiHistory: new Map(),   // noteId -> [{role, content}] 多轮对话上下文
+    trans: new Map(),       // paperId -> {pageNum: 译文}（与电脑端共享）
+    annos: new Map(),       // paperId -> [批注]
+    transSeed: {},          // 导出版里烤进来的译文 {safeKey: {pageNum: 译文}}
   };
 
   const FOLDERS = [
@@ -543,6 +546,8 @@
     } catch (e) { /* ignore */ }
 
     if (raw && raw.pdfs) state.pdfs = raw.pdfs;
+    // 导出版里烤进来的译文（还没连云盘时也能看）
+    if (raw && raw.trans) state.transSeed = raw.trans;
 
     const existing = await DB.allNotes();
     const have = new Map(existing.map((n) => [n.id, n]));
@@ -1805,7 +1810,97 @@
     currentPage: 1,
     rendered: new Set(),   // 已经画过的页码
     pending: false,
+    zoom: 1,               // 用户缩放倍数（1 = 适合宽度）
+    showTrans: true,        // 显示译文栏
+    trans: null,           // {pageNum: 译文}
+    annos: [],             // 批注
   };
+
+  // ------------------------------------------------------------------
+  // 译文快照 / 批注：来自「同步根」
+  //
+  //   同步根在 WebDAV 里是 vault 根的**兄弟目录**：
+  //     「我的坚果云/MicroBench同步」   ← 译文快照 + 批注（两台设备共享）
+  //     「我的坚果云/MicroBench工作台」 ← 笔记与原文 PDF
+  //
+  //   ⚠ 没有它，平板就只剩「能看 PDF」—— 跟用微信直接打开一个 PDF
+  //     没有任何区别。译文（和标注）才是它跟电脑端对等的地方。
+  // ------------------------------------------------------------------
+
+  /** 同步根的 URL（Java 侧按 syncRoot 拼，不走 vaultRoot）。 */
+  function syncUrl(kind, path) {
+    const segs = String(path || "").split("/")
+      .filter((s) => s && s !== "." && s !== "..")
+      .map(encodeURIComponent);
+    return "/dav/sync/" + kind + "/" + segs.join("/");
+  }
+
+  /**
+   * 复刻桌面端的 paper_id：文件名(去.pdf, 截70) + "_" + djb2(完整相对路径)。
+   * 必须与 app.py:_paper_id_for 逐字一致，否则找不到对应的快照文件。
+   */
+  function paperIdFor(relPath) {
+    const p = String(relPath || "").replace(/\\/g, "/");
+    const parts = p.split("/");
+    let base = parts[parts.length - 1] || "";
+    if (/\.pdf$/i.test(base)) base = base.slice(0, -4);
+    base = base.slice(0, 70) || "paper";
+    return base + "_" + hash(p);
+  }
+
+  /**
+   * 同步目录里的文件名 = paper_id 去掉非「字母/数字/_/-」的字符。
+   * ⚠ Python 的 str.isalnum() 对中文是 True，所以中文**要保留** ——
+   *   这里用 \p{L}\p{N} 覆盖 Unicode 字母与数字。
+   */
+  function safePaperKey(pid) {
+    return String(pid || "").replace(/[^\p{L}\p{N}_-]/gu, "").slice(0, 128);
+  }
+
+  /** 拉一篇论文的译文快照。返回 {pageNum: 译文}，没有就返回 null。 */
+  async function loadTranslation(pdfId) {
+    const key = safePaperKey(paperIdFor(pdfId));
+    if (!key) return null;
+    // ① 本地缓存 —— 没网也能看译文
+    const cached = await DB.getMeta("trans_" + key, null);
+    if (cached && Object.keys(cached).length) return cached;
+    // ② 云盘同步根（最新 —— 电脑端翻完同步过来，平板立刻能看）
+    try {
+      const r = await fetch(syncUrl("file", "snapshots/" + key + ".json"));
+      if (r.ok) {
+        const data = await r.json();
+        const pages = {};
+        (data.pages || []).forEach((p) => {
+          if (p && p.translation) pages[p.page_num] = p.translation;
+        });
+        if (Object.keys(pages).length) {
+          await DB.setMeta("trans_" + key, pages);
+          return pages;
+        }
+      }
+    } catch (e) {
+      console.warn("拉译文快照失败（离线？）", e);
+    }
+    // ③ 导出版里烤进来的（还没连云盘时也有）
+    const baked = (state.transSeed || {})[key];
+    if (baked && Object.keys(baked).length) return baked;
+    return null;
+  }
+
+  /** 拉一篇论文的批注。 */
+  async function loadAnnotations(pdfId) {
+    const key = safePaperKey(paperIdFor(pdfId));
+    if (!key) return [];
+    try {
+      const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
+      if (!r.ok) return [];
+      const data = await r.json();
+      return Array.isArray(data.annotations) ? data.annotations : [];
+    } catch (e) {
+      console.warn("拉批注失败", e);
+      return [];
+    }
+  }
 
   /** 从已连接的 vault 目录里取一个文件。没连目录就返回 null。 */
   async function getVaultFile(relPath) {
@@ -1839,6 +1934,26 @@
   function pdfStatus(msg) {
     const el = $("pdf-status");
     if (el) el.textContent = msg || "";
+  }
+
+  /**
+   * 让整页刚好塞进可视宽度（再乘用户的缩放倍数）。
+   *
+   * ⚠ 之前固定 scale=1.15 —— 在平板上整页比屏幕宽，
+   *   于是只能看到左半边（用户说的「只显示了一部分」）。
+   */
+  function pdfColumnWidth() {
+    const body = $("pdf-body");
+    const avail = Math.max(240, (body ? body.clientWidth : 320) - 20);
+    // 宽屏是左右双栏（原文 | 译文），每栏只有一半宽
+    return window.innerWidth >= 900 ? Math.max(200, Math.floor(avail / 2)) : avail;
+  }
+
+  function pdfFitScale(page) {
+    const vp = page.getViewport({ scale: 1 });
+    let s = pdfColumnWidth() / vp.width;
+    s = Math.max(0.25, Math.min(s, 3));
+    return s * (pdfState.zoom || 1);
   }
 
   async function openPdf(pdfId) {
@@ -1876,12 +1991,263 @@
       pdfState.id = pdfId;
       pdfState.rendered.clear();
       pdfState.currentPage = 1;
+      pdfState.zoom = 1;
       $("pdf-body").innerHTML = "";
-      pdfStatus("");
+      pdfStatus("正在取译文…");
       await renderPdfPage(1);
       $("pdf-pageinfo").textContent = `1 / ${pdfState.numPages}`;
+      const node = document.querySelector('[data-pdf-page="1"]');
+      if (node) node.scrollIntoView({ block: "start" });
+
+      // 译文和批注：**与电脑端共享的那份**（同步根里）。
+      // 拿到它们，平板才跟电脑端对等 —— 否则就只是个 PDF 阅读器。
+      const [trans, annos] = await Promise.all([
+        loadTranslation(pdfId),
+        loadAnnotations(pdfId),
+      ]);
+      pdfState.trans = trans;
+      pdfState.annos = annos || [];
+      // 手写笔迹跟批注存在一起 —— 先把已有的笔迹装回来
+      inkState.strokes = {};
+      inkState.paperId = pdfId;
+      (annos || []).forEach((a) => {
+        if (!a || !a.strokes || !a.strokes.length) return;
+        a.strokes.forEach((s) => {
+          const pg = (s && s.page != null) ? s.page : 0;
+          const pts = (s && s.pts) ? s.pts : (Array.isArray(s) ? s : null);
+          if (pts && pts.length >= 4) inkStrokes(pg).push(pts);
+        });
+      });
+      if (trans || (annos && annos.length)) {
+        // 译文到了要重画（每页卡里要插入译文栏）
+        await redrawPdf();
+        const n = Object.keys(trans || {}).length;
+        pdfStatus(trans
+          ? `已载入译文 ${n} 页` + (annos && annos.length ? ` · 批注 ${annos.length} 条` : "")
+          : (annos && annos.length ? `已载入批注 ${annos.length} 条` : ""));
+        setTimeout(() => { pdfStatus(""); }, 2600);
+      } else {
+        pdfStatus("没有找到这台论文的译文快照（电脑端翻译后同步过来就有了）");
+      }
     } catch (e) {
       pdfStatus("打开失败：" + e.message);
+    }
+  }
+
+  /** 把某页的译文插进页卡。 */
+  function renderTranslationInto(wrap, n) {
+    if (pdfState.showTrans === false) return;
+    const t = pdfState.trans && pdfState.trans[n];
+    if (!t) return;
+    const box = el("div", "tb-pdf-trans");
+    box.appendChild(el("div", "tb-pdf-trans-head", `第 ${n} 页 · 译文（与电脑端共享）`));
+    const body = el("div", "tb-pdf-trans-body");
+    // renderMarkdown 内部会做白名单消毒
+    body.innerHTML = renderMarkdown(t);
+    box.appendChild(body);
+    wrap.appendChild(box);
+  }
+
+  /** 把某页的批注高亮画在原文上。 */
+  function renderAnnoInto(annoLayer, n) {
+    const list = (pdfState.annos || []).filter(
+      (a) => a && a.page === n && a.rects && a.rects.length);
+    list.forEach((a) => {
+      (a.rects || []).forEach((r) => {
+        if (!r) return;
+        const d = el("div", "tb-pdf-anno");
+        d.style.left = (r.x * 100) + "%";
+        d.style.top = (r.y * 100) + "%";
+        d.style.width = (r.w * 100) + "%";
+        d.style.height = (r.h * 100) + "%";
+        d.setAttribute("data-color", a.color || "yellow");
+        d.title = a.note || a.quote || "";
+        annoLayer.appendChild(d);
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // 手写标注：在 PDF 原文上手写
+  //
+  //   笔迹用**归一化坐标**存（0~1），跟批注放在同一个文件里 ——
+  //   这样换设备、换缩放比例都不会错位，而且能跟电脑端共享同一份。
+  // ------------------------------------------------------------------
+
+  /** {page: [ [x0,y0,x1,y1,...], ... ]} */
+  const inkState = { on: false, paperId: null, strokes: {} };
+
+  function inkStrokes(page) {
+    if (!inkState.strokes[page]) inkState.strokes[page] = [];
+    return inkState.strokes[page];
+  }
+
+  /** 把某一页的笔迹画到画布上。 */
+  function drawInkPage(page, cv, ctx) {
+    if (!cv || !ctx) return;
+    const r = cv.getBoundingClientRect();
+    ctx.clearRect(0, 0, r.width || cv.width, r.height || cv.height);
+    const w = r.width || cv.width;
+    const h = r.height || cv.height;
+    ctx.strokeStyle = "#D8342A";
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    (inkState.strokes[page] || []).forEach((pts) => {
+      if (!pts || pts.length < 4) return;
+      ctx.beginPath();
+      ctx.moveTo(pts[0] * w, pts[1] * h);
+      for (let i = 2; i + 1 < pts.length; i += 2) {
+        ctx.lineTo(pts[i] * w, pts[i + 1] * h);
+      }
+      ctx.stroke();
+    });
+  }
+
+  /**
+   * 给某一页的原文装上手写层。
+   * @param layer  .tb-pdf-ink 容器
+   * @param page   页码
+   */
+  function setupInkLayer(layer, page) {
+    if (!layer) return;
+    const cv = el("canvas");
+    layer.appendChild(cv);
+    const ctx = cv.getContext("2d");
+    let drawing = false;
+    let cur = null;
+
+    function fit() {
+      const r = layer.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      cv.width = Math.max(1, Math.floor((r.width || 1) * dpr));
+      cv.height = Math.max(1, Math.floor((r.height || 1) * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      drawInkPage(page, cv, ctx);
+    }
+
+    function pt(e) {
+      const r = layer.getBoundingClientRect();
+      if (!r.width || !r.height) return null;
+      return [
+        Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+        Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)),
+      ];
+    }
+
+    layer.addEventListener("pointerdown", (e) => {
+      if (!inkState.on) return;
+      e.preventDefault();
+      drawing = true;
+      cur = [];
+      const p = pt(e);
+      if (p) cur = [p[0], p[1]];
+    });
+    layer.addEventListener("pointermove", (e) => {
+      if (!drawing) return;
+      e.preventDefault();
+      const p = pt(e);
+      if (!p) return;
+      cur.push(p[0], p[1]);
+      drawInkPage(page, cv, ctx);
+    });
+    const end = (e) => {
+      if (!drawing) return;
+      drawing = false;
+      if (cur && cur.length >= 4) {
+        inkStrokes(page).push(cur);
+        drawInkPage(page, cv, ctx);
+        scheduleInkSave();
+      }
+      cur = null;
+      if (e && e.preventDefault) e.preventDefault();
+    };
+    layer.addEventListener("pointerup", end);
+    layer.addEventListener("pointercancel", end);
+    layer.addEventListener("pointerleave", end);
+
+    // 画布尺寸要等原文画完才知道
+    fit();
+    if (window.requestAnimationFrame) requestAnimationFrame(fit);
+    pdfState.inkLayers = pdfState.inkLayers || {};
+    pdfState.inkLayers[page] = layer;
+    layer.classList.toggle("is-on", inkState.on);
+  }
+
+  /** 手写开关。 */
+  function inkToggle(on) {
+    inkState.on = on;
+    const layers = pdfState.inkLayers || {};
+    Object.keys(layers).forEach((k) => {
+      const l = layers[k];
+      if (l) l.classList.toggle("is-on", on);
+    });
+    const btn = $("pdf-toggle-ink");
+    if (btn) btn.classList.toggle("is-active", on);
+    if (on) toast("手写已开启：在原文上直接画。画完点「保存标注」同步到坚果云。");
+  }
+
+  let _inkSaveTimer = null;
+  function scheduleInkSave() {
+    if (_inkSaveTimer) clearTimeout(_inkSaveTimer);
+    _inkSaveTimer = setTimeout(() => { saveInk(); }, 1200);
+  }
+
+  /**
+   * 把手写笔迹存到**同步根**的批注文件里（跟电脑端共享同一份）。
+   */
+  async function saveInk() {
+    const pdfId = pdfState.id;
+    if (!pdfId) return;
+    const key = safePaperKey(paperIdFor(pdfId));
+    if (!key) return;
+    const strokes = [];
+    Object.keys(inkState.strokes).forEach((p) => {
+      (inkState.strokes[p] || []).forEach((pts) => {
+        strokes.push({ page: parseInt(p, 10) || 0, pts: pts });
+      });
+    });
+    if (!strokes.length) { toast("还没有笔迹"); return; }
+
+    // 读现有批注 → 合并（去掉旧的同 id 手写条目）→ 写回
+    let data = { paper_id: key, annotations: [] };
+    try {
+      const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
+      if (r.ok) data = await r.json();
+    } catch (e) { /* 离线：下面会提示 */ }
+    const list = Array.isArray(data.annotations) ? data.annotations : [];
+    const id = "ink_" + key;
+    const merged = list.filter((a) => a && a.id !== id);
+    merged.push({
+      id: id,
+      page: 0,
+      source: "ink",
+      quote: "手写标注",
+      note: "",
+      color: "red",
+      rects: [],
+      strokes: strokes,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    const payload = {
+      paper_id: key,
+      updated_at: new Date().toISOString(),
+      schema_version: 2,
+      annotations: merged,
+    };
+    if (!nativeBridge || typeof nativeBridge.putSync !== "function") {
+      toast("浏览器里只能存在本机；装成 APK 才会同步到坚果云", true);
+      return;
+    }
+    try {
+      await nativeCall("putSync", [
+        "annotations/" + key + ".json",
+        JSON.stringify(payload, null, 1),
+      ]);
+      toast("手写标注已存到坚果云（电脑端同步后能看到）");
+    } catch (e) {
+      toast("保存手写失败：" + (e && e.message ? e.message : e), true);
     }
   }
 
@@ -1897,17 +2263,30 @@
     }
     const pdfjsLib = await loadPdfJs();
     const page = await doc.getPage(n);
-    const viewport = page.getViewport({ scale: pdfState.scale });
+    const viewport = page.getViewport({ scale: pdfFitScale(page) });
     const dpr = window.devicePixelRatio || 1;
 
     const wrap = el("div", "tb-pdf-page");
     wrap.setAttribute("data-pdf-page", String(n));
+
+    // ---- 原文侧 ----
+    const orig = el("div", "tb-pdf-orig");
     const canvas = el("canvas");
-    wrap.appendChild(canvas);
+    orig.appendChild(canvas);
     const textLayer = el("div", "textLayer");
     textLayer.style.width = viewport.width + "px";
     textLayer.style.height = viewport.height + "px";
-    wrap.appendChild(textLayer);
+    orig.appendChild(textLayer);
+    // 批注高亮层（盖在原文上）
+    const annoLayer = el("div", "tb-pdf-anno-layer");
+    orig.appendChild(annoLayer);
+    // 手写层
+    const inkLayer = el("div", "tb-pdf-ink");
+    orig.appendChild(inkLayer);
+    wrap.appendChild(orig);
+
+    // ---- 译文侧 ----
+    renderTranslationInto(wrap, n);
 
     canvas.width = Math.floor(viewport.width * dpr);
     canvas.height = Math.floor(viewport.height * dpr);
@@ -1945,8 +2324,10 @@
     } catch (e) {
       console.warn("文本层渲染失败", e);
     }
+    renderAnnoInto(annoLayer, n);
+    // 手写层要等原文画完（尺寸定了）才能装
+    setupInkLayer(inkLayer, n);
     pdfState.rendered.add(n);
-    if (n === 1) wrap.scrollIntoView({ block: "start" });
   }
 
   /** pdf.js 的 renderTextLayer 不可用时的手工兜底（照抄桌面版实现）。 */
@@ -1980,14 +2361,37 @@
     if (node) node.scrollIntoView({ block: "start", behavior: "smooth" });
   }
 
-  /** 缩放后整本重画（页数多时只重画当前附近的页）。 */
+  /**
+   * 缩放后整本重画。
+   *
+   * ⚠ 必须**记住滚动锚点**再重画 ——
+   *   之前重画完就停在最上面，用户会觉得「缩放之后划不动」。
+   */
   async function redrawPdf() {
     if (!pdfState.doc) return;
     const pages = Array.from(pdfState.rendered).sort((a, b) => a - b);
+    if (!pages.length) return;
+    const body = $("pdf-body");
+    const cur = pdfState.currentPage || 1;
+    // 记下当前页在视口里的相对位置（0 = 刚到顶部，1 = 在底部）
+    const anchor0 = body.querySelector(`[data-pdf-page="${cur}"]`);
+    let ratio = 0;
+    if (anchor0) {
+      const br = body.getBoundingClientRect();
+      const ar = anchor0.getBoundingClientRect();
+      ratio = br.height ? (ar.top - br.top) / br.height : 0;
+    }
     pdfState.rendered.clear();
-    $("pdf-body").innerHTML = "";
+    body.innerHTML = "";
     for (const n of pages) {
       await renderPdfPage(n);
+    }
+    // 重画后回到同一个位置
+    const anchor1 = body.querySelector(`[data-pdf-page="${cur}"]`);
+    if (anchor1) {
+      const br = body.getBoundingClientRect();
+      const ar = anchor1.getBoundingClientRect();
+      body.scrollTop = (ar.top - br.top) + ratio * br.height - 8;
     }
     pdfStatus("");
   }
@@ -2352,8 +2756,18 @@
     $("pdf-close").onclick = closePdf;
     $("pdf-prev").onclick = () => gotoPdfPage(pdfState.currentPage - 1);
     $("pdf-next").onclick = () => gotoPdfPage(pdfState.currentPage + 1);
-    $("pdf-zoom-in").onclick = () => { pdfState.scale = Math.min(3, pdfState.scale * 1.2); redrawPdf(); };
-    $("pdf-zoom-out").onclick = () => { pdfState.scale = Math.max(0.4, pdfState.scale / 1.2); redrawPdf(); };
+    $("pdf-zoom-in").onclick = () => { pdfState.zoom = Math.min(4, (pdfState.zoom || 1) * 1.2); redrawPdf(); };
+    $("pdf-zoom-out").onclick = () => { pdfState.zoom = Math.max(0.4, (pdfState.zoom || 1) / 1.2); redrawPdf(); };
+    // 译文开关 —— 有译文时默认开着（这是平板跟「直接看 PDF」的根本区别）
+    $("pdf-toggle-trans").onclick = () => {
+      pdfState.showTrans = pdfState.showTrans === false;
+      $("pdf-toggle-trans").classList.toggle("is-active", pdfState.showTrans);
+      redrawPdf();
+    };
+    // 手写开关
+    $("pdf-toggle-ink").onclick = () => { inkToggle(!inkState.on); };
+    // 保存手写
+    $("pdf-save-ink").onclick = () => { saveInk(); };
     document.querySelectorAll("[data-close-lib]").forEach((b) => {
       b.onclick = () => { $("pdf-lib").hidden = true; };
     });
@@ -2542,6 +2956,10 @@
       // 种子装载（本地优先：不能拿导出快照覆盖本地正文）
       loadSeed: loadSeed,
       openDB: openDB,
+      // paper_id 契约（必须与 app.py:_paper_id_for 逐字一致）
+      paperIdFor: paperIdFor,
+      safePaperKey: safePaperKey,
+      syncUrl: syncUrl,
       state: state,
     };
   }
