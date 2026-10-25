@@ -31,7 +31,12 @@
     .replace(/&/g, E_AMP + "amp;")
     .replace(/</g, E_LT + "lt;")
     .replace(/>/g, E_GT + "gt;")
-    .replace(/"/g, E_QUOT + "quot;");
+    // ⚠⚠ 这里必须是 **E_AMP**，不是 E_QUOT。
+    //   原来写成了 E_QUOT + "quot;" —— 产出的是 `"quot;` 而不是 `&quot;`，
+    //   于是「引号转义」根本没生效：属性值里的引号照样能闭合属性，
+    //   `![x" onerror="alert(1)](a.png)` 照样能注入 onerror。
+    //   这就是 XSS 能打通的真正根因 —— esc() 从上线起就没转义过引号。
+    .replace(/"/g, E_AMP + "quot;");
 
   /* ------------------------------------------------------------------
      HTML 消毒
@@ -56,6 +61,15 @@
   const DROP_WITH_CONTENT = /<\s*(script|style|iframe|object|embed|link|meta|base|form|svg|math|noscript|template)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi;
   const DROP_SELF_CLOSING = /<\s*(script|style|iframe|object|embed|link|meta|base|form|svg|math|noscript|template)\b[^>]*\/?>/gi;
 
+  // 属性白名单 —— 比「逐个禁 on*」稳得多。
+  // 禁 on* 的话，漏掉一个新名字（onfocus / formaction / xlink:href…）
+  // 就是一条现成的注入通道。
+  const ALLOWED_ATTRS = new Set([
+    "class", "id", "href", "src", "alt", "title", "width", "height",
+    "colspan", "rowspan", "start", "type", "lang", "dir",
+    "data-lang", "data-tex", "data-type",
+  ]);
+
   function sanitizeHtml(s) {
     let out = String(s == null ? "" : s);
     out = out.replace(DROP_WITH_CONTENT, "").replace(DROP_SELF_CLOSING, "");
@@ -66,23 +80,56 @@
           // 不在白名单 -> 当普通文本显示
           return m.replace(/</g, E_LT).replace(/>/g, E_GT);
         }
-        let a = String(attrs || "");
-        // 事件处理器
-        a = a.replace(/\son[a-zA-Z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-        // 危险协议
-        a = a.replace(/\s(href|src|xlink:href|formaction|action)\s*=\s*("|')?\s*(javascript|vbscript|data)\s*:[^"'>\s]*("|')?/gi,
-          " $1=\"#\"");
-        return m.replace(rawTag, tag).replace(attrs, a);
+        if (m.charAt(1) === "/") {
+          return "</" + tag + ">";
+        }
+        // 属性**白名单**：不在名单里的一律丢掉。
+        // style 也在名单外 —— 它能做全屏 UI 覆盖。
+        const kept = [];
+        const src = String(attrs || "");
+        const attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+        let am;
+        while ((am = attrRe.exec(src)) !== null) {
+          const name = am[1].toLowerCase();
+          if (!ALLOWED_ATTRS.has(name)) continue;
+          let val = am[3] != null ? am[3] : (am[4] != null ? am[4] : (am[5] || ""));
+          if (name === "href" || name === "src") {
+            val = safeHref(val);
+          }
+          kept.push(name + "=\"" + esc(val) + "\"");
+        }
+        const selfClose = /\/\s*$/.test(src);
+        return "<" + tag + (kept.length ? " " + kept.join(" ") : "")
+          + (selfClose ? "/" : "") + ">";
       });
     return out;
   }
 
-  /** 链接协议白名单 —— 只有这些能进 href */
+  /**
+   * 链接协议白名单 —— 只有这些能进 href。
+   *
+   * ⚠ 判定协议之前必须先「解码实体 + 去控制字符」：
+   *   - `jav&#x61;script:alert(1)` —— 实体是 HTML **解析时**才解码的，
+   *     不先解码就会当成普通字符串放过去。
+   *   - `java<TAB>script:alert(1)` —— 浏览器会忽略 URL 里的制表符/换行，
+   *     看着不像 javascript:，实际是。
+   */
   function safeHref(url) {
-    const u = String(url || "").trim();
-    if (/^(javascript|vbscript|data):/i.test(u)) return "#";
-    if (/^[a-z][a-z0-9+.-]*:/i.test(u) && !/^(https?|mailto|tel):/i.test(u)) return "#";
-    return u;
+    const raw = String(url == null ? "" : url).trim();
+    const probe = raw
+      // 数字实体
+      .replace(/&#x([0-9a-fA-F]+);?/g, (m2, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/&#([0-9]+);?/g, (m2, d) => String.fromCharCode(parseInt(d, 10)))
+      // 少数几个关键的具名实体
+      .replace(/&colon;/gi, ":")
+      .replace(/&tab;/gi, "\t")
+      .replace(/&newline;/gi, "\n")
+      .replace(/&NewLine;/gi, "\n")
+      // 浏览器忽略 URL 里的控制字符与空白
+      .replace(/[\u0000-\u0020\u007f]+/g, "");
+    if (/^(javascript|vbscript|data):/i.test(probe)) return "#";
+    if (/^[a-z][a-z0-9+.-]*:/i.test(probe) && !/^(https?|mailto|tel):/i.test(probe)) return "#";
+    return raw;
   }
 
   /** djb2 — 用来判断一份内容有没有变过。刻意不用 crypto.subtle：
@@ -138,7 +185,7 @@
           d.createObjectStore("pdfcache", { keyPath: "id" });
         }
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => { db = req.result; resolve(db); };
       req.onerror = () => reject(req.error);
       req.onblocked = () => reject(new Error("IndexedDB 被另一个标签页占着"));
     });
@@ -231,8 +278,16 @@
     return src.replace(/^\uFEFF?---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "");
   }
 
-  function extractMath(text) {
-    const formulas = [];
+  /**
+   * 抽出公式，换成占位符。
+   *
+   * ⚠ ctx 用来**跨递归层共享公式表**。
+   *   原来每层递归都自己建一张表，而占位符 @@MBK0@@ 是外层生成的 ——
+   *   内层的表是空的，取 formulas[0] 就是 undefined → renderMath 抛 TypeError
+   *   → 整篇笔记渲染不出来（引用块、多行列表里的公式必崩）。
+   */
+  function extractMath(text, ctx) {
+    const formulas = ctx ? ctx.formulas : [];
     // 注意回调签名：String.replace 的第一个参数是**完整匹配字符串**
     // （是个 string，不是 match 数组），第二个才是第一个捕获组。
     // 写成 (m) => m[1] 拿到的是匹配串的第二个字符 —— 公式会被截成一个 "$"。
@@ -258,13 +313,16 @@
   }
 
   function renderMath(formulas) {
-    if (!formulas.length) return "";
+    if (!formulas || !formulas.length) return "";
+    // 兜底：表里不该有空洞，但万一有，别让整篇笔记渲染不出来
+    const list = formulas.filter((f) => f && typeof f.tex === "string");
+    if (!list.length) return "";
     if (typeof katex === "undefined") {
       // KaTeX 没加载出来时退回源码，至少不吞掉公式
-      return formulas.map((f) =>
+      return list.map((f) =>
         `<code class="math-error">${esc(f.tex.trim())}</code>`).join("");
     }
-    return formulas.map((f) => {
+    return list.map((f) => {
       try {
         return katex.renderToString(f.tex, {
           displayMode: f.display, throwOnError: false, strict: "ignore",
@@ -281,9 +339,29 @@
     }).join("");
   }
 
-  function renderMarkdown(src) {
+  /**
+   * 渲染 Markdown。
+   *
+   * ⚠ 外层包了 try/catch —— 渲染失败宁可退回纯文本源码，也别白屏。
+   *   白屏会让 openNote 抛异常，连带把 saveCurrent 里的 pushToDir 跳过
+   *   （用户以为存了，其实只存在本地），还会让 pullFromDir 末尾的
+   *   openNote 抛出去，整轮同步静默中断。
+   */
+  function renderMarkdown(src, ctx) {
     if (!src) return "";
-    const { text, formulas } = extractMath(stripFrontmatter(String(src)));
+    try {
+      return renderMarkdownInner(src, ctx);
+    } catch (e) {
+      console.warn("Markdown 渲染失败，回退纯文本", e);
+      return `<pre>${esc(String(src))}</pre>`;
+    }
+  }
+
+  function renderMarkdownInner(src, ctx) {
+    if (!src) return "";
+    // 公式表跨递归层共享（见 extractMath 的注释）
+    const c = ctx || { formulas: [] };
+    const { text } = extractMath(stripFrontmatter(String(src)), c);
     const lines = text.split("\n");
     let out = "";
     let i = 0;
@@ -298,17 +376,22 @@
       });
       // 外来 HTML 过一遍白名单消毒
       s = sanitizeHtml(s);
-      // 图片
+      // ⚠⚠ 图片 / 链接的插值**必须转义**。
+      //   sanitizeHtml 跑在**前面**，管不到这里新生成的 HTML ——
+      //   而 alt / href 里的引号能直接冲破属性：
+      //     ![x" onerror="alert(1)](a.png)
+      //       -> <img alt="x" onerror="alert(1)" src="a.png">   （实测命中）
+      //   笔记正文、云盘同步下来的 .md、导入的 vault 包都能走到这里。
       s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g,
-        (m, alt, src2) => `<img alt="${alt}" src="${safeHref(src2)}">`);
+        (m, alt, src2) => `<img alt="${esc(alt)}" src="${esc(safeHref(src2))}">`);
       // 链接
       s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
-        (m, t2, href) => `<a href="${safeHref(href)}" rel="noopener noreferrer">${t2}</a>`);
+        (m, t2, href) => `<a href="${esc(safeHref(href))}" rel="noopener noreferrer">${esc(t2)}</a>`);
       // Obsidian 双链
       s = s.replace(/\[\[([^\]]+)\]\]/g, (m, raw) => {
         const target = raw.split("|")[0].trim();
         const alias = (raw.split("|")[1] || target).trim();
-        return `<span class="wikilink-missing">${alias}</span>`;
+        return `<span class="wikilink-missing">${esc(alias)}</span>`;
       });
       // 粗斜体
       s = s.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
@@ -367,7 +450,7 @@
         while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
           buf.push(lines[i].replace(/^\s*>\s?/, "")); i++;
         }
-        out += `<blockquote>${renderMarkdown(buf.join("\n"))}</blockquote>`;
+        out += `<blockquote>${renderMarkdown(buf.join("\n"), c)}</blockquote>`;
         continue;
       }
       // 列表（含任务列表）
@@ -399,7 +482,7 @@
             let done = false;
             if (/^\[[ xX]\]\s?/.test(txt)) { done = /^\[[xX]\]/.test(txt); txt = txt.replace(/^\[[ xX]\]\s?/, ""); }
             const inner = x.lines.length > 1
-              ? inline(txt.split("\n")[0]) + renderMarkdown(x.lines.slice(1).join("\n"))
+              ? inline(txt.split("\n")[0]) + renderMarkdown(x.lines.slice(1).join("\n"), c)
               : inline(txt);
             return `<li${done ? ' class="done"' : ""}>${inner}</li>`;
           }).join("") + `</${tag}>`;
@@ -418,11 +501,13 @@
       else i++;
     }
 
-    // 把公式占位符换成渲染好的 KaTeX
-    const rendered = renderMath(formulas);
+    // 把公式占位符换成渲染好的 KaTeX。
+    // ⚠ 别在这儿再调一次 renderMath(formulas) —— 那是死代码，
+    //   而且会让每个公式被 KaTeX 渲染**两遍**（长笔记明显卡顿）。
     return out.replace(/@@MBK(\d+)@@/g, (m, idx) => {
-      const one = renderMath([formulas[+idx]]);
-      return one;
+      const one = c.formulas[+idx];
+      if (!one) return "";
+      return renderMath([one]);
     });
   }
 
@@ -439,6 +524,7 @@
     syncMode: "local",     // local | dir
     dirtyCount: 0,
     pendingSelection: "",  // 从 PDF 里划词带过来的原文
+    aiHistory: new Map(),   // noteId -> [{role, content}] 多轮对话上下文
   };
 
   const FOLDERS = [
@@ -464,6 +550,19 @@
     if (raw && raw.notes && raw.notes.length) {
       const seed = raw.notes.map((r) => {
         const old = have.get(r.id);
+        // ⚠⚠ 本地已有的记录必须**以本地为准**。
+        //   种子里的 body 是「打包那一刻」的静态快照（可能是三天前的），
+        //   拿它覆盖本地正文 = 刷新一次就把平板上的编辑抹掉；
+        //   更糟的是 dirty 还留着 1、baseHash 却是旧文本的哈希 →
+        //   下次 push 会把**旧文本写回坚果云**，把两边一起回滚。
+        //   （这正是「本地优先」被违反的��方。）
+        if (old) {
+          return Object.assign({}, old, {
+            title: old.title || r.title || "",
+            group: old.group || r.group || "",
+            pdfs: (old.pdfs && old.pdfs.length) ? old.pdfs : (r.pdfs || []),
+          });
+        }
         return {
           id: r.id,
           title: r.title || "",
@@ -471,11 +570,11 @@
           rel: r.rel || r.id,
           body: r.body || "",
           html: r.html || "",
-          pdfs: r.pdfs || (old ? old.pdfs : []),
-          dirty: old ? old.dirty : 0,
-          deleted: old ? old.deleted : 0,
-          baseHash: old ? old.baseHash : hash(r.body || ""),
-          mtime: old ? old.mtime : (r.mtime || 0),
+          pdfs: r.pdfs || [],
+          dirty: 0,
+          deleted: 0,
+          baseHash: hash(r.body || ""),
+          mtime: r.mtime || 0,
         };
       });
       // 本地有、种子没有的（用户自己新建的）要保留
@@ -536,6 +635,10 @@
   function openNote(id) {
     const n = state.notes.get(id);
     if (!n) return;
+    // ⚠ 只有**真的换了笔记**才清 AI 对话区。
+    //   同步完成后 pullFromDir 会重调一次 openNote（同一篇），
+    //   那时候要是也清，用户正在看的 AI 回答就被抹掉了。
+    const noteChanged = state.currentId !== id;
     state.currentId = id;
     // URL 跟随当前笔记 —— 这样刷新 / 分享 / 收藏都能回到同一篇。
     if (location.hash !== "#/note/" + encodeURIComponent(id)) {
@@ -572,6 +675,16 @@
     const doc = $("doc");
     doc.innerHTML = (n.html && !n.dirty) ? n.html : renderMarkdown(n.body || "");
     doc.scrollTop = 0;
+    // 换笔记了，AI 面板的对话区也要跟着换 ——
+    // 否则上一篇的问答会挂在新笔记下面，看着像是问这一篇的。
+    if (noteChanged) {
+      const aiOut = $("ai-output");
+      if (aiOut) aiOut.innerHTML = "";
+      const qb = $("ai-question");
+      if (qb) qb.value = "";
+      state.pendingSelection = "";
+      aiShowContext("");
+    }
     buildNav();
     DB.setMeta("current_note", id);
     if (window.matchMedia("(max-width: 719px)").matches) setPane("doc");
@@ -598,7 +711,14 @@
     state.dirtyCount = [...state.notes.values()].filter((x) => x.dirty && !x.deleted).length;
     updateSyncDot();
     buildNav();
-    openNote(n.id);
+    // ⚠ 以前这里调 openNote(n.id) 来「刷新预览」——
+    //   而 openNote 是**有副作用的整页渲染**：它会把 #editor 重置成
+    //   n.body、清 AI 面板、重置滚动位置。
+    //   于是保存期间继续敲的字，在保存完成后被**无声抹掉**；
+    //   而且 openNote 一旦抛异常（比如笔记里有嵌套公式），
+    //   后面的 pushToDir 根本不会执行 —— 用户以为存了，其实只存在本地。
+    // 现在只刷新正文预览，不动编辑器。
+    refreshDocPreview(n);
 
     // ⚠ 以前只写 IndexedDB —— 平板上改的笔记**永远写不回坚果云**。
     //   结果是下次同步发现云端版本不一样，走冲突分支，
@@ -617,6 +737,17 @@
     toast("已保存到平板本地");
   }
 
+  /** 只刷新正文预览（不动编辑器、不重置滚动、不清 AI 面板）。 */
+  function refreshDocPreview(n) {
+    const doc = $("doc");
+    if (!doc || !n) return;
+    try {
+      doc.innerHTML = (n.html && !n.dirty) ? n.html : renderMarkdown(n.body || "");
+    } catch (e) {
+      console.warn("预览刷新失败", e);
+    }
+  }
+
   function firstHeading(src) {
     const m = /^\s*#{1,3}\s+(.+)$/m.exec(stripFrontmatter(src || ""));
     return m ? m[1].trim() : "";
@@ -629,7 +760,12 @@
     $("new-title").textContent = quick ? "速记" : "新建笔记";
     $("new-name").value = "";
     $("new-body").value = "";
-    $("new-body-field").style.display = quick ? "" : "";
+    // ⚠ 原来这里是 `quick ? "" : ""` —— 三元两边一样，
+    //   等于「速记」和「新建笔记」完全是一回事（死代码）。
+    //   速记 = 快速记一条（只填标题，进去再写）；
+    //   新建笔记 = 连正文一起写。
+    const bodyField = $("new-body-field");
+    if (bodyField) bodyField.hidden = !!quick;
     const sel = $("new-folder");
     sel.innerHTML = "";
     FOLDERS.forEach((f) => {
@@ -649,8 +785,12 @@
     const body = $("new-body").value.trim();
     const stamp = new Date();
     const p = (n) => String(n).padStart(2, "0");
-    const fname = `${title.replace(/[\\/:*?"<>|]/g, "_")}_${stamp.getFullYear()}${p(stamp.getMonth() + 1)}${p(stamp.getDate())}.md`;
-    const id = `${folder}/${fname}`;
+    const baseName = title.replace(/[\\/:*?"<>|]/g, "_");
+    // ⚠ 文件名必须**唯一**。
+    //   原来只到「标题 + 日期」—— 同一天建两篇同名笔记，第二篇的
+    //   state.notes.set(id, …) + DB.putNote 会**直接覆盖第一篇**，
+    //   第一篇连同正文一起消失，而且没有任何提示。
+    const id = uniqueNoteId(folder, baseName, stamp);
     const content = body
       ? `# ${title}\n\n${body}\n`
       : `# ${title}\n\n> 创建于 ${fmtTime(stamp.getTime())}\n`;
@@ -669,6 +809,30 @@
   }
 
   function STATE_DIRTY_SAVED() { return "已创建，记得同步到云盘"; }
+
+  /**
+   * 生成一个**不与现有笔记重名**的 id。
+   *
+   * ⚠ 同名覆盖是静默的数据丢失：
+   *   state.notes.set(id, …) + DB.putNote 会直接顶掉原来那篇，
+   *   连同正文一起消失，还没有提示。
+   *   命名带上秒级时间戳 + 随机后缀；万一还是撞了（极小概率），
+   *   就再追加序号，直到不重复为止。
+   */
+  function uniqueNoteId(folder, baseName, stamp) {
+    const p = (n) => String(n).padStart(2, "0");
+    const day = `${stamp.getFullYear()}${p(stamp.getMonth() + 1)}${p(stamp.getDate())}`;
+    const sec = `${p(stamp.getHours())}${p(stamp.getMinutes())}${p(stamp.getSeconds())}`;
+    const rand = Math.random().toString(36).slice(2, 6);
+    let id = `${folder}/${baseName}_${day}_${sec}_${rand}.md`;
+    let n = 2;
+    while (state.notes.has(id)) {
+      id = `${folder}/${baseName}_${day}_${sec}_${rand}_${n}.md`;
+      n++;
+      if (n > 99) break;
+    }
+    return id;
+  }
 
   // ------------------------------------------------------------------
   // 同步：File System Access（安卓 Chrome 真双向）
@@ -1001,8 +1165,19 @@
         await DB.putNote(note);
         added++;
       } else if (cur.dirty) {
-        // 本地改过：云盘也变了才算冲突
-        if (cur.baseHash && hash(text) !== cur.baseHash) {
+        // 本地改过。
+        // ⚠ 不能拿 baseHash 是否为空来短路 —— 平板新建的笔记 baseHash 是 ""，
+        //   原来那样整个分支被跳过，云端同名版本被**无声忽略**
+        //   （既不采用、也不报冲突）。
+        // 判据：两边内容不一样就是冲突。
+        // baseHash 有值时再额外要求「云端相对 base 也变了」，
+        // 否则只是本地单方面编辑，不算冲突。
+        const localHash = hash(cur.body || "");
+        const cloudHash = hash(text);
+        const cloudChanged = cur.baseHash
+          ? (cloudHash !== cur.baseHash)
+          : (cloudHash !== localHash);
+        if (cloudHash !== localHash && cloudChanged) {
           conflicts++;
           await resolveConflict(cur, text);
         }
@@ -1043,8 +1218,12 @@
       "",
     ].join("\n");
     const stamp = new Date();
-    const p = (n) => String(n).padStart(2, "0");
-    const id = `${localNote.group || "_其它"}/${localNote.title.replace(/[\\/:*?"<>|]/g, "_")}_冲突_${stamp.getFullYear()}${p(stamp.getMonth() + 1)}${p(stamp.getDate())}${p(stamp.getHours())}${p(stamp.getMinutes())}.md`;
+    // ⚠ 冲突合并稿也要唯一 —— 原来只到「分钟」，同名笔记在同一分钟内
+    //   冲突两次，后一份就把前一份**覆盖**了（恰好在最易出事的时候丢数据）。
+    const id = uniqueNoteId(
+      localNote.group || "_其它",
+      `${localNote.title.replace(/[\\/:*?"<>|]/g, "_")}_冲突`,
+      stamp);
     const note = {
       id, title: `${localNote.title}（冲突合并）`, group: localNote.group || "_其它",
       rel: id, body: merged, html: "", dirty: 1, deleted: 0,
@@ -1061,8 +1240,26 @@
     toast("发现冲突，已另存为「冲突合并」笔记，两边都没丢", true);
   }
 
-  /** 把本地改动写回云盘。返回 {ok, fail} —— silent=true 时不弹 toast。 */
+  /**
+   * 把本地改动写回云盘。返回 {ok, fail} —— silent=true 时不弹 toast。
+   *
+   * ⚠ 单飞（同一时刻只跑一次）+ 写盘前后比对内容哈希。
+   *   以前每次调用都独立跑一遍循环，没有互斥：
+   *   连点两次「保存」时，P1 写盘途中 P2 改了 n.body 并置 dirty=1，
+   *   P1 回来后执行 `n.dirty = 0; n.baseHash = hash(n.body)` ——
+   *   而此时 n.body 已经是新内容了，于是**新内容被标记成"已同步"**，
+   *   但真正落盘的是旧内容 → 云端拿到旧版本、本地改动消失，无任何提示。
+   */
+  let pushChain = Promise.resolve();
+
   async function pushToDir(silent) {
+    // 串成一条链：后来的排在前面那次后面跑
+    const run = pushChain.then(() => doPushToDir(silent), () => doPushToDir(silent));
+    pushChain = run.catch(() => {});
+    return run;
+  }
+
+  async function doPushToDir(silent) {
     const backend = currentBackend();
     if (!backend) {
       if (!silent) {
@@ -1078,12 +1275,22 @@
 
     let ok = 0, fail = 0;
     for (const n of dirty) {
+      // 写盘用**快照**，不引用可变对象
+      const snap = n.body || "";
+      const snapHash = hash(snap);
       try {
-        await backend.writeText(n.id, n.body || "");
-        n.dirty = 0;
-        n.baseHash = hash(n.body || "");
-        await DB.putNote(n);
-        ok++;
+        await backend.writeText(n.id, snap);
+        if (hash(n.body || "") === snapHash) {
+          // 写盘期间没人改它 —— 可以安全地清 dirty
+          n.dirty = 0;
+          n.baseHash = snapHash;
+          await DB.putNote(n);
+          ok++;
+        } else {
+          // 写盘期间又改了 —— 保留 dirty，下一轮再推
+          fail++;
+          console.warn("写盘期间内容又变了，保留待同步标记:", n.id);
+        }
       } catch (e) {
         fail++;
         console.error("写入失败", n.id, e);
@@ -1161,8 +1368,12 @@
           state.notes.set(r.id, note);
           await DB.putNote(note);
           added++;
-        } else if (cur.dirty && cur.baseHash && r.baseHash &&
-                   hash(cur.body || "") !== cur.baseHash && r.baseHash !== cur.baseHash) {
+        } else if (cur.dirty && hash(cur.body || "") !== hash(r.body || "")) {
+          // 本地改过 + 两边内容不同 ⇒ 冲突，两边都保留。
+          // ⚠ 原来要求 `cur.baseHash && r.baseHash` **都非空**才走冲突分支。
+          //   平板新建的笔记 baseHash 是 ""，旧版本导出的包里也没有 ——
+          //   于是直接落进 else 分支：本地改动被包里的内容**静默覆盖**，
+          //   dirty 还被清 0。改动的笔记就这么没了。
           await resolveConflict(cur, r.body || "");
           updated++;
         } else {
@@ -1186,13 +1397,15 @@
   }
 
   // ------------------------------------------------------------------
-  // AI：平板直连 MiniMax（流式）
+  // AI：平板直连 MiniMax（浏览器里流式，APK 里走原生代理）
   // ------------------------------------------------------------------
+  const SYS_RESEARCH =
+    "你是半导体/微电子方向的科研助手。用中文回答，先给结论再给依据，" +
+    "涉及公式时给出 LaTeX 源码（行内 $...$，块级 $$...$$）。";
+
   const PROMPTS = {
     explain: (sel) => [
-      { role: "system", content:
-        "你是半导体/微电子方向的科研助手。用中文回答，先给结论再给依据，" +
-        "涉及公式时给出 LaTeX 源码（行内 $...$，块级 $$...$$）。" },
+      { role: "system", content: SYS_RESEARCH },
       { role: "user", content:
         `请解读下面这段论文原文，说明它在讲什么、关键结论是什么、有没有值得警惕的前提。\n\n${sel}` },
     ],
@@ -1210,12 +1423,16 @@
       { role: "user", content: `请总结这篇笔记：\n\n${sel}` },
     ],
     ask: (sel, q) => [
-      { role: "system", content:
-        "你是半导体/微电子方向的科研助手，回答用中文，简洁直接，" +
-        "涉及公式给出 LaTeX 源码。" },
+      { role: "system", content: SYS_RESEARCH },
       { role: "user", content: q + (sel ? `\n\n【选中的原文】\n${sel}` : "") },
     ],
   };
+
+  const AI_LABEL = { ask: "问", explain: "解读", translate: "翻译", summarize: "摘要" };
+  /** 带上最近几轮对话 —— 追问时模型才知道前文在讲什么 */
+  const AI_HISTORY_TURNS = 3;
+  /** 历史里每条答案最多留这么多字，免得 token 越滚越大 */
+  const AI_HISTORY_MAX_CHARS = 1200;
 
   let aiAbort = null;
 
@@ -1250,6 +1467,157 @@
     return { content, reasoning };
   }
 
+  /** 取（并按需创建）某一篇笔记的对话历史。 */
+  function aiHistory(noteId) {
+    if (!noteId) return [];
+    let h = state.aiHistory.get(noteId);
+    if (!h) {
+      h = [];
+      state.aiHistory.set(noteId, h);
+    }
+    return h;
+  }
+
+  /**
+   * 往对话区追加一条「提问」记录。
+   *
+   * ⚠ 输入栏发完就清空（用户明确要求）—— 但问题不能跟着消失，
+   *   所以它作为一条记录留在对话区里。
+   *   用 textContent 赋值，不会注入 HTML。
+   */
+  function aiAppendTurn(kind, question, selection) {
+    const out = $("ai-output");
+    if (!out) return null;
+    const turn = el("div", "tb-ai-turn tb-ai-turn-q");
+    turn.appendChild(el("span", "tb-ai-turn-label", AI_LABEL[kind] || "问"));
+    const body = el("div", "tb-ai-turn-body");
+    if (kind === "ask") {
+      body.textContent = question || "";
+    } else if (selection) {
+      const sel = el("div", "tb-ai-turn-sel");
+      sel.textContent = selection.length > 280
+        ? selection.slice(0, 280) + "…" : selection;
+      body.appendChild(sel);
+    }
+    turn.appendChild(body);
+    out.appendChild(turn);
+    return turn;
+  }
+
+  /** 追加一个回答块，返回 [状态条, 正文容器]。 */
+  function aiAppendAnswer() {
+    const out = $("ai-output");
+    const turn = el("div", "tb-ai-turn tb-ai-turn-a");
+    const status = el("div", "tb-ai-status", "正在思考…");
+    const buf = el("div");
+    turn.appendChild(status);
+    turn.appendChild(buf);
+    out.appendChild(turn);
+    out.scrollTop = out.scrollHeight;
+    return [status, buf];
+  }
+
+  /** 显示/隐藏「带上原文」的提示条 —— 让人看得见这次提问会带上哪段。 */
+  function aiShowContext(text) {
+    const box = $("ai-context");
+    const label = $("ai-context-text");
+    if (!box || !label) return;
+    if (text) {
+      label.textContent = text.length > 200 ? text.slice(0, 200) + "…" : text;
+      box.hidden = false;
+    } else {
+      label.textContent = "";
+      box.hidden = true;
+    }
+  }
+
+  /**
+   * 发一次请求，把正文取回来。
+   *
+   * 浏览器里流式（onDelta 边收边渲染）；APK 里走原生代理（一次性拿回）。
+   * 返回 {content, reasoning, aborted}。
+   */
+  async function aiRequest(payload, cfg, onDelta) {
+    const url = `${cfg.base.replace(/\/+$/, "")}/chat/completions`;
+    const bodyStr = JSON.stringify(payload);
+
+    // APK 里页面跑在 https://appassets.androidplatform.net ——
+    // 外部 AI 接口不会回这个 origin 的 Access-Control-Allow-Origin，
+    // **fetch 必被 CORS 打死**。走原生代理就没有跨域问题。
+    // 代价：原生代理拿不到流式增量，只能一次性拿回完整 SSE 文本。
+    if (nativeBridge && typeof nativeBridge.httpPost === "function") {
+      const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${cfg.key}`]);
+      if (aiAbort && aiAbort.signal.aborted) {
+        return { content: "", reasoning: "", aborted: true };
+      }
+      if (!r || !r.ok) {
+        throw new Error("HTTP " + ((r && r.status) || "?") + " "
+          + String((r && (r.error || r.body)) || "").slice(0, 200));
+      }
+      const parsed = parseSse(r.body);
+      if (parsed.content && onDelta) onDelta(parsed.content);
+      return parsed;
+    }
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${cfg.key}`,
+      },
+      body: bodyStr,
+      signal: aiAbort ? aiAbort.signal : undefined,
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status} ${t.slice(0, 200)}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let pending = "";
+    let full = "";
+    let reasoning = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending += dec.decode(value, { stream: true });
+      const lines = pending.split("\n");
+      pending = lines.pop();
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s.startsWith("data:")) continue;
+        const p2 = s.slice(5).trim();
+        if (!p2 || p2 === "[DONE]") continue;
+        try {
+          const obj = JSON.parse(p2);
+          const ch = (obj.choices && obj.choices[0]) || {};
+          const d = ch.delta || {};
+          if (d.content) {
+            full += d.content;
+            if (onDelta) onDelta(full);
+          }
+          if (d.reasoning_content) reasoning += d.reasoning_content;
+        } catch (e) { /* 心跳/畸形行忽略 */ }
+      }
+    }
+    return { content: full, reasoning };
+  }
+
+  /**
+   * 输入栏的 Enter 处理。抽成独立函数是为了能脱离浏览器单测。
+   *
+   * ⚠ isComposing 必须判断：中文输入法正在选词时按 Enter 是
+   *   「确认候选词」，不是「发送」。不判断的话，
+   *   选完词一按回车问题就发出去了 —— 中文用户必踩。
+   */
+  function aiOnKeyDown(e) {
+    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey
+        && !e.isComposing) {
+      e.preventDefault();
+      runAI("ask");
+    }
+  }
+
   async function runAI(kind) {
     const cfg = state.ai;
     if (!cfg.key) {
@@ -1257,25 +1625,56 @@
       openSettings();
       return;
     }
+    // ⚠ 记下发起时是哪篇笔记。
+    //   请求是异步的 —— 用户在等待期间切了笔记的话，
+    //   事后用 state.currentId 记账就会记到**另一篇**笔记名下。
+    const noteId = state.currentId;
     const note = currentNote();
     const sel = selectedText() || state.pendingSelection || "";
     const bodyText = note ? (note.body || "") : "";
     if (kind === "explain" || kind === "translate") {
       if (!sel) { toast("先在正文或 PDF 里选中一段文字", true); return; }
     }
-    const q = $("ai-question").value.trim();
-    if (kind === "ask" && !q) { toast("写下你的问题", true); return; }
+
+    const qBox = $("ai-question");
+    const q = (qBox.value || "").trim();
+    if (kind === "ask" && !q) {
+      toast("写下你的问题", true);
+      if (qBox) qBox.focus();
+      return;
+    }
+
+    // ⚠⚠ 发出去就**清空输入栏** —— 别把问题留在框里。
+    //   留着的话下一次很容易顺手按回车，把上一句原样再发一遍
+    //   （而且框里堆着长问题，看不清自己到底问了什么）。
+    //   问题本身不会丢：它作为一条记录留在下面的对话区里。
+    if (qBox) qBox.value = "";
     state.pendingSelection = "";
+    aiShowContext("");
+
+    // 提问记录留在对话区（清空输入栏后，问题还能看到）
+    aiAppendTurn(kind, q, sel);
 
     const model = kind === "translate" ? (cfg.modelT || cfg.model) : cfg.model;
-    const messages = PROMPTS[kind](kind === "ask" ? (sel || bodyText.slice(0, 4000)) : (sel || bodyText.slice(0, 6000)), q);
+    const base = PROMPTS[kind](
+      kind === "ask" ? (sel || bodyText.slice(0, 4000)) : (sel || bodyText.slice(0, 6000)),
+      q);
 
+    // 多轮上下文：把这一篇笔记之前的问答带上 —— 追问时模型才知道前文在讲什么。
+    // ⚠ system 消息必须在最前面，所以历史插在 system 和本次 user 之间。
+    let messages = base;
+    if (kind === "ask") {
+      const hist = aiHistory(noteId);
+      const ctx = hist.slice(-AI_HISTORY_TURNS * 2).map((h) => ({
+        role: h.role, content: h.content,
+      }));
+      messages = [base[0]].concat(ctx, [base[1]]);
+    }
+
+    const [status, buf] = aiAppendAnswer();
     const out = $("ai-output");
-    out.innerHTML = "";
-    const status = el("div", "tb-ai-status", "正在思考…");
-    out.appendChild(status);
-    const buf = el("div");
-    out.appendChild(buf);
+    const stopBtn = $("btn-ai-stop");
+    if (stopBtn) stopBtn.hidden = false;
 
     if (aiAbort) aiAbort.abort();
     aiAbort = new AbortController();
@@ -1293,85 +1692,48 @@
       payload.thinking = { type: "disabled" };
     }
 
+    let answer = "";
     try {
-      const url = `${cfg.base.replace(/\/+$/, "")}/chat/completions`;
-      const bodyStr = JSON.stringify(payload);
-
-      // APK 里页面跑在 https://appassets.androidplatform.net ——
-      // 外部 AI 接口不会回这个 origin 的 Access-Control-Allow-Origin，
-      // **fetch 必被 CORS 打死**。走原生代理就没有跨域问题。
-      // 代价：原生代理拿不到流式增量，只能一次性拿回完整 SSE 文本。
-      if (nativeBridge && typeof nativeBridge.httpPost === "function") {
-        const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${cfg.key}`]);
-        if (!r || !r.ok) {
-          throw new Error("HTTP " + ((r && r.status) || "?") + " "
-            + String((r && (r.error || r.body)) || "").slice(0, 200));
-        }
-        const parsed = parseSse(r.body);
-        const full = parsed.content;
-        if (full) {
-          buf.innerHTML = renderMarkdown(full);
-          status.textContent = `完成 · ${model}`;
-        } else if (parsed.reasoning) {
-          // 正文空、只剩思考 —— 思考把 max_tokens 预算吃光了
-          buf.innerHTML = renderMarkdown(parsed.reasoning);
-          status.textContent = "上游只返回了思考过程（正文预算被吃光）—— 换个模型或调大 max_tokens";
-          status.setAttribute("data-error", "1");
-        } else {
-          status.textContent = "上游返回了空内容 — 换个模型或把 max_tokens 调大";
-          status.setAttribute("data-error", "1");
-        }
+      const res = await aiRequest(payload, cfg, (txt) => {
+        buf.innerHTML = renderMarkdown(txt);
+        if (out) out.scrollTop = out.scrollHeight;
+      });
+      if (res.aborted) {
+        status.textContent = "已停止";
         return;
       }
-
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${cfg.key}`,
-        },
-        body: bodyStr,
-        signal: aiAbort.signal,
-      });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status} ${t.slice(0, 200)}`);
-      }
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let pending = "";
-      let full = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        pending += dec.decode(value, { stream: true });
-        const lines = pending.split("\n");
-        pending = lines.pop();
-        for (const line of lines) {
-          const s = line.trim();
-          if (!s.startsWith("data:")) continue;
-          const payload2 = s.slice(5).trim();
-          if (payload2 === "[DONE]") continue;
-          try {
-            const obj = JSON.parse(payload2);
-            const delta = obj.choices && obj.choices[0].delta
-              ? (obj.choices[0].delta.content || "") : "";
-            if (delta) {
-              full += delta;
-              buf.innerHTML = renderMarkdown(full);
-            }
-          } catch (e) { /* 心跳/畸形行忽略 */ }
-        }
-      }
-      status.textContent = full ? `完成 · ${model}` : "上游没有返回正文（可能预算被思考吃掉）";
-      if (!full) {
+      answer = res.content || "";
+      if (answer) {
+        buf.innerHTML = renderMarkdown(answer);
+        status.textContent = `完成 · ${model}`;
+      } else if (res.reasoning) {
+        // 正文空、只剩思考 —— 思考把 max_tokens 预算吃光了
+        buf.innerHTML = renderMarkdown(res.reasoning);
+        status.textContent = "上游只返回了思考过程（正文预算被吃光）—— 换个模型或调大 max_tokens";
+        status.setAttribute("data-error", "1");
+      } else {
         status.textContent = "上游返回了空内容 — 换个模型或把 max_tokens 调大";
+        status.setAttribute("data-error", "1");
       }
     } catch (e) {
-      if (e.name === "AbortError") status.textContent = "已取消";
+      if (e.name === "AbortError") status.textContent = "已停止";
       else {
         status.textContent = "失败：" + e.message;
         status.setAttribute("data-error", "1");
+      }
+    } finally {
+      if (stopBtn) stopBtn.hidden = true;
+      // 记进历史，供下一轮追问用
+      if (answer) {
+        const hist = aiHistory(noteId);
+        hist.push({
+          role: "user",
+          content: kind === "ask"
+            ? q
+            : (AI_LABEL[kind] + "：" + (sel || "").slice(0, 300)),
+        });
+        hist.push({ role: "assistant", content: answer.slice(0, AI_HISTORY_MAX_CHARS) });
+        while (hist.length > AI_HISTORY_TURNS * 2) hist.shift();
       }
     }
   }
@@ -1672,15 +2034,28 @@
 
   /** 划词气泡：PDF 里选中文字 -> 解读 / 翻译 / 提问 */
   function initPdfSelection() {
-    const layer = $("pdf-textlayer");
+    // ⚠⚠ 必须绑在 **#pdf-body** 上，**不能**绑在某个 textLayer 上。
+    //   textLayer 是每渲染一页就新建的，而 openPdf() 一进来就会
+    //   `$("pdf-body").innerHTML = ""` 把旧的整个清掉 ——
+    //   监听器绑在会被清掉的节点上，划词气泡就**永远不再出现**，
+    //   而且没有任何报错（划词答疑整条功能静默不通）。
+    const body = $("pdf-body");
     const bubble = $("pdf-sel");
-    if (!layer || !bubble) return;
+    if (!body || !bubble) return;
 
     const hide = () => { bubble.hidden = true; };
     const show = (sel) => {
       const text = String(sel || "").trim();
       if (!text) { hide(); return; }
-      const rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
+      let rect = null;
+      try {
+        const s = window.getSelection();
+        if (!s || s.rangeCount === 0) { hide(); return; }
+        rect = s.getRangeAt(0).getBoundingClientRect();
+      } catch (e) {
+        hide();
+        return;
+      }
       if (!rect || (rect.width === 0 && rect.height === 0)) { hide(); return; }
       bubble.dataset.text = text;
       bubble.hidden = false;
@@ -1693,13 +2068,13 @@
       bubble.style.left = left + "px";
     };
 
-    layer.addEventListener("mouseup", () => {
+    body.addEventListener("mouseup", () => {
       setTimeout(() => show(window.getSelection().toString()), 10);
     });
-    layer.addEventListener("touchend", () => {
+    body.addEventListener("touchend", () => {
       setTimeout(() => show(window.getSelection().toString()), 60);
     });
-    layer.addEventListener("scroll", hide);
+    body.addEventListener("scroll", hide, { passive: true });
 
     bubble.querySelectorAll("[data-pdf-ai]").forEach((b) => {
       b.onclick = () => {
@@ -1709,7 +2084,11 @@
         closePdf();
         // 交给 AI 面板处理
         state.pendingSelection = text;
-        $("ai-question").value = kind === "ask" ? "" : "";
+        // ⚠ 原来这里是 `$("ai-question").value = kind === "ask" ? "" : "";`
+        //   —— 三元两边一样，等于永远清空输入框（死代码）。
+        //   真正该做的是：把「这次会带上哪段原文」显示出来，
+        //   输入框本身留给用户写字。
+        aiShowContext(kind === "ask" ? text : "");
         setPane("ai");
         if (kind === "ask") {
           $("ai-question").focus();
@@ -1745,12 +2124,16 @@
     for (let i = 0; i < todo.length; i++) {
       const id = todo[i];
       try {
-        const r = await fetch(davUrl("file", id));
-        if (!r.ok) { fail++; continue; }
-        const blob = await r.blob();
+        // ⚠ 走 backend.readBlob()，不要写死 fetch("/dav/file/…")。
+        //   写死的话，浏览器（FSA）模式下每个请求都 404 ——
+        //   「缓存全部原文」在浏览器里 100% 失败，只弹一句「失败 24」。
+        //   backend.readBlob 会先看本地缓存，再按当前后端取
+        //   （DAV 走云盘，FSA 走本地目录）。
+        const blob = await backend.readBlob(id);
+        if (!blob) { fail++; continue; }
         await DB.cachePdf(id, blob);
         ok++;
-        got += blob.size;
+        got += blob.size || 0;
       } catch (e) {
         fail++;
       }
@@ -2034,6 +2417,38 @@
       b.onclick = () => runAI(b.dataset.ai);
     });
 
+    // ---- AI 面板的输入与对话控制 ----
+    const qBox = $("ai-question");
+    if (qBox) {
+      qBox.addEventListener("keydown", aiOnKeyDown);
+    }
+    const stopBtn = $("btn-ai-stop");
+    if (stopBtn) {
+      stopBtn.onclick = () => {
+        if (aiAbort) {
+          aiAbort.abort();
+          toast("已停止");
+        }
+      };
+    }
+    const clearBtn = $("btn-ai-clear");
+    if (clearBtn) {
+      clearBtn.onclick = () => {
+        const out = $("ai-output");
+        if (out) out.innerHTML = "";
+        state.aiHistory.delete(state.currentId);
+        toast("对话已清空");
+      };
+    }
+    const ctxClear = $("ai-context-clear");
+    if (ctxClear) {
+      ctxClear.onclick = () => {
+        state.pendingSelection = "";
+        aiShowContext("");
+        toast("这次不带原文");
+      };
+    }
+
     $("scrim").onclick = () => setPane("doc");
 
     let searchTimer = null;
@@ -2097,6 +2512,13 @@
       }
       const s = document.getElementById("sync-status");
       if (s) s.textContent = "启动失败";
+      // 把阶段轨迹亮出来 —— 平时它是隐藏的（没人看得见），
+      // 但白屏时它是唯一能看出卡在哪一步的线索。
+      const stage = document.getElementById("mb-stage");
+      if (stage) {
+        stage.hidden = false;
+        stage.textContent = "启动阶段: " + (stage.textContent || "(空)");
+      }
     });
   });
 
@@ -2109,6 +2531,18 @@
       hash: hash,
       firstHeading: firstHeading,
       stripFrontmatter: stripFrontmatter,
+      // AI 面板（输入栏清空、多轮上下文这些行为必须有护栏）
+      runAI: runAI,
+      aiOnKeyDown: aiOnKeyDown,
+      aiHistory: aiHistory,
+      aiAppendTurn: aiAppendTurn,
+      aiAppendAnswer: aiAppendAnswer,
+      aiShowContext: aiShowContext,
+      parseSse: parseSse,
+      // 种子装载（本地优先：不能拿导出快照覆盖本地正文）
+      loadSeed: loadSeed,
+      openDB: openDB,
+      state: state,
     };
   }
 })();

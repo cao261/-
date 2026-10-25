@@ -10,6 +10,7 @@ V1.1 hardening:
 """
 
 import os
+import sys
 import json
 import re
 import hmac
@@ -1555,7 +1556,11 @@ async def api_upload_pdf(
     target_dir = _safe_path(BASE_DIR, "01_Literature", topic_category, "01_论文原文_PDF")
     target_dir.mkdir(parents=True, exist_ok=True)
     save_to = _safe_path(target_dir, pdf_name)
-    save_to.write_bytes(pdf_bytes)
+    # ⚠ tmp + os.replace —— 直接 write_bytes 的话，写到一半被坚果云上传，
+    #   另一台设备会拿到半截 PDF；而同名重复上传还会**静默覆盖**已有那篇。
+    _tmp_pdf = save_to.with_suffix(".pdf.tmp")
+    _tmp_pdf.write_bytes(pdf_bytes)
+    os.replace(_tmp_pdf, save_to)
     pdf_saved_path = str(save_to.relative_to(BASE_DIR)).replace("\\", "/")
 
     sections_out = []
@@ -3259,6 +3264,17 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
 
     pages_out = [p.model_dump() for p in req.pages]
 
+    # ⚠⚠ 合并，不是整份替换。
+    #   前端只上传**自己翻过的那几页**（static/index.html 里
+    #   `pages.filter(p => p.translated && p.translation)`）。
+    #   整份替换的话：A 翻了 1–5 页、B 翻了 6–10 页，
+    #   B 同步一次就把 A 的 1–5 页清空了 —— A 下次打开要重翻 5 页，
+    #   **重新烧 token**。
+    #   （docs/SYNC_CONTRACT.md 声称快照是「整份替换」且「不会互相踩坏」，
+    #    实测不成立 —— 快照是整个同步层里唯一会互相踩坏的一路。）
+    existing = _safe_read_json(_snapshot_path(safe_id)) or {}
+    pages_out = _merge_snapshot_pages(existing, req, pages_out)
+
     payload = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "paper_id": safe_id,
@@ -3501,22 +3517,116 @@ def _js_base36(n: int) -> str:
     return "".join(reversed(out))
 
 
+def _djb2_base36_utf16(s: str) -> str:
+    """JS 的 djb2 + toString(36)，**按 UTF-16 码元**迭代。
+
+    ⚠ JS 的 s.charCodeAt(i) 取 UTF-16 码元，Python 的 ord(ch) 取码点 ——
+      路径里有 emoji（代理对）时两端算出的哈希不一样，
+      paper_id / 批注 / 快照 / 阅读进度就**静默**对不上。
+      实现与 merge_changes.djb2_base36 保持一致（那边本来就写对了）。
+    """
+    h = 5381
+    raw = s.encode("utf-16-le", errors="surrogatepass")
+    for i in range(0, len(raw), 2):
+        unit = raw[i] | (raw[i + 1] << 8)
+        h = ((h << 5) + h + unit) & 0xFFFFFFFF
+    return _js_base36(h)
+
+
+def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
+    """合并两个快照文件（按 page_num），返回合并后的 JSON 文本。
+
+    dst 是「已有的一份」，src 是「要并进去的一份」，src 的页优先。
+    合并结果与 dst 相同（或没法合）时返回 None —— 不用写盘。
+
+    ⚠ 不能整份 copy：整份替换会让「页数更少的那一份」赢 ——
+      A 翻了 1–5 页、B 翻了 6–10 页，B 同步一次，A 的 1–5 页就没了。
+    """
+    try:
+        new = _safe_read_json(src) or {}
+        cur = _safe_read_json(dst) or {}
+    except OSError:
+        return None
+    if not isinstance(new, dict) or not new.get("pages"):
+        return None
+    old_sig = (cur or {}).get("paper_text_signature") or ""
+    new_sig = new.get("paper_text_signature") or ""
+    if old_sig and new_sig and old_sig != new_sig:
+        # 原文变了 —— 旧译文作废，整份以新的为准
+        merged = dict(new)
+    else:
+        pages: dict = {}
+        for src_pages in ((cur or {}).get("pages") or [], new.get("pages") or []):
+            for p in src_pages:
+                try:
+                    pages[int(p.get("page_num"))] = p
+                except (TypeError, ValueError):
+                    continue
+        if not pages:
+            return None
+        merged = dict(cur or {})
+        merged.update(new)
+        merged["pages"] = [pages[k] for k in sorted(pages)]
+    text = json.dumps(merged, ensure_ascii=False, indent=2)
+    try:
+        if dst.exists() and dst.read_text(encoding="utf-8") == text:
+            return None
+    except OSError:
+        pass
+    return text
+
+
+def _merge_snapshot_pages(existing: dict, req, incoming: list) -> list:
+    """把新上传的页与**磁盘上已有的页**按 page_num 合并。
+
+    为什么不能整份替换：前端只上传自己翻过的那几页。
+    整份替换的话，A 翻了 1–5 页、B 翻了 6–10 页，
+    B 同步一次就把 A 的 1–5 页清空了 —— A 要重翻 5 页、重新烧 token。
+
+    源文件变了（paper_text_signature 不同）时不能合并 ——
+    老的译文对应的是旧文本，留着就是错的。
+    """
+    old_pages: dict = {}
+    for p in (existing or {}).get("pages") or []:
+        try:
+            old_pages[int(p.get("page_num"))] = p
+        except (TypeError, ValueError):
+            continue
+    if not old_pages:
+        return incoming
+    old_sig = (existing or {}).get("paper_text_signature") or ""
+    new_sig = getattr(req, "paper_text_signature", "") or ""
+    if old_sig and new_sig and old_sig != new_sig:
+        # 原文变了 —— 老的译文作废，只留新传的
+        return incoming
+    merged = dict(old_pages)
+    for p in incoming:
+        try:
+            merged[int(p.get("page_num"))] = p
+        except (TypeError, ValueError):
+            continue
+    return [merged[k] for k in sorted(merged)]
+
+
 def _paper_id_for(relative_path: str) -> str:
     """复刻前端 index.html 的 paperId 生成：base + djb2(完整相对路径)。
 
     必须逐字复刻 —— 两台设备算出的 paper_id 不一致，批注/快照/进度就全对不上。
     任何一边改了这条规则，另一边都得同步改。
+
+    ⚠⚠ 哈希必须按 **UTF-16 码元** 算，不是码点。
+       JS 的 s.charCodeAt(i) 取 UTF-16 码元（emoji = 代理对，算 2 个），
+       Python 的 ord(ch) 取码点（emoji 算 1 个）—— 路径里只要有 emoji
+       （或扩展 B 区的汉字），两端算出的 paper_id 就不同，
+       批注/快照/阅读进度**静默**认不出来。
+       下面直接复用 merge_changes.djb2_base36 —— 那边已经写对了。
     """
     path = (relative_path or "").replace("\\", "/")
     base = path.split("/")[-1]
     if base.lower().endswith(".pdf"):
         base = base[:-4]
     base = base[:70] or "paper"
-    h = 5381
-    for ch in path:
-        # JS: h = ((h << 5) + h + s.charCodeAt(i)) | 0
-        h = ((h << 5) + h + ord(ch)) & 0xFFFFFFFF
-    return f"{base}_{_js_base36(h)}"
+    return f"{base}_{_djb2_base36_utf16(path)}"
 
 
 def _sha256_file(path: Path) -> str:
@@ -3566,8 +3676,14 @@ def _vault_pdfs() -> list:
 
 def _write_file_meta(safe: str, meta: dict) -> None:
     meta["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-    _file_meta_path(safe).write_text(
-        json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+    path = _file_meta_path(safe)
+    # ⚠ 必须 tmp + os.replace。
+    #   这个目录在坚果云的同步范围内 —— 直接 write_text 的话，
+    #   写到一半就被坚果云上传了，另一台设备读到半截 JSON，
+    #   _safe_read_json 静默返回 None → 那篇 PDF 的清单凭空消失。
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _device_id() -> str:
@@ -3858,10 +3974,14 @@ async def api_sync(req: SyncRequest):
                 if fp.stat().st_size > SYNC_MAX_FILE_BYTES:
                     continue
                 dst = dst_dir / fp.name
-                # 共享目录里更新才覆盖（两台设备轮流翻同一篇时不会互相回退）
-                if dst.exists() and dst.stat().st_mtime >= fp.stat().st_mtime:
+                # ⚠ 按 page_num 合并，不整份覆盖 ——
+                #   否则「页数更少的那一份」会赢，另一台已翻的页被清空。
+                merged = _merge_snapshot_files(dst, fp)
+                if merged is None:
                     continue
-                shutil.copyfile(fp, dst)
+                tmp = dst.with_suffix(".json.tmp")
+                tmp.write_text(merged, encoding="utf-8")
+                os.replace(tmp, dst)
                 pushed["snapshots"].append(fp.name)
             except OSError:
                 continue
@@ -3874,26 +3994,15 @@ async def api_sync(req: SyncRequest):
         if ann_shared_dir.is_dir():
             for fp in sorted(ann_shared_dir.glob("*.json")):
                 pushed["annotations"].append(fp.name)
-        # 兼容：旧版本把批注存在本机 logs/ 下
-        ann_local_dir = BASE_DIR / "logs" / "_pdf_snapshots" / "annotations"
-        if ann_local_dir.is_dir():
-            for fp in ann_local_dir.glob("*.json"):
-                try:
-                    dst = ann_shared_dir / fp.name
-                    cur = _safe_read_json(dst) or {}
-                    new = _safe_read_json(fp) or {}
-                    items = _merge_annotation_lists(
-                        cur.get("annotations") or [], new.get("annotations") or [], [])
-                    payload = {"paper_id": new.get("paper_id", fp.stem),
-                               "updated_at": _dt.datetime.now().isoformat(timespec="seconds"),
-                               "schema_version": 2, "annotations": items}
-                    ann_shared_dir.mkdir(parents=True, exist_ok=True)
-                    dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
-                                   encoding="utf-8")
-                    if fp.name not in pushed["annotations"]:
-                        pushed["annotations"].append(fp.name)
-                except OSError:
-                    continue
+        # ⚠⚠ 原来这里还有一段「兼容旧版本」：把本机 logs/_pdf_snapshots/annotations/
+        #    下的**陈旧副本**读回来，用 _merge_annotation_lists(cur, new, [])
+        #    （deleted 传空）合并写回共享目录。
+        #    删除墓碑只存在于保存请求的瞬时参数里、**从不落盘**，
+        #    于是「已删除的 id」因为不在 cur 里被当成「新增」加回去 ——
+        #    A 设备删掉批注，B 设备同步一次，批注就复活了，还回灌给 A。
+        #    （实测：A delete -> shared ids: [] -> B sync -> shared ids: ['anno-1']）
+        #    本机副本现在只是共享目录的**镜像**（拉取时照抄），
+        #    真正的数据源永远是共享目录，所以这段回灌是纯负债 —— 删掉。
 
     # ---------- 推送：阅读进度 ----------
     if not req.pull_only and req.progress:
@@ -3922,29 +4031,43 @@ async def api_sync(req: SyncRequest):
                 if fp.stat().st_size > SYNC_MAX_FILE_BYTES:
                     continue
                 dst = local_snap_dir / fp.name
-                if dst.exists() and dst.stat().st_mtime >= fp.stat().st_mtime:
+                # ⚠ 同样按 page_num 合并 —— 共享目录那份不该把本机
+                #   已翻的页整块清掉。
+                merged = _merge_snapshot_files(dst, fp)
+                if merged is None:
                     continue
-                shutil.copyfile(fp, dst)
+                tmp = dst.with_suffix(".json.tmp")
+                tmp.write_text(merged, encoding="utf-8")
+                os.replace(tmp, dst)
                 pulled["snapshots"].append(fp.name)
                 snapshot_updated = True
             except OSError:
                 continue
 
-        # ---------- 拉取：批注（共享 → 本机，按 id 合并） ----------
+        # ---------- 拉取：批注（共享 → 本机，本机只是**镜像**） ----------
+        # ⚠ 本机副本必须**整体照抄**共享目录，不能按 id 合并 ——
+        #   合并会把共享目录里已经删掉的批注又加回来（没有删除墓碑），
+        #   而且原来那个「长度没变就跳过」的判断让本机副本**永远不更新**
+        #   （改内容但条数不变时更新被丢弃）。
+        #   本机副本只是给「升级前的旧位置」当回落用的镜像，
+        #   真源永远是共享目录。
         src_ann = _sync_dir("annotations")
+        ann_local_dir = BASE_DIR / "logs" / "_pdf_snapshots" / "annotations"
         ann_local_dir.mkdir(parents=True, exist_ok=True)
         for fp in src_ann.glob("*.json"):
             try:
-                new = _safe_read_json(fp) or {}
+                if fp.stat().st_size > SYNC_MAX_FILE_BYTES:
+                    continue
                 dst = ann_local_dir / fp.name
+                new = _safe_read_json(fp) or {}
                 cur = _safe_read_json(dst) or {}
-                items = _merge_annotation_lists(
-                    cur.get("annotations") or [], new.get("annotations") or [], [])
-                if len(items) == len(cur.get("annotations") or []):
+                new_items = new.get("annotations") or []
+                if (cur.get("annotations") or []) == new_items:
                     continue
                 payload = {"paper_id": new.get("paper_id", fp.stem),
-                           "updated_at": _dt.datetime.now().isoformat(timespec="seconds"),
-                           "schema_version": 2, "annotations": items}
+                           "updated_at": (new.get("updated_at")
+                                          or _dt.datetime.now().isoformat(timespec="seconds")),
+                           "schema_version": 2, "annotations": new_items}
                 dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                                encoding="utf-8")
                 pulled["annotations"].append(fp.name)

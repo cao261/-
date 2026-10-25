@@ -77,6 +77,12 @@ class Note:
     html_body: str = ""
     formulas: list = field(default_factory=list)
     search_text: str = ""
+    # 原文（含 YAML frontmatter）。
+    # ⚠ 平板工作台的笔记会被**写回云盘** —— 如果种子里的正文没有
+    #   frontmatter，用户在平板上改一笔再写回去，Obsidian 的
+    #   title/tags/last_updated 就被抹掉了。
+    #   渲染时 renderMarkdown 会 stripFrontmatter，所以带着也无妨。
+    raw: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +104,7 @@ def collect_notes() -> list[Note]:
                 body = md.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
+            raw_body = body
             body, fm = split_frontmatter(body)
             title = (fm.get("title") or "").strip() or _first_heading(body) or md.stem
             sub = md.parent.relative_to(base).as_posix()
@@ -109,6 +116,7 @@ def collect_notes() -> list[Note]:
                     folder=folder,
                     subfolder="" if sub == "." else sub,
                     body=body,
+                    raw=raw_body,
                 )
             )
             idx += 1
@@ -989,7 +997,12 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
             "title": n.title,
             "rel": n.rel,
             "group": n.folder,
-            "body": n.body,
+            # ⚠ 用**含 frontmatter 的原文**。
+            #   平板上的笔记会写回云盘 —— 种子正文里没有 frontmatter 的话，
+            #   用户在平板上改一笔再同步，Obsidian 的 title/tags/last_updated
+            #   就被抹掉了（而且是**静默**抹掉的）。
+            #   渲染侧 renderMarkdown 会 stripFrontmatter，读者看不到。
+            "body": (getattr(n, "raw", "") or n.body),
             "mtime": 0,
             "pdfs": getattr(n, "_pdfs", []),
         })

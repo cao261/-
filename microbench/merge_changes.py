@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -85,9 +86,21 @@ def safe_target(vault: Path, rel: str) -> Path | None:
     if not rel.lower().endswith(".md"):
         return None
     target = vault.joinpath(*parts)
+    # ⚠ 包含性判断必须用**逻辑路径**（os.path.abspath），不能用 resolve()。
+    #   resolve() 会**穿透 junction** —— 本机 vault 的 01_Literature 等目录
+    #   全是指向坚果云的 junction，resolve 之后目标跑到 C 盘的坚果云目录里，
+    #   相对 vault.resolve()（D 盘）自然「越界」→ 全部拒绝。
+    #   实测：junction 部署下 safe_target 对每一条笔记都返回 None，
+    #   平板上的编辑一条都合不回来。
+    #   abspath 同样把 ".." 归一化，上面也已经显式拒了 ".." / 绝对路径 / 盘符，
+    #   遍历攻击照拦。（与 generator._safe_path 的修法一致，见 AGENTS.md §4.4。）
     try:
-        target.resolve().relative_to(vault.resolve())
-    except ValueError:
+        base = os.path.abspath(str(vault))
+        tgt = os.path.abspath(str(target))
+        if os.path.commonpath([base, tgt]) != base:
+            return None
+    except (OSError, ValueError):
+        # commonpath 在跨盘（Windows）时会抛 ValueError
         return None
     return target
 

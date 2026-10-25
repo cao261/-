@@ -178,6 +178,43 @@ def test_relative_path_participates_in_hash():
     assert app._paper_id_for(a) != app._paper_id_for(b)
 
 
+# 非 BMP 字符（emoji、扩展 B 区汉字、数学字母）——
+# ⚠ JS 的 charCodeAt 取 UTF-16 **码元**（代理对算 2 个），
+#   Python 的 ord 取**码点**（代理对算 1 个）。
+#   以前后端用 ord 逐码点算，于是这类路径的前后端 paper_id 不一样，
+#   跨设备的快照/批注/进度就**静默**认不出来。
+#   LOCKED 里的样本全是 BMP 字符，覆盖不到这个洞 —— 所以单独立一组。
+NON_BMP_PATHS = [
+    "01_Literature/04_Survey_综述/\U0001F680 rocket paper.pdf",
+    "01_Literature/04_Survey_综述/a\U0001F600b.pdf",
+    "01_Literature/04_Survey_综述/\U00020BB7 \U0001D400 math.pdf",
+    "01_Literature/04_Survey_综述/中文路径.pdf",
+]
+
+
+def test_non_bmp_paths_match_frontend():
+    """含代理对的路径，前后端 paper_id 必须逐字一致。"""
+    from microbench import app
+    frontend = _run_frontend(NON_BMP_PATHS)
+    for p in NON_BMP_PATHS:
+        assert frontend[p] == app._paper_id_for(p), (
+            f"非 BMP 路径的前后端 paper_id 不一致（同步会静默断裂）:\n"
+            f"  路径: {p}\n"
+            f"  前端: {frontend[p]}\n"
+            f"  后端: {app._paper_id_for(p)}"
+        )
+
+
+def test_backend_hash_uses_utf16_code_units():
+    """后端必须按 UTF-16 码元算 —— 改回 ord() 逐码点就会红。"""
+    from microbench import app
+    p = "01_Literature/\U0001F600.pdf"
+    # 代理对算 2 个码元（0xD83D, 0xDE00），不是 1 个码点
+    assert app._djb2_base36_utf16("\U0001F600") != app._js_base36(
+        ((5381 << 5) + 5381 + 0x1F600) & 0xFFFFFFFF
+    )
+
+
 def test_sync_channel_names_are_contract():
     """四个通道的目录名也是契约 —— 改名会让两台设备对不上。"""
     from microbench import app

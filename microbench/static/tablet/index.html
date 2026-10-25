@@ -90,10 +90,17 @@
         <button class="tb-btn tb-sm" data-ai="explain">解读选中</button>
         <button class="tb-btn tb-sm" data-ai="translate">翻译选中</button>
         <button class="tb-btn tb-sm" data-ai="summarize">摘要全文</button>
-        <button class="tb-btn tb-sm" data-ai="ask">自由提问</button>
+        <button class="tb-btn tb-sm tb-btn-primary" data-ai="ask" id="btn-ai-send">发送提问</button>
+        <button class="tb-btn tb-sm" id="btn-ai-stop" hidden>停止</button>
+        <button class="tb-btn tb-sm" id="btn-ai-clear">清空对话</button>
       </div>
       <div class="tb-ai-input">
-        <textarea id="ai-question" rows="2" placeholder="问点什么…（选中文字后点「解读选中」会带上原文）"></textarea>
+        <div class="tb-ai-ctx" id="ai-context" hidden>
+          <span class="tb-ai-ctx-label">带上原文</span>
+          <span class="tb-ai-ctx-text" id="ai-context-text"></span>
+          <button class="tb-ai-ctx-x" id="ai-context-clear" type="button" title="不带这段原文">×</button>
+        </div>
+        <textarea id="ai-question" rows="2" placeholder="写下你的问题，Enter 发送 / Shift+Enter 换行"></textarea>
       </div>
       <div class="tb-ai-output" id="ai-output"></div>
     </div>
@@ -235,12 +242,11 @@
       <button class="tb-icon" id="pdf-zoom-in" aria-label="放大">＋</button>
     </div>
   </div>
-  <div class="tb-pdf-body" id="pdf-body">
-    <div class="tb-pdf-page" id="pdf-page-wrap">
-      <canvas id="pdf-canvas"></canvas>
-      <div class="textLayer" id="pdf-textlayer"></div>
-    </div>
-  </div>
+  <!-- ⚠ 这里**不能**放静态的 textLayer 占位。
+       openPdf() 一进来就会把 #pdf-body 的内容整个清空，
+       绑在占位节点上的划词监听器会跟着节点一起消失 ——
+       划词气泡就永远不再出现。监听现在绑在 #pdf-body 本身（见 app.js）。 -->
+  <div class="tb-pdf-body" id="pdf-body"></div>
   <div class="tb-pdf-bar">
     <button class="tb-icon" id="pdf-prev" aria-label="上一页">‹</button>
     <span class="tb-pdf-pageinfo" id="pdf-pageinfo">– / –</span>
@@ -255,7 +261,7 @@
 </div>
 
 <script type="application/json" id="mb-data">__DATA__</script>
-<div id="mb-stage" style="display:none"></div>
+<div id="mb-stage" class="tb-stage" hidden></div>
 <!--INLINE_PDFJS_CSS-->
 <!--INLINE_PDFJS_WORKER-->
 <!--INLINE_PDFJS_JS-->
