@@ -5336,7 +5336,9 @@
       if (!html) return "";
       // 公式原图标记（⟦FORMULA:x0,y0,x1,y1⟧）没法搬进 .md —— 坐标对读者
       // 没有意义，而且换个 PDF 就失效了。导出时换成一句人话。
-      html = String(html).replace(/⟦FORMULA:[^⟧]*⟧/g, "【公式：见 PDF 原文】");
+      // 表格标记同理（正常情况下服务端已经换成 Markdown 表格了，这里兜底）。
+      html = String(html).replace(/⟦FORMULA:[^⟧]*⟧/g, "【公式：见 PDF 原文】")
+                      .replace(/⟦TABLE[^⟧]*⟧/g, "【表格：见 PDF 原文】");
       const un = (s) => String(s)
         .replace(/&lt;/g, "<")
         .replace(/&gt;/g, ">")

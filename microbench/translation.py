@@ -532,6 +532,9 @@ FORMULA_TEXT_FALLBACK = (
     "请对照左侧 PDF 原文】"
 )
 
+# 表格标记的兜底文案（正常路径由服务端用多模态抄出的 Markdown 表格替换）
+TABLE_TEXT_FALLBACK = "【表格未能读出，请对照左侧 PDF 原文】"
+
 
 def _normalize_formula_markers(text: str) -> str:
     """修好带坐标的公式标记；修不好的换成文字提示。"""
@@ -551,6 +554,10 @@ def _normalize_formula_markers(text: str) -> str:
 
     out = re.sub(r"⟦FORMULA:([^⟧]*)⟧", repl, text)
     out = out.replace("⟦FORMULA⟧", FORMULA_TEXT_FALLBACK)
+    # 表格标记：正常情况下服务端在翻译后已经用 Markdown 表格替换掉了。
+    # 万一漏了（模型把标记抄变形、或者走的是别的翻译入口），
+    # 这里换成一句人话，别把坐标漏给读者。
+    out = re.sub(r"⟦TABLE[^⟧]*⟧", TABLE_TEXT_FALLBACK, out)
     return out
 
 

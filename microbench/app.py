@@ -1271,10 +1271,16 @@ async def api_serve_pdf(
     )
 
 
-def _pdf_clip_png(pdf_path, page: int, rect: tuple, scale: float = 4.0) -> bytes:
+def _pdf_clip_png(pdf_path, page: int, rect: tuple, scale: float = 4.0,
+                  max_pixels: int = 4_000_000) -> bytes:
     """把 PDF 某一页的一块区域裁成 PNG 字节（PyMuPDF）。
 
     公式原图、表格截图都走这里。rect = (x0, y0, x1, y1)（PDF 点）。
+
+    max_pixels 是**必需的**护栏：裁剪框虽然被限制在页面内，但客户端可以
+    把 scale 调到 8、裁整页 → 4752×6264 ≈ 3000 万像素，一次请求就是
+    ~90MB 的原始 RGB，PNG 编码还会再占一份 → 本机服务被打爆。
+    超了就自动降档（和 paper_text.render_page_png 同一套做法）。
     """
     import fitz  # PyMuPDF
     with fitz.open(str(pdf_path)) as doc:
@@ -1290,6 +1296,11 @@ def _pdf_clip_png(pdf_path, page: int, rect: tuple, scale: float = 4.0) -> bytes
             raise ValueError("裁剪区域无效")
         if (cx1 - cx0) > pr.width or (cy1 - cy0) > pr.height:
             raise ValueError("裁剪区域超出页面")
+        # 像素总量保护：超出就按比例降 scale（上限 1.0，保证一定能出来）
+        w_pt, h_pt = cx1 - cx0, cy1 - cy0
+        pixels = (w_pt * scale) * (h_pt * scale)
+        if pixels > max_pixels:
+            scale = max(1.0, scale * (max_pixels / pixels) ** 0.5)
         pix = pg.get_pixmap(clip=fitz.Rect(cx0, cy0, cx1, cy1),
                             matrix=fitz.Matrix(scale, scale), alpha=False)
         return pix.tobytes("png")
@@ -1470,23 +1481,9 @@ async def api_formula_image(
                             detail="公式裁图需要 PyMuPDF (fitz), 请先 pip install pymupdf") from exc
 
     try:
-        with fitz.open(str(pdf_path)) as doc:
-            if page > doc.page_count:
-                raise HTTPException(status_code=404, detail=f"页码越界: {page}")
-            pg = doc.load_page(page - 1)
-            pr = pg.rect
-            # 裁剪区必须落在页面内，且不能大得离谱（防 abused 参数换内存）
-            cx0, cy0 = max(pr.x0, min(x0, pr.x1)), max(pr.y0, min(y0, pr.y1))
-            cx1, cy1 = min(pr.x1, max(x1, pr.x0)), min(pr.y1, max(y1, pr.y0))
-            if cx1 - cx0 <= 0 or cy1 - cy0 <= 0:
-                raise HTTPException(status_code=400, detail="rect 区域无效")
-            if (cx1 - cx0) > pr.width or (cy1 - cy0) > pr.height:
-                raise HTTPException(status_code=400, detail="rect 区域超出页面")
-            pix = pg.get_pixmap(clip=fitz.Rect(cx0, cy0, cx1, cy1),
-                                 matrix=fitz.Matrix(scale, scale), alpha=False)
-            png = pix.tobytes("png")
-    except HTTPException:
-        raise
+        png = _pdf_clip_png(pdf_path, page, (x0, y0, x1, y1), scale)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"公式裁图失败: {e}")
 

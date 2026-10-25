@@ -1035,14 +1035,6 @@ def _looks_like_body_text(bw, x_mid: float) -> bool:
     return bodyish(left) and bodyish(right)
 
 
-def _band_is_table_like(bw, x_mid: float) -> bool:
-    """这一带像不像表格行：不是正文，而且含好几个数字。"""
-    if _looks_like_body_text(bw, x_mid):
-        return False
-    digits = sum(1 for w in bw if any(ch.isdigit() for ch in w["text"]))
-    return digits >= 3
-
-
 # 论文里的表格必有表题（"Table I. Properties of ..." / "TABLE 2" / "表 1"）。
 # **用表题定位表格**，而不是用"有很多数字"—— 公式行也全是数字
 # （"a ¼ 33 31 (2)"），按数字判会把公式当表格（实测 eq (2)/(3) 被误判）。
@@ -1209,33 +1201,6 @@ def _table_marker(words: list, width: float, height: float) -> str:
         max(0.0, x0 - pad), max(0.0, y0 - pad),
         min(width, x1 + pad), min(height, y1 + pad))
 
-
-def _table_unit(rows: list[str], words: list, width: float,
-                height: float) -> list[str]:
-    """把一段表格正文换成「多模态读图」标记。
-
-    条件（都要满足才换）：
-      - 至少两行（单行不算表格）；
-      - 至少两行里有 3 个以上数字（数字多才像表格，图表标题不算）；
-      - 区域有实际宽度。
-
-    不满足就原样保留文本 —— 宁可给模型看碎片，也别把正文误当表格。
-    """
-    if len(rows) < 2 or not words:
-        return list(rows)
-    numeric_rows = sum(1 for r in rows if len(re.findall(r"\d", r)) >= 3)
-    if numeric_rows < 2:
-        return list(rows)
-    x0 = min(w["x0"] for w in words)
-    x1 = max(w["x1"] for w in words)
-    y0 = min(w["top"] for w in words)
-    y1 = max(w["bottom"] for w in words)
-    if x1 - x0 < 20 or y1 - y0 < 12:
-        return list(rows)
-    pad = 3.0
-    return ["⟦TABLE:{:.1f},{:.1f},{:.1f},{:.1f}⟧".format(
-        max(0.0, x0 - pad), max(0.0, y0 - pad),
-        min(width, x1 + pad), min(height, y1 + pad))]
 
 
 def _band_column_gap(band_words, width):

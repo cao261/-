@@ -220,3 +220,19 @@ def test_formula_image_endpoint_rejects_bad_rect(client, sandbox):
                     params={"relative_path": "01_Literature/sample2.pdf",
                             "page": 2, "rect": "abc"})
     assert r2.status_code in (400, 422), r2.text
+
+
+def test_formula_image_pixel_cap(client, sandbox):
+    """整页 + 最大 scale 也不能把内存打爆（必须有像素上限）。"""
+    pdf_dir = sandbox / "01_Literature"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    target = pdf_dir / "sample3.pdf"
+    shutil.copyfile(JACERS, target)
+    r = client.get("/api/paper/formula_image",
+                   params={"relative_path": "01_Literature/sample3.pdf",
+                           "page": 2, "rect": "0,0,600,800", "scale": 8})
+    assert r.status_code == 200, r.text
+    # 返回的 PNG 像素数必须在上限内（4M）
+    import struct
+    w, h = struct.unpack(">II", r.content[16:24])
+    assert w * h <= 4_200_000, f"裁图像素数失控: {w}x{h}"
