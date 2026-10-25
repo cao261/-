@@ -116,10 +116,12 @@ function reset() {
   T.state.ai.key = "test-key";
   T.state.ai.base = "https://api.example.com/v1";
   T.state.ai.model = "MiniMax-M3.1-Flash";
+  T.state.ai.modelT = "MiniMax-M3";
   T.state.notes.clear();
   T.state.notes.set("note-1", { id: "note-1", title: "测试笔记", body: "笔记正文", rel: "note-1.md" });
   T.state.currentId = "note-1";
   T.state.aiHistory.clear();
+  T.resetThrottle();          // 别让限流器把测试拖慢
 }
 
 /** 收集一棵 DOM 树里出现过的所有标签名 */
@@ -242,6 +244,91 @@ function collectText(node, out) {
   T.state.aiHistory.clear();
   getEl("ai-output").innerHTML = "";
   check(getEl("ai-output").children.length === 0, "清空后对话区为空");
+
+  console.log("\n[8] 429 自动换模型（交接文档 §2 ② —— 平板最该做的一条）");
+  reset();
+  const realFetch = global.fetch;
+  let hit = 0;
+  global.fetch = async (url, opts) => {
+    hit++;
+    if (hit === 1) {
+      calls.push({ url, opts, payload: JSON.parse(opts.body) });
+      return {
+        ok: false,
+        status: 429,
+        text: async () => '{"error":{"message":"RateLimitError: too many requests"}}',
+      };
+    }
+    return realFetch(url, opts);
+  };
+  getEl("ai-question").value = "主模型额度用完了怎么办";
+  await T.runAI("ask");
+  check(hit === 2, "429 之后自动重试了一次（实际请求 " + hit + " 次）");
+  check(calls.length === 2, "两次请求都被记下来了");
+  check(calls[0].payload.model === "MiniMax-M3.1-Flash",
+    "第一次用的是主模型（" + calls[0].payload.model + "）");
+  check(calls[1].payload.model === "MiniMax-M3",
+    "重试时换成了另一个模型（" + calls[1].payload.model + "）");
+  const outEl8 = getEl("ai-output");
+  const turn8 = outEl8.children[outEl8.children.length - 1];
+  const st8 = (turn8.children[0] || {})._text || "";
+  check(st8.indexOf("完成") >= 0 && st8.indexOf("MiniMax-M3") >= 0,
+    "完成后说的是**实际用的那个**模型 -> " + st8);
+  check(st8.indexOf("限流") < 0 && st8.indexOf("失败") < 0,
+    "换模型成功后不该再报错 -> " + st8);
+  global.fetch = realFetch;
+
+  console.log("\n[9] 两个模型都 429 时只试一次就报错（不能无限重试）");
+  reset();
+  let hit2 = 0;
+  global.fetch = async (url, opts) => {
+    hit2++;
+    calls.push({ url, opts, payload: JSON.parse(opts.body) });
+    return {
+      ok: false,
+      status: 429,
+      text: async () => '{"error":{"message":"Token Plan limit exceeded"}}',
+    };
+  };
+  getEl("ai-question").value = "两个模型都没额度";
+  await T.runAI("ask");
+  check(hit2 === 2, "最多试 2 次（主模型 + 备用），实际 " + hit2 + " 次");
+  const outEl9 = getEl("ai-output");
+  const turn9 = outEl9.children[outEl9.children.length - 1];
+  const st9 = (turn9.children[0] || {})._text || "";
+  check(st9.indexOf("失败") >= 0, "最终照实报错 -> " + st9);
+  check(st9.indexOf("额度") >= 0, "说的是「额度用完」而不是「限流」 -> " + st9);
+  global.fetch = realFetch;
+
+  console.log("\n[10] 等待期看得见「已用时」（用户原话：等了半天什么也没输出）");
+  reset();
+  const realFetch2 = global.fetch;
+  global.fetch = async (url, opts) => {
+    await new Promise((r) => setTimeout(r, 1200));
+    return realFetch2(url, opts);
+  };
+  getEl("ai-question").value = "慢一点的请求";
+  const pending = T.runAI("ask");
+  await new Promise((r) => setTimeout(r, 1100));
+  const outEl10 = getEl("ai-output");
+  const turn10 = outEl10.children[outEl10.children.length - 1];
+  const st10 = (turn10.children[0] || {})._text || "";
+  check(/\d+\s*s/.test(st10), "等待期状态条带已用时 -> " + JSON.stringify(st10));
+  await pending;
+  const st10b = (turn10.children[0] || {})._text || "";
+  check(st10b.indexOf("思考中") < 0, "结束后状态条不再显示「思考中」 -> " + st10b);
+  global.fetch = realFetch2;
+
+  console.log("\n[11] 按模型限流（平板直连，得自己卡）");
+  check(T.rpmFor("Agnes-3.0-Flash") === 11, "Agnes 记 11 RPM（免费版额度小）");
+  check(T.rpmFor("MiniMax-M3") === 30, "普通模型记 30 RPM");
+  T.resetThrottle();
+  const t0 = Date.now();
+  await T.throttleModel("MiniMax-M3");
+  await T.throttleModel("MiniMax-M3");
+  const dt = Date.now() - t0;
+  check(dt >= 1500, "同一模型连发两次，第二次被限流器挡住（等了 " + dt + "ms）");
+  T.resetThrottle();
 
   console.log("\n" + "=".repeat(60));
   console.log("PASS " + pass + "  FAIL " + fail);

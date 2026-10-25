@@ -211,6 +211,36 @@
     return safeErr(raw).slice(0, 200);
   }
 
+  /* ------------------------------------------------------------------
+   * 按模型限流
+   *
+   * 平板是**直连** LLM API 的（不经过本机服务端），
+   * 所以桌面端 `llm.py` 里的限流表对平板不生效 —— 得自己卡。
+   *
+   * 桌面实测过的数字：Agnes（免费版）只有 11 RPM，
+   * 付费模型（MiniMax / DeepSeek）30 RPM 够用。
+   * 超了就是 429 —— 上面还有「换模型重试」兜着，
+   * 但先别把自己打爆。
+   * ------------------------------------------------------------------ */
+  const _lastReqAt = new Map();        // model -> 上次真正发出去的时刻
+
+  function rpmFor(model) {
+    const m = String(model || "").toLowerCase();
+    return m.indexOf("agnes") >= 0 ? 11 : 30;
+  }
+
+  async function throttleModel(model) {
+    try {
+      const minGap = Math.ceil(60000 / rpmFor(model));
+      const last = _lastReqAt.get(model) || 0;
+      const wait = last + minGap - Date.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      _lastReqAt.set(model, Date.now());
+    } catch (e) {
+      // 限流器出问题不能挡住正事
+    }
+  }
+
   /** djb2 — 用来判断一份内容有没有变过。刻意不用 crypto.subtle：
    *  file:// 在部分浏览器里不是 secure context，subtle 会直接不存在。 */
   function hash(s) {
@@ -1739,8 +1769,12 @@
         return { content: "", reasoning: "", aborted: true };
       }
       if (!r || !r.ok) {
-        throw new Error(friendlyHttpError((r && r.status) || 0,
+        const err = new Error(friendlyHttpError((r && r.status) || 0,
           String((r && (r.error || r.body)) || "")));
+        // ⚠ 把状态码带出去 —— 上层要靠它判断「是不是 429」，
+        //   才知道该不该换模型重试。靠字符串匹配 HTTP 429 太脆。
+        err.status = Number((r && r.status) || 0) || 0;
+        throw err;
       }
       const parsed = parseSse(r.body);
       if (parsed.content && onDelta) onDelta(parsed.content);
@@ -1758,7 +1792,9 @@
     });
     if (!res.ok) {
       const t = await res.text().catch(() => "");
-      throw new Error(friendlyHttpError(res.status, t));
+      const err = new Error(friendlyHttpError(res.status, t));
+      err.status = res.status;          // ← 上层靠它判断该不该换模型
+      throw err;
     }
     const reader = res.body.getReader();
     const dec = new TextDecoder();
@@ -1949,11 +1985,54 @@
     }
 
     let answer = "";
+    let usedModel = model;
+    // ⚠ 等待期要**看得见**（交接文档 §2 ①）：
+    //   用户原话「他有可能等了半天然后什么也没输出」。
+    //   没有已用时，用户只能盯着一个不动的光标猜是不是死了。
+    const t0 = Date.now();
+    let gotFirstDelta = false;
+    const tick = setInterval(() => {
+      if (gotFirstDelta) return;
+      const s = Math.floor((Date.now() - t0) / 1000);
+      status.textContent = s > 60
+        ? "⏳ 还在想… · " + s + "s（可能模型在长思考，可点停止或换模型）"
+        : "⏳ 思考中… · " + s + "s";
+    }, 1000);
     try {
-      const res = await aiRequest(payload, cfg, (txt) => {
+      // ⚠ 429 自动换模型（交接文档 §2 ② —— 平板最该做的一条）：
+      //   平板天然有两个模型配置（cfg.model 推理 / cfg.modelT 翻译快模型），
+      //   主模型额度用完或被限流 → 换另一个顶一下。
+      //   **只换一次**：换完还不行就照实报错，别无限重试烧额度。
+      const altModel = (kind === "translate")
+        ? (cfg.model || "")
+        : (cfg.modelT || "");
+      const onDelta = (txt) => {
+        if (!gotFirstDelta) { gotFirstDelta = true; clearInterval(tick); }
         buf.innerHTML = renderMarkdown(txt);
         if (out) out.scrollTop = out.scrollHeight;
-      });
+      };
+      let res = null;
+      try {
+        await throttleModel(model);
+        res = await aiRequest(payload, cfg, onDelta);
+      } catch (e1) {
+        const st = Number(e1 && e1.status) || 0;
+        if (st === 429 && altModel && altModel !== model) {
+          status.textContent = "主模型 " + model + " 额度/限流 → 换 " + altModel + " 重试…";
+          usedModel = altModel;
+          payload.model = altModel;
+          // 换模型后，思考开关要按新模型重算（原来那个是给主模型定的）
+          if (isTranslate && /MiniMax-M3$/.test(altModel)) {
+            payload.thinking = { type: "disabled" };
+          } else {
+            delete payload.thinking;
+          }
+          await throttleModel(altModel);
+          res = await aiRequest(payload, cfg, onDelta);
+        } else {
+          throw e1;
+        }
+      }
       if (res.aborted) {
         status.textContent = "已停止";
         return;
@@ -1961,7 +2040,7 @@
       answer = res.content || "";
       if (answer) {
         buf.innerHTML = renderMarkdown(answer);
-        status.textContent = `完成 · ${model}`;
+        status.textContent = `完成 · ${usedModel}`;
       } else if (res.reasoning) {
         // 正文空、只剩思考 —— 思考把 max_tokens 预算吃光了
         buf.innerHTML = renderMarkdown(res.reasoning);
@@ -1978,6 +2057,7 @@
         status.setAttribute("data-error", "1");
       }
     } finally {
+      clearInterval(tick);
       if (stopBtn) stopBtn.hidden = true;
       // 记进历史，供下一轮追问用
       if (answer) {
@@ -3396,6 +3476,10 @@
       safeErr: safeErr,
       friendlyHttpError: friendlyHttpError,
       esc: esc,
+      // 按模型限流（平板直连，得自己卡）
+      rpmFor: rpmFor,
+      throttleModel: throttleModel,
+      resetThrottle: function () { _lastReqAt.clear(); },
       // AI 面板（输入栏清空、多轮上下文这些行为必须有护栏）
       runAI: runAI,
       aiOnKeyDown: aiOnKeyDown,
