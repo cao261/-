@@ -6373,7 +6373,6 @@
       }
 
       const modelName = _llmStatus.active_model || "LLM";
-      const rpmInfo = _getCurrentRpmInfo();
       if (_llmStatus.is_degraded) {
         // ⚠️ 别把备用模型的 RPM 写进徽标 —— 那是 Agnes 的限流值（11/20），
         //    用户会读成"我被限流到 20 RPM 了"，正是这次要消除的误判。

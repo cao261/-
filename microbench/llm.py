@@ -556,7 +556,10 @@ def mask_paths(text: str) -> str:
     out = re.sub(r"[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n]+\\)*[^\\/:*?\"<>|\r\n]*",
                  "<本机路径>", text)
     # POSIX 绝对路径（/opt/... /home/...）
-    out = re.sub(r"(?<![\w<])/(?:[^\s'\"]+/)+[^\s'\"]*", "<本机路径>", out)
+    # ⚠️ 不能吃掉 URL 里的路径部分：`https://example.com/a/b/c` 里
+    #    `://` 之后的那段会被当绝对路径抹掉 → 整个 URL 变成 "https:<本机路径>"
+    #    （独立审查 M-3 实测）。所以要求斜杠前面不是 ":" 的一部分。
+    out = re.sub(r"(?<![\w<:/])(/(?:[^\s'\"]+/)+[^\s'\"]*)", r"<本机路径>", out)
     return out
 
 
@@ -606,7 +609,7 @@ def _degrade_text(kind: str) -> str:
                       "或换一个限流更宽松的模型。",
         "no_output": "主模型这次没吐出正文（思考把 token 预算烧光了），"
                      "已临时改用备用模型；这跟额度无关。",
-    }.get(kind, "主模型暂时不可用，已自动降级到备用模型。")
+    }.get(kind, "")
 
 
 def _safe_base_url(url: str) -> str:
@@ -875,6 +878,10 @@ class DualModelManager:
             return {"success": False, "message": f"探针网络请求异常: {e}"}
 
     def get_status(self) -> dict:
+        # 短 TTL 到期 → 顺手恢复，别让 API 继续返回陈旧的降格状态
+        # （徽标会一直显示"无正文"，独立审查 M-5）。
+        if self._ttl_expired():
+            self.mark_recovered()
         primary = self.get_primary_config()
         fallback = self.get_fallback_config()
 
@@ -2432,7 +2439,7 @@ def summarize_paper(meta: dict) -> dict:
         # LLMError 要人话化（上游 429/401…）；别的异常保持原样。
         # ⚠️ 这里把错误**吞掉**了（返回 partial），所以外层 app.py 的
         # `except llm.LLMError` 根本看不到它 —— 人话化必须在这里做。
-        detail = friendly_error_text(e) if isinstance(e, LLMError) else _redact_secrets(str(e))
+        detail = friendly_error_text(e) if isinstance(e, LLMError) else _mask_paths(_redact_secrets(str(e)))
         return {
             "tldr": f"({title[:30]}... — LLM 未配置或调用失败: {detail[:80]})",
             "key_points": [

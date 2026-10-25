@@ -38,6 +38,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # ---------------------------------------------------------------------------
 os.environ.setdefault("SYNC_PDF_BODY", "1")
 
+# ---------------------------------------------------------------------------
+# ⚠️ LLM 的 key **不能**在这里 setdefault。
+#
+# `microbench.llm` 在 import 时 `load_dotenv(..., override=False)` —— 如果
+# 这时 os.environ 里已经有 AGNES_API_KEY，.env 里的**真 key 就进不来**，
+# 后面那些"真调模型"的端点测试（translate_page / explain_stream…）会全部
+# 拿到占位符 → 上游 401 → 集体变红。
+#
+# 需要"备用模型已配置"这个条件的**行为级**降格断言，改在**那条测试里**
+# 用 pytest 的 monkeypatch 单独设（测试执行期生效、结束自动还原）。
+# ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session")
 def project_root() -> Path:

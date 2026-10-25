@@ -21,6 +21,26 @@ EXPORT = ROOT / "microbench" / "export_offline.py"
 SECRET = "9f8ac2b1e77d4a6fSECRETVALUE"
 
 
+def _except_blocks(src, marker):
+    """按行切出每个 `except ... as e:` 块（到下一个 except / 顶层定义为止）。
+
+    不能用正则 `(?=\\n\\s*except |\\n\\s*\\n)` 切：块内一个空行就会把块截断
+    （独立审查实测：9 个分支只匹配到 1 个，其余全漏检）。
+    """
+    lines = src.split("\n")
+    starts = [i for i, ln in enumerate(lines) if marker in ln]
+    blocks = []
+    for i in starts:
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            s = lines[j]
+            if re.match(r"\s*except\b", s) or re.match(r"(def |async def |@app\.|class )", s):
+                end = j
+                break
+        blocks.append("\n".join(lines[i:end]))
+    return blocks
+
+
 # ---------------------------------------------------------------------------
 # 1) 密钥脱敏：不能再有漏网形态
 # ---------------------------------------------------------------------------
@@ -88,13 +108,48 @@ def test_error_exits_redact_before_sending_to_browser():
 
 
 def test_app_error_details_use_safe_err():
-    """app.py 里回前端的异常消息要走 _safe_err（脱敏 + 抹路径）。"""
+    """app.py 里回前端的异常消息要走 _safe_err（脱敏 + 抹路径）。
+
+    ⚠️ 上一轮的正则只认 `detail=f"...{e}"`（插值紧跟引号），
+    恰恰漏掉了它要防的那一种形态 `{e})"`（独立审查实测：
+    改回 `{e}` 护栏依然全绿）。现在改成**按 except 块切分**再在块内找插值。
+    """
     src = APP.read_text(encoding="utf-8")
-    # 只看 except Exception / except llm.LLMError 块里的原始插值
-    for m in re.finditer(r"detail=f\"([^\"]*?)\{(str\(e\)|e)\}\"", src):
-        snippet = src[max(0, m.start() - 260):m.end() + 20]
-        assert "_safe_err(e)" in snippet or "friendly_error_text" in snippet, \
-            f"异常消息没走 _safe_err: ...{snippet[-160:]}"
+    checked = 0
+    for blk in _except_blocks(src, "except Exception as e:"):
+        if "llm.LLMError" not in blk:
+            continue          # 普通异常不必人话化
+        if "_safe_err(e)" in blk or "friendly_error_text" in blk:
+            continue          # 已做转换
+        for m in re.finditer(r"\{(str\(e\)|e)[^}]*\}", blk):
+            checked += 1
+            assert False, (
+                "except Exception 分支处理了 LLMError，却把原始异常插值给了用户: "
+                f"...{blk[max(0, m.start() - 160):m.end() + 20][-180:]}"
+            )
+    assert checked == 0, "有 except 块把原始异常直接插给了前端"
+
+
+def test_mask_paths_handles_spaces_and_keeps_urls():
+    """路径遮罩：带空格的 Windows 路径要整段遮住；URL 不能被误伤。"""
+    # 带空格 → 必须整段遮住（旧正则遇空格即停 → 只遮一半）
+    out = llm.mask_paths(r"打开失败: C:\Program Files (x86)\Microsoft\Edge\msedge.exe")
+    assert "Program Files" not in out, f"带空格的路径只遮了一半: {out}"
+    assert "msedge.exe" not in out, out
+    # URL → 不能把路径部分吃掉
+    out = llm.mask_paths("请求失败: https://example.com/api/v1/chat")
+    assert "example.com" in out, f"URL 被误伤: {out}"
+    # 普通内容不能误伤
+    for text in ("2026/10/25", "分数 1/2", "a/b"):
+        assert llm.mask_paths(text) == text, f"误伤: {text!r} -> {llm.mask_paths(text)!r}"
+
+
+def test_badge_does_not_show_fallback_rpm():
+    """徽标不能显示备用模型的限流 RPM（用户会读成自己被限流）。"""
+    src = (ROOT / "microbench" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "降格 ${rpmInfo.rpm} RPM" not in src, \
+        "徽标还在显示备用模型的限流 RPM"
+    assert "kindLabel" in src, "徽标应该显示降格分类（配额/限流/无正文）"
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +282,7 @@ def test_status_exposes_degrade_kind_and_text():
     assert "degraded_text" in st, sorted(st)
 
 
-def test_no_output_does_not_globally_degrade_permanently():
+def test_no_output_does_not_globally_degrade_permanently(monkeypatch):
     """「这次没产出正文」不能永久压着主模型。
 
     ⚠️ 这条护栏原来是用**源码正则匹配**写的 → 双向失效（独立审查实测）：
@@ -235,8 +290,19 @@ def test_no_output_does_not_globally_degrade_permanently():
       - 只把变量 `is_quota` 改名 → 护栏变红（假阳性，无害重构也报）
     现在改成**行为级断言**：mock 主模型返回"未产出正文" → 调 chat() →
     断言降格是**短 TTL**（会自己到期），而不是永久。
+
+    ⚠️ 备用模型必须"已配置"才会进降格分支 —— 这里用 monkeypatch 单独设
+    （**不能**在 conftest 模块级 setdefault：那会挡住 .env 里的真 key，
+    让"真调模型"的端点测试全部拿到占位符而变红）。
     """
     from microbench import llm as llm_mod
+
+    monkeypatch.setenv("AGNES_API_KEY", "test-dummy-agnes-key")
+    monkeypatch.setenv("LLM_FALLBACK_API_KEY", "test-dummy-agnes-key")
+    # ⚠️ 主模型也要"已配置"：chat() 里 `if not is_degraded and primary["configured"]`
+    #    这一整块才是降格逻辑所在的分支 —— 主模型没配置就直接走备用模型，
+    #    根本不会进降格逻辑（干净检出上就是这样"看起来没降格"）。
+    monkeypatch.setenv("LLM_API_KEY", "test-dummy-primary-key")
 
     calls = {"n": 0}
 
@@ -278,10 +344,12 @@ def test_no_output_does_not_globally_degrade_permanently():
         llm_mod.model_manager.mark_recovered()
 
 
-def test_no_output_degrade_expires_on_its_own():
+def test_no_output_degrade_expires_on_its_own(monkeypatch):
     """短 TTL 降格到期后自动恢复主模型。"""
     from microbench import llm as llm_mod
 
+    monkeypatch.setenv("AGNES_API_KEY", "test-dummy-agnes-key")
+    monkeypatch.setenv("LLM_FALLBACK_API_KEY", "test-dummy-agnes-key")
     llm_mod.model_manager.mark_recovered()
     llm_mod.model_manager.mark_degraded("空正文", kind="no_output", ttl_seconds=0.05)
     assert llm_mod.model_manager.get_status()["is_degraded"] is True
@@ -293,9 +361,11 @@ def test_no_output_degrade_expires_on_its_own():
     llm_mod.model_manager.mark_recovered()
 
 
-def test_mark_recovered_clears_degrade_kind():
+def test_mark_recovered_clears_degrade_kind(monkeypatch):
     """恢复后不能还带着旧的降格分类（否则 API 会说'额度用完了'但已恢复）。"""
     from microbench import llm as llm_mod
+    monkeypatch.setenv("AGNES_API_KEY", "test-dummy-agnes-key")
+    monkeypatch.setenv("LLM_FALLBACK_API_KEY", "test-dummy-agnes-key")
     llm_mod.model_manager.mark_degraded("x", kind="quota")
     llm_mod.model_manager.mark_recovered()
     st = llm_mod.model_manager.get_status()
