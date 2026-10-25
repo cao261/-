@@ -251,6 +251,32 @@ def main() -> int:
     check('msg.indexOf("限流")' in app_js,
           "限流错误不会被静默吞掉（否则用户以为同步成功了）")
 
+    print("\n[18] 本地优先：断网也要能存能看，联网时同步上去")
+    check('"annos_" + key' in app_js,
+          "本地批注存在 meta store（不升 IndexedDB 版本，零升级风险）")
+    check("DB_VER = 2" in app_js,
+          "IndexedDB 版本没升（升级会被旧标签页挡住 → 白屏）")
+    check("openDBWithoutVersion" in app_js,
+          "版本对不上时降级打开（不白屏）")
+    check("saveAnnotations" in app_js, "有批注保存入口")
+    check("pushAnnosToCloud" in app_js, "批注会同步到坚果云")
+    check("mergeAnnos" in app_js, "批注按 id 合并（不能整份覆盖）")
+    # 顺序：先写本地，再同步云盘
+    save_i = app_js.find("async function saveAnnotations")
+    body = app_js[save_i:save_i + 900] if save_i >= 0 else ""
+    check(body.find("putAnnos") < body.find("pushAnnosToCloud"),
+          "保存顺序是「先写本地，再同步云盘」")
+
+    print("\n[19] 平板要达到电脑端的同等能力")
+    check("pdf-layout" in app_js, "有布局三选一（原文+译文 / 仅原文 / 仅译文）")
+    check("仅原文" in app_js and "仅译文" in app_js, "三种布局都在")
+    check("captureInkPage" in app_js, "能把原文+手写合成图片")
+    check("askAiWithInk" in app_js, "手写能直接问 AI（多模态）")
+    check("image_url" in app_js, "用 image_url 把图发给模型")
+    check("saveQuoteAsAnno" in app_js, "划词能存成批注")
+    check("collectSelectionRects" in app_js, "选区矩形归一化（跟电脑端同一套）")
+    check("data-pdf-anno" in app_js, "划词气泡上有「标注」按钮")
+
     print(f"\n{'=' * 60}")
     print(f"PASS {len(PASS)}  FAIL {len(FAIL)}")
     for f in FAIL:

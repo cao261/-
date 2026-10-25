@@ -91,6 +91,7 @@
         <button class="tb-btn tb-sm" data-ai="translate">翻译选中</button>
         <button class="tb-btn tb-sm" data-ai="summarize">摘要全文</button>
         <button class="tb-btn tb-sm tb-btn-primary" data-ai="ask" id="btn-ai-send">发送提问</button>
+        <button class="tb-btn tb-sm" id="btn-ai-ink" title="把手写标注连同问题一起发给模型">✍ 带上我的手写问 AI</button>
         <button class="tb-btn tb-sm" id="btn-ai-stop" hidden>停止</button>
         <button class="tb-btn tb-sm" id="btn-ai-clear">清空对话</button>
       </div>
@@ -238,9 +239,9 @@
     <button class="tb-icon" id="pdf-close" aria-label="关闭">×</button>
     <div class="tb-pdf-title" id="pdf-title"></div>
     <div class="tb-pdf-ctrl">
-      <button class="tb-btn tb-sm" id="pdf-toggle-trans" title="显示/隐藏译文">译</button>
+      <button class="tb-btn tb-sm" id="pdf-layout" title="切换：原文+译文 / 仅原文 / 仅译文">原文+译文</button>
       <button class="tb-btn tb-sm" id="pdf-toggle-ink" title="在原文上手写">手写</button>
-      <button class="tb-btn tb-sm" id="pdf-save-ink" title="把笔迹存到坚果云">存</button>
+      <button class="tb-btn tb-sm" id="pdf-save-ink" title="把笔迹存到平板本地（联网后同步到坚果云）">存</button>
       <button class="tb-icon" id="pdf-zoom-out" aria-label="缩小">−</button>
       <button class="tb-icon" id="pdf-zoom-in" aria-label="放大">＋</button>
     </div>
@@ -259,6 +260,7 @@
     <button data-pdf-ai="explain">解读</button>
     <button data-pdf-ai="translate">翻译</button>
     <button data-pdf-ai="ask">提问</button>
+    <button data-pdf-anno="1">标注</button>
   </div>
   <div class="tb-pdf-status" id="pdf-status"></div>
 </div>

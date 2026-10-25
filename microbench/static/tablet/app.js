@@ -165,12 +165,19 @@
   // IndexedDB
   // ------------------------------------------------------------------
   const DB_NAME = "mb_tablet";
+  // ⚠⚠ 不要因为「想加个新 store」就升 DB_VER。
+  //   IndexedDB 升版本需要**所有**打开着这个库的连接都让路；
+  //   有一个旧版本标签页/旧 WebView 挡着，新版本就永远
+  //   onblocked —— 表现是**白屏 + 「启动失败」**。
+  //   本地批注因此放在已有的 meta store 里（键 "annos_<paper_id>"），
+  //   不需要升版本，零风险。
   const DB_VER = 2;
   let db = null;
 
   function openDB() {
     return new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VER);
+      let settled = false;
       req.onupgradeneeded = () => {
         const d = req.result;
         if (!d.objectStoreNames.contains("notes")) {
@@ -185,10 +192,55 @@
           d.createObjectStore("pdfcache", { keyPath: "id" });
         }
       };
-      req.onsuccess = () => { db = req.result; resolve(db); };
-      req.onerror = () => reject(req.error);
-      req.onblocked = () => reject(new Error("IndexedDB 被另一个标签页占着"));
+      req.onsuccess = () => {
+        settled = true;
+        db = req.result;
+        // 别的标签页要升版本时，把这边的连接关掉 ——
+        // 不关的话它会一直挡着别人，白屏。
+        try {
+          db.onversionchange = () => { try { db.close(); } catch (e) { /* ignore */ } };
+        } catch (e) { /* ignore */ }
+        resolve(db);
+      };
+      req.onerror = () => {
+        if (settled) return;
+        settled = true;
+        // ⚠ 版本对不上（本地库比这份代码新 —— 装过更新的版本又装回旧的）
+        //   直接抛出去就是「白屏 + 一句看不懂的英文」。
+        //   退一步：按现有版本打开、不做升级 —— 存储照常能用，
+        //   只是可能少几个新功能，**但不会白屏**。
+        if (req.error && req.error.name === "VersionError") {
+          openDBWithoutVersion(resolve, reject);
+          return;
+        }
+        reject(req.error);
+      };
+      req.onblocked = () => {
+        // 被旧版本挡住了 —— 给它 6 秒自己关掉；超时给一条**能指路**的提示。
+        setTimeout(() => {
+          if (!settled) {
+            reject(new Error("另一个标签页正开着旧版本的工作台 —— 关掉它再打开"));
+          }
+        }, 6000);
+      };
     });
+  }
+
+  /** 不带版本号打开：沿用现有版本，不触发升级。 */
+  function openDBWithoutVersion(resolve, reject) {
+    try {
+      const req = indexedDB.open(DB_NAME);
+      req.onsuccess = () => {
+        db = req.result;
+        try {
+          db.onversionchange = () => { try { db.close(); } catch (e) { /* ignore */ } };
+        } catch (e) { /* ignore */ }
+        resolve(db);
+      };
+      req.onerror = () => reject(req.error);
+    } catch (e) {
+      reject(e);
+    }
   }
 
   function tx(store, mode, fn) {
@@ -225,6 +277,15 @@
     },
     deleteNote(id) { return tx("notes", "readwrite", (s) => s.delete(id)); },
     clearNotes() { return tx("notes", "readwrite", (s) => s.clear()); },
+    // ---- 本地批注（离线可写可看，联网时同步） ----
+    // ⚠ 放在 meta store 里而不是新建 store —— 新建 store 要升 DB_VER，
+    //   而升版本会被旧标签页挡住（白屏 + 启动失败）。零风险优先。
+    getAnnos(key) {
+      return this.getMeta("annos_" + key, null);
+    },
+    putAnnos(key, value) {
+      return this.setMeta("annos_" + key, value);
+    },
     getMeta(k, dflt) {
       return new Promise((resolve, reject) => {
         const t = db.transaction("meta", "readonly");
@@ -1662,7 +1723,60 @@
     }
   }
 
-  async function runAI(kind) {
+  /**
+   * 把「原文 + 手写」合成一张图（给 AI 看）。
+   *
+   * ⚠ 手写是图形，AI 读不懂 —— 必须转成**图片**发过去（多模态）。
+   *   合成而不是只截笔迹层：AI 需要看到手写标注**画在哪**。
+   */
+  async function captureInkPage(pageNum) {
+    const wrap = document.querySelector(`[data-pdf-page="${pageNum}"]`);
+    if (!wrap || !wrap.querySelector) return null;
+    const orig = wrap.querySelector(".tb-pdf-orig");
+    const src = orig ? orig.querySelector("canvas") : null;
+    if (!src || !src.width) return null;
+    const inkCv = wrap.querySelector(".tb-pdf-ink canvas");
+    // 压到 1200px 宽 —— 原图带 dpr，一页可能 2000+ px，发出去太大
+    const maxW = 1200;
+    const scale = Math.min(1, maxW / src.width);
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.floor(src.width * scale));
+    cv.height = Math.max(1, Math.floor(src.height * scale));
+    const ctx = cv.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(src, 0, 0, cv.width, cv.height);
+    if (inkCv && inkCv.width) {
+      ctx.drawImage(inkCv, 0, 0, cv.width, cv.height);
+    }
+    try {
+      return cv.toDataURL("image/jpeg", 0.82);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 「带上我的手写问 AI」—— 把手写标注连同问题一起发给模型。 */
+  async function askAiWithInk() {
+    const pages = Object.keys(inkState.strokes)
+      .filter((p) => (inkState.strokes[p] || []).length);
+    if (!pages.length) {
+      toast("先在手写模式下画几笔，再点这个", true);
+      return;
+    }
+    const q = ($("ai-question").value || "").trim();
+    if (!q) {
+      toast("写下你的问题", true);
+      $("ai-question").focus();
+      return;
+    }
+    const img = await captureInkPage(parseInt(pages[0], 10));
+    if (!img) { toast("截不到手写内容", true); return; }
+    await runAI("ask", { imageDataUrl: img });
+  }
+
+  async function runAI(kind, opts) {
+    const o = opts || {};
     const cfg = state.ai;
     if (!cfg.key) {
       toast("还没配置 API Key，先去设置里填一下", true);
@@ -1713,6 +1827,21 @@
         role: h.role, content: h.content,
       }));
       messages = [base[0]].concat(ctx, [base[1]]);
+    }
+
+    // ⚠ 带上图片（手写标注）—— OpenAI 兼容的 content 数组格式。
+    //   手写是图形，文字描述不出来，得让模型直接看图。
+    if (o.imageDataUrl) {
+      const last = messages[messages.length - 1];
+      if (last && last.role === "user") {
+        messages[messages.length - 1] = {
+          role: "user",
+          content: [
+            { type: "text", text: String(last.content || "") },
+            { type: "image_url", image_url: { url: o.imageDataUrl } },
+          ],
+        };
+      }
     }
 
     const [status, buf] = aiAppendAnswer();
@@ -1850,7 +1979,7 @@
     rendered: new Set(),   // 已经画过的页码
     pending: false,
     zoom: 1,               // 用户缩放倍数（1 = 适合宽度）
-    showTrans: true,        // 显示译文栏
+    layout: "both",         // both | orig | trans（原文+译文 / 仅原文 / 仅译文）
     trans: null,           // {pageNum: 译文}
     annos: [],             // 批注
   };
@@ -1926,18 +2055,100 @@
     return null;
   }
 
-  /** 拉一篇论文的批注。 */
+  /**
+   * 取一篇论文的批注：**本地优先**，联网时再跟云端对齐。
+   *
+   * ⚠ 本地优先是硬要求 —— 断网也要能看批注、也要能写批注。
+   *   云盘只是「让另一台设备也能看到」的同步目标，**不是数据源**。
+   *   跟电脑端的语义一致：本地改完，联网时同步上去。
+   */
   async function loadAnnotations(pdfId) {
     const key = safePaperKey(paperIdFor(pdfId));
     if (!key) return [];
+    // ① 本地
+    const rec = await DB.getAnnos(key);
+    const local = (rec && rec.items) || [];
+    const dirty = !!(rec && rec.dirty);
+    // ② 云端（联网时；离线就跳过，不报错）
+    let cloud = [];
     try {
       const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
-      if (!r.ok) return [];
-      const data = await r.json();
-      return Array.isArray(data.annotations) ? data.annotations : [];
+      if (r.ok) {
+        const data = await r.json();
+        cloud = Array.isArray(data.annotations) ? data.annotations : [];
+      }
     } catch (e) {
-      console.warn("拉批注失败", e);
-      return [];
+      console.warn("拉批注失败（离线？）", e);
+    }
+    if (!cloud.length) {
+      return local;
+    }
+    // ③ 合并
+    //   本地是**干净**的（之前同步过）→ 云端没有的，说明是在别处删掉了，
+    //     本地也跟着删 —— 否则会「删了又复活」。
+    //   本地**有未同步的改动** → 合并，本地那份为准。
+    const merged = dirty ? mergeAnnos(cloud, local) : cloud;
+    await DB.putAnnos(key, { items: merged, dirty: dirty ? 1 : 0, at: Date.now() });
+    return merged;
+  }
+
+  /** 按 id 合并两份批注（后到的覆盖先到的）。 */
+  function mergeAnnos(base, extra) {
+    const map = new Map();
+    base.forEach((a) => { if (a && a.id) map.set(a.id, a); });
+    extra.forEach((a) => { if (a && a.id) map.set(a.id, a); });
+    return Array.from(map.values()).sort((a, b) =>
+      String(a.created_at || "").localeCompare(String(b.created_at || "")));
+  }
+
+  /**
+   * 保存批注：**先写本地**（立刻生效、断网也能用），再尽力同步到云盘。
+   * 同步失败（离线/限流）时本地那份留着，下次再试 —— 不丢。
+   */
+  async function saveAnnotations(pdfId, items, silent) {
+    const key = safePaperKey(paperIdFor(pdfId));
+    if (!key) return false;
+    // ① 本地先存 —— 硬要求：断网也能改
+    await DB.putAnnos(key, { items: items, dirty: 1, at: Date.now() });
+    // ② 再同步到云盘
+    const ok = await pushAnnosToCloud(key, items);
+    if (ok) {
+      await DB.putAnnos(key, { items: items, dirty: 0, at: Date.now() });
+    } else if (!silent) {
+      toast("已存到平板本地（联网后会自动同步到坚果云）");
+    }
+    return ok;
+  }
+
+  /** 把批注写到同步根（先读云端合并，再写回 —— 不能整份覆盖）。 */
+  async function pushAnnosToCloud(key, items) {
+    if (!nativeBridge || typeof nativeBridge.putSync !== "function") {
+      return false;      // 浏览器里没有同步根
+    }
+    try {
+      let cloud = [];
+      try {
+        const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
+        if (r.ok) {
+          const d = await r.json();
+          cloud = Array.isArray(d.annotations) ? d.annotations : [];
+        }
+      } catch (e) { /* 云端读不到就以本地为准 */ }
+      const merged = mergeAnnos(cloud, items);
+      const payload = {
+        paper_id: key,
+        updated_at: new Date().toISOString(),
+        schema_version: 2,
+        annotations: merged,
+      };
+      await nativeCall("putSync", [
+        "annotations/" + key + ".json",
+        JSON.stringify(payload, null, 1),
+      ]);
+      return true;
+    } catch (e) {
+      console.warn("批注同步失败", e);
+      return false;
     }
   }
 
@@ -2075,7 +2286,7 @@
 
   /** 把某页的译文插进页卡。 */
   function renderTranslationInto(wrap, n) {
-    if (pdfState.showTrans === false) return;
+    if ((pdfState.layout || "both") === "orig") return;
     const t = pdfState.trans && pdfState.trans[n];
     if (!t) return;
     const box = el("div", "tb-pdf-trans");
@@ -2233,7 +2444,10 @@
   }
 
   /**
-   * 把手写笔迹存到**同步根**的批注文件里（跟电脑端共享同一份）。
+   * 把手写笔迹存成一条批注（跟电脑端共享同一份文件）。
+   *
+   * ⚠ 先存**本地**（断网也能存），再尽力同步到云盘 ——
+   *   跟电脑端的语义一致：本地改完，联网时同步上去。
    */
   async function saveInk() {
     const pdfId = pdfState.id;
@@ -2248,16 +2462,10 @@
     });
     if (!strokes.length) { toast("还没有笔迹"); return; }
 
-    // 读现有批注 → 合并（去掉旧的同 id 手写条目）→ 写回
-    let data = { paper_id: key, annotations: [] };
-    try {
-      const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
-      if (r.ok) data = await r.json();
-    } catch (e) { /* 离线：下面会提示 */ }
-    const list = Array.isArray(data.annotations) ? data.annotations : [];
     const id = "ink_" + key;
-    const merged = list.filter((a) => a && a.id !== id);
-    merged.push({
+    const now = new Date().toISOString();
+    const items = (pdfState.annos || []).filter((a) => a && a.id !== id);
+    items.push({
       id: id,
       page: 0,
       source: "ink",
@@ -2266,28 +2474,76 @@
       color: "red",
       rects: [],
       strokes: strokes,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+      created_at: now,
+      updated_at: now,
     });
-    const payload = {
-      paper_id: key,
-      updated_at: new Date().toISOString(),
-      schema_version: 2,
-      annotations: merged,
-    };
-    if (!nativeBridge || typeof nativeBridge.putSync !== "function") {
-      toast("浏览器里只能存在本机；装成 APK 才会同步到坚果云", true);
-      return;
-    }
-    try {
-      await nativeCall("putSync", [
-        "annotations/" + key + ".json",
-        JSON.stringify(payload, null, 1),
-      ]);
-      toast("手写标注已存到坚果云（电脑端同步后能看到）");
-    } catch (e) {
-      toast("保存手写失败：" + (e && e.message ? e.message : e), true);
-    }
+    pdfState.annos = items;
+    const ok = await saveAnnotations(pdfId, items, true);
+    toast(ok
+      ? "手写标注已保存并同步到坚果云（电脑端同步后能看到）"
+      : "手写标注已存到平板本地（联网后会自动同步）", !ok);
+  }
+
+  /**
+   * 划词存成批注（跟电脑端同一套数据）。
+   * @param quote 选中的原文
+   * @param rects 选区在原文页面上的归一化矩形
+   */
+  async function saveQuoteAsAnno(quote, rects) {
+    const pdfId = pdfState.id;
+    if (!pdfId || !quote) return;
+    const key = safePaperKey(paperIdFor(pdfId));
+    if (!key) return;
+    const now = new Date().toISOString();
+    const id = "a" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const items = (pdfState.annos || []).slice();
+    items.push({
+      id: id,
+      page: pdfState.currentPage || 0,
+      source: "pdf",
+      quote: quote.slice(0, 4000),
+      note: "",
+      color: "yellow",
+      rects: rects || [],
+      created_at: now,
+      updated_at: now,
+    });
+    pdfState.annos = items;
+    const ok = await saveAnnotations(pdfId, items, true);
+    toast(ok ? "批注已保存并同步到坚果云" : "批注已存到平板本地（联网后同步）", !ok);
+  }
+
+  /**
+   * 收集选区相对于原文页面的**归一化矩形**（跟电脑端同一套算法）。
+   * 这样高亮框在两台设备、两种缩放下都对得上。
+   */
+  function collectSelectionRects() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return [];
+    let range;
+    try { range = sel.getRangeAt(0); } catch (e) { return []; }
+    const rects = Array.from(range.getClientRects() || [])
+      .filter((r) => r.width > 1 && r.height > 1);
+    if (!rects.length) return [];
+    let node = range.startContainer;
+    if (node && node.nodeType === 3) node = node.parentElement;
+    const wrapper = node && node.closest ? node.closest(".tb-pdf-orig") : null;
+    if (!wrapper) return [];
+    const wr = wrapper.getBoundingClientRect();
+    if (!wr.width || !wr.height) return [];
+    const out = [];
+    rects.forEach((r) => {
+      const x = (r.left - wr.left) / wr.width;
+      const y = (r.top - wr.top) / wr.height;
+      const w = r.width / wr.width;
+      const h = r.height / wr.height;
+      if (x < -0.02 || y < -0.02 || x > 1.02 || y > 1.02) return;  // 选到了页面外
+      out.push({
+        x: Math.max(0, x), y: Math.max(0, y),
+        w: Math.min(1, w), h: Math.min(1, h),
+      });
+    });
+    return out;
   }
 
   async function renderPdfPage(n) {
@@ -2305,7 +2561,7 @@
     const viewport = page.getViewport({ scale: pdfFitScale(page) });
     const dpr = window.devicePixelRatio || 1;
 
-    const wrap = el("div", "tb-pdf-page");
+    const wrap = el("div", "tb-pdf-page lay-" + (pdfState.layout || "both"));
     wrap.setAttribute("data-pdf-page", String(n));
 
     // ---- 原文侧 ----
@@ -2538,6 +2794,17 @@
         } else {
           runAI(kind);
         }
+      };
+    });
+
+    // 划词存成批注 —— 跟电脑端同一套数据（本地先存，联网时同步）
+    bubble.querySelectorAll("[data-pdf-anno]").forEach((b) => {
+      b.onclick = () => {
+        const text = bubble.dataset.text || "";
+        if (!text) { hide(); return; }
+        const rects = collectSelectionRects();
+        hide();
+        saveQuoteAsAnno(text, rects);
       };
     });
   }
@@ -2797,16 +3064,30 @@
     $("pdf-next").onclick = () => gotoPdfPage(pdfState.currentPage + 1);
     $("pdf-zoom-in").onclick = () => { pdfState.zoom = Math.min(4, (pdfState.zoom || 1) * 1.2); redrawPdf(); };
     $("pdf-zoom-out").onclick = () => { pdfState.zoom = Math.max(0.4, (pdfState.zoom || 1) / 1.2); redrawPdf(); };
-    // 译文开关 —— 有译文时默认开着（这是平板跟「直接看 PDF」的根本区别）
-    $("pdf-toggle-trans").onclick = () => {
-      pdfState.showTrans = pdfState.showTrans === false;
-      $("pdf-toggle-trans").classList.toggle("is-active", pdfState.showTrans);
-      redrawPdf();
-    };
+    // 布局三选一：原文+译文 / 仅原文 / 仅译文
+    // ⚠ 平板屏幕小，双栏并排看很挤 —— 必须能切成单栏。
+    const layBtn = $("pdf-layout");
+    if (layBtn) {
+      const LAYOUTS = [["both", "原文+译文"], ["orig", "仅原文"], ["trans", "仅译文"]];
+      const syncLabel = () => {
+        const cur = LAYOUTS.find((x) => x[0] === (pdfState.layout || "both")) || LAYOUTS[0];
+        layBtn.textContent = cur[1];
+        layBtn.classList.toggle("is-active", cur[0] !== "orig");
+      };
+      layBtn.onclick = () => {
+        const i = LAYOUTS.findIndex((x) => x[0] === (pdfState.layout || "both"));
+        pdfState.layout = LAYOUTS[(i + 1) % LAYOUTS.length][0];
+        syncLabel();
+        redrawPdf();
+      };
+      syncLabel();
+    }
     // 手写开关
     $("pdf-toggle-ink").onclick = () => { inkToggle(!inkState.on); };
     // 保存手写
     $("pdf-save-ink").onclick = () => { saveInk(); };
+    // 带上手写问 AI（多模态：把手写标注转成图片发给模型）
+    $("btn-ai-ink").onclick = () => { askAiWithInk(); };
     document.querySelectorAll("[data-close-lib]").forEach((b) => {
       b.onclick = () => { $("pdf-lib").hidden = true; };
     });
@@ -2999,6 +3280,11 @@
       paperIdFor: paperIdFor,
       safePaperKey: safePaperKey,
       syncUrl: syncUrl,
+      // 本地优先的批注存取
+      DB: DB,
+      saveAnnotations: saveAnnotations,
+      loadAnnotations: loadAnnotations,
+      mergeAnnos: mergeAnnos,
       state: state,
     };
   }

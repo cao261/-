@@ -55,7 +55,7 @@ function getEl(id) {
 }
 
 // ---- 假 IndexedDB ---------------------------------------------------------
-const STORE_KEYS = { notes: "id", meta: "k", pdfcache: "id" };
+const STORE_KEYS = { notes: "id", meta: "k", pdfcache: "id", annos: "id" };
 
 function fakeIndexedDB() {
   const data = { notes: new Map(), meta: new Map(), pdfcache: new Map() };
@@ -353,6 +353,52 @@ function check(cond, label) {
       check(true, "含公式的译文都渲染成了 KaTeX");
     }
   }
+
+  console.log("\n[9] 本地优先：断网也要能存、能看批注");
+  await T.openDB();
+  const realFetch = global.fetch;
+  global.fetch = async () => { throw new Error("offline"); };
+  const rel = "01_Literature/01_论文原文_PDF/x.pdf";
+  const key = T.safePaperKey(T.paperIdFor(rel));
+  const items = [{ id: "a1", page: 1, quote: "离线写的批注", rects: [], strokes: [] }];
+  const synced = await T.saveAnnotations(rel, items, true);
+  check(synced === false, "离线时同步失败（预期）");
+  const rec = await T.DB.getAnnos(key);
+  check(rec && rec.items && rec.items.length === 1,
+    "但本地已经存下来了");
+  check(rec && rec.dirty === 1, "本地标记为「待同步」");
+  const back = await T.loadAnnotations(rel);
+  check(back.length === 1 && back[0].quote === "离线写的批注",
+    "断网时也能把本地批注读出来");
+  global.fetch = realFetch;
+
+  console.log("\n[10] 批注合并：按 id 合并，不整份覆盖");
+  const m = T.mergeAnnos(
+    [{ id: "a1", quote: "云端的" }, { id: "a2", quote: "只有云端有" }],
+    [{ id: "a1", quote: "本地的" }, { id: "a3", quote: "只有本地有" }]);
+  check(m.length === 3, "合并后是 3 条（实际 " + m.length + "）");
+  const a1 = m.find((x) => x.id === "a1");
+  check(a1 && a1.quote === "本地的", "同 id 时本地那条为准（本地优先）");
+
+  console.log("\n[11] 布局三选一（平板屏幕小，双栏要能切）");
+  check(src.indexOf("pdf-layout") >= 0, "有布局切换按钮");
+  check(src.indexOf('lay-" + (pdfState.layout') >= 0, "页卡按布局加 class");
+  check(src.indexOf("仅原文") >= 0 && src.indexOf("仅译文") >= 0,
+    "三种布局：原文+译文 / 仅原文 / 仅译文");
+  const css2 = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  check(css2.indexOf(".tb-pdf-page.lay-orig .tb-pdf-trans") >= 0,
+    "仅原文时隐藏译文栏");
+  check(css2.indexOf(".tb-pdf-page.lay-trans .tb-pdf-orig") >= 0,
+    "仅译文时隐藏原文栏");
+
+  console.log("\n[12] 手写要能直接问 AI、也能存成批注");
+  check(src.indexOf("captureInkPage") >= 0, "能把原文+手写合成图片");
+  check(src.indexOf("askAiWithInk") >= 0, "有「带上手写问 AI」的入口");
+  check(src.indexOf("image_url") >= 0, "用多模态的 image_url 把图发给模型");
+  check(src.indexOf("saveQuoteAsAnno") >= 0, "划词能存成批注");
+  check(src.indexOf("collectSelectionRects") >= 0, "选区矩形归一化（跟电脑端同一套）");
+  check(src.indexOf('data-pdf-anno') >= 0 || src.indexOf("pdf-anno") >= 0,
+    "划词气泡上有「标注」按钮");
 
   console.log("\n" + "=".repeat(60));
   console.log("PASS " + pass + "  FAIL " + fail);

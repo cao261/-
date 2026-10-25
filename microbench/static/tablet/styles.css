@@ -457,10 +457,14 @@ button { cursor:pointer; }
   margin:0 auto 14px; max-width:100%;
   display:flex; flex-direction:column;
 }
-/* 宽屏（横屏）自动变成左右双栏 —— 跟电脑端一样 */
+/* 布局三选一：原文+译文 / 仅原文 / 仅译文。
+   平板屏幕小，双栏并排看很挤 —— 必须能切成单栏。 */
+.tb-pdf-page.lay-orig .tb-pdf-trans { display:none; }
+.tb-pdf-page.lay-trans .tb-pdf-orig { display:none; }
+/* 宽屏（横屏）双栏才并排 —— 跟电脑端一样 */
 @media (min-width: 900px) {
-  .tb-pdf-page { flex-direction:row; align-items:flex-start; }
-  .tb-pdf-orig { border-right:1px solid #E6E1D8; }
+  .tb-pdf-page.lay-both { flex-direction:row; align-items:flex-start; }
+  .tb-pdf-page.lay-both .tb-pdf-orig { border-right:1px solid #E6E1D8; }
 }
 .tb-pdf-orig { position:relative; flex:0 0 auto; }
 .tb-pdf-page canvas { display:block; }
