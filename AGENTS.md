@@ -766,6 +766,14 @@ if str(REPO) not in sys.path:      # ← 脚本模式必须有这一步
 **做法**：`microbench/auto_sync.py`（幂等，没新提交就什么都不做）。
 定时任务**每 2 小时**跑一次（Asia/Shanghai `0 */2 * * *`）。
 
+> **这台机（30461）上的定时任务**：
+> 名字「定期同步对方设备的升级（本机 + 平板 APK）」
+> `cron_id = d2c04537-d595-43ca-9efb-3a8a8ae8ca88`
+> 跑法 = 在仓库根目录执行 `python microbench/auto_sync.py`，读最后一行
+> `MB_SYNC_RESULT: {json}`，按 `action` 决定怎么汇报。
+> **另一台设备上的 agent 看到这段就知道：对方推的东西会自动跟过来，
+> 不用等人工同步**；反过来，这台机也会自动同步对方推的东西。
+
 ```powershell
 python microbench/auto_sync.py              # 正常同步
 python microbench/auto_sync.py --dry-run    # 只看有没有新提交
