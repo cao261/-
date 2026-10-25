@@ -274,7 +274,50 @@ JACERS 综述第 2 页 Table I：文本层抽出来是 `B700 16.5`、
 
 ---
 
-## 8. 答疑面板最小化 = 收成侧边栏
+## 8. 批注（标注）：记录不丢 + 列表按当前页定位
+
+**用户原话（2026-10-25）**："如果我重新翻译的话……这个标注是不是就直接没了？
+这个记录要有。还有就是如果有很多标注的话……我希望就是我点开哪一页，
+它显示的那个标记的列表是从那个开始的，不要每次都从第一页的标注开始。"
+
+### 8.1 两条承诺
+
+| 承诺 | 实现 | 判定 |
+|---|---|---|
+| **重译后记录不丢** | 译文侧标注找不到原引文时**不删除**，只置 `orphan=true` | `applyAnnotationsToPage()`：包不上高亮 → `a.orphan = !(a.rects && a.rects.length)` |
+| **列表按当前页定位** | 抽屉打开时滚到**当前页**的第一条 | `openAnnoDrawer()`：按 `el.dataset.page` 找本页条目 |
+
+### 8.2 "位置失效" ≠ "批注丢了"
+
+重译会改写译文 → 原来划的那句话在新译文里不存在了 → 高亮包不上。
+
+- **译文侧标注**（无 `rects`）：高亮找不到了 → 标 **⚠ 位置失效**（虚线边框），
+  但 `quote` / `note` / 颜色全部保留，笔记一个字都不丢
+- **PDF 侧标注**（有 `rects`）：高亮画在 PDF 画布的覆盖层上，**不受重译影响**
+  → 永远不算失效
+- 失效标记**会自愈**：译文恢复成原来那句 → 重新包上高亮 → `orphan=false`
+
+### 8.3 抽屉定位规则
+
+列表按页码排序后：
+
+1. 本页有标注 → 滚到**本页第一条**（`block: "start"`）
+2. 本页没有 → 落在**下一页的第一条**
+3. 超出范围 → 回退到第一条
+
+### 8.4 改这块时必须跑
+
+```bash
+node microbench/_test_reader_annotations.js     # 21 项
+python -m pytest tests/test_reader_annotations.py -q
+```
+
+测试用 node 跑 `index.html` 里的**真实函数**（切片 + eval），不是抄一份。
+反向验证：`git stash` 掉改动后同一套测试要红 12 项 —— 否则说明断言是恒真的。
+
+---
+
+## 9. 答疑面板最小化 = 收成侧边栏
 
 **用户原话**："划线解答有点问题，最好点最小化能够缩小至侧边栏"。
 
@@ -284,16 +327,18 @@ JACERS 综述第 2 页 Table I：文本层抽出来是 `B700 16.5`、
 
 ---
 
-## 9. 改完必跑
+## 10. 改完必跑
 
 ```bash
 python -m pytest tests -q
 node microbench/_test_reader_markdown.js
+node microbench/_test_reader_annotations.js
 ```
 
 - `tests/test_column_order.py` —— 页内顺序契约
 - `tests/test_qa_fixes.py` —— 空正文检测 / 多模态 / 侧边栏契约
 - `tests/test_reader_formula_table.py` —— 公式坐标 / 表格渲染 / 快照版本化
 - `tests/test_reader_table_vision.py` —— 表格多模态读图契约
+- `tests/test_reader_annotations.py` —— 批注不丢 / 列表按当前页定位
 
 仓库有 pre-commit 钩子，提交时会自动跑离线测试套件。

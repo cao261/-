@@ -1534,6 +1534,20 @@
     }
     .anno-item-note { font-size: 12.5px; color: var(--fg-strong); line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
     .anno-item-meta { font-size: 10px; color: var(--fg-subtle); margin-top: 5px; display: flex; gap: 8px; }
+    /* 位置失效的批注（该页重译后引文对不上了）：记录留着，笔记不丢，
+       只是标出来"高亮找不到了"，别让用户以为批注被删了。 */
+    .anno-item-orphan { border-style: dashed; border-color: var(--accent-terracotta); }
+    .anno-item-orphan .anno-item-quote { opacity: .75; }
+    .anno-item-orphan-tip {
+      font-size: 11px; color: var(--accent-terracotta);
+      margin: 0 0 5px; line-height: 1.4;
+    }
+    .anno-orphan-warn {
+      font-size: 11.5px; color: var(--accent-terracotta);
+      background: rgba(178, 83, 54, .08);
+      border: 1px solid rgba(178, 83, 54, .3);
+      border-radius: 5px; padding: 6px 8px; margin-bottom: 8px;
+    }
     .anno-empty { padding: var(--s-5); text-align: center; color: var(--fg-subtle); font-size: 12px; }
 
     /* ---------- 原文（PDF 侧）上的高亮覆盖层 ----------
@@ -6444,7 +6458,10 @@
           label.appendChild(badge);
         }
         badge.textContent = "📝 " + count;
-        badge.title = "本页有 " + count + " 条批注 · 点击查看";
+        const orphanN = _annoState.items.filter(a => a.page === pageNum && a.orphan).length;
+        badge.title = "本页有 " + count + " 条批注"
+          + (orphanN ? "（其中 " + orphanN + " 条位置已失效，笔记仍在）" : "")
+          + " · 点击查看";
         badge.onclick = (e) => { e.stopPropagation(); openAnnoDrawer(pageNum); };
       });
     }
@@ -6956,6 +6973,7 @@
       const noteEl = document.getElementById("anno-note");
       const titleEl = document.getElementById("anno-editor-title");
       const delBtn = document.getElementById("anno-delete-btn");
+      const warnEl = document.getElementById("anno-orphan-warn");
       const sel = _readerSelState || {};
 
       if (annoId) {
@@ -6967,6 +6985,8 @@
         if (noteEl) noteEl.value = a.note || "";
         if (titleEl) titleEl.textContent = "✍ 编辑批注";
         if (delBtn) delBtn.style.display = "inline-block";
+        // 位置失效的标注：明确告诉用户"笔记还在，只是高亮找不到了"
+        if (warnEl) warnEl.style.display = a.orphan ? "block" : "none";
       } else {
         const quote = (sel.text || "").trim();
         if (!quote) { showToast("请先划选一段文字再标注", true); return; }
@@ -6976,6 +6996,7 @@
         if (noteEl) noteEl.value = "";
         if (titleEl) titleEl.textContent = "✍ 新建批注";
         if (delBtn) delBtn.style.display = "none";
+        if (warnEl) warnEl.style.display = "none";
       }
 
       // 位置：贴着划词气泡（没有气泡就放屏幕中间偏上）
@@ -7182,7 +7203,15 @@
       let applied = 0;
       _annoState.items.forEach(a => {
         if (a.page !== pageNum) return;
-        if (_wrapTextWithMark(container, a.quote, a.id, a.color)) applied++;
+        if (_wrapTextWithMark(container, a.quote, a.id, a.color)) {
+          applied++;
+          a.orphan = false;
+        } else {
+          // 译文侧标注（没有 PDF 坐标）遇到重译 → 引文对不上，位置失效。
+          // **记录必须留着**（用户写的笔记不能凭空消失），只是高亮找不到了。
+          // PDF 侧标注有 rects，高亮画在 PDF 画布上，不受重译影响 → 不算失效。
+          a.orphan = !(a.rects && a.rects.length);
+        }
       });
       return applied;
     }
@@ -7225,7 +7254,10 @@
           (slot || head).appendChild(badge);
         }
         badge.textContent = "📝 " + count;
-        badge.title = "本页有 " + count + " 条批注 · 点击查看";
+        const orphanN = _annoState.items.filter(a => a.page === pageNum && a.orphan).length;
+        badge.title = "本页有 " + count + " 条批注"
+          + (orphanN ? "（其中 " + orphanN + " 条位置已失效，笔记仍在）" : "")
+          + " · 点击查看";
       });
     }
 
@@ -7243,10 +7275,13 @@
         items.forEach(a => {
           const el = document.createElement("div");
           el.className = "anno-item";
+          el.dataset.page = String(a.page || 0);
+          if (a.orphan) el.classList.add("anno-item-orphan");
           const color = _ANNO_COLORS.find(c => c.id === a.color);
           el.innerHTML =
             '<div class="anno-item-quote" style="--anno-line:' + ((color && color.hex) || "#FACC15") + '">'
             + escapeHtml(a.quote) + '</div>'
+            + (a.orphan ? '<div class="anno-item-orphan-tip">⚠ 位置失效（该页重译后原文变了）· 笔记已保留</div>' : '')
             + (a.note ? '<div class="anno-item-note">' + escapeHtml(a.note) + '</div>' : '<div class="anno-item-note" style="color:var(--fg-subtle);font-style:italic;">（只高亮，没有笔记）</div>')
             + '<div class="anno-item-meta"><span>' + (a.page > 0 ? "第 " + a.page + " 页" : "章节视图") + '</span><span>' + escapeHtml((a.updated_at || a.created_at || "").slice(0, 10)) + '</span></div>';
           el.onclick = () => {
@@ -7261,8 +7296,17 @@
       }
       drawer.style.display = "flex";
       if (pageNum) {
-        const el = list.querySelector(".anno-item");
-        if (el) el.scrollIntoView({ block: "nearest" });
+        // 定位到**当前页**的批注（不是每次都从第一页的第一条开始）：
+        // 本页的第一条 → 本页没有就落在下一页的第一条 → 再没有就退回第一条。
+        let target = null;
+        const els = Array.from(list.querySelectorAll(".anno-item"));
+        for (const el of els) {
+          const p = parseInt(el.dataset.page || "0", 10);
+          if (p === pageNum) { target = el; break; }
+          if (!target && p > pageNum) target = el;
+        }
+        if (!target) target = els[0] || null;
+        if (target) target.scrollIntoView({ block: "start" });
       }
     }
 
@@ -8405,6 +8449,10 @@
           <button class="btn-zoom-toggle" onclick="closeAnnotationEditor()" title="关闭" aria-label="关闭">×</button>
         </div>
         <div id="anno-quote" class="anno-quote"></div>
+        <div id="anno-orphan-warn" class="anno-orphan-warn" style="display:none;">
+          ⚠ 这条批注的位置失效了：该页重新翻译过，译文变了，原来高亮的那句话
+          对不上了。<b>你的笔记仍然保留着</b>（不会被删掉），只是高亮暂时找不到位置。
+        </div>
         <div class="anno-color-row" id="anno-color-row"></div>
         <textarea id="anno-note" class="field-textarea" rows="3"
                   placeholder="写下你的理解、疑问或结论（可留空，只高亮）…"></textarea>
