@@ -244,6 +244,7 @@ def main() -> int:
 
     if not remote or remote == local:
         result["action"] = "up_to_date"
+        result["ok"] = True       # 「没有新东西」是**正常结束**，不是失败
         result["messages"].append("没有新提交，无需同步")
         log("== 已是最新，无需同步 ==")
         return finish()
@@ -253,12 +254,14 @@ def main() -> int:
     if rc == 0:
         # 本地已经包含了远端 —— 说明本机自己推过（反方向），不用合并
         result["action"] = "local_ahead"
+        result["ok"] = True
         result["messages"].append("本地已包含远端全部提交（没有需要同步的新升级）")
         log("== 远端没有本机没有的提交，无需同步 ==")
         return finish()
 
     if args.dry_run:
         result["action"] = "would_update"
+        result["ok"] = True
         rc, out = git("log", "--oneline", f"{local}..{remote}")
         result["messages"].append("有 %d 个新提交待同步" % len(out.splitlines()))
         log("== 有新提交（dry-run，不动手）==\n" + out[:1500])
@@ -336,6 +339,7 @@ def main() -> int:
     result["head_after"] = head_short()
     result["new_commits"] = n_new
     result["backup_branch"] = backup
+    result["ok"] = True          # ← 走到这里就说明这一轮是成功的
     result["messages"].append(
         "已同步 %d 个提交，测试全绿%s" % (n_new, "，并已推送到 GitHub" if result["pushed"] else ""))
     if result.get("apk"):
