@@ -330,6 +330,183 @@ function collectText(node, out) {
   check(dt >= 1500, "同一模型连发两次，第二次被限流器挡住（等了 " + dt + "ms）");
   T.resetThrottle();
 
+  // ==================================================================
+  // [12] 思考预算（抄电脑端 AGENTS.md §4.38，2026-10-27）
+  //
+  // 根因：M3.1-Flash **强制思考**，思考 token 与正文**共用**同一个
+  // max_tokens 预算池 → 预算给小了，正文一个字都出不来。
+  // 电脑端实测（7K 上下文 + 生产提示词 + 真实模型）：
+  //     max_tokens=4000  → 59.9s / 正文 **0 字**
+  //     max_tokens=16000 → 86.2s / 正文 **4884 字**
+  // 平板是直连模型的（不走后端），所以这套预算必须自己写一份。
+  // ==================================================================
+  console.log("\n[12] 思考预算：答疑必须给足「思考 + 正文」的额度");
+  reset();
+  getEl("ai-question").value = "磁电传感器的工作原理是什么？";
+  await T.runAI("ask");
+  check(calls[0].payload.max_tokens >= 16000,
+    "答疑的 max_tokens >= 16000（实际 " + calls[0].payload.max_tokens + "）");
+  check(T.AI_QA_MAX_TOKENS >= 16000,
+    "AI_QA_MAX_TOKENS = " + T.AI_QA_MAX_TOKENS + "（实测需要 >=16000）");
+
+  console.log("\n[13] 翻译的预算按「正文」算，不能照抄答疑的数");
+  reset();
+  global.getSelection = () => ({ toString: () => "选中的论文段落" });
+  await T.runAI("translate");
+  check(calls[0].payload.max_tokens === 4000,
+    "翻译用 4000（直译型模型关思考，按正文算）→ 实际 " + calls[0].payload.max_tokens);
+  check(calls[0].payload.thinking && calls[0].payload.thinking.type === "disabled",
+    "翻译关掉思考（MiniMax-M3 支持）");
+  global.getSelection = () => ({ toString: () => "" });
+
+  console.log("\n[14] 强制思考模型（M3.1-Flash）不能发 thinking=disabled（上游会 400）");
+  check(T.modelForcesThinking("MiniMax-M3.1-Flash") === true,
+    "M3.1-Flash 被认成强制思考模型");
+  check(T.modelForcesThinking("MiniMax-M3") === false,
+    "M3 不是强制思考模型");
+  check(T.shouldSendThinkingDisabled("https://api.minimaxi.com/v1", "MiniMax-M3.1-Flash") === false,
+    "M3.1-Flash 不发 thinking=disabled");
+  check(T.shouldSendThinkingDisabled("https://api.minimaxi.com/v1", "MiniMax-M3") === true,
+    "MiniMax-M3 发 thinking=disabled（省时）");
+  check(T.shouldSendThinkingDisabled("https://apihub.agnes-ai.com/v1", "Agnes-3.0-Flash") === false,
+    "Agnes 不发 thinking=disabled（传了会静默吃光预算 → 正文 0 字）");
+  check(T.shouldSendThinkingDisabled("https://api.deepseek.com/v1", "deepseek-flash") === true,
+    "DeepSeek 必须发 thinking=disabled（不传反而正文 0 字）");
+
+  console.log("\n[15] 思考强度 reasoning_effort（抄电脑端 §4.39）");
+  check(T.reasoningEffortFor("https://api.minimaxi.com/v1", "MiniMax-M3.1-Flash", "low") === "low",
+    "MiniMax 网关拿得到 low");
+  check(T.reasoningEffortFor("https://api.deepseek.com/v1", "deepseek-flash", "low") === "low",
+    "DeepSeek 网关拿得到 low");
+  check(T.reasoningEffortFor("https://example.com/v1", "my-model", "low") === null,
+    "未知网关**不发** reasoning_effort（判错的后果是 HTTP 400）");
+  check(T.reasoningEffortFor("https://api.minimaxi.com/v1", "MiniMax-M3.1-Flash", "none") === "low",
+    "强制思考模型拿 none 会 400 → 自动降级成 low");
+  reset();
+  getEl("ai-question").value = "随便问一句";
+  await T.runAI("ask");
+  check(calls[0].payload.reasoning_effort === undefined,
+    "未知网关的请求体里没有 reasoning_effort（测试用的 base 是 example.com）");
+
+  console.log("\n[16] 空正文要自己救一次：抬预算重试（不能只提示不改）");
+  reset();
+  let emptyHit = 0;
+  const realFetch3 = global.fetch;
+  global.fetch = async (url, opts) => {
+    emptyHit++;
+    const payload = JSON.parse(opts.body);
+    if (emptyHit === 1) {
+      // 第一次：只有思考，没有正文（预算被思考吃光的典型症状）
+      calls.push({ url, opts, payload });
+      const enc = new TextEncoder();
+      const sse = 'data: {"choices":[{"delta":{"reasoning_content":"想了很久"}}]}\n\ndata: [DONE]\n\n';
+      return {
+        ok: true, status: 200,
+        body: { getReader() { let d = false; return {
+          async read() { if (d) return { done: true, value: undefined };
+            d = true; return { done: false, value: enc.encode(sse) }; } }; } },
+        text: async () => sse,
+      };
+    }
+    // 第二次：正文出来了
+    // ⚠ 不要再手动 push —— realFetch3 自己会记账（手动 push 会记成 3 次）
+    return realFetch3(url, opts);
+  };
+  getEl("ai-question").value = "这个问题让模型想了很久";
+  await T.runAI("ask");
+  check(emptyHit === 2, "正文为空后自动重试了一次（实际请求 " + emptyHit + " 次）");
+  check(calls.length === 2, "两次请求都记下来了");
+  check(calls[1].payload.max_tokens > calls[0].payload.max_tokens,
+    "重试时抬高了 max_tokens（" + calls[0].payload.max_tokens + " -> " + calls[1].payload.max_tokens + "）");
+  check(calls[1].payload.max_tokens <= 32000,
+    "抬到上限就停（<= 32000），别无限抬");
+  check(calls[1].payload.thinking === undefined,
+    "强制思考模型（M3.1-Flash）重试时**不**发 thinking=disabled（那是空操作）");
+  const outEl16 = getEl("ai-output");
+  const turn16 = outEl16.children[outEl16.children.length - 1];
+  const st16 = (turn16.children[0] || {})._text || "";
+  check(st16.indexOf("完成") >= 0, "重试成功后显示完成 -> " + st16);
+  global.fetch = realFetch3;
+
+  console.log("\n[17] 能关思考的模型：空正文时关掉思考重试（而不是原样重发）");
+  reset();
+  let emptyHit2 = 0;
+  const realFetch4 = global.fetch;
+  global.fetch = async (url, opts) => {
+    emptyHit2++;
+    const payload = JSON.parse(opts.body);
+    calls.push({ url, opts, payload });
+    if (emptyHit2 === 1) {
+      const enc = new TextEncoder();
+      const sse = 'data: {"choices":[{"delta":{"reasoning_content":"空转"}}]}\n\ndata: [DONE]\n\n';
+      return {
+        ok: true, status: 200,
+        body: { getReader() { let d = false; return {
+          async read() { if (d) return { done: true, value: undefined };
+            d = true; return { done: false, value: enc.encode(sse) }; } }; } },
+        text: async () => sse,
+      };
+    }
+    return realFetch4(url, opts);
+  };
+  // 把主模型换成 MiniMax-M3（能关思考）
+  T.state.ai.model = "MiniMax-M3";
+  getEl("ai-question").value = "换个模型试试";
+  await T.runAI("ask");
+  check(emptyHit2 === 2, "空正文后重试了一次（实际 " + emptyHit2 + " 次）");
+  check(calls[1].payload.thinking && calls[1].payload.thinking.type === "disabled",
+    "重试时关掉了思考（MiniMax-M3 支持）");
+  global.fetch = realFetch4;
+
+  console.log("\n[18] 重答不死锁：新请求替换旧请求，旧回调不许覆盖新答案区");
+  reset();
+  const realFetch5 = global.fetch;
+  let seq = 0;
+  global.fetch = async (url, opts) => {
+    seq++;
+    const mine = seq;
+    const enc = new TextEncoder();
+    if (mine === 1) {
+      // 第一个请求：慢，等它被第二个请求顶掉
+      await new Promise((r) => setTimeout(r, 400));
+      const sse = sseOf("旧请求的答案");
+      return {
+        ok: true, status: 200,
+        body: { getReader() { let d = false; return {
+          async read() { if (d) return { done: true, value: undefined };
+            d = true; return { done: false, value: enc.encode(sse) }; } }; } },
+        text: async () => sse,
+      };
+    }
+    return realFetch5(url, opts);
+  };
+  getEl("ai-question").value = "第一个问题";
+  const p1 = T.runAI("ask");
+  await new Promise((r) => setTimeout(r, 80));
+  getEl("ai-question").value = "第二个问题";
+  const p2 = T.runAI("ask");
+  await Promise.all([p1, p2]);
+  const outEl18 = getEl("ai-output");
+  const turns18 = outEl18.children;
+  const lastTurn18 = turns18[turns18.length - 1];
+  const lastSt18 = (lastTurn18.children[0] || {})._text || "";
+  const lastBuf18 = (lastTurn18.children[1] || {})._html || "";
+  check(lastBuf18.indexOf("这是回答。") >= 0,
+    "新请求的答案区是**新答案**，没被旧请求覆盖 -> " + JSON.stringify(lastBuf18));
+  check(lastSt18.indexOf("已完成") < 0 && lastSt18.indexOf("已停止") < 0,
+    "新请求的状态条没被旧请求写成「已停止」-> " + lastSt18);
+  global.fetch = realFetch5;
+
+  console.log("\n[19] 能力边界：平板端是直连模型的，提示词必须自己写一份");
+  reset();
+  getEl("ai-question").value = "帮我上网找张实物图";
+  await T.runAI("ask");
+  const sysMsg = calls[0].payload.messages[0];
+  check(sysMsg.role === "system", "第一条是 system 提示词");
+  check(sysMsg.content.indexOf("不能联网") >= 0, "提示词写明了不能联网");
+  check(sysMsg.content.indexOf("必须回答") >= 0, "提示词要求「必须回答」（不许交白卷）");
+  check(sysMsg.content.indexOf("最后一句") >= 0, "能力边界放最后一句（用户明确改过口径）");
+
   console.log("\n" + "=".repeat(60));
   console.log("PASS " + pass + "  FAIL " + fail);
   process.exit(fail === 0 ? 0 : 1);

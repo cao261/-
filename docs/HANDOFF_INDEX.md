@@ -22,16 +22,21 @@
 5. [`READER_CONTRACT.md`](READER_CONTRACT.md) —— 改阅读器前必读（页内顺序/公式/批注）。
 
 ### 我负责平板端（Android/iPad 那台）
-1. **[`HANDOFF_2026-10-25-TABLET-DAV-FIX.md`](HANDOFF_2026-10-25-TABLET-DAV-FIX.md)** ← **最新，先看这份**
+1. **[`HANDOFF_2026-10-27-TABLET-QA-BUDGET.md`](HANDOFF_2026-10-27-TABLET-QA-BUDGET.md)** ← **最新，先看这份**
+   平板端补齐桌面端 `2216afa` 那轮答疑修复的**其余根因**：
+   思考预算按「思考+正文」算（16000）、空正文自动抬预算重试、
+   请求序号守卫（重答不死锁）、`reasoning_effort=low`、摘要提示词补能力边界。
+   ⚠ 平板的 `reasoning_effort` 判定**只看网关地址不看模型名**（故意的差别，文档里说了为什么）。
+2. [`HANDOFF_2026-10-25-TABLET-DAV-FIX.md`](HANDOFF_2026-10-25-TABLET-DAV-FIX.md)
    平板端「同步 0 篇 / 24 篇 PDF 全 404」的**根因与修法**：
    vault 前缀是空的，而界面只看账号密码，所以显示「已连接」。
    **空结果必须当成错误** —— 这条最值得抄。
-2. [`HANDOFF_2026-10-25-TABLET-ADAPT.md`](HANDOFF_2026-10-25-TABLET-ADAPT.md)
+3. [`HANDOFF_2026-10-25-TABLET-ADAPT.md`](HANDOFF_2026-10-25-TABLET-ADAPT.md)
    桌面端这轮做的哪些事**平板端要抄、哪些抄不了、哪些不用抄**。
-3. [`HANDOFF_TABLET_2026-10-25.md`](HANDOFF_TABLET_2026-10-25.md) +
+4. [`HANDOFF_TABLET_2026-10-25.md`](HANDOFF_TABLET_2026-10-25.md) +
    [`HANDOFF_TABLET_2026-10-25-B.md`](HANDOFF_TABLET_2026-10-25-B.md) —— 平板端此前的两轮交接。
-4. [`AUDIT_2026-10-25.md`](AUDIT_2026-10-25.md) —— 第二轮全面审计报告。
-5. **平板端必须自查的两件事**（在 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` §8）：
+5. [`AUDIT_2026-10-25.md`](AUDIT_2026-10-25.md) —— 第二轮全面审计报告。
+6. **平板端必须自查的两件事**（在 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` §8）：
    - 离线导出 HTML 的 XSS 面（平板走**另一套** JS 消毒器，桌面端的修复不过去）；
    - 密钥脱敏的盲区（JSON 形态的 key、裸 `Authorization`、URL userinfo…）。
    → **这两条已在 30461 上修完**（见 `HANDOFF_2026-10-25-TABLET-DAV-FIX.md`
@@ -57,7 +62,8 @@
 
 | 文档 | 日期 | 解决什么问题 | 状态 |
 |---|---|---|---|
-| `AUDIT_2026-10-26.md` | 10-26 | 第三轮审计（后端/模型层/前端）+ **P0 五处已修** | ✅ **当前最新，先看这份** |
+| `HANDOFF_2026-10-27-TABLET-QA-BUDGET.md` | 10-27 | **平板端**：补齐答疑「只思考不回答」的预算 / 重试 / 序号守卫 / 思考强度 | ✅ 最新（平板端） |
+| `AUDIT_2026-10-26.md` | 10-26 | 第三轮审计（后端/模型层/前端）+ **P0 五处已修** | ✅ 有效 |
 | `HANDOFF_2026-10-25-GLYPH-PERF.md` | 10-25 深夜 | **桌面端**：打开/上传论文卡 8 分钟（逐页串行认字 → 整篇批量 + 语义键词典） | ✅ 最新（桌面端） |
 | `HANDOFF_2026-10-25-TABLET-DAV-FIX.md` | 10-25 深夜 | **平板端**：同步 0 篇 / PDF 全 404 的根因与修法 | ✅ 最新（平板端） |
 | `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` | 10-25 晚 | 浏览器实测抓出的 5 个 bug + 安全 5 项 + 降格分类 | ✅ 有效 |

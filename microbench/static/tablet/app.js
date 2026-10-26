@@ -1673,6 +1673,20 @@
     "不要长时间空转，不要编造链接或图片。" +
     "【必须回答】无论如何都要给出有实质内容的回答，做不到也要写清哪部分能做哪部分做不到，不允许交白卷。";
 
+  // ⚠ 摘要也是「科研助手」角色 —— 同样可能被问到"帮我查下最新进展"，
+  //   一样要让它**自己说清做不到**，而不是长时间空转交白卷。
+  //   能力边界条款与 SYS_RESEARCH **逐字一致**（护栏会断言两者相同，
+  //   防止改了一处忘了另一处 —— 抄两份最容易漂移）。
+  const SYS_SUMMARY =
+    "你是科研助手。用中文给出结构化摘要：研究问题、方法、关键结论、" +
+    "对本方向的价值与局限。分点写，不超过 600 字。" +
+    "【能力边界】你不能联网、不能搜索网页、不能打开链接、不能获取任何图片或实物照片，" +
+    "也没有其他外部工具。若问题需要这些能力，先把基于给定内容能答的部分答完" +
+    "（如建议检索关键词和数据库），再在回答的最后一句用一句话说明" +
+    "\"我没有联网检索能力，无法直接找到图片/最新资料\"。" +
+    "不要长时间空转，不要编造链接或图片。" +
+    "【必须回答】无论如何都要给出有实质内容的回答，做不到也要写清哪部分能做哪部分做不到，不允许交白卷。";
+
   const PROMPTS = {
     explain: (sel) => [
       { role: "system", content: SYS_RESEARCH },
@@ -1687,9 +1701,7 @@
       { role: "user", content: sel },
     ],
     summarize: (sel) => [
-      { role: "system", content:
-        "你是科研助手。用中文给出结构化摘要：研究问题、方法、关键结论、" +
-        "对本方向的价值与局限。分点写，不超过 600 字。" },
+      { role: "system", content: SYS_SUMMARY },
       { role: "user", content: `请总结这篇笔记：\n\n${sel}` },
     ],
     ask: (sel, q) => [
@@ -1704,7 +1716,121 @@
   /** 历史里每条答案最多留这么多字，免得 token 越滚越大 */
   const AI_HISTORY_MAX_CHARS = 1200;
 
+  // ------------------------------------------------------------------
+  // 思考预算与时限（2026-10-27 抄电脑端 AGENTS.md §4.38 / §4.39）
+  //
+  // ⚠ 平板端是**直连模型**的（不走后端），所以这套预算必须自己写一份。
+  //
+  // 根因：**M3.1-Flash 强制思考，思考 token 与正文共用同一个 max_tokens
+  // 预算池**。答疑原来给 8000 → 8K 上下文时思考就把预算吃光 → **正文 0 字**
+  // → 用户看到「一直显示在思考、就是不回答」。
+  //
+  // 电脑端实测（7K 上下文 + 生产提示词 + 真实模型）：
+  //     max_tokens=4000  → 59.9s / 正文 **0 字**
+  //     max_tokens=16000 → 86.2s / 正文 **4884 字**
+  //
+  // → 答疑/解读/摘要统一给 16000；翻译是「关思考的直译型模型」，4000 够用
+  //   （⚠ 同一个常量在不同任务里的含义不同，别照抄）。
+  const AI_QA_MAX_TOKENS = 16000;
+  const AI_TRANSLATE_MAX_TOKENS = 4000;
+  /** 空正文后抬高预算重试时的上限。再大也没意义：32000 也可能不产出正文。 */
+  const AI_MAX_ESCALATION_MAX_TOKENS = 32000;
+  /**
+   * 答疑时限（秒）。时限只该防「真卡死」，不该砍掉还在正常思考的请求
+   * （用户原话："他即使思考再久也行，我只要他能回答问题"）。
+   * 电脑端 QA_TIMEOUT = 300。
+   */
+  const AI_QA_TIMEOUT_MS = 300000;
+  /**
+   * 思考强度：用户原话"思考型模型思考要三十秒到九十秒……你把它给设定成 low"。
+   *
+   * ⚠ 判错的后果是 **HTTP 400**（请求直接被拒，不是静默失败）→ 判定必须保守。
+   * 只有**实测认这个参数**的网关才发；未知网关一律不发。
+   *
+   * ⚠ 强制思考模型（M3.1-Flash）**不能**用 none —— 上游 400 原文：
+   *   "reasoning effort none is not allowed" → 只能给 low。
+   */
+  const AI_REASONING_EFFORT = "low";
+  /** 实测接受 reasoning_effort 的网关（provider 关键词）。 */
+  const AI_REASONING_EFFORT_OK_PROVIDERS = ["deepseek", "agnes", "minimaxi", "minimax"];
+
+  /**
+   * 这个模型是不是**强制思考**（推理 token 与正文共用 max_tokens 预算池）。
+   *
+   * 判据跟电脑端 llm.py 的 `model_forces_thinking` 一致：只认**已知**模型名，
+   * 未知模型按「不强制」处理（宁可多给预算，也不要误判）。
+   */
+  function modelForcesThinking(model) {
+    const m = String(model || "").trim();
+    if (!m) return false;
+    return m === "MiniMax-M3.1-Flash";
+  }
+
+  /**
+   * 这个网关能不能接受 reasoning_effort 参数？
+   *
+   * 判错 → HTTP 400 → 请求直接被拒。→ 未知网关**一律不发**。
+   *
+   * ⚠ 判据只认 **base（网关地址）**，不看模型名 —— 这跟电脑端 llm.py
+   *   （base + 模型名一起判）有一处**故意的**差别：
+   *   平板的用户可以把自己的接口指向**任意** OpenAI 兼容网关，
+   *   那种网关上照样挂着「MiniMax-M3.1-Flash」这个模型名，
+   *   但它**不一定认 reasoning_effort** → 发了就 400。
+   *   → 网关才是决定「认不认这个参数」的东西，模型名不是。
+   */
+  function acceptsReasoningEffort(base, model) {
+    const hay = String(base || "").toLowerCase();
+    if (!hay) return false;
+    if (!AI_REASONING_EFFORT_OK_PROVIDERS.some((p) => hay.indexOf(p) >= 0)) {
+      return false;
+    }
+    // 强制思考模型不能拿 none（会 400）→ 由 reasoningEffortFor 降级成 low。
+    if (modelForcesThinking(model)) return true;
+    return true;
+  }
+
+  /**
+   * 算出这次请求该带的 reasoning_effort 值（null = 不带）。
+   *
+   * level: "low"（默认）/ "minimal" / "none"
+   *   - 强制思考模型：none 会被 400 → 自动降级成 "low"
+   *   - 不支持该参数的网关：返回 null（干脆不发）
+   */
+  function reasoningEffortFor(base, model, level) {
+    if (!acceptsReasoningEffort(base, model)) return null;
+    let lv = String(level || AI_REASONING_EFFORT).trim().toLowerCase();
+    if (lv !== "low" && lv !== "minimal" && lv !== "none") lv = AI_REASONING_EFFORT;
+    if (lv === "none" && modelForcesThinking(model)) return "low";
+    return lv;
+  }
+
+  /**
+   * 这次请求要不要带 thinking={"type":"disabled"}？
+   *
+   * 抄电脑端 llm.py 的 `should_send_thinking_disabled`：
+   *   - MiniMax-M3.1-Flash：强制 adaptive thinking → 传了直接 **400**
+   *   - Agnes：传了会**静默**把预算全花在思考上 → 正文一字不出
+   *   - DeepSeek：**必须**传（不传反而正文 0 字）
+   * 判据走 **provider**（模型名会变，provider 不会）。
+   */
+  function shouldSendThinkingDisabled(base, model) {
+    const m = String(model || "").trim();
+    if (modelForcesThinking(m)) return false;
+    const hay = (String(base || "") + " " + m).toLowerCase();
+    // Agnes 整个 provider 不吃这个参数（静默吃光预算）
+    if (hay.indexOf("agnes") >= 0) return false;
+    return true;
+  }
+
   let aiAbort = null;
+  /**
+   * 请求序号守卫（抄电脑端 `_qaRequestSeq` / `_isCurrentAsk`）。
+   *
+   * ⚠ 没有它会怎样：新请求替换旧请求后，**被中止的旧请求的回调仍会执行**
+   * → 旧请求把「已取消」写进**新请求正在写的答案区** → 用户看到新答案被覆盖成
+   * 「已停止」。→ 每次请求拿一个序号，回调先确认「我还是当前主人」再动手。
+   */
+  let aiRequestSeq = 0;
 
   function selectedText() {
     const sel = window.getSelection();
@@ -1806,8 +1932,11 @@
    *
    * 浏览器里流式（onDelta 边收边渲染）；APK 里走原生代理（一次性拿回）。
    * 返回 {content, reasoning, aborted}。
+   *
+   * ⚠ signal 必须**由调用方传进来**：不能读全局的 aiAbort ——
+   *   全局变量会被下一次请求换掉（旧请求的回调就跟着新请求走了）。
    */
-  async function aiRequest(payload, cfg, onDelta) {
+  async function aiRequest(payload, cfg, onDelta, signal) {
     const url = `${cfg.base.replace(/\/+$/, "")}/chat/completions`;
     const bodyStr = JSON.stringify(payload);
 
@@ -1817,7 +1946,7 @@
     // 代价：原生代理拿不到流式增量，只能一次性拿回完整 SSE 文本。
     if (nativeBridge && typeof nativeBridge.httpPost === "function") {
       const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${cfg.key}`]);
-      if (aiAbort && aiAbort.signal.aborted) {
+      if (signal && signal.aborted) {
         return { content: "", reasoning: "", aborted: true };
       }
       if (!r || !r.ok) {
@@ -1840,7 +1969,7 @@
         "Authorization": `Bearer ${cfg.key}`,
       },
       body: bodyStr,
-      signal: aiAbort ? aiAbort.signal : undefined,
+      signal: signal || undefined,
     });
     if (!res.ok) {
       const t = await res.text().catch(() => "");
@@ -2020,20 +2149,51 @@
     const stopBtn = $("btn-ai-stop");
     if (stopBtn) stopBtn.hidden = false;
 
+    // ⚠ 请求序号守卫（抄电脑端 `_qaRequestSeq` / `_isCurrentAsk`）：
+    //   新请求替换旧请求后，**被中止的旧请求的回调仍会执行**。
+    //   不设守卫的话，旧请求收尾会把「新请求正在用的停止按钮」藏掉，
+    //   还会把旧答案塞进多轮上下文 —— 用户看着像"新问题没生效"。
+    const mySeq = ++aiRequestSeq;
+    const isCurrent = () => mySeq === aiRequestSeq;
+
     if (aiAbort) aiAbort.abort();
-    aiAbort = new AbortController();
+    const controller = new AbortController();
+    aiAbort = controller;
+    // 超时：只该防"真卡死"，不该砍掉还在正常思考的请求
+    // （用户原话："他即使思考再久也行，我只要他能回答问题"）。
+    // 电脑端 QA_TIMEOUT = 300 → 平板同样给 300s。
+    let timedOut = false;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, AI_QA_TIMEOUT_MS);
 
     // 翻译用快模型并关思考；解读/答疑用推理模型
     const isTranslate = kind === "translate";
     const payload = {
       model,
       messages,
-      max_tokens: isTranslate ? 4000 : 8000,
+      max_tokens: isTranslate ? AI_TRANSLATE_MAX_TOKENS : AI_QA_MAX_TOKENS,
       temperature: 0.3,
       stream: true,
     };
-    if (isTranslate && /MiniMax-M3$/.test(model)) {
+    // ⚠ 强制思考的模型（M3.1-Flash）**不能**按直译型给 4000 ——
+    //   思考会把预算吃光、正文 0 字（电脑端实测：4000 时正文只剩 291 字，
+    //   8000 时一个字都没有）。→ 这种模型按"思考+正文"给预算。
+    if (isTranslate && modelForcesThinking(model)) {
+      payload.max_tokens = AI_QA_MAX_TOKENS;
+    }
+    // 翻译：直译型模型关掉思考（省时）。判据抄电脑端 llm.py：
+    //   MiniMax-M3 ✅ / DeepSeek ✅（不传反而正文 0 字）/
+    //   M3.1-Flash ❌（传了直接 400）/ Agnes ❌（传了静默吃光预算）
+    if (isTranslate && shouldSendThinkingDisabled(cfg.base, model)) {
       payload.thinking = { type: "disabled" };
+    }
+    // 答疑/解读/摘要：思考强度 low（用户原话"设定成 low"）。
+    // ⚠ 未知网关**一律不发** —— 判错的后果是 HTTP 400（请求直接被拒）。
+    if (!isTranslate) {
+      const effort = reasoningEffortFor(cfg.base, model, AI_REASONING_EFFORT);
+      if (effort) payload.reasoning_effort = effort;
     }
 
     let answer = "";
@@ -2063,33 +2223,97 @@
         buf.innerHTML = renderMarkdown(txt);
         if (out) out.scrollTop = out.scrollHeight;
       };
-      let res = null;
-      try {
-        await throttleModel(model);
-        res = await aiRequest(payload, cfg, onDelta);
-      } catch (e1) {
-        const st = Number(e1 && e1.status) || 0;
-        if (st === 429 && altModel && altModel !== model) {
-          status.textContent = "主模型 " + model + " 额度/限流 → 换 " + altModel + " 重试…";
-          usedModel = altModel;
-          payload.model = altModel;
-          // 换模型后，思考开关要按新模型重算（原来那个是给主模型定的）
-          if (isTranslate && /MiniMax-M3$/.test(altModel)) {
-            payload.thinking = { type: "disabled" };
-          } else {
+      /**
+       * 发一次请求（自带两层兜底）。
+       *
+       * ① 模型不认 thinking 参数 → 去掉它重试一次
+       *    （还没吐内容，重试是无缝的；仿电脑端 llm.py 的 400 处理）
+       * ② 429 → 换另一个模型重试一次（只换一次）
+       */
+      const sendOnce = async () => {
+        try {
+          await throttleModel(payload.model);
+          return await aiRequest(payload, cfg, onDelta, controller.signal);
+        } catch (e1) {
+          const st = Number(e1 && e1.status) || 0;
+          const msg = String((e1 && e1.message) || "");
+          if (st === 400 && payload.thinking && /thinking/i.test(msg)) {
             delete payload.thinking;
+            await throttleModel(payload.model);
+            return await aiRequest(payload, cfg, onDelta, controller.signal);
           }
-          await throttleModel(altModel);
-          res = await aiRequest(payload, cfg, onDelta);
-        } else {
+          if (st === 429 && altModel && altModel !== payload.model) {
+            status.textContent = "主模型 " + payload.model + " 额度/限流 → 换 " + altModel + " 重试…";
+            usedModel = altModel;
+            payload.model = altModel;
+            // 换模型后，思考开关/思考强度/预算都要按**新模型**重算
+            //（原来那个是给主模型定的）
+            if (isTranslate) {
+              if (shouldSendThinkingDisabled(cfg.base, altModel)) {
+                payload.thinking = { type: "disabled" };
+              } else {
+                delete payload.thinking;
+              }
+              payload.max_tokens = modelForcesThinking(altModel)
+                ? AI_QA_MAX_TOKENS : AI_TRANSLATE_MAX_TOKENS;
+            } else {
+              delete payload.thinking;
+              payload.max_tokens = AI_QA_MAX_TOKENS;
+              const effort2 = reasoningEffortFor(cfg.base, altModel, AI_REASONING_EFFORT);
+              if (effort2) payload.reasoning_effort = effort2;
+              else delete payload.reasoning_effort;
+            }
+            await throttleModel(altModel);
+            return await aiRequest(payload, cfg, onDelta, controller.signal);
+          }
           throw e1;
         }
-      }
+      };
+
+      let res = await sendOnce();
       if (res.aborted) {
-        status.textContent = "已停止";
+        status.textContent = timedOut
+          ? "超过 " + Math.round(AI_QA_TIMEOUT_MS / 1000) + " 秒还没返回（可能是模型在长思考）—— 可点停止或换模型重试"
+          : "已停止";
         return;
       }
       answer = res.content || "";
+
+      // ⚠ 空正文 → **先自己救一次**，别让用户干等再报错。
+      //   根因：思考型模型的思考 token 与正文共用 max_tokens 预算池，
+      //   思考吃光预算 → 正文 0 字（电脑端实测 4000 → 0 字 / 16000 → 4884 字）。
+      //   → 能关思考的模型：关掉思考再试；关不掉的（强制思考型）：**加预算**再试。
+      //   ⚠ 抄电脑端的教训：对强制思考模型"关思考"是**空操作**
+      //     （参数根本不下发 → 请求与第一次完全相同 → 再等 55 秒还是 0 字）。
+      if (!answer) {
+        const canDisable = shouldSendThinkingDisabled(cfg.base, payload.model);
+        if (canDisable) {
+          payload.thinking = { type: "disabled" };
+          payload.max_tokens = Math.max(payload.max_tokens, AI_QA_MAX_TOKENS);
+        } else {
+          payload.max_tokens = Math.min(
+            Math.max(payload.max_tokens * 4, 4000), AI_MAX_ESCALATION_MAX_TOKENS);
+        }
+        status.textContent = canDisable
+          ? "正文为空 → 关掉思考重试…"
+          : "正文为空（预算被思考吃光）→ 把预算抬到 " + payload.max_tokens + " 重试…";
+        buf.innerHTML = "";
+        gotFirstDelta = false;
+        const res2 = await sendOnce();
+        if (res2 && res2.aborted) {
+          // 重试期间被中止（用户点了停止，或超时了）→ 如实说，别报「空内容」
+          status.textContent = timedOut
+            ? "超过 " + Math.round(AI_QA_TIMEOUT_MS / 1000) + " 秒还没返回（可能是模型在长思考）—— 可点停止或换模型重试"
+            : "已停止";
+          return;
+        }
+        if (res2) {
+          res = res2;              // 后面报错时要用**最后一次**的思考内容
+          answer = res2.content || "";
+          if (answer) buf.innerHTML = renderMarkdown(answer);
+        }
+      }
+
       if (answer) {
         buf.innerHTML = renderMarkdown(answer);
         status.textContent = `完成 · ${usedModel}`;
@@ -2103,25 +2327,33 @@
         status.setAttribute("data-error", "1");
       }
     } catch (e) {
-      if (e.name === "AbortError") status.textContent = "已停止";
-      else {
+      if (e.name === "AbortError") {
+        status.textContent = timedOut
+          ? "超过 " + Math.round(AI_QA_TIMEOUT_MS / 1000) + " 秒还没返回（可能是模型在长思考）—— 可点停止或换模型重试"
+          : "已停止";
+      } else {
         status.textContent = "失败：" + safeErr(e && e.message ? e.message : e);
         status.setAttribute("data-error", "1");
       }
     } finally {
       clearInterval(tick);
-      if (stopBtn) stopBtn.hidden = true;
-      // 记进历史，供下一轮追问用
-      if (answer) {
-        const hist = aiHistory(noteId);
-        hist.push({
-          role: "user",
-          content: kind === "ask"
-            ? q
-            : (AI_LABEL[kind] + "：" + (sel || "").slice(0, 300)),
-        });
-        hist.push({ role: "assistant", content: answer.slice(0, AI_HISTORY_MAX_CHARS) });
-        while (hist.length > AI_HISTORY_TURNS * 2) hist.shift();
+      clearTimeout(timeoutTimer);
+      // ⚠ 只有**当前请求**才能碰共享状态（停止按钮 / 多轮上下文）。
+      //   旧请求收尾时把新请求的停止按钮藏掉 → 用户没法停止新请求了。
+      if (isCurrent()) {
+        if (stopBtn) stopBtn.hidden = true;
+        // 记进历史，供下一轮追问用
+        if (answer) {
+          const hist = aiHistory(noteId);
+          hist.push({
+            role: "user",
+            content: kind === "ask"
+              ? q
+              : (AI_LABEL[kind] + "：" + (sel || "").slice(0, 300)),
+          });
+          hist.push({ role: "assistant", content: answer.slice(0, AI_HISTORY_MAX_CHARS) });
+          while (hist.length > AI_HISTORY_TURNS * 2) hist.shift();
+        }
       }
     }
   }
@@ -3555,6 +3787,16 @@
       aiAppendAnswer: aiAppendAnswer,
       aiShowContext: aiShowContext,
       parseSse: parseSse,
+      // 思考预算 / 思考强度判定（抄电脑端 llm.py，判错的后果是 HTTP 400）
+      modelForcesThinking: modelForcesThinking,
+      acceptsReasoningEffort: acceptsReasoningEffort,
+      reasoningEffortFor: reasoningEffortFor,
+      shouldSendThinkingDisabled: shouldSendThinkingDisabled,
+      AI_QA_MAX_TOKENS: AI_QA_MAX_TOKENS,
+      AI_TRANSLATE_MAX_TOKENS: AI_TRANSLATE_MAX_TOKENS,
+      AI_MAX_ESCALATION_MAX_TOKENS: AI_MAX_ESCALATION_MAX_TOKENS,
+      AI_QA_TIMEOUT_MS: AI_QA_TIMEOUT_MS,
+      AI_REASONING_EFFORT: AI_REASONING_EFFORT,
       // 种子装载（本地优先：不能拿导出快照覆盖本地正文）
       loadSeed: loadSeed,
       openDB: openDB,
