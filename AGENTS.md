@@ -864,6 +864,27 @@ GitHub 访问**需要默认代理** `http://127.0.0.1:65532`；
 ⚠ **后端改动要重启服务才生效**（§2.5）。脚本**故意不自动重启**——
 半夜关掉用户正开着的窗口不合适。报告里会明确提示「需重启工作台窗口」。
 
+#### ⚠ 手动 `git pull` 之后，APK 不会自动重打 —— 但测试会因此变红
+
+`auto_sync.py` 里有「重打 APK」这一步，**手动 pull 没有**。
+而 `tests/test_apk_delivery.py::test_translations_are_baked_in` 断言：
+「本地 `logs/_pdf_snapshots/` 里**当前抽取版本**的译文必须都烤进单文件」。
+
+→ 只要本机新翻完的译文还没进 APK（单文件里 `trans` 是空的），
+  这条测试就红，报「有当前版本的译文，却一份都没烤进单文件」。
+  **看着像 bug，其实是 APK 过期**（2026-10-26 实测：APK 是 10-25 23:46 的，
+  本机 10-26 11:41 又翻了三篇 → 必红）。
+
+→ **手动 pull 之后必须补一刀**：
+
+```powershell
+pwsh -NoProfile -File android/build_apk.ps1     # 导出 → 打包 → 签名 → 交付验收(5 项)
+python -m pytest tests/test_apk_delivery.py -q   # 必须 5 passed
+```
+
+⚠ **交付物只由构建脚本产出**（§4.18 末段）：`MicroBench_平板工作台.html` / `.apk`
+不要手动改，也不要用测试来"顺手重新导出"——两份必须**逐字节相同**。
+
 **盯它**：`logs/auto_sync.log`（脚本 stdout 追加）+ 定时任务自己的运行记录。
 脚本最后一行输出 `MB_SYNC_RESULT: {json}`，给 agent 读。
 
