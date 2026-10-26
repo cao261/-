@@ -204,11 +204,43 @@ def test_qa_endpoints_accept_model():
 
 
 def test_qa_model_args_mapping(monkeypatch):
+    """答疑的模型映射。
+
+    ⚠️ 契约变更（2026-10-26，用户要求）：答疑**不再**跟随主模型，
+    默认用 MiniMax-M3.1-Flash（会推导）。主模型是 MiniMax-M3 —— 翻译用的
+    直译型，7.6s 但不擅长推导；答疑要的是"会推导"。
+    翻译与答疑因此是**两套独立**的选择。
+    """
     _set_custom_env(monkeypatch)
-    assert app_mod._qa_model_args("")["model_name"] is None
+    # 跟随默认 → 答疑专用模型（M3.1-Flash），不是主模型
+    assert app_mod._qa_model_args("")["model_name"] == llm.DEFAULT_QA_MODEL
+    assert app_mod._qa_model_args("")["model_name"] != "MiniMax-M3"
     assert app_mod._qa_model_args("agnes")["force_fallback"] is True
     assert app_mod._qa_model_args("custom:我的模型")["model_name"] == "custom:我的模型"
     assert app_mod._qa_model_args("MiniMax-M3")["model_name"] == "MiniMax-M3"
+    # DeepSeek 走自己的网关
+    assert app_mod._qa_model_args("deepseek-flash")["model_name"] == "deepseek-flash"
+
+
+def test_qa_and_translation_models_are_independent(monkeypatch):
+    """翻译用 A、答疑用 B 必须能同时成立（不能共用一个下拉框）。"""
+    _set_custom_env(monkeypatch)
+    tr = app_mod._resolve_translation_model("deepseek-flash")
+    qa = app_mod._qa_model_args("MiniMax-M3.1-Flash")
+    assert tr[0] == "deepseek-flash"
+    assert qa["model_name"] == "MiniMax-M3.1-Flash"
+
+
+def test_qa_thinking_is_disabled_only_for_non_reasoning_models(monkeypatch):
+    """答疑的 thinking 参数按模型给：
+    - M3.1-Flash 强制思考 → 不能关（传了直接 400）
+    - DeepSeek Flash → 必须关（不关的话思考吃光预算、正文为空）
+    - Agnes → 不能关（静默吃光预算 → 98.6s / 0 字）
+    """
+    _set_custom_env(monkeypatch)
+    assert app_mod._qa_model_args("MiniMax-M3.1-Flash")["disable_thinking"] is False
+    assert app_mod._qa_model_args("deepseek-flash")["disable_thinking"] is True
+    assert app_mod._qa_model_args("agnes")["disable_thinking"] is False
 
 
 def test_effective_model_name_reports_the_chosen_one(monkeypatch):

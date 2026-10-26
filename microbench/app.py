@@ -667,6 +667,10 @@ def _resolve_translation_model(requested: str):
 
     自定义模型（.env 里 LLM_CUSTOM_N_*）的 id 形如 "custom:我的模型"，
     原样传下去：llm.chat 会按 id 找到它自己的 base_url / key / 限流档。
+
+    DeepSeek（deepseek-flash / deepseek-v4-pro）是**独立网关**，
+    同样必须按 id 找到自己的 base_url / key —— 不能当成
+    「主模型网关下的另一个模型名」，否则会拿着 MiniMax 的 key 去打 DeepSeek。
     """
     req = (requested or "").strip()
     if not req:
@@ -678,31 +682,67 @@ def _resolve_translation_model(requested: str):
         cfg = llm.resolve_model_config(req)
         if cfg:
             return req, False, req
+    # DeepSeek 内置 provider：有自己的 base_url/key
+    if llm.resolve_model_config(req) is not None:
+        return req, False, req
     return req, False, req
 
 
-# 可供界面选择的翻译模型。MiniMax 系共用同一套 key/base_url；
-# 'agnes' 走备用模型（免费无限，但更慢）；
-# 用户自己的 API 模型由 .env 的 LLM_CUSTOM_N_* 追加（见 llm.custom_model_configs）。
+# 可供界面选择的**翻译**模型（与答疑清单分开，见 qa_model_choices）。
+#
+# 用户 2026-10-26 的原话：
+#   "用于翻译的…mini Max 不开思考版本的 M3…Agnes 的 3.0 Flash…
+#    应该多用这个 flash 吧。flash 能不能不开思考版本…这样翻译比较好"
+#
+# 翻译的诉求 = **快 + 完整**，所以：
+#   - MiniMax-M3：关思考（实测 7.6s / 1956 字，比开思考快 4 倍且干净）
+#   - Agnes 3.0 Flash：免费无限，但慢（实测 24.5s）+ ⚠ 严格限流 11 RPM
+#   - DeepSeek Flash：最快（实测 3.7s）+ 支持读图（表格能抄）+ 独立额度
+#
+# ⚠️ M3.1-Flash / M2.7 是**思考型**，做直译是坑（慢、推理吃光预算、
+#    译文被截断），标注清楚但保留（用户可能故意要它对比）。
 TRANSLATION_MODEL_CHOICES = (
     {"id": "", "label": "跟随当前设置", "hint": "默认：LLM_TRANSLATION_MODEL 或主模型"},
-    {"id": "MiniMax-M3", "label": "MiniMax-M3", "hint": "直译最快最稳（推荐）"},
-    {"id": "MiniMax-M3.1-Flash", "label": "MiniMax-M3.1-Flash", "hint": "强制思考，很慢且易截断"},
-    {"id": "MiniMax-M2.7", "label": "MiniMax-M2.7", "hint": "会混入思考文本"},
-    {"id": "agnes", "label": "Agnes 3.0 Flash", "hint": "免费无限额度，较慢"},
+    {"id": "MiniMax-M3", "label": "MiniMax-M3", "hint": "直译最快最稳（推荐）· 已关思考"},
+    {"id": "agnes", "label": "Agnes 3.0 Flash", "hint": "免费无限额度 · 较慢 · ⚠ 严格限流 11 RPM"},
+    {"id": "MiniMax-M3.1-Flash", "label": "MiniMax-M3.1-Flash",
+     "hint": "⚠ 强制思考：直译很慢且易截断，不建议"},
+    {"id": "MiniMax-M2.7", "label": "MiniMax-M2.7",
+     "hint": "⚠ 会混入思考文本，不建议"},
 )
 
 
 def _qa_model_args(model: str = "") -> dict:
     """把前端传来的模型 id 转成 llm.chat / llm.chat_stream_async 的参数。
 
-    ''        → 跟随默认（主模型，降级时自动走备用）
+    ''        → **答疑默认模型**（MiniMax-M3.1-Flash，会推导）；
+                降级时自动走备用
     'agnes'  → 强制走备用模型
+    'deepseek-flash' → DeepSeek（自己的 base_url/key/限流档）
     'custom:x' → 用户自己的 API 模型（自己的 base_url/key/限流档）
     其它      → 同一套 key/base_url 下的另一个模型名
+
+    ⚠️ 答疑默认**不能**跟随主模型：主模型是 MiniMax-M3（翻译用的直译型，
+    7.6s 但不擅长推导）。答疑要的是"会推导"→ M3.1-Flash（强制思考型）。
+
+    disable_thinking：只有"思考型模型"才需要思考。
+      - MiniMax-M3.1-Flash：强制思考（传 disabled 直接 400）→ **不能传**
+      - DeepSeek Flash：**必须传** —— 它默认开着思考，不传的话
+        reasoning 吃掉 8293 字符、content 一字不出（实测 20.9s / 0 字）
+      - Agnes：不能传（传了会静默把预算全花在思考上 → 98.6s / 0 字）
+    → 交给 llm.should_send_thinking_disabled 按 provider 判定，
+      这里只表达"这个任务要不要关思考"。
     """
+    if not (model or "").strip():
+        # 跟随默认 → 落到答疑专用模型（LLM_QA_MODEL，默认 M3.1-Flash）
+        m_name = llm.qa_model_name() or llm.DEFAULT_QA_MODEL
+        return {"model_name": m_name, "force_fallback": False,
+                "disable_thinking": False}
     m_name, m_fallback, _ = _resolve_translation_model(model)
-    return {"model_name": m_name or None, "force_fallback": m_fallback}
+    # 非思考型模型（DeepSeek Flash / M3）做答疑：思考没用还慢 → 关掉
+    disable = llm.model_prefers_no_thinking(m_name or "")
+    return {"model_name": m_name or None, "force_fallback": m_fallback,
+            "disable_thinking": disable}
 
 
 def _effective_model_name(requested: str = "") -> str:
@@ -723,8 +763,18 @@ def _effective_model_name(requested: str = "") -> str:
 
 
 def translation_model_choices() -> list[dict]:
-    """界面上能选的模型 = 内置的 + 用户自己配的（.env LLM_CUSTOM_N_*）。"""
+    """界面上能选的模型 = 内置的 + DeepSeek + 用户自己配的（.env LLM_CUSTOM_N_*）。"""
     out = [dict(m) for m in TRANSLATION_MODEL_CHOICES]
+    # DeepSeek：独立网关、独立额度。用户原话："mini Max 不够用、Agnes 又太慢，
+    # 我就换 deep seek" → 必须是**开箱即用**的手动选项，不能要求先手编 .env。
+    for c in llm.deepseek_model_configs():
+        out.append({
+            "id": c["id"],
+            "label": c["label"],
+            "hint": (f"DeepSeek · {c['hint']} · {c['rpm']} RPM"
+                     + ("" if c["configured"] else " · ⚠ 没配 API key")),
+            "deepseek": True,
+        })
     for c in llm.custom_model_configs():
         out.append({
             "id": c["id"],
@@ -734,6 +784,36 @@ def translation_model_choices() -> list[dict]:
             "custom": True,
         })
     return out
+
+
+def _is_degraded_for(requested: str = "") -> bool:
+    """**这次请求实际用的模型**是不是处于降格状态。
+
+    ⚠️ 不能直接用全局的 `get_llm_status()["is_degraded"]`：
+    那是「主模型（MiniMax）降格了」，与**这次实际用的模型**可能无关。
+
+    真实事故（2026-10-26 浏览器实测）：MiniMax 额度烧完 → 全局降格，
+    但用户在下拉框里**显式选了 DeepSeek**（独立额度，完全正常）
+    → 徽标却显示「🤖 DeepSeek V4.1 Flash（默认） (降格)」
+    → 用户以为"选 DeepSeek 也没用/换模型没生效"。
+
+    判据：
+    - 用户显式选了 DeepSeek / 自定义模型 → 这些有**独立额度**，
+      不受主模型降格影响 → 不标降格。
+    - 用户选了「跟随默认」或 Agnes → 主模型降格时它们会走备用链路
+      → 要标降格（说明"现在是备用模型在答"）。
+    """
+    req = (requested or "").strip()
+    if not req:
+        # 跟随默认 → 主模型降格时确实换成了备用模型，要标出来
+        return bool(llm.get_llm_status().get("is_degraded", False))
+    # 显式指定了模型
+    m_name, m_fallback, _ = _resolve_translation_model(req)
+    if m_fallback:
+        # 选的是 Agnes（备用模型本身）→ 主模型降格对它有影响
+        return bool(llm.get_llm_status().get("is_degraded", False))
+    # DeepSeek / 自定义模型 → 独立额度，不受主模型降格影响
+    return False
 
 
 async def _resolve_page_glyphs(text: str, glyphs: list, pdf_source, page_no: int,
@@ -879,6 +959,71 @@ async def api_llm_translation_models():
         "active_model": active,
         "primary": llm.model_manager.get_primary_config().get("model", ""),
         "fallback": llm.model_manager.get_fallback_config().get("model", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 答疑（划词解答）用的模型清单 —— 与翻译**分开**
+# ---------------------------------------------------------------------------
+# 用户诉求（2026-10-26）：
+#   - 翻译 → MiniMax-M3（关思考）为主，Agnes 3.0 Flash / DeepSeek Flash 备用
+#   - 答疑 → MiniMax-M3.1-Flash 为主（要推理），也能切 DeepSeek Flash / Agnes
+#   - 两者**必须能各自独立切换**：翻译用 M3、答疑用 M3.1-Flash 是常态，
+#     共用一个下拉框就永远只能一起换 → 逼用户为翻译去忍受慢模型。
+#
+# ⚠️ 答疑默认模型与翻译默认模型**不同**：
+#   翻译要「快 + 完整」→ MiniMax-M3，关思考
+#   答疑要「会推导」→ MiniMax-M3.1-Flash，**必须开着思考**（强制思考型）
+QA_MODEL_CHOICES = (
+    {"id": "MiniMax-M3.1-Flash", "label": "MiniMax-M3.1-Flash",
+     "hint": "答疑默认 · 会推理推导 · 额度紧张时换下面两个"},
+    {"id": "deepseek-flash", "label": "DeepSeek V4.1 Flash",
+     "hint": "独立额度 · 快 · 支持读图"},
+    {"id": "agnes", "label": "Agnes 3.0 Flash",
+     "hint": "免费无限额度 · 但慢（⚠ 严格限流 11 RPM）"},
+)
+
+
+def qa_model_choices() -> list[dict]:
+    """界面上能选的**答疑**模型 = 专用三项 + 用户自己的模型。
+
+    不含 MiniMax-M3 / M2.7：那两个是"直译型"，做推导不如 M3.1-Flash，
+    放进来只会让人误选。
+    """
+    out = [dict(m) for m in QA_MODEL_CHOICES]
+    # DeepSeek 的提示语按"答疑"场景重写（抄表读图能力对答疑不关键）
+    for m in out:
+        if m["id"] == "deepseek-flash":
+            cfg = llm.resolve_model_config("deepseek-flash")
+            if cfg:
+                m["hint"] = ("DeepSeek · 独立额度 · 快"
+                             + ("" if cfg.get("configured") else " · ⚠ 没配 API key"))
+    for c in llm.deepseek_model_configs():
+        if not any(m["id"] == c["id"] for m in out):
+            out.append({
+                "id": c["id"],
+                "label": c["label"],
+                "hint": (f"DeepSeek · {c['hint']}"
+                         + ("" if c["configured"] else " · ⚠ 没配 API key")),
+                "deepseek": True,
+            })
+    for c in llm.custom_model_configs():
+        out.append({
+            "id": c["id"],
+            "label": c["label"],
+            "hint": (f"你自己的 API 模型 · {c['model']}"
+                     + ("" if c["configured"] else " · ⚠ 没配 API key")),
+            "custom": True,
+        })
+    return out
+
+
+@app.get("/api/llm/qa_models")
+async def api_llm_qa_models():
+    """界面上的「换模型答疑」下拉框选项（与翻译清单分开）。"""
+    return {
+        "models": qa_model_choices(),
+        "active_model": llm.qa_active_model(),
     }
 
 
@@ -1583,6 +1728,12 @@ async def _read_table_vision(pdf_path, page: int, rect: tuple,
 
     model：用户在前端手动选的模型。**必须跟着走** —— 正文用新模型、表格用
     旧模型会让人以为"换模型没生效"（2026-10-25 独立审查）。
+
+    ⚠️ 但**只有支持视觉的模型才能抄表**：
+    实测（2026-10-26）deepseek-v4-pro 收下截图后**编造了整张表**
+    （数值一个都不对，格式却像真表）—— 这跟"错公式比没公式危险得多"是同一条
+    红线：宁可让用户看到"表格未能读出"，也不能给他一份看着像真的错表。
+    → 不支持视觉 → 自动改用已验证的视觉模型（deepseek-flash 优先）。
     """
     import base64
     png = await asyncio.to_thread(_pdf_clip_png, pdf_path, page, rect, 4.0)
@@ -1593,6 +1744,24 @@ async def _read_table_vision(pdf_path, page: int, rect: tuple,
          "image_url": {"url": f"data:image/png;base64,{b64}"}},
     ]
     m_name, m_fallback, _cache_key = _resolve_translation_model(model)
+    # 跟随默认时：翻译专用模型（LLM_TRANSLATION_MODEL）可能是强制思考型或
+    # 不支持视觉的模型 → 同样要过视觉检查。
+    if not m_name:
+        m_name = llm.translation_model_name() or None
+
+    # 视觉能力检查：选中的模型读不了图 → 换用已验证的视觉模型
+    if m_name and not llm.model_supports_vision(m_name):
+        alt = llm.vision_fallback_model()
+        if alt:
+            print(f"[MicroBench] 模型「{m_name}」不支持读图，"
+                  f"表格改用「{alt}」抄录", file=sys.stderr)
+            m_name = alt
+            m_fallback = False
+        else:
+            raise RuntimeError(
+                f"模型「{m_name}」不支持读图，且没有可用的视觉模型替补"
+            )
+
     raw = await asyncio.to_thread(
         llm.chat,
         messages=[
@@ -1603,7 +1772,7 @@ async def _read_table_vision(pdf_path, page: int, rect: tuple,
         temperature=0.0,
         timeout=180,
         disable_thinking=llm.translation_disable_thinking(),
-        model_name=m_name or llm.translation_model_name() or None,
+        model_name=m_name,
         force_fallback=m_fallback,
     )
     md = _clean_table_markdown(raw)
@@ -2931,6 +3100,8 @@ EXPLAIN_SYSTEM_PROMPT = """你是学术论文 AI 解读助手, 帮助硕博生�
 3. 学术化但简洁, 用中文
 4. 如果用户问的"创新点"或"方法", 用 bullet 列出
 5. 如果章节内容不足以回答, 明确说明
+6. 【能力边界】: 你不能联网、不能搜索网页、不能打开链接、不能获取任何图片或实物照片, 也没有其他外部工具。若问题需要这些能力, 先把基于论文内容能答的部分答完, 再在**最后一句**用一句话说明"我没有联网检索能力, 无法直接找到图片/最新资料"。不要长时间空转, 不要编造链接或图片。
+7. 【必须回答】: 无论如何都要给出有实质内容的回答, 做不到也要写清哪部分能做哪部分做不到, 不允许交白卷。
 """
 
 
@@ -2943,6 +3114,8 @@ CROSS_QA_SYSTEM_PROMPT = """你是学术论文跨章节综合分析助手, 帮�
 4. 学术化、简洁, 用中文
 5. 如果问题涉及对比 (新旧方法对比/预期 vs 实际), 用表格或并列 bullet
 6. 如果提供章节不足以回答, 明确指出缺失哪类信息
+7. 【能力边界】: 你不能联网、不能搜索网页、不能打开链接、不能获取任何图片或实物照片, 也没有其他外部工具。若问题需要这些能力, 先把基于论文内容能答的部分答完, 再在**最后一句**用一句话说明"我没有联网检索能力, 无法直接找到图片/最新资料"。不要长时间空转, 不要编造链接或图片。
+8. 【必须回答】: 无论如何都要给出有实质内容的回答, 做不到也要写清哪部分能做哪部分做不到, 不允许交白卷。
 """
 
 
@@ -2967,6 +3140,27 @@ class CrossQARequest(BaseModel):
 # reference them.
 
 
+# ---------------------------------------------------------------------------
+# 答疑的输出预算与时限（2026-10-26 实测修）
+# ---------------------------------------------------------------------------
+# 答疑默认模型是 MiniMax-M3.1-Flash —— **强制思考**，而且
+# **思考 token 与正文共用同一个 max_tokens 预算池**。
+#
+# 原来给 4000 / 120s，实测（7K 上下文 + 真实提示词）：
+#     59.9s / 正文 **0 字** → 报"未产出正文"
+# 用户看到的现象就是「一直显示在思考、就是不回答」（2026-10-26 截图）。
+#
+# → 预算给足（思考用掉多少，正文还剩多少都得有余额）
+# → 时限放宽：用户原话"他即使思考再久也行，我只要他能回答"
+# → 思考强度调低（用户原话："把它给设定成 low，思考强度设定的低一点"）：
+#   上游认 reasoning_effort 参数（实测 M3.1-Flash 的 400 报错原文点名了它：
+#   "requires adaptive thinking; reasoning effort none is not allowed"）。
+#   强制思考模型不能关到 none → 会被降级成 low（见 llm.reasoning_effort_for）。
+QA_MAX_TOKENS = 16000
+QA_TIMEOUT = 300
+QA_REASONING_EFFORT = "low"
+
+
 EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是一个微电子与集成电路领域资深学者与论文精读导师。
 用户在阅读微电子/半导体器件/TCAD/EDA学术论文时，划选了一段难以理解的文字、公式或技术论述向你提问。
 
@@ -2976,6 +3170,11 @@ EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是一个微电子与集成电路领域
 3. 【术语全称与公式拆解】：对涉及的专业缩写（如 DTCO, GAA-FET, CFET, SDE, SDevice, DIBL, SS）给出中英文全称与物理意义；对公式中的关键变量进行清晰解释，公式使用标准 LaTeX 排版（如 $I_{on}/I_{off}$, $\mu_{eff}$）。
 4. 【工程与研究启发】：结合当前先进节点（如 Sub-3nm/2nm）或前沿论文研究范式，指出该段内容对研究者有何启发或实操注意事项。
 5. 结构清晰，采用分段 Markdown 格式输出。
+6. 【能力边界（必须遵守）】：你没有联网能力，不能联网、不能搜索网页、不能打开任何链接、不能获取任何图片/实物照片/视频，也没有任何其他外部工具。你只能看到下面给出的论文片段与上下文。
+   - 若用户的问题需要这些外部能力（上网找图、查最新进展、要实物照片、找某个具体网址……），你要**先把能做的那部分答完**（例如这类器件/结构通常长什么样、该论文里对应的图号或章节、建议用什么检索关键词和数据库去查），然后在**回答的最后一句**用一句话说明："以上基于论文内容；我没有联网检索能力，无法直接为你找到图片/最新资料。"
+   - 不要把能力边界声明放在开头当第一句 —— 先给实质内容，边界放最后一句就够了。
+   - 绝不要为了"像是在搜索"而长时间空转推理；绝不要编造图片链接、网址、文献编号或 DOI；绝不要假装你看过图片或访问过网页。
+7. 【必须回答】：无论如何都要给出一段有实质内容的回答。确实做不到时也要写清"哪部分能做、哪部分做不到、你自己可以怎么拿到"，**不允许交白卷、不允许只思考不回答**。
 """
 
 
@@ -3173,8 +3372,12 @@ async def api_explain_stream(req: ExplainRequest, request: Request):
                     {"role": "system", "content": EXPLAIN_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=1200,
+                # ⚠️ 同划词答疑：思考型模型（M3.1-Flash 强制思考）下，
+                # 原来的 1200 tokens + 默认 60 秒时限 → 必然"一直想、不回答"。
+                max_tokens=QA_MAX_TOKENS,
                 temperature=0.3,
+                timeout=QA_TIMEOUT,
+                reasoning_effort=QA_REASONING_EFFORT,
                 **_qa_model_args(req.model),
             )
             async for chunk in _stream_llm_event_gen(chunk_iter):
@@ -3237,8 +3440,11 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
                     {"role": "system", "content": CROSS_QA_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=4000,
+                # ⚠️ 同上：思考型模型必须给足预算与时限。
+                max_tokens=QA_MAX_TOKENS,
                 temperature=0.3,
+                timeout=QA_TIMEOUT,
+                reasoning_effort=QA_REASONING_EFFORT,
                 **_qa_model_args(req.model),
             )
             async for chunk in _stream_llm_event_gen(chunk_iter):
@@ -3332,17 +3538,27 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
 
     async def event_gen():
         try:
-            st = llm.get_llm_status()
             meta = {"model": _effective_model_name(req.model),
-                    "is_degraded": st.get("is_degraded", False)}
+                    # ⚠️ 降格标记看的是**这次实际用的模型**，不是全局状态
+                    #    （全局降格 ≠ 用户选的模型降格 → 2026-10-26 徽标误导）
+                    "is_degraded": _is_degraded_for(req.model)}
             chunk_iter = llm.chat_stream_async(
                 messages=[
                     {"role": "system", "content": EXPLAIN_SELECTION_SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
-                max_tokens=4000,
+                # ⚠️ 预算与时限（2026-10-26 实测修）：
+                # 答疑默认模型是 MiniMax-M3.1-Flash —— **强制思考**，
+                # 思考 token 与正文**共用** max_tokens 预算池。
+                # 原来给 4000：8K 上下文时思考就把预算吃光 →
+                # **正文 0 字**（实测 59.9s / 0 字）→ 用户看到的就是
+                # 「一直显示在思考、就是不回答」。
+                # → 思考型模型给足预算；超时也放宽（用户原话："他即使
+                #   思考再久也行，我只要他能回答"）。
+                max_tokens=QA_MAX_TOKENS,
                 temperature=0.3,
-                timeout=120,
+                timeout=QA_TIMEOUT,
+                reasoning_effort=QA_REASONING_EFFORT,
                 **_qa_model_args(req.model),
             )
             async for chunk in _stream_llm_event_gen(chunk_iter, meta=meta):

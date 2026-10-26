@@ -56,6 +56,55 @@ DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_AGNES_BASE_URL = "https://apihub.agnes-ai.com/v1"
 DEFAULT_AGNES_MODEL = "agnes-3.0-flash"
 
+# ---------------------------------------------------------------------------
+# DeepSeek（内置第三方 provider）
+# ---------------------------------------------------------------------------
+# 为什么单独做内置 provider，而不是塞进 .env 的 LLM_CUSTOM_N_* 槽：
+#   - DeepSeek 是**独立网关**（自己的 base_url + 自己的 key），
+#     MiniMax / Agnes 两个网关的 /v1/models 里都没有它（实测 2026-10-26）；
+#   - 用户原话："mini Max 不够用，然后 Agnes 又太慢了，我就换 deep seek"
+#     → 这是一个**日常要手动切**的选项，必须开箱即用，不能要求先手编 .env；
+#   - 它有**视觉/无视觉之分**，而表格抄录全靠多模态读图
+#     （无视觉模型会"自信地编造"整张表，见 VISION_CAPABLE_MODELS 的说明）。
+#
+# 模型 id 用 DeepSeek 官方的名字（deepseek-flash / deepseek-v4-pro），
+# 与前端下拉框里的 id 一致，方便排查。
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
+
+# DeepSeek 官方 API 当前暴露的模型（2026-10-26 实测 GET /v1/models）：
+#   deepseek-flash   —— 支持图片输入（视觉）
+#   deepseek-v4-pro  —— **不支持**视觉
+# ⚠️ 官方文档确认："deepseek-v4-pro does not support vision"，
+#    "deepseek-flash accepts JPEG/PNG/GIF/WebP as image_url blocks"。
+#
+# ⚠️⚠️ 视觉差别不是"能力差一点"，是"会造假"：
+#   实测（2026-10-26，JACERS 综述第 2 页生产坐标裁图）：
+#     deepseek-flash  → 抄出 −90｜−175｜−109｜｜~700｜16.5，与论文印刷值一致
+#     deepseek-v4-pro → **完全编造了另一张表**（石英/钛酸钡/PZT-5H…），
+#                       数值没有一个对得上，但格式完全像张真表
+#   → 无视觉模型**绝不能**接抄表任务，否则用户会拿到一份"看着像真的"错表。
+#     这跟 §4.6「错公式比没公式危险得多」是同一条红线。
+#
+# 抄表路径因此必须做能力检查：模型不支持视觉 → 换用支持视觉的模型，
+# 而不是把编造的表格拼进译文。
+VISION_CAPABLE_MODELS: set[str] = {
+    "MiniMax-M3",
+    "MiniMax-M3.1-Flash",
+    "MiniMax-M2.7",
+    "agnes-3.0-flash",
+    "deepseek-flash",
+}
+
+# 无视觉模型 → 抄表时的替补（按顺序找第一个支持视觉的）。
+# 选 deepseek-flash：它是唯一实测能正确读表格的第三方模型，且比 Agnes 快
+# （实测 1.9s vs Agnes 25~35s）。
+VISION_FALLBACK_CHAIN: tuple[str, ...] = (
+    "deepseek-flash",
+    "MiniMax-M3",
+    "agnes-3.0-flash",
+)
+
 # 注意: MiniMax-M3.1-Flash 强制开启思考模式，思考 token 与输出 token 共用
 # max_tokens 预算。上限给太小会导致思考吃光额度、最终 content 为空或被截断。
 DEFAULT_MAX_TOKENS = 4000
@@ -121,6 +170,142 @@ def model_forces_thinking(model: str) -> bool:
     if not model:
         return False
     return model in _THINKING_FORCED_MODELS or model in _THINKING_DISABLE_UNSUPPORTED
+
+
+# ---------------------------------------------------------------------------
+# thinking 参数：**按模型分别**决定能不能发（2026-10-26 实测）
+# ---------------------------------------------------------------------------
+# ⚠️ 不能一刀切。实测三个模型对 thinking={"type":"disabled"} 的反应**完全
+# 不同**，而且其中两种是**静默失败**（HTTP 200、看起来成功、内容是空的）：
+#
+#   模型                     传 disabled                  不传
+#   ------------------------------------------------------------------
+#   MiniMax-M3               7.6s / 2033字 ✅ 干净        32.5s / 混入思考文本
+#   MiniMax-M3.1-Flash       **HTTP 400 直接拒**          正常（强制思考）
+#   Agnes 3.0 Flash          **98.6s / 正文 0 字** ❌      27.9s / 2092字 ✅
+#   DeepSeek Flash           3.9s / 906字 ✅ 干净          20.9s / **正文 0 字** ❌
+#
+# 两个必须记住的坑：
+#   1. **Agnes 传 disabled 会静默吃光预算**：不报错、返回 200，但
+#      reasoning_content 有 9072 字符、content 一字没有、max_tokens 4000
+#      全被思考吃掉 → 用户等 98 秒拿到空白。原代码对所有模型统一发这个
+#      参数，所以**一旦选 Agnes 翻译就会白等**（2026-10-26 实测发现）。
+#   2. **DeepSeek 不传反而空**：它默认开着思考（reasoning 8293 字符、
+#      content 0 字）→ DeepSeek **必须**传 disabled。
+#
+# 判据按 **provider** 走（不看模型名），因为模型名会变、provider 不会。
+
+# 这些模型**不能**接受 thinking 参数（发了会被拒或吞掉预算）：
+#   - MiniMax-M3.1-Flash：强制 adaptive thinking，传 disabled 直接 400
+#   - Agnes（整个 provider）：传了会静默把预算全花在思考上 → 正文为空
+_THINKING_PARAM_REJECTED_PROVIDERS: tuple[str, ...] = ("agnes",)
+
+
+def cfg_accepts_thinking_param(cfg: dict) -> bool:
+    """这个配置能不能接受 thinking={"type":"disabled"} 参数？
+
+    不能的：
+      - MiniMax-M3.1-Flash（强制 adaptive thinking）→ 直接 400
+      - Agnes 整个 provider → **静默**把 max_tokens 预算全花在思考上，
+        正文一字不出（实测 98.6s / 0 字）。这是最阴险的一种：不报错，
+        用户只看到"翻译完但什么都没有"。
+
+    判据走 provider 而不是模型名（模型名会变，provider 不会）。
+    """
+    if not cfg:
+        return True
+    model = (cfg.get("model") or "").strip()
+    if model in _THINKING_FORCED_MODELS or model in _THINKING_DISABLE_UNSUPPORTED:
+        return False
+    base = (cfg.get("base_url") or "").lower()
+    if any(p in base or p in model.lower() for p in _THINKING_PARAM_REJECTED_PROVIDERS):
+        return False
+    return True
+
+
+def should_send_thinking_disabled(cfg: dict, disable_thinking: bool) -> bool:
+    """最终判断：这次请求要不要带 thinking={"type":"disabled"}。
+
+    disable_thinking=False → 永远不发（要思考时用）。
+    disable_thinking=True  → 看这个 provider 吃不吃这套参数。
+    """
+    if not disable_thinking:
+        return False
+    return cfg_accepts_thinking_param(cfg)
+
+
+# ---------------------------------------------------------------------------
+# 思考强度：reasoning_effort（2026-10-26 实测）
+# ---------------------------------------------------------------------------
+# 用户诉求："思考型模型思考要三十秒到九十秒……你把它给设定成 low，
+#            思考强度设定的低一点。Max token 可以设定高一点，
+#            反正就保证他都能正常运行就行。"
+#
+# ⚠️ 之前只有"开/关"两档（thinking.type=disabled / 不传），
+#    强制思考模型（M3.1-Flash）被卡在中间：**关不掉**，只能全开 →
+#    思考烧光预算 → 正文 0 字。
+#
+# 实测（MiniMax M3.1-Flash 的 400 报错原文，2026-10-26）：
+#   'model "MiniMax-M3.1-Flash" requires adaptive thinking;
+#    reasoning effort none is not allowed (2013)'
+#   'thinking.type="disabled" (including reasoning.effort=none) is not allowed'
+# → 上游**认 reasoning_effort 这个参数**，只是 `none` 被拒。
+#   `low` / `minimal` 都**通过校验**（实测返 429 = 过了参数校验，只是额度用完）。
+#
+# 跨模型实测 reasoning_effort 的效果（DeepSeek Flash，同一问题）：
+#   不传      → 正文 68 字 / 思考 73 字 / 1.9s
+#   low       → 正文 70 字 / 思考 157 字 / 2.0s   ← 不降思考量！
+#   minimal   → 正文 95 字 / 思考 238 字 / 2.1s   ← 反而更多！
+#   none      → 正文 65 字 / 思考   9 字 / 0.9s   ← 真的关掉了
+# → **low 并不等于"思考更少"**，只有 none 是"完全关"。
+#   对强制思考模型，none 不可用 → 能做的只是"给足预算"，
+#   让思考吃完还有余额留给正文（见 app.QA_MAX_TOKENS）。
+#
+# 所以本模块提供的是**能力判定**（这个模型/网关能不能吃这个参数），
+# 具体值由调用方决定；判定错了会 400，所以一律先问 provider。
+#
+# 这些 provider 实测**接受** reasoning_effort：
+#   - DeepSeek（api.deepseek.com）：none 有效（思考 73 → 9 字）
+#   - Agnes（apihub.agnes-ai.com）：none 有效
+#   - MiniMax（api.minimaxi.com）：low/minimal 通过校验；none 被拒
+_REASONING_EFFORT_OK_PROVIDERS: tuple[str, ...] = ("deepseek", "agnes", "minimaxi", "minimax")
+
+# 强制思考模型**不能**用 none（会 400）。
+def cfg_accepts_reasoning_effort(cfg: dict) -> bool:
+    """这个配置能不能接受 reasoning_effort 参数？
+
+    判错的后果是 **HTTP 400**（请求直接被拒，不是静默失败），
+    所以判定必须保守：不确定就不发。
+    """
+    if not cfg:
+        return False
+    base = (cfg.get("base_url") or "").lower()
+    model = (cfg.get("model") or "").lower()
+    hay = f"{base} {model}"
+    if any(p in hay for p in _REASONING_EFFORT_OK_PROVIDERS):
+        # 强制思考模型不接受 none —— 那等于关掉思考。
+        if model_forces_thinking(cfg.get("model") or ""):
+            return True   # low / minimal 仍然可用
+        return True
+    return False
+
+
+def reasoning_effort_for(cfg: dict, level: str = "low") -> Optional[str]:
+    """算出这次请求该带的 reasoning_effort 值（None = 不带）。
+
+    level: "low"（默认）/ "minimal" / "none"
+    - 强制思考模型：none 会被 400 → 强制降级到 "low"。
+    - 不支持该参数的 provider：返回 None（干脆不发）。
+    """
+    if not cfg_accepts_reasoning_effort(cfg):
+        return None
+    lv = (level or "low").strip().lower()
+    if lv not in ("low", "minimal", "none"):
+        lv = "low"
+    if lv == "none" and model_forces_thinking(cfg.get("model") or ""):
+        # 强制思考模型：none = 关思考 = 400
+        lv = "low"
+    return lv
 
 # 思考型模型（M3.1-Flash）的最小合理输出预算。低于这个值几乎必然被思考
 # 吃光；达到这个值还失败，说明是输入本身让模型陷入无限思考，应直接降级。
@@ -212,6 +397,21 @@ def friendly_error_text(exc: BaseException) -> str:
       不做二次包装。
     """
     msg = str(exc)
+    # ⚠️ 内部标记必须先拦下来，不能甩给用户（2026-10-26）。
+    # 空正文（模型只吐思考、正文一个字没出）用户看到的是：
+    #   "__TRUNCATED_BY_MAX_TOKENS__: 未产出正文(stream ended with no
+    #    visible content, max_tokens=100)"
+    # —— 一堆内部标记 + 英文，用户看不懂，只会觉得"程序坏了"。
+    if TRUNCATED_NO_BODY in msg:
+        return (
+            "模型这次没有产出任何正文（只输出了思考过程，正文为空）。"
+            "换个模型再试，或把问题问得更具体一点。"
+        )
+    if TRUNCATED_BODY_CUT in msg:
+        return (
+            "模型输出被长度限制截断了，回答不完整。"
+            "换个模型，或缩小范围（少看上下文）再试。"
+        )
     m = _HTTP_CODE_RE.search(msg)
     if not m:
         # ⚠️ 没有 HTTP 码的异常（网络/协议/URL 解析错误）**也必须脱敏+抹路径**：
@@ -443,12 +643,97 @@ def custom_model_configs() -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek provider（内置，独立网关）
+# ---------------------------------------------------------------------------
+
+# DeepSeek 的模型清单（2026-10-26 实测 GET https://api.deepseek.com/v1/models）
+DEEPSEEK_MODELS: tuple[dict, ...] = (
+    {
+        "id": "deepseek-flash",
+        "label": "DeepSeek V4.1 Flash",
+        "hint": "支持读图（表格/公式）· 快 · 独立于 MiniMax 额度",
+    },
+    {
+        "id": "deepseek-v4-pro",
+        "label": "DeepSeek V4 Pro",
+        "hint": "推理更强 · 不支持读图（表格会自动换用 DeepSeek Flash）",
+    },
+)
+
+
+def deepseek_model_configs() -> list[dict]:
+    """DeepSeek 内置 provider 的模型配置。
+
+    key 从 DEEPSEEK_API_KEY 读；留空则复用 LLM_API_KEY（自建网关同 key 的情形）。
+    没配 key → configured=False → 界面上标注"⚠ 没配 API key"，不静默失败。
+    """
+    api_key = (os.getenv("DEEPSEEK_API_KEY", "") or "").strip() \
+        or (os.getenv("LLM_API_KEY", "") or "").strip()
+    base_url = (os.getenv("DEEPSEEK_BASE_URL", "") or "").strip().rstrip("/") \
+        or DEFAULT_DEEPSEEK_BASE_URL
+    default_model = (os.getenv("DEEPSEEK_MODEL", "") or "").strip() \
+        or DEFAULT_DEEPSEEK_MODEL
+    try:
+        rpm = int((os.getenv("DEEPSEEK_RPM", "") or "").strip() or DEFAULT_CUSTOM_RPM)
+    except ValueError:
+        rpm = DEFAULT_CUSTOM_RPM
+    rpm = max(1, min(rpm, 120))
+    min_interval = max(1.0, round(60.0 / rpm * 0.9, 2)) \
+        if rpm != DEFAULT_CUSTOM_RPM else DEFAULT_CUSTOM_MIN_INTERVAL
+
+    out: list[dict] = []
+    for m in DEEPSEEK_MODELS:
+        # DEEPSEEK_MODEL 指定的模型排在最前（用户想固定用哪个）
+        is_default = m["id"] == default_model
+        out.append({
+            "id": m["id"],
+            "label": m["label"] + ("（默认）" if is_default else ""),
+            "hint": m["hint"],
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": m["id"],
+            "rpm": rpm,
+            "min_interval": min_interval,
+            "configured": bool(api_key),
+            "is_fallback": False,
+            # 走**自己的** base_url/key → 与自定义模型同一条代码路径
+            # （先试它，失败自动退回主模型 → 备用模型）。
+            "is_custom": True,
+            "is_deepseek": True,
+            "supports_vision": m["id"] in VISION_CAPABLE_MODELS,
+        })
+    return out
+
+
+def model_supports_vision(model_id: str) -> bool:
+    """这个模型能不能读图（表格/公式抄录靠它）。
+
+    判据刻意**保守**：只认白名单里的模型。
+    未知模型（用户自己配的）按"不支持"处理 → 抄表会自动换用已验证的视觉模型。
+    理由：让用户读到"表格未能读出"的提示，远好过让用户读到一份编造的表格。
+    """
+    return (model_id or "").strip() in VISION_CAPABLE_MODELS
+
+
+def vision_fallback_model() -> Optional[str]:
+    """找一个已验证支持视觉的模型（抄表读图失败时的替补）。
+
+    按 VISION_FALLBACK_CHAIN 顺序取第一个**当前能用**的。
+    """
+    for mid in VISION_FALLBACK_CHAIN:
+        if mid in VISION_CAPABLE_MODELS:
+            return mid
+    return None
+
+
 def resolve_model_config(model_id: str) -> Optional[dict]:
     """按模型 id 找配置。
 
     - ""            → None（跟随默认设置）
     - "agnes"       → 备用模型配置（Agnes）
     - "custom:xxx"  → 自定义模型配置
+    - "deepseek-*"  → DeepSeek 内置 provider 的模型
     - 其它名字       → None（表示"同一套 key/base_url 下的另一个模型名"）
     """
     mid = (model_id or "").strip()
@@ -465,6 +750,9 @@ def resolve_model_config(model_id: str) -> Optional[dict]:
         for cfg in custom_model_configs():
             if cfg["id"] == mid:
                 return cfg
+    for cfg in deepseek_model_configs():
+        if cfg["id"] == mid:
+            return cfg
     return None
 
 
@@ -969,6 +1257,21 @@ class DualModelManager:
                 }
                 for c in custom_model_configs()
             ],
+            # DeepSeek（内置 provider，独立网关 + 独立额度）
+            "deepseek_models": [
+                {
+                    "id": c["id"],
+                    "label": c["label"],
+                    "model": c["model"],
+                    "base_url": _safe_base_url(c["base_url"]),
+                    "configured": c["configured"],
+                    "rpm": c["rpm"],
+                    "min_interval": c["min_interval"],
+                    "supports_vision": c.get("supports_vision", False),
+                    "rate_limit": limiter_for_config(c).stats(),
+                }
+                for c in deepseek_model_configs()
+            ],
         }
 
 
@@ -1067,6 +1370,71 @@ def translation_active_model() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 答疑（划词解答）专用的模型 —— 与翻译**分开**
+# ---------------------------------------------------------------------------
+# 用户诉求（2026-10-26）：
+#   "翻译用 M3（不开思考）… 解答问题就用 MiniMax 的 3.1 Flash 版本，
+#    或者也能换 deep seek V4.1 flash"→ 两者要**各自独立**切换。
+#
+# 为什么要分开（不是重复造轮子）：
+#   翻译的诉求 = 快 + 完整 → M3，关思考（实测 8.4s / 2918 字）
+#   答疑的诉求 = 会推导   → M3.1-Flash，**必须开着思考**（强制思考型，
+#     传 thinking.type=disabled 直接 400）
+# 共用一个下拉框 → 想换翻译模型就必须连带换掉答疑模型，反之亦然。
+
+DEFAULT_QA_MODEL = "MiniMax-M3.1-Flash"
+
+
+def qa_model_name() -> str:
+    """答疑任务专用的模型名（空串 = 跟随主模型）。
+
+    默认 MiniMax-M3.1-Flash：答疑要的是"会推导"，而它是**强制思考**型
+    （翻译场景下它是灾难：整页 41.7s、推理吃光预算导致正文被截断）。
+    """
+    return (os.getenv("LLM_QA_MODEL", "") or "").strip()
+
+
+def qa_active_model() -> str:
+    """答疑实际会用到的模型名（给界面徽标/下拉框"当前"标记用）。"""
+    q = qa_model_name()
+    if q:
+        return q
+    primary = model_manager.get_primary_config().get("model") or ""
+    # 主模型不是强制思考型时，答疑默认用 M3.1-Flash（更会推导）
+    if primary and primary != DEFAULT_QA_MODEL:
+        return DEFAULT_QA_MODEL
+    return primary or DEFAULT_QA_MODEL
+
+
+def qa_disable_thinking() -> bool:
+    """答疑要不要**主动**关思考模式。
+
+    判据：只有"明确知道支持关思考"的模型才主动关。
+
+    - MiniMax-M3 / M2.7 / DeepSeek Flash：支持关 → 关掉更省时（实测
+      DeepSeek Flash 关思考后 reasoning_content 长度归 0）。
+    - MiniMax-M3.1-Flash：**强制思考**，传 disabled 直接 400 → 不传。
+      （即使误传了，_invoke_model 也会在 400 时自动去掉参数重试一次，
+        并把这个模型记进 _THINKING_DISABLE_UNSUPPORTED —— 但那是"撞了
+        再退"，每个新进程都要白撞一次，所以这里直接不传。）
+    - Agnes：非思考型，关不关无所谓；不传最安全。
+    - 未知模型：不传（宁可慢，不要 400）。
+
+    ⚠️ 答疑**默认是要思考的**（"会推导"）—— 这是与翻译最大的区别。
+    """
+    return False
+
+
+def model_prefers_no_thinking(model_id: str) -> bool:
+    """这个模型适合**主动**关掉思考模式吗（用于答疑/直译这类"要正文不要推导"的场景）。"""
+    return (model_id or "").strip() in (
+        "MiniMax-M3",
+        "MiniMax-M2.7",
+        "deepseek-flash",
+    )
+
+
+# ---------------------------------------------------------------------------
 # HTTP session helpers (proxy-aware)
 # ---------------------------------------------------------------------------
 #
@@ -1152,7 +1520,7 @@ def _invoke_model(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
-    if disable_thinking and cfg["model"] not in _THINKING_DISABLE_UNSUPPORTED:
+    if should_send_thinking_disabled(cfg, disable_thinking):
         payload["thinking"] = {"type": "disabled"}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -1434,7 +1802,16 @@ def chat(
     primary = model_manager.get_primary_config()
     custom_cfg = resolve_model_config(model_name) if model_name else None
     is_custom = bool(custom_cfg and custom_cfg.get("is_custom"))
-    if model_name and not is_custom and model_name != primary["model"]:
+    # ⚠️ "agnes" 是**备用模型**的别名，不是"主模型网关下的另一个模型名"。
+    #   把它当成模型名 → primary 被改成 model="agnes" → 拿着 MiniMax 的 key
+    #   去打 "agnes" → HTTP 400 invalid params, unknown model 'agnes'
+    #   （2026-10-26 实测：用户选「Agnes 3.0 Flash」翻译时必现）
+    #   → 命中 fallback 配置时，必须走 force_fallback 链路，不能改 primary。
+    is_fallback_alias = bool(
+        custom_cfg and custom_cfg.get("is_fallback")
+    )
+    if (model_name and not is_custom and not is_fallback_alias
+            and model_name != primary["model"]):
         primary = dict(primary, model=model_name)
     fallback = model_manager.get_fallback_config()
 
@@ -1445,7 +1822,7 @@ def chat(
         )
 
     # 强制走备用模型：直接用 fallback 配置，跳过主模型与降级探测
-    if force_fallback:
+    if force_fallback or is_fallback_alias:
         if not fallback["configured"]:
             raise LLMError("备用模型未配置 (AGNES_API_KEY), 无法强制使用")
         success, res, status_code = _invoke_with_budget_escalation(
@@ -1750,6 +2127,7 @@ async def _invoke_model_async(
     json_mode: bool,
     max_retries: int = 2,
     cancel_event: Optional[asyncio.Event] = None,
+    disable_thinking: bool = False,
 ) -> tuple[bool, str, Optional[int]]:
     """Async equivalent of _invoke_model().
 
@@ -1772,6 +2150,8 @@ async def _invoke_model_async(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    if should_send_thinking_disabled(cfg, disable_thinking):
+        payload["thinking"] = {"type": "disabled"}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
@@ -1849,6 +2229,17 @@ async def _invoke_model_async(
 
             last_err = err
 
+            # 模型不支持 thinking 参数（例如 M3.1-Flash 强制 adaptive thinking）：
+            # 去掉该参数重试一次，别直接失败。顺便把这个模型记下来：之后
+            # 直接不再发该参数，省掉每个分块一次 400 + 重试的往返。
+            # （同步路径 _invoke_model 里早有这段；异步路径原来漏了。）
+            if resp.status_code == 400 and "thinking" in payload and "thinking" in err.lower():
+                payload.pop("thinking", None)
+                disable_thinking = False
+                _THINKING_DISABLE_UNSUPPORTED.add(cfg["model"])
+                if attempt < max_retries:
+                    continue
+
             # Agnes 429 rate limit backoff
             if resp.status_code == 429 and is_agnes and attempt < max_retries:
                 if _cancelled():
@@ -1917,6 +2308,7 @@ async def chat_async(
     json_mode: bool = False,
     max_retries: int = 2,
     cancel_event: Optional[asyncio.Event] = None,
+    disable_thinking: bool = False,
     model_name: Optional[str] = None,
     force_fallback: bool = False,
 ) -> str:
@@ -1938,9 +2330,12 @@ async def chat_async(
     custom_cfg = resolve_model_config(model_name) if model_name else None
     is_custom = bool(custom_cfg and custom_cfg.get("is_custom"))
     # 换模型（同一套 key/base_url 下的另一个模型名）—— 同步 chat() 一直有这步，
-    # 异步路径漏了 → 答疑时选了 M3.1-Flash 实际发出去的还是 M3
+    # 异步路径漏了 → 答疑时选了 M3.1-Flash 实际发出去的���是 M3
     # （2026-10-25 独立审查发现：用户"换模型"的诉求在答疑入口全部落空）
-    if model_name and not is_custom and model_name != primary["model"]:
+    # ⚠️ "agnes" 是**备用模型**的别名，不是模型名 —— 见 _apply_model_alias 的说明。
+    is_fallback_alias = bool(custom_cfg and custom_cfg.get("is_fallback"))
+    if (model_name and not is_custom and not is_fallback_alias
+            and model_name != primary["model"]):
         primary = dict(primary, model=model_name)
 
     if not primary["configured"] and not fallback["configured"] and not is_custom:
@@ -1959,6 +2354,7 @@ async def chat_async(
         ok, res, _ = await _invoke_model_async(
             custom_cfg, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, cancel_event=cancel_event,
+            disable_thinking=disable_thinking,
         )
         if ok:
             return res
@@ -1966,10 +2362,14 @@ async def chat_async(
               f"自动退回默认模型链路: {res}", file=sys.stderr)
 
     # 强制走备用模型（用户在界面上选了 Agnes）
-    if force_fallback and fallback["configured"]:
+    # ⚠️ is_fallback_alias：model_name 直接传 "agnes" 时也要走这里
+    #   （否则会被当成"主模型网关下的模型名"→ 拿着 MiniMax 的 key 打 agnes
+    #    → HTTP 400 unknown model 'agnes'，2026-10-26 实测）
+    if (force_fallback or is_fallback_alias) and fallback["configured"]:
         ok, res, _ = await _invoke_model_async(
             fallback, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, cancel_event=cancel_event,
+            disable_thinking=disable_thinking,
         )
         if ok:
             return res
@@ -1988,6 +2388,7 @@ async def chat_async(
         success, res, status_code = await _invoke_model_async(
             primary, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, cancel_event=cancel_event,
+            disable_thinking=disable_thinking,
         )
         if success:
             return res
@@ -1997,6 +2398,7 @@ async def chat_async(
             fb_success, fb_res, _ = await _invoke_model_async(
                 fallback, messages, max_tokens, temperature, timeout, json_mode,
                 max_retries=max_retries, cancel_event=cancel_event,
+            disable_thinking=disable_thinking,
             )
             if fb_success:
                 return fb_res
@@ -2008,6 +2410,7 @@ async def chat_async(
         success, res, _ = await _invoke_model_async(
             fallback, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, cancel_event=cancel_event,
+            disable_thinking=disable_thinking,
         )
         if success:
             return res
@@ -2052,6 +2455,7 @@ async def _stream_model(
     timeout: int,
     cancel_event: Optional[asyncio.Event] = None,
     disable_thinking: bool = False,
+    reasoning_effort: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """Yield content chunks from a single model via httpx streaming.
 
@@ -2070,6 +2474,9 @@ async def _stream_model(
     Models that reject the parameter (M3.1-Flash forces adaptive thinking)
     get a 400; we drop the parameter and retry once, and remember the model
     in _THINKING_DISABLE_UNSUPPORTED so we stop sending it.
+
+    reasoning_effort: "low" / "minimal" / "none" —— 思考强度（2026-10-26）。
+    强制思考模型不接受 none（400），reasoning_effort_for() 会自动降级成 low。
     """
     if httpx is None:
         raise LLMError("httpx 包未安装, 请先 pip install httpx")
@@ -2082,8 +2489,15 @@ async def _stream_model(
         "temperature": temperature,
         "stream": True,  # request SSE
     }
-    if disable_thinking and cfg["model"] not in _THINKING_DISABLE_UNSUPPORTED:
+    if should_send_thinking_disabled(cfg, disable_thinking):
         payload["thinking"] = {"type": "disabled"}
+    # 思考强度（2026-10-26）："low" / "minimal"。
+    # ⚠️ 强制思考模型（M3.1-Flash）**不能**用 none（实测 400：
+    # "reasoning effort none is not allowed"）→ reasoning_effort_for 会挡住。
+    if reasoning_effort:
+        effort = reasoning_effort_for(cfg, reasoning_effort)
+        if effort:
+            payload["reasoning_effort"] = effort
 
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
@@ -2124,6 +2538,12 @@ async def _stream_model(
                 # quota exhaustion (429) from a rate-limit (also 429 but
                 # with a different body) without re-parsing the message.
                 err.status_code = resp.status_code
+                # ⚠️ 模型不支持 thinking 参数（例如 M3.1-Flash 强制 adaptive
+                # thinking）→ 这里**不**就地重试：流式的 <think> 剥离需要
+                # 缓冲器，就地重试会绕过它、让思考文本漏给浏览器。
+                # 改由 chat_stream_async 层重试（它会先剥掉 thinking 再发）。
+                # 已知模型由 should_send_thinking_disabled 预先拦住，
+                # 这道只兜底未知模型。
                 raise err
 
             body_visible_chars = 0
@@ -2138,7 +2558,15 @@ async def _stream_model(
                     if not in_think and think_buf:
                         body_visible_chars += len(think_buf.strip())
                         yield think_buf
-                    return
+                    # ⚠️ 这里**必须 break 而不是 return** —— 直接 return 会跳过
+                    #    循环之后的空正文守卫，于是「上游正常发了 [DONE] 但正文
+                    #    一个字都没吐」的情况被当成成功：前端收到 [DONE]、
+                    #    渲染出一个空答案，AI 活动面板还显示「✅ 完成」。
+                    #    （实测 2026-10-26：M3.1-Flash 答「帮我到网上找实物图」
+                    #     思考 43 秒后只发思考、不发正文 → 用户看到的就是
+                    #     「显示在回答、实际没有回答」。）
+                    #    break 让流程落到循环后的守卫，两种断流方式一起兜住。
+                    break
                 try:
                     obj = json.loads(data)
                     delta = obj["choices"][0]["delta"].get("content", "") or ""
@@ -2224,6 +2652,7 @@ async def chat_stream_async(
     disable_thinking: bool = False,
     model_name: Optional[str] = None,
     force_fallback: bool = False,
+    reasoning_effort: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """Streaming version of chat() with cancellation support.
 
@@ -2266,7 +2695,10 @@ async def chat_stream_async(
     # 换模型：与同步 chat() / chat_async() 保持一致
     # （漏了这步 → 答疑时选了别的模型，实际发出去的仍是主模型，
     #   而界面徽标还显示"用户选的那个" → 骗人）
-    if model_name and not is_custom and model_name != primary["model"]:
+    # ⚠️ "agnes" 是**备用模型**的别名，不是模型名 —— 见 _apply_model_alias 的说明。
+    is_fallback_alias = bool(custom_cfg and custom_cfg.get("is_fallback"))
+    if (model_name and not is_custom and not is_fallback_alias
+            and model_name != primary["model"]):
         primary = dict(primary, model=model_name)
 
     if not primary["configured"] and not fallback["configured"] and not is_custom:
@@ -2289,6 +2721,7 @@ async def chat_stream_async(
             async for chunk in _stream_model(
                 custom_cfg, messages, max_tokens, temperature, timeout, cancel_event,
                 disable_thinking=disable_thinking,
+                reasoning_effort=reasoning_effort,
             ):
                 if chunk.strip():
                     emitted = True
@@ -2305,10 +2738,12 @@ async def chat_stream_async(
             # 继续往下走主/备链路
 
     # 强制走备用模型（用户在界面上选了 Agnes 答疑）
-    if force_fallback and fallback["configured"]:
+    # ⚠️ is_fallback_alias：model_name 直接传 "agnes" 时也要走这里
+    if (force_fallback or is_fallback_alias) and fallback["configured"]:
         async for chunk in _stream_model(
             fallback, messages, max_tokens, temperature, timeout, cancel_event,
             disable_thinking=disable_thinking,
+            reasoning_effort=reasoning_effort,
         ):
             yield chunk
         return
@@ -2346,6 +2781,7 @@ async def chat_stream_async(
             async for chunk in _stream_model(
                 primary, messages, max_tokens, temperature, timeout, cancel_event,
                 disable_thinking=disable_thinking,
+                reasoning_effort=reasoning_effort,
             ):
                 if chunk.strip():
                     emitted = True
@@ -2365,18 +2801,54 @@ async def chat_stream_async(
             # 20K context, max_tokens=4000 -> 14398 chars of reasoning and a
             # 2-char body with thinking on, vs a clean answer with it off).
             # Nothing was streamed yet, so the retry is seamless.
+            #
+            # ⚠️ 但对**强制思考模型**（M3.1-Flash）这个重试是**空操作**：
+            #    `should_send_thinking_disabled` 对它返回 False → 参数根本
+            #    不会下发 → 发出去的请求与第一次**完全相同** → 再等 55 秒，
+            #    还是 0 字。实测（2026-10-26）：空正文后重试把 55 秒变成
+            #    111 秒，然后才报错 —— 用户白等一倍时间。
+            #    → 这种模型要重试的话，必须**抬高 max_tokens**
+            #      （思考与正文共用预算池，给足就能出正文）。
             if (
                 not disable_thinking
                 and TRUNCATED_MARKER in err_msg
                 and TRUNCATED_NO_BODY in err_msg
             ):
+                if should_send_thinking_disabled(primary, True):
+                    # 这条重试真的会让请求不同（关掉思考）→ 值得重试。
+                    async for chunk in _stream_model(
+                        primary, messages, max_tokens, temperature, timeout,
+                        cancel_event, disable_thinking=True,
+                        reasoning_effort=reasoning_effort,
+                    ):
+                        yield chunk
+                    return
+                # 强制思考模型：关不掉思考 → 只能**加预算**再试一次。
+                # 抬到 MAX_ESCALATION_MAX_TOKENS 为止，再失败就报错。
+                bigger = min(max(max_tokens * 4, MIN_REASONABLE_MAX_TOKENS),
+                              MAX_ESCALATION_MAX_TOKENS)
+                if bigger > max_tokens:
+                    async for chunk in _stream_model(
+                        primary, messages, bigger, temperature, timeout,
+                        cancel_event, disable_thinking=False,
+                        reasoning_effort=reasoning_effort,
+                    ):
+                        yield chunk
+                    return
+            status = getattr(e, "status_code", None)
+            # 模型不接受 thinking 参数 → 去掉它重试一次（还没吐任何内容，
+            # 重试是无缝的）。已知模型由 should_send_thinking_disabled 预先
+            # 拦住，这条是给未知模型兜底的。
+            if (status == 400 and disable_thinking
+                    and "thinking" in err_msg.lower()):
+                _THINKING_DISABLE_UNSUPPORTED.add(primary.get("model") or "")
                 async for chunk in _stream_model(
                     primary, messages, max_tokens, temperature, timeout,
-                    cancel_event, disable_thinking=True,
+                    cancel_event, disable_thinking=False,
+                    reasoning_effort=reasoning_effort,
                 ):
                     yield chunk
                 return
-            status = getattr(e, "status_code", None)
             # ⚠️ status 为 None 表示这不是 HTTP 状态码错误（网络中断、协议错误、
             #    URL 解析失败……）—— 那种情况**不能**当成配额耗尽。
             #    旧的宽松分支（"429" in err_msg）会把这类错误也算成配额耗尽
@@ -2399,6 +2871,7 @@ async def chat_stream_async(
         async for chunk in _stream_model(
             fallback, messages, max_tokens, temperature, timeout, cancel_event,
             disable_thinking=disable_thinking,
+            reasoning_effort=reasoning_effort,
         ):
             yield chunk
         return

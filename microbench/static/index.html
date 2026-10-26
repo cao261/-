@@ -2844,6 +2844,9 @@
       //   onAbort()       — user cancelled mid-flight (AbortError)
       // ---------------------------------------------------------------
       let _activeAsk = null; // {controller, btn, originalHTML}
+      // 答疑请求的递增序号：用于判断"我还是不是当前这次请求"。
+      // 新请求会中止旧请求，旧请求的回调靠它识别自己已过期（2026-10-26）。
+      let _qaRequestSeq = 0;
       function cancelActiveAsk() {
         if (_activeAsk && _activeAsk.controller) {
           try { _activeAsk.controller.abort(); } catch {}
@@ -2962,8 +2965,14 @@
               else if (el < _AI_WARN_MS) _aiTaskStage(t.id, "模型处理中（可能在读表格 / 思考）");
               else _aiTaskStage(t.id, "很慢：可能在读表格或模型陷入长思考");
             } else if (t.kind === "qa") {
+              // ⚠️ 文案要给出**下一步能做什么**，不能只说"还在想"
+              // （用户原话 2026-10-26："他显然就不会再输出了"）。
+              // 长思考是 M3.1-Flash 的常态（实测首字 17~27s），
+              // 但超过一分钟还一个字没有，就该告诉用户可以换模型/重问了。
               if (el < 8000) _aiTaskStage(t.id, "等待模型首个回答");
-              else _aiTaskStage(t.id, "模型还在想（未产出内容）");
+              else if (el < 45000) _aiTaskStage(t.id, "模型还在想（尚未产出内容）");
+              else if (el < _AI_WARN_MS) _aiTaskStage(t.id, "模型思考较久（尚未产出内容）· 可点取消换模型");
+              else _aiTaskStage(t.id, "很慢：模型可能陷入长思考 · 建议取消并换模型重试");
             }
           });
         }, 500);
@@ -3089,11 +3098,20 @@
       async function askLLMStream(btn, url, payload, options) {
         options = options || {};
         if (_activeAsk) {
-          showToast("已有 AI 请求进行中, 请先取消或等待完成", true);
-          // Tell the caller: every caller has already painted a spinner and
-          // only onError/onAbort/onSuccess can clear it again.
-          if (options.onError) options.onError(new Error("已有 AI 请求进行中"));
-          return null;
+          // ⚠️ 用户原话（2026-10-26）："我给他反馈之后他会显示就是已有AI在
+          // 回答中这个提问失败……但是他显然就不会再输出了"。
+          //
+          // 也就是说：**用户想重答时，旧请求还在跑**（模型陷在长思考里，
+          // 一直不吐正文），于是单飞守卫直接把新请求拒了 —— 用户被卡死：
+          // 既拿不到旧答案，也发不出新问题。
+          //
+          // 现在改成「**替换**」而不是「拒绝」：新请求接管，把旧的中止掉。
+          // 旧请求的 abort 会走它自己的 catch → onAbort/onError 回调，
+          // 但那时它已经不是当前面板的主人了（见 _qaRequestSeq 守卫）。
+          const old = _activeAsk;
+          _activeAsk = null;
+          try { if (old && old.controller) old.controller.abort(); } catch (e) { /* 忽略 */ }
+          showToast("已中止上一次请求，开始新的提问");
         }
         if (!btn) {
           // No button to host the spinner/cancel control — the request is
@@ -3107,6 +3125,16 @@
         btn.innerHTML = `<span>⏳ 解答中...</span> <button type="button" data-cancel-ask style="margin-left:6px; padding:1px 8px; font-size:11px; background:var(--accent-terracotta); color:#fff; border:0; border-radius:6px; cursor:pointer;">✕ 取消</button>`;
         const cancelBtn = btn.querySelector("[data-cancel-ask]");
         if (cancelBtn) cancelBtn.onclick = cancelActiveAsk;
+
+        // ⚠️ 请求序号守卫（2026-10-26）：
+        // 新的请求会 abort 掉旧的（见上面的"替换"逻辑），但旧请求的
+        // catch → onError/onAbort 回调**仍会执行**（AbortError 走的是
+        // onAbort 分支）。如果不加序号守卫，旧请求的回调会把**新**请求
+        // 正在写的答案区覆盖成"已取消"，用户看到的就是新问题刚开跑就被
+        // 自己的旧请求擦掉了。
+        // → 每次发请求领一个递增序号；回调只在"我还是当前主人"时才生效。
+        const _askSeq = ++_qaRequestSeq;
+        const _isCurrentAsk = () => _qaRequestSeq === _askSeq;
 
         // 登记到「AI 活动」：答疑最容易出现"等半天没输出"（模型在思考），
         // 这里给出实时已用时 + 阶段，面板里也能直接取消。
@@ -3156,6 +3184,20 @@
               if (!line.startsWith("data: ")) continue;
               const data = line.slice(6);
               if (data === "[DONE]") {
+                // ⚠️ 空正文不能当成成功（2026-10-26 浏览器实测）：
+                // 上游可能正常发 [DONE] 但一个可见字符都没吐（思考烧光预算）。
+                // 这时若照常调 onSuccess("")，界面上就是一个空答案 +
+                // "✅ 完成"，用户看到的就是「显示在回答、实际没有回答」。
+                // → 明确报错，并给出可操作的下一步。
+                if (!accumulated.trim()) {
+                  const emptyErr = new Error(
+                    "模型没有产出任何内容（只输出了思考过程，正文为空）。" +
+                    "换个模型再试，或把问题问得更具体一点。"
+                  );
+                  _aiTaskEnd(_aiQaTaskId, "error", emptyErr.message);
+                  if (options.onError) options.onError(emptyErr);
+                  return null;
+                }
                 if (options.onSuccess) options.onSuccess(accumulated, meta);
                 _aiTaskEnd(_aiQaTaskId, "done");
                 return accumulated;
@@ -3164,7 +3206,7 @@
               try { obj = JSON.parse(data); }
               catch { continue; } // skip malformed
               if (obj.cancelled) {
-                if (options.onAbort) options.onAbort();
+                if (_isCurrentAsk() && options.onAbort) options.onAbort();
                 _aiTaskEnd(_aiQaTaskId, "cancelled");
                 return null;
               }
@@ -3186,12 +3228,23 @@
             }
           }
           // Stream ended without [DONE] — treat as soft complete
+          if (!accumulated.trim()) {
+            const emptyErr = new Error(
+              "模型没有产出任何内容（连接结束但正文为空）。换个模型再试。"
+            );
+            _aiTaskEnd(_aiQaTaskId, "error", emptyErr.message);
+            if (options.onError) options.onError(emptyErr);
+            return null;
+          }
           if (options.onSuccess) options.onSuccess(accumulated, meta);
           _aiTaskEnd(_aiQaTaskId, "done");
           return accumulated;
         } catch (err) {
           if (err && err.name === "AbortError") {
-            if (options.onAbort) options.onAbort();
+            // ⚠️ 只有"我还是当前主人"时才通知界面。
+            // 否则：这个请求是被**新请求**替换掉的，它的中止回调会把
+            // 新请求正在写的答案区覆盖成"已取消"。
+            if (_isCurrentAsk() && options.onAbort) options.onAbort();
             _aiTaskEnd(_aiQaTaskId, "cancelled");
             return null;
           }
@@ -3199,10 +3252,15 @@
           if (options.onError) options.onError(err);
           return null;
         } finally {
-          _activeAsk = null;
-          if (btn) {
-            btn.disabled = false;
-            btn.innerHTML = originalHTML;
+          // ⚠️ 只有当前主人才能清 _activeAsk —— 被替换掉的旧请求收尾时
+          // 若把 _activeAsk 清了，会把**新**请求的登记一起抹掉
+          // （新请求就再也取消不掉了）。
+          if (_isCurrentAsk()) {
+            _activeAsk = null;
+            if (btn) {
+              btn.disabled = false;
+              btn.innerHTML = originalHTML;
+            }
           }
         }
       }
@@ -6834,10 +6892,27 @@
 
       updateQAQuotedSnippet();
 
+      // 加载答疑模型选项（与翻译的下拉框独立）。
+      // 只在第一次打开时拉；之后用记住的选择。
+      if (!_qaModelChoicesLoaded) {
+        _qaModelChoicesLoaded = true;
+        _loadQAModelPref();
+        loadQAModelChoices();
+      }
+
       const modelPill = document.getElementById("qa-panel-model-pill");
       if (modelPill && _llmStatus) {
-        modelPill.textContent = _llmStatus.is_degraded ? "🛡️ 降格保护" : "🤖 主模型";
-        modelPill.style.color = _llmStatus.is_degraded ? "var(--accent-terracotta)" : "var(--accent-olive)";
+        // 徽标要显示**答疑实际用的模型**（用户自己选的那个），
+        // 不能写死"主模型" —— 否则用户切了模型却看不到变化。
+        const sel = document.getElementById("qa-model-select");
+        const opt = sel && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex] : null;
+        if (opt && sel.value) {
+          modelPill.textContent = opt.textContent;
+          modelPill.style.color = "";
+        } else {
+          modelPill.textContent = _llmStatus.is_degraded ? "🛡️ 降格保护" : "🤖 主模型";
+          modelPill.style.color = _llmStatus.is_degraded ? "var(--accent-terracotta)" : "var(--accent-olive)";
+        }
       }
 
       if (presetQ) {
@@ -7245,7 +7320,33 @@
     // ===========================================================================
     // _pdfTransModel：工具栏下拉框选中的模型（"" = 跟随 .env 的默认设置）。
     // 换模型后缓存键也跟着换（服务端按模型分键），所以换模型 = 真的重译。
+    //
+    // ⚠️ 翻译和答疑是**两套独立**的选择（用户 2026-10-26 的要求）：
+    //   翻译 → M3（关思考，快）/ Agnes Flash / DeepSeek Flash
+    //   答疑 → M3.1-Flash（会推导）/ DeepSeek Flash / Agnes Flash
+    // 共用一个下拉框 → 想换翻译模型就连带换掉答疑模型，反之亦然。
     let _pdfTransModel = "";
+
+    // _qaModel：划词答疑用的模型（与翻译**独立**）。
+    // 存 localStorage：用户的额度和偏好不该每次开面板都要重选。
+    let _qaModel = "";
+    let _qaModelChoicesLoaded = false;
+
+    const _QA_MODEL_STORAGE_KEY = "microbench.qaModel";
+
+    function _loadQAModelPref() {
+      try {
+        _qaModel = localStorage.getItem(_QA_MODEL_STORAGE_KEY) || "";
+      } catch (e) { _qaModel = ""; }
+    }
+
+    function _saveQAModelPref(v) {
+      _qaModel = v || "";
+      try {
+        if (_qaModel) localStorage.setItem(_QA_MODEL_STORAGE_KEY, _qaModel);
+        else localStorage.removeItem(_QA_MODEL_STORAGE_KEY);
+      } catch (e) { /* 隐私模式静默降级 */ }
+    }
 
     async function loadTranslationModelChoices() {
       const sel = document.getElementById("pdf-trans-model");
@@ -7280,6 +7381,51 @@
       if (tagEl) tagEl.textContent = "🔄 重译中…";
       if (textEl) textEl.className = "page-text pdf-translation-loading";
       await translatePdfPage(pageNum, null, true, true, _pdfTransModel);
+    }
+
+    // ---------------------------------------------------------------------------
+    // 答疑模型选择（与翻译**独立**）
+    // ---------------------------------------------------------------------------
+    // 用户 2026-10-26："翻译用 M3 不开思考…解答问题用 M3.1 Flash，
+    // 也能换 DeepSeek V4.1 Flash…我能自主的切换，我这个额度用完，
+    // 我能切换另一个额度。"
+    //
+    // 所以答疑面板必须能**单独**换模型，不能跟翻译共用一个下拉框。
+    async function loadQAModelChoices() {
+      const sel = document.getElementById("qa-model-select");
+      if (!sel) return;
+      try {
+        const r = await fetch("/api/llm/qa_models");
+        if (!r.ok) return;
+        const d = await r.json();
+        const cur = sel.value || _qaModel;
+        sel.innerHTML = "";
+        (d.models || []).forEach(m => {
+          const o = document.createElement("option");
+          o.value = m.id;
+          o.textContent = m.label;
+          o.title = m.hint || "";
+          sel.appendChild(o);
+        });
+        // 首选用户记住的选择；没有记住的就用服务端说的默认模型
+        const wanted = cur || d.active_model || "";
+        sel.value = wanted;
+        if (!sel.value && sel.options.length) sel.selectedIndex = 0;
+        _qaModel = sel.value || "";
+      } catch (e) { /* 拉不到就保持默认 */ }
+    }
+
+    function onQAModelChange(v) {
+      _saveQAModelPref(v);
+      _qaModel = v || "";
+      const pill = document.getElementById("qa-panel-model-pill");
+      // 徽标立刻反映当前选择，别让用户以为还用的是主模型
+      if (pill) {
+        const opt = document.querySelector('#qa-model-select option[value="' +
+          (_qaModel || "").replace(/"/g, '\\"') + '"]');
+        pill.textContent = opt ? opt.textContent : "🤖 主模型";
+        pill.style.color = "";
+      }
     }
 
     // 重新翻译整篇：按 RPM 保护排队，一页一页来
@@ -8114,9 +8260,10 @@
         feedback: (feedbackText || "").slice(0, 2000),
         prior_answer: (priorAnswer || "").slice(0, 8000),
         force_scope: newScope.mode,
-        // 用工具栏当前选中的模型回答（'' = 跟随默认 / 'agnes' = 备用 /
-        // 'custom:xxx' = 用户自己的 API 模型）
-        model: _pdfTransModel || "",
+        // 用**答疑面板**自己选中的模型回答（与翻译用的模型互不影响）：
+        // '' = 跟随默认 / 'agnes' = 备用 / 'deepseek-flash' = DeepSeek /
+        // 'custom:xxx' = 用户自己的 API 模型
+        model: _qaModel || "",
       }, {
         label: "划词答疑",
         onStage: (stage, t) => {
@@ -8443,9 +8590,10 @@
         // falls back to the mid cap (8000) and silently truncates the
         // wide (20K) / full (50K) contexts.
         force_scope: scope.mode,
-        // 用工具栏当前选中的模型回答（'' = 跟随默认 / 'agnes' = 备用 /
-        // 'custom:xxx' = 用户自己的 API 模型）
-        model: _pdfTransModel || "",
+        // 用**答疑面板**自己选中的模型回答（与翻译用的模型互不影响）：
+        // '' = 跟随默认 / 'agnes' = 备用 / 'deepseek-flash' = DeepSeek /
+        // 'custom:xxx' = 用户自己的 API 模型
+        model: _qaModel || "",
       };
 
       await askLLMStream(submitBtn, "/api/paper/explain_selection_stream", payload, {
@@ -8970,6 +9118,13 @@
             <div class="qa-panel-sub">针对所选片段深度解答与推导</div>
           </div>
           <div class="row gap-1">
+            <!-- 答疑模型选择（与翻译工具栏的下拉框**独立**） -->
+            <select id="qa-model-select" class="field-input"
+                    style="font-size:11px; padding:3px 6px; max-width:190px;"
+                    onchange="onQAModelChange(this.value)"
+                    title="选一个模型来解答（与翻译用的模型互不影响）。默认 MiniMax-M3.1-Flash 会推导；额度用完可切 DeepSeek Flash 或 Agnes">
+              <option value="">🤖 主模型</option>
+            </select>
             <span id="qa-panel-model-pill" class="badge-neutral">AI 就绪</span>
             <button class="btn-zoom-toggle" onclick="minimizeReaderQAPanel()" title="最小化" aria-label="最小化">−</button>
             <button class="btn-zoom-toggle" onclick="toggleReaderQAPanel()" title="关闭" aria-label="关闭">×</button>
