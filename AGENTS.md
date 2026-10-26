@@ -13,14 +13,15 @@
 > 两台设备（25353 / 30461）之间**没有会话通道**（`session send` 只能投本机会话），
 > 交接一律走仓库：对方 `git pull` 就能拿到（`auto_sync.py` 每 2 小时也会自动同步，§4.19）。
 >
-> ⚠️ **别只读 `docs/` 目录**：交接文档有 5 份，散在目录里很容易漏读。
+> ⚠️ **别只读 `docs/` 目录**：交接文档有 6 份，散在目录里很容易漏读。
 > 索引里按「桌面端 / 平板端 / 同步契约」分好了组，也标了哪份已过时。
 > **当前最新且最重要**的是
-> [`docs/HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md`](docs/HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md)
-> （浏览器实测抓出的 5 个真 bug + 安全审计 5 项 + 降格提示改造）。
-> 最新一份是
-> [`docs/HANDOFF_2026-10-25-GLYPH-PERF.md`](docs/HANDOFF_2026-10-25-GLYPH-PERF.md)
-> （「打开/上传论文卡 8 分钟」的取证与修复 —— 坑记在 §4.24）。
+> [`docs/HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md`](docs/HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md)
+> （桌面端**专注模式**：屏幕只留「论文页 + 译文页」——
+> ⚠ **在分支 `feat/zen-focus-mode` 上，`main` 没动**，不想要就 `git checkout main`）。
+> 性能那轮是
+> [`docs/HANDOFF_2026-10-27-PERF-OPTIMIZATION.md`](docs/HANDOFF_2026-10-27-PERF-OPTIMIZATION.md)
+> （打开论文 2496ms → 50ms，坑记在 §4.42）。
 > ⚠️ 交接文档是**某个时点的快照**，不是长期状态 —— 以 §4.4 和各机实测为准。
 
 ---
@@ -1515,6 +1516,93 @@ WebDAV 同步保持 150s（同步卡住就该早点失败重试）。
 >   下次环境一变（换个网关、换个模型）就会翻车。
 > - **两个端对同一机制的判定可以有意不同** —— 只要**理由**写进注释，
 >   并且各自有护栏钉住，就不算分歧，算「按各自的部署环境取证」。
+
+### 4.48 `.reader-shell` 会被 flex 收缩成半屏 —— fit-content 的坑（2026-10-27 浏览器实测）
+
+**症状**：专注模式单栏看论文页，PDF 只占左半屏，右半屏全空。
+
+**根因（探针实测，不是猜的）**：
+
+    .reader-shell  cw=616   ← 视口 1280px，它只占了一半
+    .pdf-split     gtc="308px 308px"
+
+`#reader-modal` 打开时是 `display:flex`（**行向** flex），
+`.reader-shell` 是它的 flex item，`width:auto` → 走 **fit-content 收缩**：
+壳的宽度 = 内容的 max-content，**不是视口宽度**。
+
+平时看不出问题：顶栏在文档流里、内容很宽 → 壳被撑满。
+**一旦顶栏脱离文档流**（专注模式把顶栏改成 `position:fixed`），
+壳里只剩 `.pdf-split` → 壳立刻缩成 fit-content → 半屏。
+
+**修**：`.reader-shell { width:100%; min-width:0 }`（`min-width:0` 同理 ——
+否则 min-content 撑大时 flex item 不肯缩）。
+
+> **教训**：改 flex 容器的子项宽度前，先问「它是不是某个 flex item」。
+> `width:auto` 在 flex item 上 = fit-content，不是「自适应父宽」。
+> 交叉轴上给 `margin:auto` 还会**取消 stretch** → 同样变成 fit-content
+> （§4.12 里 `@media (700-1100px) .reader-shell > * { max-width:860px; margin:auto }`
+> 就是这一类，专注模式要把它顶掉）。
+
+> **教训 2**：症状「PDF 只占一半」有两个候选根因（fit-content 收缩 / media query 的 max-width）。
+> **别按屏幕宽度猜** —— 之前修的是 `700-1100px` 那条 media query，
+> 在 1280 屏上**根本不生效**，所以症状一点没变。
+> 正确做法是**埋探针量实际宽度**（`getComputedStyle` + `clientWidth`），
+> 一测就分清了。
+
+### 4.49 PDF 画布宽度：阅读器从隐藏变可见时，窗口尺寸**一点没变**（2026-10-27 浏览器实测）
+
+**症状**：画布永远 520px 宽（`availWidth = max(260, (listEl.clientWidth || 520) - 4)` 的兜底值）。
+
+**根因**：阅读器打开前是 `display:none` → `#pdf-pages-list` 的 clientWidth = 0
+→ 首次渲染走兜底 520。等阅读器**真的显示出来**，
+**窗口尺寸一点没变** → `window resize` **根本不触发** → 画布永远停在 520。
+
+**修**（三处一起，缺一不可）：
+
+1. `ResizeObserver` **直接观察 `#pdf-pages-list`** —— 覆盖「隐藏→可见」「单栏→双栏」
+   这些 window resize 抓不到的宽度变化；
+2. `_pdfRelayoutBusy` **忙标记** —— 重绘期间忽略尺寸回调，
+   否则「清空列表 → 高度变化 → 又排一次重绘」会**自激循环**；
+3. 渲染结束后用**渲染起始宽度**（`renderW0`）复核一次 ——
+   阅读器可能是在渲染**过程中**才变可见的，那一瞬间的观察器回调被忙标记挡掉了。
+
+> **教训**：`|| 520` 这种**兜底默认值**会把「量不到」和「真的是 520」混成同一个值，
+> 静默地把 bug 藏起来。量不到的时候要能**发现**（渲染后复核），别只兜底。
+
+### 4.50 专注模式（小屏极简阅读）—— 功能尝试，在分支 `feat/zen-focus-mode`（2026-10-27）
+
+用户诉求：「屏幕不大，所有内容铺在屏幕上很乱、费劲 → 做个极简版本，
+只有论文页和译文页，其他功能隐藏，需要时自己打开，滑下来能出现一些功能。
+这是功能尝试，审查好当分支推，明天不行要能一键回退。」
+
+交接文档：[`docs/HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md`](docs/HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md)
+
+**设计要点**：
+
+- 工具条**复用既有 `.reader-topbar`**，不另做一套按钮 → 既有功能一行不少，
+  也不会和顶栏分叉出两套行为；
+- 顶栏在专注模式下是 `position:fixed` + `translateY(-101%)` 滑出，
+  **不是 `display:none`** —— 否则再也滑不回来；
+- **不给 `.reader-shell` 加 `position:relative`** —— 那会把里面
+  `position:absolute` 的浮层（批注编辑器 / 笔记抽屉）的包含块换掉，位置全乱；
+- `.zen-handle`（顶部 7px 细把手）放在 `.reader-shell` 的**最后** ——
+  插在前面会挤偏「child1=topbar / child2=章节视图 / child3=PDF 视图」的位置型契约；
+- 选择器一律 `#reader-modal` 前缀 —— 靠 id 权重压住基础样式里的
+  `@media (max-width:1200px) .reader-body` 两列规则；
+- 默认关闭 + 偏好持久化（`zenPref`）→ 下次开论文直接进专注。
+
+**这一轮浏览器实测又抓到 3 个真 bug**（都在 §4.48 / §4.49 / 本节）：
+
+| # | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 单栏看论文页，右半屏全空 | `.reader-shell` fit-content 收缩 | §4.48 |
+| 2 | 画布停在 520px | 隐藏→可见时窗口没变 | §4.49 |
+| 3 | 切「论文页」一片空白 | CSS 无条件 `display:none` | 改成 `:not(.zen-show-orig)` |
+| 4 | 「章节」「提问」点了像坏了 | 它们住在章节视图容器里，PDF 模式下整体 `display:none` | 先切章节视图；没章节数据就如实提示 |
+
+> **通用纪律**：**「点了没反应」和「显示成空白」都是 bug，不能算「功能没实现」**。
+> 用户分不清「我按错了」和「它坏了」——
+> 能切就切，切不了就**说清楚为什么**（弹提示），别给一片空白。
 
 ### 4.41 平板适配：等待期看得见 + 429 自动换模型 + 按模型限流（2026-10-25）
 

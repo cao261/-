@@ -6,29 +6,39 @@
 
 ## 阅读顺序（按你的角色选）
 
-### 谁都要看（本轮新增的两份）
-1. **[`HANDOFF_2026-10-27-PERF-OPTIMIZATION.md`](HANDOFF_2026-10-27-PERF-OPTIMIZATION.md)** ← **最新，先看这份**
+### 谁都要看（本轮新增的三份）
+1. **[`HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md`](HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md)** ← **最新，先看这份**
+   桌面端**专注模式**（小屏极简阅读）：屏幕上只留「论文页 + 译文页」，
+   顶栏工具条 / 章节导航 / AI 提问区 / 划词悬浮钮默认收起，需要时从顶部滑出。
+   ⚠ **在分支 `feat/zen-focus-mode` 上，`main` 没动** —— 不想要就 `git checkout main`。
+   浏览器实测又抓到 4 个真 bug（PDF 只占半屏 / 画布停在 520px / 切论文页空白 /
+   「章节」「提问」点了像坏了）。
+2. **[`HANDOFF_2026-10-27-PERF-OPTIMIZATION.md`](HANDOFF_2026-10-27-PERF-OPTIMIZATION.md)**
    电脑端「打开略微卡顿」的**取证与修复**：打开论文 2496ms → 50ms（PDF 抽取缓存）、
    首屏请求串行 → 全并行（async 端点里的同步磁盘扫）、滚动帧 max 391ms → 23ms（节流）。
    含**三条试过但证伪的路**（线程池并行 0.97x / 换 PyMuPDF 快 20 倍但破坏双栏顺序）。
-2. **[`HANDOFF_2026-10-27-TABLET-QA-BUDGET.md`](HANDOFF_2026-10-27-TABLET-QA-BUDGET.md)**
+3. **[`HANDOFF_2026-10-27-TABLET-QA-BUDGET.md`](HANDOFF_2026-10-27-TABLET-QA-BUDGET.md)**
    平板端补齐桌面端 `2216afa` 那轮答疑修复的其余根因（预算 / 重试 / 序号守卫 /
    `reasoning_effort` / 能力边界），并修了独立审查揪出的 6 个缺陷。
 
 ### 我负责桌面端（另一台电脑的 agent）
-1. **[`HANDOFF_2026-10-25-GLYPH-PERF.md`](HANDOFF_2026-10-25-GLYPH-PERF.md)** ← **最新**
+1. **[`HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md`](HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md)** ← **最新，先看这份**
+   专注模式（功能尝试，**在分支 `feat/zen-focus-mode`，`main` 没动**）。
+   改之前必读 `AGENTS.md` §4.48 / §4.49 / §4.50（本轮三个坑：
+   flex fit-content 收缩 / 隐藏→可见时窗口没变 / 「点了没反应」也是 bug）。
+2. **[`HANDOFF_2026-10-25-GLYPH-PERF.md`](HANDOFF_2026-10-25-GLYPH-PERF.md)**
    「打开/上传论文卡 8 分钟」的取证与修复：符号认字从**逐页串行**改成**整篇批量**，
    词典主键从**形状指纹**换成**语义键**（字体基名|字符码），打开路径**不调模型**
    （5.5s 打开）。含剩余待办（裁图带邻居 → 部分符号认不出）。
-2. **[`HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md`](HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md)**
+3. **[`HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md`](HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md)**
    浏览器实测（真人级点击）抓出的 5 个真 bug + 安全审计的 5 个问题 + 降格提示改造。
    含：PDF 模式整条工具条消失、AI 活动「取消」够不着、429 报错说人话、
    密钥脱敏盲区、离线导出 XSS。
-3. [`HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md`](HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md)
+4. [`HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md`](HANDOFF_2026-10-25-AI-ACTIVITY-AND-GLYPHS.md)
    AI 活动可视化（徽标/浮层/取消）+ 符号认字（× ≈ ≥）的实现要点。
-   ⚠️ 其中「符号认字」那节的**形状指纹方案已被上面第 1 份取代**（误判率 26~41%）。
-4. [`LLM_CONTRACT.md`](LLM_CONTRACT.md) —— 改模型层前必读（换模型/降级/速率/表格读图）。
-5. [`READER_CONTRACT.md`](READER_CONTRACT.md) —— 改阅读器前必读（页内顺序/公式/批注）。
+   ⚠️ 其中「符号认字」那节的**形状指纹方案已被上面第 2 份取代**（误判率 26~41%）。
+5. [`LLM_CONTRACT.md`](LLM_CONTRACT.md) —— 改模型层前必读（换模型/降级/速率/表格读图）。
+6. [`READER_CONTRACT.md`](READER_CONTRACT.md) —— 改阅读器前必读（页内顺序/公式/批注）。
 
 ### 我负责平板端（Android/iPad 那台）
 1. **[`HANDOFF_2026-10-27-TABLET-QA-BUDGET.md`](HANDOFF_2026-10-27-TABLET-QA-BUDGET.md)** ← **最新，先看这份**
@@ -71,6 +81,7 @@
 
 | 文档 | 日期 | 解决什么问题 | 状态 |
 |---|---|---|---|
+| `HANDOFF_2026-10-27-ZEN-FOCUS-MODE.md` | 10-27 | **桌面端专注模式**：屏幕只留「论文页 + 译文页」，其余收起；浏览器实测抓到 4 个真 bug | ✅ 最新（**在分支 `feat/zen-focus-mode`，main 未动**） |
 | `HANDOFF_2026-10-27-PERF-OPTIMIZATION.md` | 10-27 | **电脑端性能**：打开论文 2.5~9.7s → 50ms、首屏并行化、滚动节流 | ✅ 最新（性能） |
 | `HANDOFF_2026-10-27-TABLET-QA-BUDGET.md` | 10-27 | **平板端**：补齐答疑「只思考不回答」的预算 / 重试 / 序号守卫 / 思考强度 | ✅ 最新（平板端） |
 | `AUDIT_2026-10-26.md` | 10-26 | 第三轮审计（后端/模型层/前端）+ **P0 五处已修** | ✅ 有效 |
