@@ -459,6 +459,10 @@ function collectText(node, out) {
   global.fetch = realFetch4;
 
   console.log("\n[18] 重答不死锁：新请求替换旧请求，旧回调不许覆盖新答案区");
+  // ⚠ 2026-10-27 独立审查揪出来的坑：原来那两条断言读的是
+  //   **新请求自己的 turn**（每次 runAI 都新建一个 turn，status/buf 是私有的）
+  //   → 旧请求根本写不到那儿去 → 两条断言**恒真**，把守卫拆了也照样绿。
+  //   真正会回归的是**共享状态**：停止按钮 + 多轮上下文。
   reset();
   const realFetch5 = global.fetch;
   let seq = 0;
@@ -485,6 +489,10 @@ function collectText(node, out) {
   await new Promise((r) => setTimeout(r, 80));
   getEl("ai-question").value = "第二个问题";
   const p2 = T.runAI("ask");
+  // ⚠ 在 p2 还在飞的时候采样：这时旧请求可能已经收尾了
+  await new Promise((r) => setTimeout(r, 600));
+  const stopHiddenMid = getEl("btn-ai-stop").hidden;
+  const histMid = JSON.stringify(T.state.aiHistory.get("note-1") || []);
   await Promise.all([p1, p2]);
   const outEl18 = getEl("ai-output");
   const turns18 = outEl18.children;
@@ -493,8 +501,16 @@ function collectText(node, out) {
   const lastBuf18 = (lastTurn18.children[1] || {})._html || "";
   check(lastBuf18.indexOf("这是回答。") >= 0,
     "新请求的答案区是**新答案**，没被旧请求覆盖 -> " + JSON.stringify(lastBuf18));
-  check(lastSt18.indexOf("已完成") < 0 && lastSt18.indexOf("已停止") < 0,
+  check(lastSt18.indexOf("已停止") < 0,
     "新请求的状态条没被旧请求写成「已停止」-> " + lastSt18);
+  // ↓↓↓ 这两条才是真能红的（共享状态）↓↓↓
+  check(stopHiddenMid === false,
+    "新请求还在跑时，停止按钮仍然可见（拆掉序号守卫就会变 true）-> hidden=" + stopHiddenMid);
+  check(histMid.indexOf("旧请求的答案") < 0,
+    "旧请求的答案没被塞进多轮上下文 -> " + histMid);
+  const histFinal = JSON.stringify(T.state.aiHistory.get("note-1") || []);
+  check(histFinal.indexOf("旧请求的答案") < 0,
+    "全部结束后，多轮上下文里也只有新答案 -> " + histFinal);
   global.fetch = realFetch5;
 
   console.log("\n[19] 能力边界：平板端是直连模型的，提示词必须自己写一份");
@@ -506,6 +522,105 @@ function collectText(node, out) {
   check(sysMsg.content.indexOf("不能联网") >= 0, "提示词写明了不能联网");
   check(sysMsg.content.indexOf("必须回答") >= 0, "提示词要求「必须回答」（不许交白卷）");
   check(sysMsg.content.indexOf("最后一句") >= 0, "能力边界放最后一句（用户明确改过口径）");
+
+  console.log("\n[20] 429 换模型不能把刚抬上去的预算冲回原值（D2）");
+  reset();
+  // 第一次：正文空 → 抬预算；第二次：429 → 换模型。
+  // 换完模型后预算必须**保持抬高**，不能被重置回 16000。
+  let hit20 = 0;
+  const realFetch6 = global.fetch;
+  global.fetch = async (url, opts) => {
+    hit20++;
+    const payload = JSON.parse(opts.body);
+    calls.push({ url, opts, payload });
+    if (hit20 === 1) {
+      const enc = new TextEncoder();
+      const sse = 'data: {"choices":[{"delta":{"reasoning_content":"空转"}}]}\n\ndata: [DONE]\n\n';
+      return {
+        ok: true, status: 200,
+        body: { getReader() { let d = false; return {
+          async read() { if (d) return { done: true, value: undefined };
+            d = true; return { done: false, value: enc.encode(sse) }; } }; } },
+        text: async () => sse,
+      };
+    }
+    if (hit20 === 2) {
+      // 重试撞 429
+      return { ok: false, status: 429, text: async () => '{"error":{"message":"Token Plan limit exceeded"}}' };
+    }
+    return realFetch6(url, opts);
+  };
+  getEl("ai-question").value = "先撞 429 再换模型";
+  await T.runAI("ask");
+  check(calls.length >= 3, "经历了「空正文 → 重试 → 429 → 换模型」（共 " + calls.length + " 次请求）");
+  const lastCall = calls[calls.length - 1];
+  check(lastCall.payload.max_tokens >= 32000,
+    "换模型后预算**没被冲回原值**（仍 >= 32000）-> " + lastCall.payload.max_tokens);
+  global.fetch = realFetch6;
+
+  console.log("\n[21] 400 参数不认要能自愈（D3/D4：thinking / reasoning_effort）");
+  reset();
+  let hit21 = 0;
+  const realFetch7 = global.fetch;
+  global.fetch = async (url, opts) => {
+    hit21++;
+    const payload = JSON.parse(opts.body);
+    calls.push({ url, opts, payload });
+    if (hit21 === 1) {
+      // 第一次 400：上游说「unrecognized request argument」（**不含** thinking 字样）
+      return { ok: false, status: 400, text: async () => '{"error":{"message":"unrecognized request argument"}}' };
+    }
+    return realFetch7(url, opts);
+  };
+  T.state.ai.model = "MiniMax-M3.1-Flash";
+  T.state.ai.base = "https://api.minimaxi.com/v1";
+  getEl("ai-question").value = "参数不被接受怎么办";
+  await T.runAI("ask");
+  check(hit21 === 2, "400 之后自动重试了一次（实际 " + hit21 + " 次）");
+  // ⚠ 答疑路径带的是 reasoning_effort（不是 thinking）→ 400 兜底要剥它
+  check(calls[0].payload.reasoning_effort === "low",
+    "第一次请求带了 reasoning_effort=low（官方网关在白名单里）");
+  check(calls[1].payload.reasoning_effort === undefined,
+    "第二次请求剥掉了 reasoning_effort（不依赖错误文案里有 'thinking' 字样）");
+  global.fetch = realFetch7;
+
+  console.log("\n[21b] 翻译路径的 thinking 被 400 剥掉");
+  reset();
+  let hit21b = 0;
+  const realFetch8 = global.fetch;
+  global.fetch = async (url, opts) => {
+    hit21b++;
+    const payload = JSON.parse(opts.body);
+    calls.push({ url, opts, payload });
+    if (hit21b === 1) {
+      return { ok: false, status: 400, text: async () => '{"error":{"message":"unrecognized request argument"}}' };
+    }
+    return realFetch8(url, opts);
+  };
+  global.getSelection = () => ({ toString: () => "选中的论文段落" });
+  T.state.ai.model = "MiniMax-M3";
+  T.state.ai.modelT = "MiniMax-M3";
+  T.state.ai.base = "https://api.minimaxi.com/v1";
+  await T.runAI("translate");
+  check(hit21b === 2, "翻译 400 之后自动重试了一次（实际 " + hit21b + " 次）");
+  check(calls[0].payload.thinking && calls[0].payload.thinking.type === "disabled",
+    "第一次翻译请求带了 thinking=disabled");
+  check(calls[1].payload.thinking === undefined,
+    "第二次翻译请求剥掉了 thinking（不依赖错误文案）");
+  global.getSelection = () => ({ toString: () => "" });
+  global.fetch = realFetch8;
+
+  console.log("\n[22] 未知网关不乱发参数（D3/D4：白名单收紧）");
+  check(T.shouldSendThinkingDisabled("https://api.example.com/v1", "gpt-4o") === false,
+    "未知网关 + 任意模型名 → 不发 thinking=disabled（否则严格网关直接 400）");
+  check(T.shouldSendThinkingDisabled("https://api.minimax.中转.example.com/v1", "MiniMax-M3") === true,
+    "含 minimax 的中转站仍按 provider 判定（thinking 是按 provider 走的）");
+  check(T.acceptsReasoningEffort("https://minimax.中转.example.com/v1", "MiniMax-M3") === false,
+    "中转站**不**在 reasoning_effort 白名单里（精确主机名，不靠子串）");
+  check(T.acceptsReasoningEffort("https://api.minimaxi.com/v1", "MiniMax-M3.1-Flash") === true,
+    "官方网关在白名单里");
+  check(T.acceptsReasoningEffort("https://api.minimaxi.com/v1", "MiniMax-M3.1-Flash") === true,
+    "官方网关 + 强制思考模型 → 仍然发（none 会 400，low 没问题）");
 
   console.log("\n" + "=".repeat(60));
   console.log("PASS " + pass + "  FAIL " + fail);

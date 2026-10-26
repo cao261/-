@@ -2590,11 +2590,36 @@
     }
 
     // Hairline under the header firms up once the masthead scrolls away.
+    //
+    // ⚠ 2026-10-27 性能优化：这个监听器原来**每个滚动事件**都跑一次，
+    //   而 scroll 事件在快速滚动时能每秒触发几十次 → 主线程被拖住。
+    //   CPU Profiler 实测：onScroll 是首屏唯一的热点函数（占 8% 采样，
+    //   远超第二名）。滚动帧 p90 96ms / max 391ms —— 用户说的「略微卡顿」。
+    //
+    // → 改成 **rAF 节流**：一帧最多写一次 DOM 属性。
+    //   行为完全不变（还是 scrollY > 8 就切状态），只是不再每个事件都写。
     function _initHeaderScrollState() {
       const header = document.getElementById("app-header");
       if (!header) return;
+      let queued = false;
+      let lastState = null;
+      const apply = () => {
+        queued = false;
+        const scrolled = String(window.scrollY > 8);
+        // 状态没变就不写 DOM —— 避免无谓的样式重算
+        if (scrolled !== lastState) {
+          lastState = scrolled;
+          header.setAttribute("data-scrolled", scrolled);
+        }
+      };
       const onScroll = () => {
-        header.setAttribute("data-scrolled", String(window.scrollY > 8));
+        if (queued) return;
+        queued = true;
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(apply);
+        } else {
+          apply();
+        }
       };
       onScroll();
       window.addEventListener("scroll", onScroll, { passive: true });
@@ -3449,10 +3474,15 @@
         const fn = window.updateObsidianStatus || updateObsidianStatus;
         if (typeof fn === "function") fn();
       } catch (e) { console.warn("更新 Obsidian 状态失败", e); }
-      try {
-        const fn = window.loadRecentFeed || loadRecentFeed;
-        if (typeof fn === "function") await fn();
-      } catch (e) { console.warn("加载文献 feed 失败", e); }
+      // ⚠ 这里**不再**拉 feed（2026-10-27 性能优化）。
+      //   原来 loadStats() 末尾 `await loadRecentFeed()`，而首屏的
+      //   _bootDashboard 又自己调了一次 → **首屏打两次同一个请求**
+      //   （实测 /api/vault/literature 被请求 2 次：52ms 那次 + 273ms 那次）。
+      //   更糟的是那个 await 让 feed **串行阻塞**在 stats 后面：
+      //   第一批请求 51ms 发出、161ms 才回来，第二批（stats 等）200ms 才开始。
+      //
+      //   → feed 归 _bootDashboard 管；loadStats 只负责数字。
+      //     需要刷新 feed 的地方（删除笔记后）自己显式调 loadRecentFeed()。
     }
 
     async function handleFetchPaper() {

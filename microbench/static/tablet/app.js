@@ -1042,17 +1042,40 @@
     if (ok) w.resolve(payload);
     else w.reject(new Error((payload && payload.error) || "原生调用失败"));
   };
+  /**
+   * 原生调用的超时兜底（毫秒），**按方法分别给**。
+   *
+   * ⚠ 为什么不能一个数打天下（2026-10-27 独立审查揪出来的）：
+   *   原来所有原生调用共用 150s。但 **AI 答疑的真实时限是 300s**
+   *   （AI_QA_TIMEOUT_MS，与电脑端 QA_TIMEOUT 一致）——
+   *   于是 APK 上的 300s 超时**永远触发不了**：150s 时 nativeCall 先 reject，
+   *   那个 Error 没有 .status → 不匹配 400/429 → 直接上屏「原生调用超时（httpPost）」，
+   *   用户还是什么都没拿到（正是本轮要消灭的症状）。
+   *
+   *   → AI 请求必须给得比 300s 还宽一点（留出超时判定的余量），
+   *     WebDAV 同步保持短（同步卡住就该早点失败重试）。
+   */
+  const NATIVE_TIMEOUT_MS = {
+    httpPost: 360000,   // AI 请求：必须 > AI_QA_TIMEOUT_MS(300s)
+    default: 150000,    // WebDAV 同步等：保持原值
+  };
   function nativeCall(method, args) {
     return new Promise((resolve, reject) => {
       const id = "cb" + (++_nativeSeq);
       // 超时兜底 —— 原生那边要是不回调（Activity 已销毁 / 线程卡死），
       // Promise 会永远挂着, 界面就一直转圈。
+      const limit = NATIVE_TIMEOUT_MS[method] || NATIVE_TIMEOUT_MS.default;
       const timer = setTimeout(() => {
         if (_nativeWaiters[id]) {
           delete _nativeWaiters[id];
-          reject(new Error("原生调用超时（" + method + "）"));
+          const err = new Error("原生调用超时（" + method + "）");
+          // ⚠ 带上方法名标记：上层要靠它区分「这是超时，不是别的错」，
+          //   否则会当成普通失败，把内部术语直接甩给用户看。
+          err.nativeTimeout = true;
+          err.method = method;
+          reject(err);
         }
-      }, 150000);
+      }, limit);
       const finish = (fn) => (v) => { clearTimeout(timer); fn(v); };
       _nativeWaiters[id] = { resolve: finish(resolve), reject: finish(reject) };
       try {
@@ -1663,9 +1686,11 @@
   // （实测 M3.1-Flash：43 秒思考 + 0 字正文）。
   // 写法：**先给实质内容，能力边界放最后一句**（用户原话："不需要他第一句话
   // 就说自己的能力边界……只需要最后能说一句就行了"）。
-  const SYS_RESEARCH =
-    "你是半导体/微电子方向的科研助手。用中文回答，先给结论再给依据，" +
-    "涉及公式时给出 LaTeX 源码（行内 $...$，块级 $$...$$）。" +
+  //
+  // ⚠ 2026-10-27 独立审查揪出来的漂移：能力边界这段原来在 SYS_RESEARCH 和
+  // SYS_SUMMARY 里**各抄了一份**，抄着抄着就差了半句（摘要那句多了个「最后能说一句」）。
+  // → 抽成**共享常量**，两个提示词都引用它 → 物理上不可能漂移。
+  const CAPABILITY_BOUNDARY =
     "【能力边界】你不能联网、不能搜索网页、不能打开链接、不能获取任何图片或实物照片，" +
     "也没有其他外部工具。若问题需要这些能力，先把基于给定内容能答的部分答完" +
     "（如建议检索关键词和数据库），再在回答的最后一句用一句话说明" +
@@ -1673,19 +1698,18 @@
     "不要长时间空转，不要编造链接或图片。" +
     "【必须回答】无论如何都要给出有实质内容的回答，做不到也要写清哪部分能做哪部分做不到，不允许交白卷。";
 
+  const SYS_RESEARCH =
+    "你是半导体/微电子方向的科研助手。用中文回答，先给结论再给依据，" +
+    "涉及公式时给出 LaTeX 源码（行内 $...$，块级 $$...$$）。" +
+    CAPABILITY_BOUNDARY;
+
   // ⚠ 摘要也是「科研助手」角色 —— 同样可能被问到"帮我查下最新进展"，
   //   一样要让它**自己说清做不到**，而不是长时间空转交白卷。
-  //   能力边界条款与 SYS_RESEARCH **逐字一致**（护栏会断言两者相同，
-  //   防止改了一处忘了另一处 —— 抄两份最容易漂移）。
+  //   → 引用同一份 CAPABILITY_BOUNDARY（不另抄一份，防漂移）。
   const SYS_SUMMARY =
     "你是科研助手。用中文给出结构化摘要：研究问题、方法、关键结论、" +
     "对本方向的价值与局限。分点写，不超过 600 字。" +
-    "【能力边界】你不能联网、不能搜索网页、不能打开链接、不能获取任何图片或实物照片，" +
-    "也没有其他外部工具。若问题需要这些能力，先把基于给定内容能答的部分答完" +
-    "（如建议检索关键词和数据库），再在回答的最后一句用一句话说明" +
-    "\"我没有联网检索能力，无法直接找到图片/最新资料\"。" +
-    "不要长时间空转，不要编造链接或图片。" +
-    "【必须回答】无论如何都要给出有实质内容的回答，做不到也要写清哪部分能做哪部分做不到，不允许交白卷。";
+    CAPABILITY_BOUNDARY;
 
   const PROMPTS = {
     explain: (sel) => [
@@ -1751,8 +1775,19 @@
    *   "reasoning effort none is not allowed" → 只能给 low。
    */
   const AI_REASONING_EFFORT = "low";
-  /** 实测接受 reasoning_effort 的网关（provider 关键词）。 */
-  const AI_REASONING_EFFORT_OK_PROVIDERS = ["deepseek", "agnes", "minimaxi", "minimax"];
+  /**
+   * 实测接受 reasoning_effort 的**网关白名单**（精确主机名，不是子串）。
+   *
+   * ⚠ 2026-10-27 独立审查揪出来的 D4：原来用「base 里含 minimax/deepseek/agnes
+   *   就算」的子串匹配 → 用户填 `https://minimax.中转.example.com/v1`
+   *   这种**中转站**地址也会命中 → 发了它不认的参数 → HTTP 400，无兜底。
+   *   → 改成**精确主机名白名单**，其余一律不发。
+   */
+  const AI_REASONING_EFFORT_OK_HOSTS = [
+    "api.minimaxi.com", "api.minimax.io",
+    "api.deepseek.com",
+    "apihub.agnes-ai.com",
+  ];
 
   /**
    * 这个模型是不是**强制思考**（推理 token 与正文共用 max_tokens 预算池）。
@@ -1771,17 +1806,27 @@
    *
    * 判错 → HTTP 400 → 请求直接被拒。→ 未知网关**一律不发**。
    *
-   * ⚠ 判据只认 **base（网关地址）**，不看模型名 —— 这跟电脑端 llm.py
+   * ⚠ 判据只认 **base 的主机名**，不看模型名 —— 这跟电脑端 llm.py
    *   （base + 模型名一起判）有一处**故意的**差别：
    *   平板的用户可以把自己的接口指向**任意** OpenAI 兼容网关，
    *   那种网关上照样挂着「MiniMax-M3.1-Flash」这个模型名，
    *   但它**不一定认 reasoning_effort** → 发了就 400。
    *   → 网关才是决定「认不认这个参数」的东西，模型名不是。
+   *
+   * ⚠ 而且要用**精确主机名**白名单，不能用子串匹配：
+   *   `https://minimax.中转.example.com` 里含 "minimax"，
+   *   但那个中转站**不保证**转发 reasoning_effort。
    */
   function acceptsReasoningEffort(base, model) {
-    const hay = String(base || "").toLowerCase();
-    if (!hay) return false;
-    if (!AI_REASONING_EFFORT_OK_PROVIDERS.some((p) => hay.indexOf(p) >= 0)) {
+    const b = String(base || "").trim().toLowerCase();
+    if (!b) return false;
+    // 取主机名（去掉协议、端口、路径）
+    let host = b;
+    const m = b.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/);
+    if (m) host = m[1];
+    host = host.split("@").pop();       // 去掉 userinfo
+    host = host.split(":")[0];          // 去掉端口
+    if (!AI_REASONING_EFFORT_OK_HOSTS.includes(host)) {
       return false;
     }
     // 强制思考模型不能拿 none（会 400）→ 由 reasoningEffortFor 降级成 low。
@@ -1812,13 +1857,26 @@
    *   - Agnes：传了会**静默**把预算全花在思考上 → 正文一字不出
    *   - DeepSeek：**必须**传（不传反而正文 0 字）
    * 判据走 **provider**（模型名会变，provider 不会）。
+   *
+   * ⚠ 2026-10-27 独立审查揪出来的 D3：原来的写法是
+   *   「除 M3.1-Flash 和 Agnes 之外**一律发**」——
+   *   那意味着用户在设置里填**任意**模型名（如 gpt-4o / glm-4.6）都会带上
+   *   thinking 参数，严格校验的网关直接 400。
+   *   → 改成**白名单**：只有**实测支持**这个参数的 provider 才发，
+   *     未知网关不发（宁可慢，不要 400）。
    */
+  const AI_THINKING_DISABLED_OK_PROVIDERS = ["deepseek", "minimaxi", "minimax"];
+
   function shouldSendThinkingDisabled(base, model) {
     const m = String(model || "").trim();
     if (modelForcesThinking(m)) return false;
     const hay = (String(base || "") + " " + m).toLowerCase();
     // Agnes 整个 provider 不吃这个参数（静默吃光预算）
     if (hay.indexOf("agnes") >= 0) return false;
+    // 未知网关不发：用户填什么模型名都有可能，宁可慢一点也不要 400
+    if (!AI_THINKING_DISABLED_OK_PROVIDERS.some((p) => hay.indexOf(p) >= 0)) {
+      return false;
+    }
     return true;
   }
 
@@ -2224,11 +2282,15 @@
         if (out) out.scrollTop = out.scrollHeight;
       };
       /**
-       * 发一次请求（自带两层兜底）。
+       * 发一次请求（自带三层兜底）。
        *
-       * ① 模型不认 thinking 参数 → 去掉它重试一次
+       * ① 模型不认 thinking / reasoning_effort 参数 → 剥掉重试一次
        *    （还没吐内容，重试是无缝的；仿电脑端 llm.py 的 400 处理）
        * ② 429 → 换另一个模型重试一次（只换一次）
+       *
+       * ⚠ ① 的判据**不能只看错误文案**：上游可能说
+       *   "unrecognized request argument"，也可能把参数名写在第 200 字之后。
+       *   → 判据改成「**请求带了可选参数 + 400**」，文案只作辅助。
        */
       const sendOnce = async () => {
         try {
@@ -2237,7 +2299,14 @@
         } catch (e1) {
           const st = Number(e1 && e1.status) || 0;
           const msg = String((e1 && e1.message) || "");
-          if (st === 400 && payload.thinking && /thinking/i.test(msg)) {
+          // ① 参数不认 → 剥掉可选参数重试一次
+          //   ⚠ 顺序：先剥 reasoning_effort，再剥 thinking（两个都可能触发 400）
+          if (st === 400 && payload.reasoning_effort) {
+            delete payload.reasoning_effort;
+            await throttleModel(payload.model);
+            return await aiRequest(payload, cfg, onDelta, controller.signal);
+          }
+          if (st === 400 && payload.thinking) {
             delete payload.thinking;
             await throttleModel(payload.model);
             return await aiRequest(payload, cfg, onDelta, controller.signal);
@@ -2248,17 +2317,24 @@
             payload.model = altModel;
             // 换模型后，思考开关/思考强度/预算都要按**新模型**重算
             //（原来那个是给主模型定的）
+            //
+            // ⚠ 预算要用 **max（下限, 当前值）**，不能用赋值覆盖
+            //   （2026-10-27 独立审查揪出来的 D2）：
+            //   正文空 → 预算刚从 16000 抬到 32000 → 重试正好撞 429 →
+            //   换模型 → 被重置回 16000 → 若新模型也是强制思考型
+            //   → 思考再吃一次预算 → **又 0 字**。用户白等三倍时间。
             if (isTranslate) {
               if (shouldSendThinkingDisabled(cfg.base, altModel)) {
                 payload.thinking = { type: "disabled" };
               } else {
                 delete payload.thinking;
               }
-              payload.max_tokens = modelForcesThinking(altModel)
+              const floor = modelForcesThinking(altModel)
                 ? AI_QA_MAX_TOKENS : AI_TRANSLATE_MAX_TOKENS;
+              payload.max_tokens = Math.max(payload.max_tokens, floor);
             } else {
               delete payload.thinking;
-              payload.max_tokens = AI_QA_MAX_TOKENS;
+              payload.max_tokens = Math.max(payload.max_tokens, AI_QA_MAX_TOKENS);
               const effort2 = reasoningEffortFor(cfg.base, altModel, AI_REASONING_EFFORT);
               if (effort2) payload.reasoning_effort = effort2;
               else delete payload.reasoning_effort;
@@ -2331,6 +2407,12 @@
         status.textContent = timedOut
           ? "超过 " + Math.round(AI_QA_TIMEOUT_MS / 1000) + " 秒还没返回（可能是模型在长思考）—— 可点停止或换模型重试"
           : "已停止";
+      } else if (e && e.nativeTimeout) {
+        // ⚠ 原生代理超时（APK 专属路径）：不能把内部术语甩给用户
+        //   "原生调用超时（httpPost）" —— 用户看不懂，也不知道下一步做什么。
+        status.textContent = "等待模型响应超时（" + Math.round(NATIVE_TIMEOUT_MS.httpPost / 1000)
+          + " 秒）—— 可能是模型在长时间思考，可点停止或换个模型重试";
+        status.setAttribute("data-error", "1");
       } else {
         status.textContent = "失败：" + safeErr(e && e.message ? e.message : e);
         status.setAttribute("data-error", "1");

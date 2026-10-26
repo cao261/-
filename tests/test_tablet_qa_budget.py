@@ -229,20 +229,35 @@ def test_reasoning_effort_reaches_the_request_payload(src: str):
 # ---------------------------------------------------------------------------
 
 def _prompt_block(src: str, const_name: str) -> str:
+    """取出某个提示词常量的**完整**定义块。
+
+    ⚠ 2026-10-27 独立审查揪出来的 T2：原来这里写的是
+    `src[start:start+1600]` —— 而 `const SYS_SUMMARY` 距
+    `const SYS_RESEARCH` 只有 525 字符 → SYS_RESEARCH 的窗口**完整吞掉**
+    了 SYS_SUMMARY 的全部文本 → 把 SYS_RESEARCH 的能力边界整段删掉，
+    断言照样绿（命中的是 SYS_SUMMARY）。
+
+    → 窗口改成「到下一个 `const SYS_` 为止」，两块互不污染。
+    """
     start = src.index(f"const {const_name}")
-    return src[start:start + 1600]
+    # 找到下一个顶层常量声明（行首是 const/let/function 且顶格）
+    m = re.search(r"\n  (?:const|let|function) ", src[start + 10:])
+    end = start + 10 + (m.start() if m else 1600)
+    return src[start:end]
 
 
 def test_all_research_prompts_declare_capability_boundary(src: str):
     """三个科研类提示词都要写清能力边界 + 必须回答。
 
     平板是**直连模型**的（不走后端提示词）→ 边界说明必须自己写一份。
+    （内容抽在共享的 CAPABILITY_BOUNDARY 里，两处引用 —— 见下面那条）
     """
+    shared = src[src.index("const CAPABILITY_BOUNDARY"):][:1200]
+    for kw in ("不能联网", "必须回答", "不允许交白卷"):
+        assert kw in shared, f"共享的能力边界条款里缺「{kw}」"
     for name in ("SYS_RESEARCH", "SYS_SUMMARY"):
-        block = _prompt_block(src, name)
-        assert "不能联网" in block, f"{name} 没写明不能联网"
-        assert "必须回答" in block, f"{name} 没有「必须回答」条款"
-        assert "不允许交白卷" in block, f"{name} 没禁止交白卷"
+        assert "CAPABILITY_BOUNDARY" in _prompt_block(src, name), \
+            f"{name} 没有引用能力边界条款"
 
 
 def test_capability_boundary_goes_in_the_last_sentence(src: str):
@@ -251,11 +266,126 @@ def test_capability_boundary_goes_in_the_last_sentence(src: str):
     用户明确要求："不需要他第一句话就说自己的能力边界。
     你只需要最后能说一句就行了。"
     """
-    block = _prompt_block(src, "SYS_RESEARCH")
-    assert "最后一句" in block, "提示词没把能力边界放在最后一句"
-    assert "我没有联网检索能力" in block, "提示词没给出明确的能力边界话术"
+    shared = src[src.index("const CAPABILITY_BOUNDARY"):][:1200]
+    assert "最后一句" in shared, "提示词没把能力边界放在最后一句"
+    assert "我没有联网检索能力" in shared, "提示词没给出明确的能力边界话术"
 
 
 def test_summary_prompt_is_actually_used(src: str):
     """摘要必须真的用带能力边界的提示词（别定义了却没接上）。"""
     assert "content: SYS_SUMMARY" in src, "摘要还在用旧提示词"
+
+
+def test_both_research_prompts_share_the_same_boundary_clause(src: str):
+    """两个科研提示词的能力边界条款必须**引用同一份**。
+
+    ⚠ 2026-10-27 独立审查揪出来的 T2：交接文档里写着
+    「护栏会断言两者逐字一致」—— 但**当时没有任何一条断言在比较它们**，
+    说的比做的多。更要命的是：那段边界原来在两处**各抄了一份**，
+    实际已经漂移了半句（摘要那句多了个「最后能说一句」）。
+
+    → 现在代码里抽成了共享常量 `CAPABILITY_BOUNDARY`，两个提示词都引用它。
+      这条断言锁的就是「**两处引用同一个常量**」——
+      比「逐字比较」更强：物理上不可能漂移。
+    """
+    assert "const CAPABILITY_BOUNDARY" in src, \
+        "能力边界条款没抽成共享常量（两处各抄一份 → 一定会漂移）"
+    for name in ("SYS_RESEARCH", "SYS_SUMMARY"):
+        block = _prompt_block(src, name)
+        assert "CAPABILITY_BOUNDARY" in block, \
+            f"{name} 没有引用共享的 CAPABILITY_BOUNDARY"
+        # 不能内联一份自己的（那等于又抄了一遍）
+        assert "【能力边界】" not in block, \
+            f"{name} 里内联了一份能力边界条款（又抄了一遍 → 会漂移）"
+
+
+def test_capability_boundary_clause_content(src: str):
+    """共享的那份边界条款本身必须内容齐全（不能抽空了）。"""
+    start = src.index("const CAPABILITY_BOUNDARY")
+    block = src[start:start + 1200]
+    for kw in ("不能联网", "搜索网页", "图片", "空转", "必须回答", "不允许交白卷", "最后一句"):
+        assert kw in block, f"共享的能力边界条款里缺「{kw}」"
+
+
+# ---------------------------------------------------------------------------
+# 6) 2026-10-27 独立审查揪出来的缺陷（回归护栏）
+# ---------------------------------------------------------------------------
+
+def test_native_timeout_exceeds_the_qa_timeout(src: str):
+    """原生代理的超时必须**比答疑时限更宽**（D1）。
+
+    原来所有原生调用共用 150s，而答疑的真实时限是 300s
+    → APK 上 300s 永远触发不了：150s 时 nativeCall 先 reject，
+    错误信息还是内部术语，用户还是什么都没拿到。
+    """
+    m = re.search(r"httpPost:\s*(\d+)", src)
+    assert m, "没找到原生调用的 httpPost 超时配置"
+    http_post_ms = int(m.group(1))
+    qa_ms = _const(src, "AI_QA_TIMEOUT_MS")
+    assert http_post_ms > qa_ms, (
+        f"原生 httpPost 超时 {http_post_ms}ms 必须大于答疑时限 {qa_ms}ms —— "
+        f"否则 APK 上答疑的超时分支永远走不到"
+    )
+
+
+def test_native_timeout_is_reported_in_plain_chinese(src: str):
+    """原生超时不能把内部术语（"原生调用超时（httpPost）"）甩给用户（D1）。"""
+    assert "nativeTimeout" in src, "原生超时没有打标记，上层认不出来"
+    body = src[src.index("async function runAI("):][:16000]
+    assert "nativeTimeout" in body, "上层没有处理原生超时（会显示成普通失败）"
+    assert "等待模型响应超时" in body, "原生超时没有转成人话"
+
+
+def test_429_swap_keeps_the_raised_budget(src: str):
+    """429 换模型**不能**把刚抬上去的预算冲回原值（D2）。
+
+    正文空 → 预算从 16000 抬到 32000 → 重试正好撞 429 → 换模型 →
+    预算被重置回 16000 → 若新模型也是强制思考型 → 思考再吃一次预算 →
+    **又 0 字**。用户白等三倍时间。
+    """
+    body = src[src.index("async function runAI("):][:16000]
+    assert "payload.max_tokens = Math.max(payload.max_tokens" in body, \
+        "429 换模型时预算用的是赋值覆盖，不是取最大值 —— 刚抬上去的预算会被冲掉"
+
+
+def test_unknown_gateway_does_not_get_thinking_disabled(src: str):
+    """未知网关不能发 thinking=disabled（D3）。
+
+    原来的写法是「除 M3.1-Flash 和 Agnes 之外一律发」→ 用户填任意模型名
+    （gpt-4o / glm-4.6）都会带上，严格校验的网关直接 400。
+    → 必须是**白名单**：只有实测支持的 provider 才发。
+    """
+    fn = src[src.index("function shouldSendThinkingDisabled("):][:1200]
+    assert "AI_THINKING_DISABLED_OK_PROVIDERS" in fn, \
+        "shouldSendThinkingDisabled 没有白名单（未知网关会被塞 thinking 参数）"
+    # 白名单必须是"命中才发"的形态，不能是"排除掉几个就发"
+    assert "some((p) => hay.indexOf(p) >= 0)" in fn, \
+        "白名单判定形态不对"
+
+
+def test_reasoning_effort_uses_an_exact_host_whitelist(src: str):
+    """reasoning_effort 的网关判定必须是**精确主机名**白名单（D4）。
+
+    子串匹配会误命中中转站（`https://minimax.中转.example.com` 里含 "minimax"）
+    → 发了它不认的参数 → HTTP 400 且无兜底。
+    """
+    fn = src[src.index("function acceptsReasoningEffort("):][:1400]
+    assert "AI_REASONING_EFFORT_OK_HOSTS" in fn, \
+        "acceptsReasoningEffort 没有用主机名白名单"
+    assert ".includes(host)" in fn, "白名单判定不是精确匹配"
+
+
+def test_four_hundred_strips_optional_params_without_relying_on_wording(src: str):
+    """400 兜底不能依赖错误文案里有没有 'thinking' 字样（D3/D4）。
+
+    上游可能说 "unrecognized request argument"，也可能把参数名写在第 200 字之后
+    → 靠文案匹配会漏掉 → 直接失败。
+    """
+    body = src[src.index("async function runAI("):][:16000]
+    assert "st === 400 && payload.reasoning_effort" in body, \
+        "reasoning_effort 没有 400 剥离兜底"
+    assert "st === 400 && payload.thinking" in body, \
+        "thinking 没有 400 剥离兜底"
+    # 不能再依赖文案匹配
+    assert not re.search(r"400\s*&&\s*payload\.thinking\s*&&\s*/thinking/i", body), \
+        "400 兜底还在靠错误文案里的 'thinking' 字样判断"

@@ -71,6 +71,7 @@ from .plot_compare import (
 from .paper_text import (fetch_full_text, split_into_sections,
                           extract_text_from_pdf, extract_page_text_with_glyphs)
 from . import glyphs as glyphs_mod
+from . import pdf_cache
 from . import lan as lan_helpers
 from .lan import resolve_token as _resolve_lan_token
 
@@ -1363,6 +1364,12 @@ def api_stats():
     dashboard re-serialised every note on every page mount (~6 KB for 23
     notes, and growing linearly). The feed uses /api/vault/literature, so
     the list was dead weight here.
+
+    ⚠ 2026-10-27 性能优化：**同步 def，不是 async def**。
+      `get_vault_stats()` + `_real_output_stats()` 都是**同步磁盘扫描**
+      （冷缓存时要遍历 vault 和同步根）→ 在 async def 里直接调会
+      **阻塞事件循环**，首屏那几个并发请求被排成两批串行。
+      改成同步 def → FastAPI 丢进 anyio 线程池 → 不冻结事件循环。
     """
     try:
         stats = get_vault_stats()
@@ -1381,7 +1388,7 @@ def api_stats():
 
 
 @app.get("/api/vault/literature")
-async def api_vault_literature(
+def api_vault_literature(
     limit: int = Query(default=20, ge=1, le=200, description="每页条目数"),
     offset: int = Query(default=0, ge=0, description="跳过前面 N 条"),
     include_qa: bool = Query(default=False, description="是否包含 04_AI划词答疑/ 子目录"),
@@ -1397,6 +1404,14 @@ async def api_vault_literature(
 
     Frontend replaces the old /api/stats feed with this endpoint so the
     "加载更多" button can stream additional pages without re-walking the disk.
+
+    ⚠ 2026-10-27 性能优化：**同步 def，不是 async def**。
+      `get_vault_stats()` 冷缓存时要全扫 vault 目录（磁盘 IO，几十~上百 ms）。
+      原来这里是 `async def` + 直接调用 → **阻塞事件循环**，
+      首屏那几个并发请求被排成两批串行（实测第一批 32ms 发出、167ms 才回来，
+      第二批 200ms 才开始）→ 首屏白白多等一个往返。
+      改成同步 def 后，FastAPI 把它丢进 anyio 线程池执行（与 api_fetch_paper
+      同一个理由），不冻结事件循环。
     """
     try:
         # Reuse get_vault_stats to keep the directory scan in one place,
@@ -1463,7 +1478,7 @@ async def api_save_paper(req: SavePaperRequest):
 
 
 @app.get("/api/paper/folders")
-async def api_paper_folders(
+def api_paper_folders(
     topic_category: str = Query(..., min_length=1, max_length=100,
                                 description="分类, e.g. 01_Device_TCAD_器件仿真"),
     kind: str = Query(default="literature_cards",
@@ -1475,6 +1490,9 @@ async def api_paper_folders(
     List existing subfolders inside the chosen topic folder.
     Used by the dashboard '保存位置' dropdown — no manual typing needed
     when the folder already exists.
+
+    ⚠ 2026-10-27 性能优化：同步 def（不是 async def）——
+      `base.iterdir()` 是同步磁盘 IO，在 async def 里直接调会阻塞事件循环。
     """
     from .generator import ALLOWED_TOPIC_CATEGORIES, _safe_path
     if topic_category not in ALLOWED_TOPIC_CATEGORIES:
@@ -2293,13 +2311,17 @@ async def api_upload_pdf(
 
 
 @app.get("/api/paper/list_vault_pdfs")
-async def api_list_vault_pdfs():
+def api_list_vault_pdfs():
     """
     List every PDF already living in the vault's 01_Literature tree.
 
     Lets the user open a paper that is already archived (or linked in from
     an external library) without re-uploading it — uploading would copy the
     file and duplicate it inside the vault.
+
+    ⚠ 2026-10-27 性能优化：同步 def（不是 async def）——
+      `root.rglob("*.pdf")` 是同步磁盘扫描，在 async def 里直接调会
+      **阻塞事件循环**（首屏那几个并发请求会被排成两批串行）。
     """
     from .generator import _safe_path
     root = _safe_path(BASE_DIR, "01_Literature")
@@ -2347,7 +2369,22 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
 
     try:
         pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
-        pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
+        # ⚠ 带缓存（2026-10-27 性能优化）：
+        #   pdfplumber 的页面解析是纯 CPU 且不可并行（实测线程池 0.97x），
+        #   全库 27 篇抽一遍 = 72 秒、平均 2.7 秒/篇、最慢 9.7 秒
+        #   → 唯一有效的优化是「别重复抽」。
+        #   缓存键含 (mtime, size) + EXTRACTOR_VERSION + 符号词典签名
+        #   → 文件改了/算法改了/词典变了都会自动失效（见 microbench/pdf_cache.py）。
+        cached = pdf_cache.read_cache(pdf_path, GLYPH_DICT_PATH)
+        if cached is not None:
+            pages = cached
+        else:
+            pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
+            try:
+                pdf_cache.write_cache(pdf_path, GLYPH_DICT_PATH, pages,
+                                      pdf_cache.cache_key(pdf_path, GLYPH_DICT_PATH))
+            except Exception:
+                pass
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF 文本提取失败: {_safe_err(e)}")
 

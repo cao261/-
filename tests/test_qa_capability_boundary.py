@@ -89,12 +89,22 @@ def test_prompt_tells_model_to_say_it_cannot_browse():
 
 
 def test_tablet_prompt_has_same_capability_boundary():
-    """平板端是**直连模型**的（不走后端提示词），边界说明要自己写一份。"""
+    """平板端是**直连模型**的（不走后端提示词），边界说明要自己写一份。
+
+    ⚠ 2026-10-27：能力边界条款已从两个提示词里抽成**共享常量**
+    `CAPABILITY_BOUNDARY`（两处各抄一份会漂移 —— 实际已经漂移过半句）。
+    → 这里验「两个提示词都引用了共享常量」，而不是在某个提示词里找文案。
+    """
     src = TABLET.read_text(encoding="utf-8")
-    start = src.index("const SYS_RESEARCH")
-    block = src[start:start + 1200]
-    assert "不能联网" in block, "平板端提示词没写明不能联网"
-    assert "必须回答" in block, "平板端提示词没有「必须回答」条款"
+    assert "const CAPABILITY_BOUNDARY" in src, "平板端没有共享的能力边界常量"
+    shared = src[src.index("const CAPABILITY_BOUNDARY"):][:1200]
+    assert "不能联网" in shared, "平板端提示词没写明不能联网"
+    assert "必须回答" in shared, "平板端提示词没有「必须回答」条款"
+    # 两个科研提示词都要引用它
+    for name in ("SYS_RESEARCH", "SYS_SUMMARY"):
+        start = src.index(f"const {name}")
+        block = src[start:start + 1200]
+        assert "CAPABILITY_BOUNDARY" in block, f"{name} 没有引用共享的能力边界常量"
 
 
 # ---------------------------------------------------------------------------

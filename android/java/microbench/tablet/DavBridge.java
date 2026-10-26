@@ -35,6 +35,18 @@ public class DavBridge {
     /** 一次原生调用的最长等待时间（毫秒）。 */
     private static final int NATIVE_TIMEOUT_MS = 120_000;
 
+    /**
+     * AI 请求（httpPost）的读超时（毫秒）。
+     *
+     * ⚠ 2026-10-27 独立审查揪出来的坑：AI 答疑的真实时限是 **300s**
+     *   （平板端 AI_QA_TIMEOUT_MS，与电脑端 QA_TIMEOUT 一致）——
+     *   而这里原来跟 WebDAV 同步共用 120s 的读超时 →
+     *   思考型模型答长问题（电脑端实测 max_tokens=16000 就要 86.2s）
+     *   会在 120s 被这里**先**掐掉，错误信息还是内部的 SocketTimeoutException。
+     *   → AI 请求必须给得比 300s 更宽（留出超时判定余量）。
+     */
+    private static final int AI_READ_TIMEOUT_MS = 360_000;
+
     private final Prefs prefs;
     private final WebView webView;
     private final MainActivity activity;
@@ -276,7 +288,9 @@ public class DavBridge {
                 try {
                     c.setRequestMethod("POST");
                     c.setConnectTimeout(30_000);
-                    c.setReadTimeout(NATIVE_TIMEOUT_MS);
+                    // AI 请求要给足时间（思考型模型可能想 1~2 分钟），
+                    // 不能跟 WebDAV 同步用同一个短读超时。
+                    c.setReadTimeout(AI_READ_TIMEOUT_MS);
                     c.setDoOutput(true);
                     c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
                     c.setRequestProperty("Accept", "text/event-stream, application/json");
