@@ -114,6 +114,27 @@ def test_reader_html_has_table_and_formula_styles():
     assert "renderFormulaImages" in html, "公式原图渲染函数没接上"
 
 
+def test_katex_render_is_idempotent():
+    """同一处公式不能被渲染两遍 —— 否则 (H) 会变成 (HH)、再变成 (HHH)。
+
+    机制：`katex.render(tex, el)` 把渲染结果写回 el 之后，
+    `el.textContent` 变成「MathML 的 <annotation> 原文 + 可视文本」
+    = "H" + "H" = "HH" → 再渲染一次就多一倍。
+
+    触发条件（2026-10-27 浏览器实测抓到，用户看到的是
+    「在施加磁场 (HHH) 时产生电场 (EEE)」）：KaTeX 是懒加载的，
+    首屏会**并发**调多次 renderMathIn（+ 150ms 重试等 katex），
+    同一个占位符就被渲染了两遍。
+    修法：渲染前先看有没有 .katex 节点，有就跳过（幂等）。
+    """
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    start = html.index("async function renderMathIn(")
+    end = html.index("\n    }\n", start)
+    body = html[start:end]
+    assert body.count('if (el.querySelector(".katex")) return;') >= 2, \
+        "renderMathIn 缺少幂等守卫 —— 同一处公式会被渲染两遍（(H) → (HH) → (HHH)）"
+
+
 def test_translation_prompt_asks_for_markdown_tables():
     """提示词要明确要求表格用 Markdown 表格输出。"""
     from microbench.app import TRANSLATION_SYSTEM_PROMPT

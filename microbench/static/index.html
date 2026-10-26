@@ -1879,7 +1879,14 @@
       z-index: 1000;
       background: var(--surface-canvas);
     }
-    .reader-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+    /* ⚠️ width:100% 不能省 —— #reader-modal 打开时是 display:flex（行向 flex），
+       .reader-shell 是它的 flex item，width:auto 会走 **fit-content 收缩**：
+       壳的宽度 = 内容的 max-content，而不是视口宽度。
+       平时顶栏在文档流里、内容很宽，壳被撑满，看不出问题；
+       一旦顶栏脱离文档流（专注模式 position:fixed），壳里只剩 .pdf-split，
+       壳立刻缩成 616px（1280 屏上只占一半），右半屏全空。
+       min-width:0 同理：否则 min-content 撑大时 flex item 不肯缩。 */
+    .reader-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; width: 100%; min-width: 0; }
 
     .seg-value {
       min-width: 48px;
@@ -1931,7 +1938,11 @@
     /* PDF split view */
     #reader-pdf-view { flex: 1; min-height: 0; }
     .pdf-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); height: 100%; min-height: 0; }
-    .pdf-split-pane { overflow-y: auto; padding: var(--s-5) var(--s-6) var(--s-12); background: var(--surface-sunken); }
+    /* scrollbar-gutter: stable —— 滚动条位置**提前占好**。
+       不占的话：PDF 画布渲染时容器还没出现滚动条（宽度按"无滚动条"量），
+       画布一加进去、竖向滚动条冒出来 → 容器宽度少 15px → 画布比容器宽 →
+       底部多一条横向滚动条。占位之后宽度从一开始就稳定。 */
+    .pdf-split-pane { overflow-y: auto; scrollbar-gutter: stable; padding: var(--s-5) var(--s-6) var(--s-12); background: var(--surface-sunken); }
     .pdf-split-pane + .pdf-split-pane { border-left: 1px solid var(--line-soft); }
     .pdf-split-pane-alt { background: var(--surface-canvas); }
     @media (max-width: 900px) { .pdf-split { grid-template-columns: 1fr; } }
@@ -2133,6 +2144,123 @@
     @media (pointer: coarse) and (min-width: 1180px) {
       .container { padding-top: var(--s-8); }
     }
+
+    /* =====================================================================
+       专注模式（Zen / Focus）——小屏极简阅读
+       目标：屏幕上只剩「论文页 + 译文页」。顶栏工具条 / 章节导航 /
+       AI 提问区 / 划词答疑悬浮钮 默认全部收起，需要时从顶部滑出。
+
+       设计约束（改之前先读）：
+       1) 工具条**复用 .reader-topbar**，不另做一套按钮
+          → 既有功能一行不多地全部保留，也不会和顶栏分叉。
+       2) 顶栏在专注模式下改成 position:fixed + translateY(-101%)，
+          脱离文档流 → .reader-body 自然撑满，不需要额外的 padding 补偿。
+       3) **不给 .reader-shell 加 position:relative** ——
+          那会把里面 position:absolute 的浮层（批注编辑器 / 笔记抽屉）
+          的包含块从 .reader-modal 换成 .reader-shell，位置全乱。
+       4) 窄屏（<860px）本来就会塌成单列；专注模式保持一致，
+          且此时章节导航不参与（单列放不下第三栏）。
+       5) 选择器一律用 #reader-modal 前缀 —— 基础样式里的
+          @media (max-width:1200px) .reader-body 是「两列」，靠 id 权重压住它，
+          专注模式才不会被基础规则反覆盖。
+       ===================================================================== */
+    #reader-modal.zen .reader-topbar {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 1200;
+      transform: translateY(-101%);
+      transition: transform .2s var(--ease);
+      max-height: 56vh;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, .22);
+    }
+    #reader-modal.zen.zen-bar-open .reader-topbar { transform: translateY(0); }
+
+    /* 章节导航：默认收起，只留论文页 + 译文页 */
+    #reader-modal.zen .reader-nav { display: none; }
+    #reader-modal.zen.zen-nav-open .reader-nav { display: block; }
+    #reader-modal.zen .reader-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    #reader-modal.zen.zen-nav-open .reader-body { grid-template-columns: 200px minmax(0, 1fr) minmax(0, 1fr); }
+
+    /* AI 提问区 / 划词答疑悬浮钮：默认收起（划词气泡不受影响，它是临时出现的）
+       ⚠️ 用 **id** 选（#reader-qa-floating-btn），别用类名 ——
+       这个按钮身上的类叫 .reader-floating-copilot-btn，
+       .reader-qa-floating-btn 是它的 id。写成类选择器会**静默失效**
+       （规则匹配不到任何元素，看着像生效了其实没生效）。 */
+    #reader-modal.zen .reader-aux { display: none; }
+    #reader-modal.zen.zen-aux-open .reader-aux { display: block; }
+    #reader-modal.zen #reader-qa-floating-btn { display: none !important; }
+
+    /* 专注模式要的是「整屏可用」—— 把基础样式里给平板准备的
+       `max-width: 860px + margin: auto` 取消掉。
+       ⚠️ 不取消的后果（浏览器实测抓到的）：
+       基础样式 `@media (700-1100px) .reader-shell > * { max-width:860px;
+       margin-left:auto; margin-right:auto; }` 在**交叉轴上用 auto 外边距
+       取消了 flex 的 stretch** → 变成 fit-content 收缩 →
+       单栏时 PDF 栏被收缩成「内容宽度」，右半屏全空。
+       专注模式本来就是为了「小屏多看字」，必须占满整屏。 */
+    #reader-modal.zen .reader-shell > * {
+      max-width: none;
+      margin-left: 0;
+      margin-right: 0;
+    }
+
+    /* 单栏模式：只显示一栏，论文页 / 译文页 二选一 */
+    #reader-modal.zen.zen-single .reader-body { grid-template-columns: minmax(0, 1fr); }
+    /* ⚠️ 章节视图里的两栏（原文 pane / 译文 pane-alt）必须**互斥**地二选一：
+       单栏默认显示译文栏；zen-show-orig 时显示原文栏。
+       浏览器实测抓到的 bug：原来的写法
+         .reader-pane:not(.reader-pane-alt){display:none}   ← 永远藏原文
+         .zen-show-orig .reader-pane-alt{display:none}     ← show-orig 时藏译文
+       两条同时生效 → 切到「论文页」时**两栏都没了**（一片空白）。
+       所以要显式地把 show-orig 下的原文 pane 放回来。 */
+    #reader-modal.zen.zen-single .reader-pane { display: none; }
+    #reader-modal.zen.zen-single .reader-pane-alt { display: block; }
+    #reader-modal.zen.zen-single.zen-show-orig .reader-pane { display: none; }
+    #reader-modal.zen.zen-single.zen-show-orig .reader-pane-alt { display: none; }
+    #reader-modal.zen.zen-single.zen-show-orig .reader-pane:not(.reader-pane-alt) { display: block; }
+    #reader-modal.zen.zen-single .pdf-split { grid-template-columns: minmax(0, 1fr); }
+    /* ⚠️ 必须带 :not(.zen-show-orig) —— 否则「切到论文页」时这条规则
+       仍然把 PDF 容器藏起来 → 切过去是一片空白（浏览器实测抓到的）。
+       同理，下面那条在 zen-show-orig 时才藏译文栏。 */
+    #reader-modal.zen.zen-single:not(.zen-show-orig) #pdf-viewer-container { display: none; }
+    #reader-modal.zen.zen-single.zen-show-orig #pdf-translations-container { display: none; }
+
+    @media (max-width: 860px) {
+      #reader-modal.zen .reader-body,
+      #reader-modal.zen.zen-nav-open .reader-body { grid-template-columns: 1fr; }
+      #reader-modal.zen.zen-nav-open .reader-nav { display: none; }
+    }
+
+    /* 顶部细把手：专注模式下唯一常驻的元素 */
+    .zen-handle {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: 7px;
+      z-index: 1199;
+      background: linear-gradient(180deg, rgba(130, 130, 150, .40), rgba(130, 130, 150, 0));
+      cursor: pointer;
+      display: none;
+      overflow: hidden;
+      transition: height .18s var(--ease);
+    }
+    #reader-modal.zen .zen-handle { display: block; }
+    #reader-modal.zen.zen-bar-open .zen-handle { opacity: 0; pointer-events: none; }
+    #reader-modal.zen .zen-handle:hover { height: 26px; }
+    .zen-handle-title {
+      display: block;
+      padding: 4px 10px 0;
+      font-size: var(--t-xs);
+      color: var(--fg-subtle);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* 专注模式专属按钮：非专注时藏起来（进入专注的按钮除外，它要一直可见） */
+    #reader-modal:not(.zen) .zen-only { display: none !important; }
+    #reader-modal:not(.zen-single) #zen-pane-btn { display: none !important; }
 </style>
 </head>
 <body>
@@ -3910,6 +4038,7 @@
           lastAnswerText: _lastAnswerText || "",
           readerMode: _readerMode || "section",
           pdfZoom: _pdfZoom || 1.0,
+          zenPref: !!_zenPref,
         };
         localStorage.setItem(LS_STATE_KEY, JSON.stringify(state));
       } catch (e) {}
@@ -3925,6 +4054,7 @@
         if (typeof s.lastAnswerText === "string") _lastAnswerText = s.lastAnswerText;
         if (s.readerMode === "section" || s.readerMode === "pdf") _readerMode = s.readerMode;
         if (typeof s.pdfZoom === "number") _pdfZoom = s.pdfZoom;
+        if (s.zenPref === true) _zenPref = true;
       } catch (e) {
         console.error("[restoreLocalState]", e);
       }
@@ -3979,6 +4109,8 @@
       loadStats();
       fetchModelStatus();
       initReaderSelectionListener();
+      _initZenMode();
+      _initPdfWidthObserver();
       _restoreLocalState();
       _restoreFromHash();
       loadVaultPdfOptions();
@@ -4057,6 +4189,10 @@
       document.getElementById("reader-modal").style.display = "flex";
       document.body.style.overflow = "hidden";
       fetchModelStatus();
+      // 专注模式偏好：上次开着 → 这次直接进专注（不用再点一次「专注」按钮）
+      if (_zenPref && !_zenMode) {
+        setTimeout(() => { if (!_zenMode) enterZenMode({ silent: true }); }, 0);
+      }
     }
     function closeReaderModal() {
       document.getElementById("reader-modal").style.display = "none";
@@ -4159,16 +4295,267 @@
       if (el) el.textContent = Math.round((_pdfZoom || 1.0) * 100) + "%";
     }
 
-    // 窗口尺寸变化 -> 按新的栏宽重新渲染 PDF。
-    // PDF 宽度是按左栏可用宽度自适应的（100% = 占满整栏），所以窗口一变
+    // =====================================================================
+    // 专注模式（Zen / Focus）
+    //
+    // 目标：小屏上只留「论文页 + 译文页」，其余界面默认收起。
+    //
+    // 唤出工具条的方式（哪种都行，总有一个能用）：
+    //   - 顶部那条 7px 细把手 —— 点一下（再点一下收起）
+    //   - 鼠标移到屏幕最上方 40px
+    //   - 内容区往回上滑（scroll up）/ 滑到最底部
+    //   - 快捷键 Z（切换专注）
+    //   - Esc（先收起工具条，再按退出专注）
+    //
+    // 工具条 = 原有 .reader-topbar（不另做一套按钮）→ 既有功能一行不少，
+    // 也不会和顶栏分叉出两套行为。
+    //
+    // 两个状态别混：
+    //   _zenMode = 当前这个阅读器是不是专注布局（运行时）
+    //   _zenPref = 用户偏好（持久化）—— 下次打开论文直接进专注
+    // =====================================================================
+    let _zenMode = false;
+    let _zenPref = false;
+    let _zenBarTimer = null;
+    let _zenScrollT = 0;
+    const ZEN_SCROLL_TOL = 4;   // 滚动方向判定容差（px）
+
+    function _zenModal() { return document.getElementById("reader-modal"); }
+    function isZenMode() { return !!_zenMode; }
+    // 只有「阅读器开着 + 处于专注」才算激活 —— 关闭阅读器后不该还有交互
+    function _zenActive() {
+      const modal = _zenModal();
+      return !!(modal && _zenMode && modal.style.display !== "none");
+    }
+
+    // 顶栏从「文档流内」变成「fixed 浮层」→ 论文页宽度变了 → PDF 画布要重算。
+    // force=true：即使新旧宽度相差 < 40px 也重绘 —— PDF 列表宽度是跟内容走的，
+    // 「看起来没变」其实画布已经和栏宽对不上了。
+    function _zenRelayoutPdf() {
+      try {
+        _pdfRelayoutIfNeeded(true);
+        // 兜底：window 的 resize 也走同一条通道
+        window.dispatchEvent(new Event("resize"));
+      } catch (e) { /* 忽略 */ }
+    }
+
+    function _zenSyncLabels() {
+      const modal = _zenModal();
+      const single = !!(modal && modal.classList.contains("zen-single"));
+      const btn = document.getElementById("zen-single-btn");
+      if (btn) btn.textContent = single ? "双栏" : "单栏";
+      const titleEl = document.getElementById("zen-handle-title");
+      const readerTitle = document.getElementById("reader-title");
+      if (titleEl) titleEl.textContent = readerTitle ? (readerTitle.textContent || "") : "";
+    }
+
+    function _zenOpenBar(sticky) {
+      const modal = _zenModal();
+      if (!modal || !_zenMode) return;
+      modal.classList.add("zen-bar-open");
+      clearTimeout(_zenBarTimer);
+      _zenBarTimer = null;
+      _zenSyncLabels();
+      if (!sticky) _zenBarTimer = setTimeout(_zenCloseBar, 2600);
+    }
+
+    function _zenCloseBar() {
+      const modal = _zenModal();
+      if (!modal || !_zenMode) return;
+      modal.classList.remove("zen-bar-open");
+      clearTimeout(_zenBarTimer);
+      _zenBarTimer = null;
+    }
+
+    function enterZenMode(opts = {}) {
+      const modal = _zenModal();
+      if (!modal) return;
+      const firstTime = !_zenMode;
+      _zenMode = true;
+      _zenPref = true;
+      modal.classList.add("zen");
+      if (opts.single) modal.classList.add("zen-single");
+      if (opts.showOrig) modal.classList.add("zen-show-orig");
+      _persistLocalState();
+      _zenSyncLabels();
+      if (firstTime && !opts.silent) {
+        showToast("专注模式：顶部细条点一下展开工具条 · Z 切换 · Esc 退出", false, 3600);
+      }
+      // 顶栏脱离文档流 → 论文页变宽 → PDF 必须重绘（否则画布和栏宽对不上）
+      setTimeout(_zenRelayoutPdf, 260);
+    }
+
+    function exitZenMode() {
+      const modal = _zenModal();
+      if (!modal) return;
+      _zenMode = false;
+      _zenPref = false;
+      modal.classList.remove("zen", "zen-bar-open", "zen-single",
+                            "zen-show-orig", "zen-nav-open", "zen-aux-open");
+      clearTimeout(_zenBarTimer);
+      _zenBarTimer = null;
+      _persistLocalState();
+      _zenSyncLabels();
+      setTimeout(_zenRelayoutPdf, 260);
+    }
+
+    function toggleZenMode() {
+      if (_zenMode) exitZenMode(); else enterZenMode();
+    }
+
+    // ⚠️ 章节导航（.reader-nav）和 AI 提问区（.reader-aux）都住在
+    //    「章节视图」容器 #reader-body 里，而 PDF 双栏模式下那个容器
+    //    整体是 display:none —— 这时候点「章节」「提问」**什么也不会发生**，
+    //    点了像按钮坏了。所以先切到章节视图再展开对应面板。
+    //
+    //    但章节视图的**内容**来自「全文拆分章节」（_readerState.sections），
+    //    只有走过 openVaultPdf / 拉取全文 的论文才有；
+    //    仅靠地址栏恢复的本地 PDF 没有章节数据 → 切过去是一片空白，
+    //    用户会以为坏了 → 这种情况直接说清楚，不切。
+    function _zenHasSections() {
+      return !!(typeof _readerState !== "undefined" && _readerState &&
+                Array.isArray(_readerState.sections) && _readerState.sections.length);
+    }
+
+    // 返回 true = 已切到章节视图（调用方接着展开面板）
+    // 返回 false = 切不过去（已弹提示说明原因，或本来就在章节视图）
+    function _zenEnsureSectionView() {
+      if (_readerMode === "section") return false;
+      if (!_zenHasSections()) {
+        showToast("这篇还没有章节数据 —— 需要先「拉取全文」拆分章节", true, 3600);
+        return false;
+      }
+      switchReaderMode("section");
+      return true;
+    }
+
+    function toggleZenNav() {
+      const modal = _zenModal();
+      if (!modal) return;
+      if (_zenEnsureSectionView()) {
+        modal.classList.add("zen-nav-open");
+        showToast("已切到章节视图（章节导航只在章节视图里有）", false, 2600);
+        return;
+      }
+      if (_readerMode !== "section") return;  // 切不过去就别动开关
+      modal.classList.toggle("zen-nav-open");
+    }
+
+    function toggleZenAux() {
+      const modal = _zenModal();
+      if (!modal) return;
+      if (_zenEnsureSectionView()) {
+        modal.classList.add("zen-aux-open");
+        showToast("已切到章节视图（提问区只在章节视图里有）", false, 2600);
+        return;
+      }
+      if (_readerMode !== "section") return;  // 切不过去就别动开关
+      modal.classList.toggle("zen-aux-open");
+    }
+
+    function toggleZenSingle() {
+      const modal = _zenModal();
+      if (!modal) return;
+      modal.classList.toggle("zen-single");
+      _zenSyncLabels();
+      setTimeout(_zenRelayoutPdf, 300);
+    }
+
+    function zenTogglePane() {
+      const modal = _zenModal();
+      if (!modal) return;
+      modal.classList.toggle("zen-show-orig");
+      setTimeout(_zenRelayoutPdf, 300);
+    }
+
+    /**
+     * 专注模式的交互接线（只跑一次，在 _bootDashboard 里调）。
+     * 所有监听器都用 document 级 + 运行时判活跃 —— 阅读器本身是常驻 DOM，
+     * 但它在关闭时 display:none，不能让这些监听器在首页上乱触发。
+     */
+    function _initZenMode() {
+      const handle = document.getElementById("zen-handle");
+      if (handle) {
+        handle.addEventListener("click", () => {
+          if (!_zenActive()) return;
+          const modal = _zenModal();
+          if (modal && modal.classList.contains("zen-bar-open")) _zenCloseBar();
+          else _zenOpenBar(true);   // 显式点开 → 常驻，不自动收起
+        });
+      }
+      // 鼠标移到屏幕最上方 → 滑出工具条（停手 2.6s 自动收起）
+      document.addEventListener("mousemove", (e) => {
+        if (!_zenActive()) return;
+        if (e.clientY <= 40) _zenOpenBar(false);
+      });
+      // 指针停在工具条上时不自动收起；离开后再开始计时
+      document.addEventListener("mouseover", (e) => {
+        if (!_zenActive()) return;
+        const bar = e.target && e.target.closest && e.target.closest(".reader-topbar");
+        if (bar) { clearTimeout(_zenBarTimer); _zenBarTimer = null; }
+      });
+      document.addEventListener("mouseout", (e) => {
+        if (!_zenActive()) return;
+        const bar = e.target && e.target.closest && e.target.closest(".reader-topbar");
+        if (bar && !(e.relatedTarget && bar.contains(e.relatedTarget))) {
+          clearTimeout(_zenBarTimer);
+          _zenBarTimer = setTimeout(_zenCloseBar, 1200);
+        }
+      });
+      // 滚动：往回上滑 / 滑到最底部 → 滑出工具条
+      // scroll 不冒泡，用 capture:true 才能在 document 上收到
+      document.addEventListener("scroll", (e) => {
+        if (!_zenActive()) return;
+        const el = e.target;
+        if (!el || !el.closest || !el.closest("#reader-body, #reader-pdf-view")) return;
+        const top = el.scrollTop || 0;
+        const dy = top - _zenScrollT;
+        _zenScrollT = top;
+        const nearBottom = (el.scrollHeight || 0) - top - (el.clientHeight || 0) < 24;
+        if (dy < -ZEN_SCROLL_TOL || nearBottom) _zenOpenBar(false);
+      }, true);
+      // 快捷键：Z 切换专注，Esc 先收工具条、再按退出专注
+      document.addEventListener("keydown", (e) => {
+        if (!_zenActive()) return;
+        const t = e.target;
+        const tag = ((t && t.tagName) || "").toLowerCase();
+        if (tag === "input" || tag === "textarea" || tag === "select" ||
+            (t && t.isContentEditable)) return;
+        if (e.key === "Escape") {
+          const modal = _zenModal();
+          if (modal && modal.classList.contains("zen-bar-open")) _zenCloseBar();
+          else exitZenMode();
+          e.preventDefault();
+          return;
+        }
+        if ((e.key === "z" || e.key === "Z") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          toggleZenMode();
+          e.preventDefault();
+        }
+      });
+    }
+
+    // PDF 栏宽变了 -> 按新的栏宽重新渲染 PDF。
+    // PDF 宽度是按左栏可用宽度自适应的（100% = 占满整栏），所以栏宽一变
     // 就得重绘，否则页面宽度和栏宽对不上，两侧又会空出来。
+    //
+    // ⚠️ 只听 window resize 是不够的（浏览器实测抓到的）：
+    //    阅读器打开前是 display:none，#pdf-pages-list 的宽度是 0；
+    //    第一次渲染时量到 0 → 走兜底 520px；等阅读器真的显示出来，
+    //    **窗口尺寸一点没变** → window resize 根本不触发 →
+    //    画布永远停在 520px，右半屏全空。
+    //    所以要直接观察 PDF 列表容器本身（ResizeObserver），
+    //    它在「隐藏 → 显示」「单栏 → 双栏」这些变化上都会报。
     let _pdfResizeTimer = null;
-    window.addEventListener("resize", () => {
+    let _pdfRelayoutBusy = false;   // 重绘进行中 → 忽略容器尺寸变化，防自激循环
+
+    function _pdfRelayoutIfNeeded(force) {
       if (_readerMode !== "pdf" || !_pdfState || !_pdfState.pdfDoc) return;
+      if (_pdfRelayoutBusy) return;
       const w = document.getElementById("pdf-pages-list")?.clientWidth || 0;
-      if (!w) return;
+      if (!w) return;               // 阅读器还没显示 / 容器不可见 → 宽度不可信
       const last = _pdfState.lastRenderWidth || 0;
-      if (last && Math.abs(w - last) < 40) return; // 变化太小不值得重绘
+      if (!force && last && Math.abs(w - last) < 40) return; // 变化太小不值得重绘
       clearTimeout(_pdfResizeTimer);
       _pdfResizeTimer = setTimeout(() => {
         if (!_pdfState || !_pdfState.rendering) return;
@@ -4178,7 +4565,20 @@
         document.getElementById("pdf-pages-list").innerHTML = "";
         loadPdfDualColumn({ keepTranslations: true, generation: gen });
       }, 250);
-    });
+    }
+
+    window.addEventListener("resize", () => _pdfRelayoutIfNeeded(false));
+
+    /** 观察 PDF 列表容器尺寸 —— 覆盖「阅读器从隐藏变可见」「专注模式切单双栏」
+     *  这些 window resize 抓不到的宽度变化。 */
+    function _initPdfWidthObserver() {
+      const listEl = document.getElementById("pdf-pages-list");
+      if (!listEl || typeof ResizeObserver === "undefined") return;
+      try {
+        const ro = new ResizeObserver(() => _pdfRelayoutIfNeeded(false));
+        ro.observe(listEl);
+      } catch (e) { /* 观察器不可用就退回 window resize */ }
+    }
 
     /**
      * 载入 PDF 文档，worker 源按「本地 vendor -> CDN」顺序尝试。
@@ -4330,20 +4730,29 @@
 
         // Render all pages
         listEl.innerHTML = "";
-        for (let p = 1; p <= pdfDoc.numPages; p++) {
-          if (_pdfState.rendering.cancelled) break;
-          // Generation guard: bail if a newer zoom toggle superseded us
-          if (_pdfState.rendering.generation !== myGen) break;
-          const pageData = await renderPdfPage(p);
-          // Re-attach the translation we already paid for (zoom only).
-          const prev = prevPageState.get(p);
-          if (prev) {
-            pageData.translated = true;
-            pageData.translation = prev.translation;
-            pageData.translation_model = prev.translation_model;
-            pageData.translated_at = prev.translated_at;
+        // 渲染开始时的栏宽（用来在渲染结束后核对栏宽有没有中途变过）
+        const renderW0 = listEl.clientWidth;
+        // 重绘进行中 → 忽略容器尺寸变化（否则清空列表触发的 ResizeObserver
+        // 回调会再排一次重绘 → 自激循环）
+        _pdfRelayoutBusy = true;
+        try {
+          for (let p = 1; p <= pdfDoc.numPages; p++) {
+            if (_pdfState.rendering.cancelled) break;
+            // Generation guard: bail if a newer zoom toggle superseded us
+            if (_pdfState.rendering.generation !== myGen) break;
+            const pageData = await renderPdfPage(p);
+            // Re-attach the translation we already paid for (zoom only).
+            const prev = prevPageState.get(p);
+            if (prev) {
+              pageData.translated = true;
+              pageData.translation = prev.translation;
+              pageData.translation_model = prev.translation_model;
+              pageData.translated_at = prev.translated_at;
+            }
+            _pdfState.pages.push(pageData);
           }
-          _pdfState.pages.push(pageData);
+        } finally {
+          _pdfRelayoutBusy = false;
         }
         // Start smooth queue (page 1 translates immediately, pages 2..N translate paced at 3.2s)
         // Skip if we're a stale generation — otherwise we'd queue unneeded translates.
@@ -4401,6 +4810,11 @@
           }
           startPdfTranslationQueue();
         }
+        // 渲染完成后再核一次栏宽 —— 用「渲染开始时的宽度」比，不是最后一页的：
+        // 阅读器可能是在渲染过程中才从隐藏变可见的（那一瞬间的
+        // ResizeObserver 回调会被 _pdfRelayoutBusy 挡掉），
+        // 不核对的话画布就停在「看不见时量到的兜底宽度 520px」上。
+        if (Math.abs(renderW0 - listEl.clientWidth) > 40) _pdfRelayoutIfNeeded(true);
       } catch (err) {
         listEl.innerHTML = `<div style="padding:18px; color:#B25336;">❌ PDF 加载失败: ${escapeHtml(String(err))}</div>`;
         if (!keepTranslations) transList.innerHTML = "";
@@ -5060,7 +5474,6 @@
       const scale = fitScale * (_pdfZoom || 1.0);
       const viewport = page.getViewport({ scale });
       if (_pdfState) _pdfState.lastRenderWidth = availWidth;
-
       const wrapper = document.createElement("div");
       wrapper.className = "pdf-page-block";
       wrapper.id = `pdf-page-block-${pageNum}`;
@@ -6114,6 +6527,15 @@
       }
       // Display math
       container.querySelectorAll(".math-display-block").forEach(el => {
+        // ⚠️ 幂等守卫：**已经渲染过就别再渲染一次**。
+        // katex.render(tex, el) 把结果写回 el 之后，el.textContent 变成
+        // 「MathML 的 <annotation> 原文 + 可视文本」= "H" + "H" = "HH"。
+        // 再渲染一次 → "HH" → 再一次 → "HHH"……
+        // 用户看到的就是 (H) 变成 (HHH)、α_ME 变成 αMEαME。
+        // 触发条件：同一个元素被 renderMathIn 处理两次
+        // （KaTeX 是懒加载的，首屏会并发调多次 + 150ms 重试，
+        //   第一次渲染完成、第二次重试随后才拿到 katex，就会渲染两遍）。
+        if (el.querySelector(".katex")) return;
         const tex = el.textContent || "";
         try {
           katex.render(tex, el, {
@@ -6129,6 +6551,7 @@
       });
       // Inline math
       container.querySelectorAll(".math-placeholder.math-inline").forEach(el => {
+        if (el.querySelector(".katex")) return;   // 同上：幂等
         const tex = el.textContent || "";
         try {
           katex.render(tex, el, {
@@ -9031,6 +9454,22 @@
           <button class="btn-pill-outline" id="sync-btn" onclick="syncNow()"
                   title="把当前阅读进度 / 已翻好的译文 / 批注推到共享目录，同时拉回另一台设备的内容">☁ 同步</button>
           <button class="btn-pill-outline" id="translate-all-btn" onclick="translateAllSections()">批量翻译</button>
+
+          <!-- 专注模式（Zen）：默认收起，需要时从顶部滑出原工具条 -->
+          <button class="btn-zoom-toggle" id="zen-toggle-btn"
+                  onclick="toggleZenMode()"
+                  title="专注模式：屏幕上只留论文页 + 译文页（快捷键 Z 切换）">◱ 专注</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-exit-btn"
+                  onclick="exitZenMode()" title="退出专注模式（Esc）">✕ 退出专注</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-nav-btn"
+                  onclick="toggleZenNav()" title="显示 / 隐藏章节导航">章节</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-single-btn"
+                  onclick="toggleZenSingle()" title="单栏 / 双栏（小屏用单栏更宽）">单栏</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-pane-btn"
+                  onclick="zenTogglePane()" title="单栏时在论文页 / 译文页之间切换">论文 ⇄ 译文</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-aux-btn"
+                  onclick="toggleZenAux()" title="显示 / 隐藏 AI 提问区">提问</button>
+
           <button class="btn-pill" onclick="closeReaderModal()"><span>关闭</span></button>
         </div>
       </div>
@@ -9258,6 +9697,16 @@
             </div>
           </div>
         </div>
+      </div>
+
+      <!-- ---------- 专注模式：顶部细把手 ----------
+           ⚠️ 必须放在 .reader-shell 的**最后**（浮动区块之后）：
+           .reader-shell 是 flex column，第 1 个孩子是 .reader-topbar、
+           第 2 个是章节视图区、第 3 个是 PDF 视图 —— 插在前面会把
+           这些位置型契约全部挤偏。放在最后则一个都不动。
+           位置：fixed，不占 flex 位；只在专注模式下显示（见 CSS）。 -->
+      <div id="zen-handle" class="zen-handle" title="专注模式：点一下展开工具条（Esc 退出）">
+        <span class="zen-handle-title" id="zen-handle-title"></span>
       </div>
 
     </div>
