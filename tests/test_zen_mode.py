@@ -302,13 +302,30 @@ def test_pdf_relayout_watches_the_container_not_only_the_window():
     等阅读器真的显示出来，**窗口尺寸一点没变** → window resize 不触发
     → 画布永远停在 520px，右半屏全空。
     所以必须直接观察列表容器（ResizeObserver）。
+
+    ⚠️ 这条曾经**只是 3 个字符串 grep** —— 独立审查（2026-10-27）用 3 个
+    变异体证明：把 `!force` 短路、忙标记守卫、渲染后宽度复核全删掉，
+    这条断言**照样绿**。现在行为级归 node 护栏（切片覆盖真代码），
+    这里只钉结构。
     """
     src = _src()
     assert "ResizeObserver" in src, \
         "没观察 PDF 列表容器 —— 阅读器从 display:none 变可见时窗口尺寸没变，PDF 画布会停在兜底宽度"
     assert "_initPdfWidthObserver()" in src, "宽度观察器没被初始化"
-    assert "_pdfRelayoutBusy" in src, \
+    assert "_pdfRelayoutBusyCount" in src, \
         "重绘期间没有「忙」标记 —— 清空列表触发的尺寸回调会再排一次重绘，自激循环"
+    assert "_pdfIsRelayoutBusy()" in src, "忙标记没有统一的判断入口"
+    # 忙标记必须是**计数**而不是布尔 —— loadPdfDualColumn 可以并发
+    assert re.search(r"_pdfRelayoutBusyCount\s*\+\+", src), \
+        "忙标记没有用计数（++/--）—— 并发渲染时先结束的那次会把标记清掉，保护提前失效"
+    assert re.search(r"_pdfRelayoutBusyCount\s*--", src), "忙标记没有配对的 --"
+    assert not re.search(r"let\s+_pdfRelayoutBusy\s*=\s*false", src), \
+        "忙标记又变回布尔了 —— 并发渲染时保护会提前失效"
+    # 渲染后复核必须是一个**独立可测的小函数**（否则护栏切片切不到它）
+    assert "function _pdfVerifyRenderedWidth(" in src, \
+        "渲染后的宽度复核没有抽成独立函数 —— 护栏切不到它，回归抓不住"
+    assert "_pdfVerifyRenderedWidth(renderW0, listEl);" in src, \
+        "渲染结束后没有调用宽度复核 —— 阅读器在渲染中途变可见时画布会停在兜底宽度"
 
 
 def test_zen_nav_and_aux_switch_to_section_view_first():
@@ -321,6 +338,85 @@ def test_zen_nav_and_aux_switch_to_section_view_first():
     src = _src()
     assert 'switchReaderMode("section")' in src, \
         "PDF 模式下点「章节」「提问」什么也不会发生 —— 章节导航/提问区住在章节视图里"
+
+
+def test_zen_handles_missing_sections_without_opening_an_empty_column():
+    """没有章节数据时，**不能**开出一条 200px 的空导航列。
+
+    独立审查（2026-10-27）抓到的中危缺陷：
+    `_zenHasSections()` 原本只在「切视图」分支里查 —— 已经在章节视图时，
+    点「章节」会无条件 `toggle("zen-nav-open")` → 导航是空的却占掉 200px 栅格列，
+    用户看着像坏了。
+    """
+    src = _src()
+    assert "_zenHasSections()" in src, "没有「这篇有没有章节数据」的判断"
+    # 「已经是章节视图」那一支也必须查一次
+    nav_fn = src[src.index("function toggleZenNav()"):src.index("function toggleZenAux()")]
+    assert "_zenHasSections()" in nav_fn, \
+        "章节视图里点「章节」没查章节数据 —— 会开出一条 200px 的空列"
+    assert "zen-nav-open" in nav_fn, "toggleZenNav 忘了切导航开关"
+
+
+def test_zen_escape_yields_to_upper_overlays():
+    """Esc 一次按键不能干两件事（退出专注 + 关掉上层弹窗）。
+
+    独立审查（2026-10-27）抓到的中危缺陷：
+    论文快照弹窗 / 诊断弹窗自己的 keydown 处理器没有 `stopPropagation`，
+    两边都会响应 → 弹窗关了，专注也退出了。
+    """
+    src = _src()
+    assert "function _zenOverlayOpen()" in src, "没有「上层弹窗开着没有」的判断"
+    keydown = src[src.index("function _initZenMode()"):]
+    keydown = keydown[:keydown.index("\n    }\n")]
+    assert "_zenOverlayOpen()" in keydown, \
+        "Esc 没有给上层弹窗让路 —— 一次按键会同时关弹窗 + 退出专注"
+    assert "snapshot-modal" in src and "diag-modal" in src, \
+        "上层弹窗的 id 变了 —— Esc 的让路判断要跟着改"
+
+
+def test_zen_handle_is_open_only_never_toggle_closed():
+    """顶部细把手只能**展开**工具条，不能"再点一下收起"。
+
+    独立审查（2026-10-27）抓到的中危缺陷（死分支）：
+    工具条打开时把手是 `pointer-events:none` 且被顶栏盖住（z-index 1199 < 1200）
+    → 点不到 → 点击处理器里那条 `_zenCloseBar()` 分支**永远不可达**，
+    而注释和交接文档都写着"再点一下收起"。
+    """
+    src = _src()
+    handle_fn = src[src.index('handle.addEventListener("click"'):]
+    handle_fn = handle_fn[:handle_fn.index("});")]
+    assert "_zenCloseBar" not in handle_fn, \
+        "把手点击处理器里还有 _zenCloseBar —— 那是死分支（把手点不到）"
+    assert "_zenOpenBar(true)" in handle_fn, "把手点击应该展开工具条"
+
+
+def test_showtoast_accepts_a_duration():
+    """showToast 的第三个参数（时长）以前是**死的**。
+
+    函数只有两个形参，但代码库里好几处（含本分支）都按
+    showToast(msg, isError, ms) 调 → 第三个参数被静默忽略 → 一律 3800ms。
+    """
+    src = _src()
+    m = re.search(r"function showToast\(([^)]*)\)", src)
+    assert m, "找不到 showToast 的定义"
+    assert "duration" in m.group(1), \
+        "showToast 没有 duration 形参 —— 传进去的时长被静默忽略"
+
+
+def test_scroll_position_is_tracked_per_container():
+    """滚动位置必须**按容器**分别记。
+
+    独立审查（2026-10-27）抓到的低危缺陷：
+    阅读器里有 4 个滚动容器（章节视图 2 个 + PDF 视图 2 个），
+    共用一个全局 `_zenScrollT` → 在译文栏滚 300px 再到 PDF 栏往上滚 5px
+    会被误判成「大幅往回上滑」→ 工具条凭空滑出。
+    """
+    src = _src()
+    assert "let _zenScrollEl = null;" in src, \
+        "没有记录「上次滚动的是哪个容器」—— 多个滚动容器共用一个滚动位置会串台"
+    scroll_fn = src[src.index('document.addEventListener("scroll"'):]
+    scroll_fn = scroll_fn[:scroll_fn.index("}, true);")]
+    assert "_zenScrollEl" in scroll_fn, "滚动处理里没按容器区分滚动位置"
 
 
 def test_narrow_screen_overrides_zen_two_columns():

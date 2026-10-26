@@ -2679,7 +2679,10 @@
   <div id="toast" role="status" aria-live="polite"></div>
 <script>
     let _toastTimer = null;
-    function showToast(msg, isError = false) {
+    // ⚠️ duration 以前是**死的** —— 函数只有两个形参，但代码库里好几处
+    //    （含本分支新增的 3 处）都按 showToast(msg, isError, ms) 调，
+    //    第三个参数被静默忽略 → 一律 3800ms。这里把形参补上。
+    function showToast(msg, isError = false, duration = 3800) {
       const t = document.getElementById("toast");
       if (!t) return;
       t.innerText = msg;
@@ -2687,7 +2690,7 @@
       t.setAttribute("data-error", isError ? "true" : "false");
       t.style.display = "block";
       clearTimeout(_toastTimer);
-      _toastTimer = setTimeout(() => { t.style.display = "none"; }, 3800);
+      _toastTimer = setTimeout(() => { t.style.display = "none"; }, duration);
     }
 
     function scrollToWork() {
@@ -4318,7 +4321,20 @@
     let _zenPref = false;
     let _zenBarTimer = null;
     let _zenScrollT = 0;
+    let _zenScrollEl = null;      // 上一次滚动的容器（滚动位置按容器分别记）
     const ZEN_SCROLL_TOL = 4;   // 滚动方向判定容差（px）
+
+    // 上层弹窗（论文快照 / 诊断）开着没有？
+    // 它们的 keydown 处理器没有 stopPropagation → 一次 Esc 会两边都响应
+    //（弹窗关了 + 专注也退出了）。所以专注的 Esc 要先给它们让路。
+    function _zenOverlayOpen() {
+      const ids = ["snapshot-modal", "diag-modal"];
+      for (const id of ids) {
+        const el = document.getElementById(id);
+        if (el && el.style.display !== "none" && el.style.display !== "") return true;
+      }
+      return false;
+    }
 
     function _zenModal() { return document.getElementById("reader-modal"); }
     function isZenMode() { return !!_zenMode; }
@@ -4328,14 +4344,20 @@
       return !!(modal && _zenMode && modal.style.display !== "none");
     }
 
-    // 顶栏从「文档流内」变成「fixed 浮层」→ 论文页宽度变了 → PDF 画布要重算。
-    // force=true：即使新旧宽度相差 < 40px 也重绘 —— PDF 列表宽度是跟内容走的，
-    // 「看起来没变」其实画布已经和栏宽对不上了。
-    function _zenRelayoutPdf() {
+    // 布局变了 → PDF 画布可能要按新栏宽重绘。
+    //
+    // ⚠️ force 必须**按调用点**给，不能一律 true：
+    //    - 进出专注（顶栏在文档流 ↔ fixed 浮层）：`.reader-shell` 宽度恒为 100%
+    //      （§4.48），顶栏进出**不改变 PDF 栏宽** → 不需要重绘。
+    //      一律 force=true 会让 391 页的论文每点一次「专注」就全量重绘一遍
+    //      （每页一次 await renderPdfPage）→ 明显卡顿。
+    //    - 切单栏 / 切论文页：`.pdf-split` 的列数变了 → 栏宽大变 → 必须重绘。
+    //
+    // 不用 `window.dispatchEvent(new Event("resize"))` 当内部调用 ——
+    // 那是全局广播，将来任何新增的 resize 监听器都会被误触发。
+    function _zenRelayoutPdf(force) {
       try {
-        _pdfRelayoutIfNeeded(true);
-        // 兜底：window 的 resize 也走同一条通道
-        window.dispatchEvent(new Event("resize"));
+        _pdfRelayoutIfNeeded(!!force);
       } catch (e) { /* 忽略 */ }
     }
 
@@ -4382,7 +4404,9 @@
         showToast("专注模式：顶部细条点一下展开工具条 · Z 切换 · Esc 退出", false, 3600);
       }
       // 顶栏脱离文档流 → 论文页变宽 → PDF 必须重绘（否则画布和栏宽对不上）
-      setTimeout(_zenRelayoutPdf, 260);
+      // ⚠️ force=false：进出专注**不改变 PDF 栏宽**（壳恒为 100% 宽），
+      //    真正的重绘交给 ResizeObserver 按实际宽度差决定 —— 见 _zenRelayoutPdf。
+      setTimeout(function () { _zenRelayoutPdf(false); }, 260);
     }
 
     function exitZenMode() {
@@ -4396,7 +4420,8 @@
       _zenBarTimer = null;
       _persistLocalState();
       _zenSyncLabels();
-      setTimeout(_zenRelayoutPdf, 260);
+      // 退出专注：顶栏回到文档流，PDF 栏宽不变 → force=false（见 _zenRelayoutPdf）
+      setTimeout(function () { _zenRelayoutPdf(false); }, 260);
     }
 
     function toggleZenMode() {
@@ -4438,6 +4463,12 @@
         return;
       }
       if (_readerMode !== "section") return;  // 切不过去就别动开关
+      // ⚠️ 已经在章节视图了，但**这篇没有章节数据** → 导航是空的，
+      //    打开只会多出一条 200px 的空列（用户看着像坏了）→ 如实提示。
+      if (!_zenHasSections()) {
+        showToast("这篇还没有章节数据 —— 章节导航需要先「拉取全文」拆分章节", true, 3600);
+        return;
+      }
       modal.classList.toggle("zen-nav-open");
     }
 
@@ -4458,14 +4489,16 @@
       if (!modal) return;
       modal.classList.toggle("zen-single");
       _zenSyncLabels();
-      setTimeout(_zenRelayoutPdf, 300);
+      // 列数变了 → PDF 栏宽大变 → 必须重绘（force=true）
+      setTimeout(function () { _zenRelayoutPdf(true); }, 300);
     }
 
     function zenTogglePane() {
       const modal = _zenModal();
       if (!modal) return;
       modal.classList.toggle("zen-show-orig");
-      setTimeout(_zenRelayoutPdf, 300);
+      // 论文页 / 译文页互斥切换 → PDF 栏宽大变 → 必须重绘（force=true）
+      setTimeout(function () { _zenRelayoutPdf(true); }, 300);
     }
 
     /**
@@ -4476,17 +4509,25 @@
     function _initZenMode() {
       const handle = document.getElementById("zen-handle");
       if (handle) {
+        // ⚠️ 把手只负责**展开**工具条，不能"再点一下收起"：
+        //    工具条打开时把手是 `pointer-events:none` 且被顶栏盖住
+        //    （z-index 1199 < 1200）→ 点不到 → 「再点一下收起」是死分支。
+        //    收起靠：Esc / 鼠标移出顶栏（1.2s 后自动收起）/ 顶栏的「✕ 退出专注」。
         handle.addEventListener("click", () => {
           if (!_zenActive()) return;
-          const modal = _zenModal();
-          if (modal && modal.classList.contains("zen-bar-open")) _zenCloseBar();
-          else _zenOpenBar(true);   // 显式点开 → 常驻，不自动收起
+          _zenOpenBar(true);   // 显式点开 → 常驻，不自动收起
         });
       }
       // 鼠标移到屏幕最上方 → 滑出工具条（停手 2.6s 自动收起）
       document.addEventListener("mousemove", (e) => {
         if (!_zenActive()) return;
-        if (e.clientY <= 40) _zenOpenBar(false);
+        if (e.clientY > 40) return;
+        // ⚠️ 指针**已经在工具条上**时不要重置定时器 ——
+        //    否则光标停在条上抖 1px 就会重挂 2.6s 定时器，
+        //    2.6s 后工具条在光标底下自己关掉（mouseover 只在"进入"时触发，补不回来）。
+        const onBar = e.target && e.target.closest && e.target.closest(".reader-topbar");
+        if (onBar) return;
+        _zenOpenBar(false);
       });
       // 指针停在工具条上时不自动收起；离开后再开始计时
       document.addEventListener("mouseover", (e) => {
@@ -4509,9 +4550,22 @@
         const el = e.target;
         if (!el || !el.closest || !el.closest("#reader-body, #reader-pdf-view")) return;
         const top = el.scrollTop || 0;
+        // ⚠️ 滚动位置必须**按容器**分别记 —— 阅读器里有 4 个滚动容器
+        //    （章节视图 2 个 + PDF 视图 2 个），共用一个全局量的话，
+        //    在译文栏滚 300px 再到 PDF 栏往上滚 5px 会被误判成
+        //    「大幅往回上滑」→ 工具条凭空滑出。
+        if (el !== _zenScrollEl) {
+          _zenScrollEl = el;
+          _zenScrollT = top;
+          return;                      // 第一次在这个容器上滚动 → 不判方向
+        }
         const dy = top - _zenScrollT;
         _zenScrollT = top;
-        const nearBottom = (el.scrollHeight || 0) - top - (el.clientHeight || 0) < 24;
+        // ⚠️ 「滑到最底部」只对**真的能滚**的容器成立 ——
+        //    scrollHeight === clientHeight 的短容器恒为真 → 一滚就弹工具条。
+        const scrollable = (el.scrollHeight || 0) > (el.clientHeight || 0) + 4;
+        const nearBottom = scrollable &&
+          (el.scrollHeight || 0) - top - (el.clientHeight || 0) < 24;
         if (dy < -ZEN_SCROLL_TOL || nearBottom) _zenOpenBar(false);
       }, true);
       // 快捷键：Z 切换专注，Esc 先收工具条、再按退出专注
@@ -4522,6 +4576,11 @@
         if (tag === "input" || tag === "textarea" || tag === "select" ||
             (t && t.isContentEditable)) return;
         if (e.key === "Escape") {
+          // ⚠️ 上层弹窗（论文快照 / 诊断）开着时，Esc **归它** ——
+          //    一次按键不能干两件事（退出专注 + 关弹窗）。
+          //    那些弹窗自己的 keydown 处理器没有 stopPropagation，
+          //    两边都会响应 → 弹窗关了，专注也退出了。
+          if (_zenOverlayOpen()) return;
           const modal = _zenModal();
           if (modal && modal.classList.contains("zen-bar-open")) _zenCloseBar();
           else exitZenMode();
@@ -4547,11 +4606,15 @@
     //    所以要直接观察 PDF 列表容器本身（ResizeObserver），
     //    它在「隐藏 → 显示」「单栏 → 双栏」这些变化上都会报。
     let _pdfResizeTimer = null;
-    let _pdfRelayoutBusy = false;   // 重绘进行中 → 忽略容器尺寸变化，防自激循环
+    // ⚠️ 必须是**计数**，不能是布尔 —— loadPdfDualColumn 可以并发（重绘定时器 +
+    //    缩放）。用布尔时，先结束的那次渲染会在 finally 里把标记清成 false，
+    //    另一场还在跑 → 忙标记提前失效 → 渲染中途的尺寸回调不再被挡。
+    let _pdfRelayoutBusyCount = 0;
+    function _pdfIsRelayoutBusy() { return _pdfRelayoutBusyCount > 0; }
 
     function _pdfRelayoutIfNeeded(force) {
       if (_readerMode !== "pdf" || !_pdfState || !_pdfState.pdfDoc) return;
-      if (_pdfRelayoutBusy) return;
+      if (_pdfIsRelayoutBusy()) return;
       const w = document.getElementById("pdf-pages-list")?.clientWidth || 0;
       if (!w) return;               // 阅读器还没显示 / 容器不可见 → 宽度不可信
       const last = _pdfState.lastRenderWidth || 0;
@@ -4568,6 +4631,23 @@
     }
 
     window.addEventListener("resize", () => _pdfRelayoutIfNeeded(false));
+
+    /**
+     * 渲染完成后复核栏宽。
+     *
+     * 阅读器可能是在**渲染过程中**才从隐藏变可见的 ——
+     * 那一瞬间的 ResizeObserver 回调会被「忙」标记挡掉，
+     * 不复核的话画布就停在「看不见时量到的兜底宽度 520px」上。
+     *
+     * 用**渲染起始时**的宽度比，不是最后一页的：
+     * 渲染中途变可见时，前几页是旧宽度、后几页是新宽度，
+     * 最后一页的宽度会掩盖掉这个事实。
+     */
+    function _pdfVerifyRenderedWidth(renderW0, listEl) {
+      const el = listEl || document.getElementById("pdf-pages-list");
+      if (!el) return;
+      if (Math.abs(renderW0 - el.clientWidth) > 40) _pdfRelayoutIfNeeded(true);
+    }
 
     /** 观察 PDF 列表容器尺寸 —— 覆盖「阅读器从隐藏变可见」「专注模式切单双栏」
      *  这些 window resize 抓不到的宽度变化。 */
@@ -4730,11 +4810,11 @@
 
         // Render all pages
         listEl.innerHTML = "";
-        // 渲染开始时的栏宽（用来在渲染结束后核对栏宽有没有中途变过）
+        // 渲染开始时的栏宽（渲染结束后用它复核栏宽有没有中途变过）
         const renderW0 = listEl.clientWidth;
         // 重绘进行中 → 忽略容器尺寸变化（否则清空列表触发的 ResizeObserver
         // 回调会再排一次重绘 → 自激循环）
-        _pdfRelayoutBusy = true;
+        _pdfRelayoutBusyCount++;
         try {
           for (let p = 1; p <= pdfDoc.numPages; p++) {
             if (_pdfState.rendering.cancelled) break;
@@ -4752,7 +4832,7 @@
             _pdfState.pages.push(pageData);
           }
         } finally {
-          _pdfRelayoutBusy = false;
+          _pdfRelayoutBusyCount--;
         }
         // Start smooth queue (page 1 translates immediately, pages 2..N translate paced at 3.2s)
         // Skip if we're a stale generation — otherwise we'd queue unneeded translates.
@@ -4812,9 +4892,9 @@
         }
         // 渲染完成后再核一次栏宽 —— 用「渲染开始时的宽度」比，不是最后一页的：
         // 阅读器可能是在渲染过程中才从隐藏变可见的（那一瞬间的
-        // ResizeObserver 回调会被 _pdfRelayoutBusy 挡掉），
+        // ResizeObserver 回调会被「忙」标记挡掉），
         // 不核对的话画布就停在「看不见时量到的兜底宽度 520px」上。
-        if (Math.abs(renderW0 - listEl.clientWidth) > 40) _pdfRelayoutIfNeeded(true);
+        _pdfVerifyRenderedWidth(renderW0, listEl);
       } catch (err) {
         listEl.innerHTML = `<div style="padding:18px; color:#B25336;">❌ PDF 加载失败: ${escapeHtml(String(err))}</div>`;
         if (!keepTranslations) transList.innerHTML = "";
