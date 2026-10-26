@@ -37,12 +37,21 @@ from . import llm
 GLYPH_MARKER_RE = re.compile(r"⟦G:(\d+)⟧")
 
 # 只接受这些符号（模型给的其它东西一律丢弃 → 退回 "[?]"）
+#
+# ⚠️ 2026-10-26 补了**括号类**：实测 JAP 综述里 46 个语义键有一大批是
+# 大括号/圆括号/方括号/竖线（TeX 数学字体里用来分组/取整/绝对值），
+# 而它们**根本不在白名单** → 模型即使认对了也会被丢弃 → 译文里还是 [?]。
+# 白名单是"模型说错就丢"的闸门，但**不该把正确答案也挡在门外**。
 ALLOWED_SYMBOLS = set(
     "≈≠≤≥<>×÷±∓∝∂∆√∞°′″⋅∘∗"
     "αβγδεζηθικλμνξορστυφχψω"
     "ΓΔΘΛΞΠΣΥΦΨΩ"
     "∈∉⊂⊃⊆⊇∪∩∅∇⊕⊗¬∧∨"
     "→←↔⇒⇔∀∃∅ℝℕℤℚ"
+    "()[]{}|‖⌈⌉⌊⌋"
+    # 常见的"变体"符号：模型倾向给这些（实测它把 ≥ 写成 ≧），
+    # 不收的话模型的一次有效输出就被整个丢掉。
+    "≧≪≫"
 )
 
 # 词典文件（放 vault 的 logs 下 → 两台设备通过坚果云共用同一份）
@@ -86,11 +95,43 @@ def semantic_key(font: str, cid: str) -> str:
     base = (font or "").split("+")[-1].strip()
     return f"{base}|{cid}"
 
+# 裁图的外扩量（pt）。
+# 必须小：窄字形只有 2~3pt 宽，外扩稍多就把**相邻字符**裁进来
+# → 模型看到混合图（"ω𝑓"）→ 认错或认不出。
+# 标定见 _render_glyph 的 docstring。
+_GLYPH_PAD_PT = 0.25
+
 _RECOGNIZE_PROMPT = (
     "下面每个编号后面，是从一篇英文论文里裁出来的一个数学符号（可能是 ×、≈、≥ "
     "这类关系符号，也可能是希腊字母）。\n"
     "请按编号顺序说出每个符号**本身**，用英文逗号分隔，格式：1=×, 2=≈\n"
     "看不清或拿不准的写 ?。只回答符号，不要解释。"
+)
+
+# 认字提示词的**加强版**：给模型一份"可能的符号清单"当锚。
+#
+# 为什么需要（2026-10-26 实测）：光说"数学符号"，模型对**括号/竖线/花括号**
+# 这类符号特别不自信 → 大量回答 "?"（实测 22 个语义键里 22 个全是 ?）。
+# 给一份清单后，模型会把"一根竖线"在"∣ | ∥"之间选一个，
+# 而不是直接放弃 —— 而"选一个"比"放弃"有用得多（清单里都是白名单符号）。
+#
+# ⚠️ 清单里的符号**全部**在 ALLOWED_SYMBOLS 里 → 认错也不会污染词典。
+_RECOGNIZE_PROMPT_WITH_HINTS = (
+    "下面每个编号后面，是从一篇英文论文里裁出来的一个**单独的**数学符号。\n"
+    "请按编号顺序说出每个符号**本身**，用英文逗号分隔，格式：1=×, 2=≈\n"
+    "可选的符号（只能从这些里面选，或者写 ?）：\n"
+    "  关系类：= ≠ < > ≤ ≥ ≈ ≪ ≫ ∝ ≧\n"
+    "  算术类：× ÷ ⋅ ∘ ∗ √ ± ∓ ∂ ∇ ∞ ° ′ ″\n"
+    "  箭头类：→ ← ↔ ⇒ ⇔\n"
+    "  集合/逻辑：∈ ∉ ⊂ ⊃ ⊆ ⊇ ∪ ∩ ∅ ∧ ∨ ¬ ∀ ∃ ℝ ℕ ℤ ℚ\n"
+    "  希腊字母：α β γ δ ε ζ η θ ι κ λ μ ν ξ ο ρ σ τ υ φ χ ψ ω "
+    "Γ Δ Θ Λ Ξ Π Σ Υ Φ Ψ Ω\n"
+    "  括号类：( ) [ ] { } | ‖ ⌈ ⌉ ⌊ ⌋\n"
+    "注意：\n"
+    "  - 图里每个格子是**一个**符号，别把它旁边的笔画算进来；\n"
+    "  - 一根竖线就写 | ；两个竖线并排写 ‖ ；圆括号写 ( )；\n"
+    "  - 花括号 { } 和竖线 | 不要搞混；\n"
+    "  - 只回答符号，不要解释。实在看不出就写 ?。"
 )
 
 
@@ -109,8 +150,21 @@ def _open_doc(pdf_source):
     return fitz.open(str(pdf_source)), True
 
 
-def _render_glyph(doc, page_no: int, bbox: dict, zoom: float = 12.0) -> Optional[bytes]:
-    """裁出一个字形的小图（PNG 字节）。"""
+def _render_glyph(doc, page_no: int, bbox: dict, zoom: float = 12.0,
+                  pad: float = _GLYPH_PAD_PT) -> Optional[bytes]:
+    """裁出一个字形的小图（PNG 字节）。
+
+    **pad（外扩量）必须小**（2026-10-26 实测标定，全库真实产物）：
+      窄字形只有 2~3pt 宽，pad 稍大就**把相邻字符裁进来** →
+      模型看到的是"ω𝑓"这种混合图，认出来的符号是错的/认不出。
+
+    实测（2008-JAP 综述 46 个语义键，判据=别的字形有多少面积落进裁剪框）：
+      pad=1.0  → 14/46 混入邻居（平均 0.35 个）
+      pad=0.35 → 11/46        pad=0.25 → 9/46
+      pad=0.10 →  7/46        pad=0.0  →  7/46
+    取 **0.25**：已接近最小混入，同时留一点余量防切掉字形
+    （实测 pad=0 时墨迹左溢 ≤0.75pt，是抗锯齿边缘，不会切字形）。
+    """
     try:
         import fitz
     except Exception:
@@ -125,7 +179,7 @@ def _render_glyph(doc, page_no: int, bbox: dict, zoom: float = 12.0) -> Optional
         # PyMuPDF 的 Rect 与 pdfplumber 一样是**左上角原点**（y 往页顶方向为正，
         # 但数值从页顶往下量）—— 不要按 PDF 原生的左下角去换算，
         # 换错了会裁到旁边的文字（实测裁出 "va" / "se"，模型把乱图认成了 ν）。
-        rect = fitz.Rect(x0 - 1.0, top - 1.0, x1 + 1.0, bottom + 1.0)
+        rect = fitz.Rect(x0 - pad, top - pad, x1 + pad, bottom + pad)
         if rect.is_empty or rect.width <= 0 or rect.height <= 0:
             return None
         pix = page.get_pixmap(clip=rect, matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -279,10 +333,13 @@ class GlyphDictionary:
             print(f"[MicroBench] 符号词典写入失败: {e}", file=sys.stderr)
 
     def get(self, key: str) -> Optional[str]:
-        """按**语义键**取符号；没命中再退回旧的形状指纹匹配。
+        """按**语义键**取符号（精确匹配）。
 
-        形状匹配只在**旧格式条目**（shape 为空的那批）上做 —— 那批没有
-        形状基准可比，纯靠距离最近来找，属兜底行为。
+        ⚠️ 这里**不再**做"形状指纹最近邻"匹配：
+        全库实测（24 篇 / 6184 个字形实例）证明形状指纹的
+        同符号差异中位 61 vs 异符号中位 74 → 两者重叠 →
+        最近邻必然把 ≈ 认成 ≥（异符号误判率 26~41%）。
+        旧词典里的形状条目**只读不写**（历史数据），不再参与匹配。
         """
         if not key:
             return None
@@ -291,16 +348,6 @@ class GlyphDictionary:
             return ent.get("sym") or None
         if isinstance(ent, str) and ent:
             return ent
-        # 旧格式兜底：形状指纹最近邻
-        best, best_d = None, 10 ** 9
-        for k, v in self.data.items():
-            if not isinstance(v, dict) or v.get("shape"):
-                continue          # 有形状基准的条目不参与纯距离匹配
-            d = _hamming(key, k)
-            if d < best_d:
-                best, best_d = v.get("sym"), d
-        if best is not None and best_d <= _MATCH_MAX_DIFF:
-            return best
         return None
 
     def get_verified(self, sem_key: str, shape_key: str) -> Optional[str]:
@@ -427,17 +474,21 @@ _RECOGNIZE_TIMEOUT = 90
 # 但**思考 token 与正文共享同一个 max_tokens 池**（主模型是推理型），
 # 思考一烧就正文为空（实测 max_tokens=800 时被截断 0 字符）。
 # 给足余量，认字这种"必须完整"的场景宁可多花 token 也不能整批作废。
-_RECOGNIZE_MAX_TOKENS = 2000
+_RECOGNIZE_MAX_TOKENS = 4000
 
 
 def _recognize_batch(strip: bytes, count: int, model_name: str = "",
                      force_fallback: bool = False, deadline: Optional[float] = None,
-                     isolated: bool = False) -> str:
+                     isolated: bool = False, hints: bool = True) -> str:
     """把拼好的字形图交给多模态模型，返回原始回答文本。
 
     **isolated=True** → 走 llm.chat_isolated（只打主模型、不改全局降格状态）。
     后台补齐任务必须用它：认字失败是**这一小任务**的问题，
     不该触发全局降格把用户正在跑的翻译也拖去备用模型。
+
+    **hints=True** → 用带「候选符号清单」的加强版提示词
+    （见 _RECOGNIZE_PROMPT_WITH_HINTS）。模型对括号/竖线类符号
+    不给清单就全答 "?"，给了清单才会选一个。
 
     抽成独立函数的原因：单页版和整篇版都要用，且**必须**保证
     data URL 的格式正确 —— 格式错了上游会返回 HTTP 400
@@ -445,7 +496,8 @@ def _recognize_batch(strip: bytes, count: int, model_name: str = "",
     """
     import base64
     content = [
-        {"type": "text", "text": _RECOGNIZE_PROMPT},
+        {"type": "text",
+         "text": _RECOGNIZE_PROMPT_WITH_HINTS if hints else _RECOGNIZE_PROMPT},
         {"type": "image_url",
          "image_url": {"url": "data:image/png;base64,"
                       + base64.b64encode(strip).decode("ascii")}},
