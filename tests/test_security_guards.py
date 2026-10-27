@@ -454,6 +454,12 @@ def test_rate_limit_messages_are_not_treated_as_quota():
         '{"base_resp":{"status_code":1008,"status_msg":"Too many requests"}}',
         '{"base_resp":{"status_code":1008,"status_msg":"rate limit exceeded"}}',
         '{"base_resp":{"status_code":1008,"status_msg":"requests per minute exceeded"}}',
+        # 2026-10-27：上游会用"计费档位"描述限流，命中了 "billing" 这个
+        # 歧义词 → 旧逻辑判成配额耗尽 → 全局降格 15 分钟。
+        # 实测报错原文："429 billing tier rate limit exceeded (org-xxx)"
+        '429 billing tier rate limit exceeded',
+        # "resource exhausted" 单独出现时是并发/限流语义（无 resource 前缀时）
+        '429 rate limit: exhausted retries',
     ]
     for msg in rate_msgs:
         assert llm.model_manager.is_quota_exhausted_error(429, msg) is False, \

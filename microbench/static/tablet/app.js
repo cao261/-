@@ -4394,7 +4394,15 @@
     });
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
+  // ⚠ 不能只挂 DOMContentLoaded（AGENTS.md §4.1 的同型坑）：
+  //   平板端是**离线单页**，脚本在 </body> 前同步加载 → 正常路径下
+  //   DOMContentLoaded 还没触发，监听器是有效的。
+  //   但**不要**改成裸监听就完事 —— 一旦有人把脚本挪到 <head>、
+  //   或改成 defer/async 动态注入，readyState 就会已经是 "interactive"，
+  //   监听器再注册就是**死的** → boot() 一次都没跑 → 平板停在
+  //   「壳子渲染出来了但空空如也」，且没有任何报错（正是用户看到的白屏）。
+  //   → 判 readyState，已就绪就直接跑。
+  function _bootSafely() {
     // boot() 是 async，任何一个 await 抛错都会变成一个没人看的 rejected
     // promise —— 页面就停在"壳子渲染出来了但空空如也"的状态，完全看不出
     // 出了什么事。这里把错误直接摊到页面上。
@@ -4418,7 +4426,13 @@
         stage.textContent = "启动阶段: " + (stage.textContent || "(空)");
       }
     });
-  });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _bootSafely);
+  } else {
+    _bootSafely();
+  }
 
   // 暴露给测试：渲染器和 hash 是这个应用最容易出错的两块，必须能脱离
   // 浏览器单测。挂在 window 上，页面里没人用它。

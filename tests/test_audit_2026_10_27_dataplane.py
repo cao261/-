@@ -33,68 +33,90 @@ from microbench.merge_changes import djb2_base36, merge_pack
 
 
 # ===========================================================================
-# ① C-2：缓存键必须区分「没有词典」和「词典文件不存在」
+# ① C-2（2026-10-28 修正）：缓存键必须是**单一真相**
+#
+# ⚠ 这组护栏的**判据在 2026-10-28 合并对方设备（25353）的第二轮审计时改了**。
+#   原判据是「词典的 (mtime,size) + 路径必须进键」，依据是
+#   「词典认出了新符号 → 文本里 ⟦G:n⟧ 对应的真实字符会变 → 必须重解」。
+#
+#   **那个前提被代码事实否掉了**：
+#     `paper_text.extract_text_from_pdf(pdf_bytes)` 的签名里**没有字典参数**，
+#     整个 paper_text 模块**不 import 也不读**符号词典。
+#     文本里的 `⟦G:<下标>⟧` 是**页内 glyphs 列表的下标**，不是词典序号；
+#     把标记换成真实字符是后面 `_resolve_document_glyphs()` 干的事，
+#     那时缓存**早写完了**。
+#   → 缓存里存的永远是**抽取原始输出**，词典维度对它**没有任何影响**。
+#
+#   而「加词典路径维度来防撞键」是**在给一个不存在的问题打补丁**，代价更严重：
+#     不同调用点用不同参数算出**不同的键** → 一份写一份读
+#     → 缓存**永远命中不了** → 842x 加速完全失效
+#     → 用户每次都等 2.7~9.7 秒重抽（**比撞键更糟**）。
+#
+#   → 正确解法：**所有调用点用同一个签名**（单一真相），
+#     再用 `EXTRACT_IMPL_REV` 覆盖「抽取实现变了」这一真正需要失效的场景。
 # ===========================================================================
 
-def test_cache_key_separates_no_dict_from_a_missing_dict_file(tmp_path):
-    """「没有词典」和「词典文件不存在」**必须**是两个键。
+def test_cache_key_takes_no_dictionary_argument():
+    """缓存键**不许**再接受词典参数。
 
-    旧版两者都算成 `[0, 0]` → 撞键 → 任何一处传 None，词典维度就静默失效
-    → 词典认出了新符号、正文里的 ⟦G:n⟧ 还是旧的 → **译文跟原文不符**。
+    只要它还能接字典参数，就说明「词典维度」这条错误路线没被彻底拔掉 ——
+    调用点一旦有人传了字典，读写两侧的键就可能不一致。
     """
-    pdf = tmp_path / "a.pdf"
-    pdf.write_bytes(b"x")
-    missing = tmp_path / "no_such_dict.json"
-    assert not missing.exists()
-    assert pdf_cache.cache_key(pdf, None) != pdf_cache.cache_key(pdf, missing), \
-        "「没有词典」和「词典文件不存在」撞键了 → 词典维度会静默失效"
+    import inspect
+
+    params = list(inspect.signature(pdf_cache.cache_key).parameters)
+    assert params == ["pdf_path"], (
+        f"cache_key 的参数是 {params} —— 词典维度必须彻底移除"
+        "（抽取层不读词典，词典维度只会让读写两侧算出不同的键 → 缓存永不命中）"
+    )
 
 
-def test_cache_key_ignores_dictionary_changes_when_there_is_no_dictionary(tmp_path):
-    """没有词典时，缓存键**不该**被任何词典文件的内容影响。"""
+def test_cache_read_and_write_use_the_same_key():
+    """**写进去的必须能被读出来** —— 读写两侧必须用同一个键。
+
+    这是「单一真相」的行为级断言：写侧 `cache_key(pdf)`，
+    读侧也必须能命中同一份快照。
+    之前若读侧多传一个字典参数 → 键不同 → 这条会红。
+    """
+    import inspect
+
+    from microbench import app as app_mod
+
+    # app.py 里**所有** pdf_cache 调用点都必须是单参数形式
+    src = inspect.getsource(app_mod)
+    import re as _re
+    for m in _re.finditer(r"pdf_cache\.(?:read_cache|write_cache|cache_key)\(([^)]*)\)", src):
+        args = m.group(1)
+        assert "GLYPH_DICT" not in args and "dict" not in args.lower(), (
+            f"app.py 里有个 pdf_cache 调用点传了词典参数：{m.group(0)}"
+            " → 读写两侧的键会不一致 → 缓存永远命中不了"
+        )
+
+
+def test_cache_key_ignores_the_glyph_dictionary_entirely(tmp_path):
+    """词典怎么变，缓存键都**不该**变。
+
+    这个缓存存的是 `extract_text_from_pdf()` 的**原始输出**，
+    而抽取层全程不读词典（见 `tests/test_pdf_cache.py` 里那条
+    「抽取层不依赖词典」的前置断言）。
+
+    原来的键里带了词典的 (mtime, size)，后果是：后台认字每认出一个新符号
+    就保存一次词典 → 签名变 → **全库 27 篇的缓存一起失效** →
+    下次打开每篇都要重抽 2.7 秒（最慢 9.7 秒）。
+    「认字越勤，打开越慢」正是这个缓存要解决的问题本身。
+    """
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
     d = tmp_path / "dict.json"
     d.write_text("{}", encoding="utf-8")
-    k1 = pdf_cache.cache_key(pdf, None)
-    d.write_text('{"k": "v"}', encoding="utf-8")
-    k2 = pdf_cache.cache_key(pdf, None)
-    assert k1 == k2, "没有词典，缓存键却跟着别的词典文件变了"
+    k1 = pdf_cache.cache_key(pdf)
 
-
-def test_cache_key_changes_when_the_dictionary_content_changes(tmp_path):
-    """有词典时，词典内容变了 → 键必须变（否则用的是旧的符号解析结果）。"""
-    pdf = tmp_path / "a.pdf"
-    pdf.write_bytes(b"x")
-    d = tmp_path / "dict.json"
-    d.write_text("{}", encoding="utf-8")
-    k1 = pdf_cache.cache_key(pdf, d)
-    d.write_text('{"k": "v"}', encoding="utf-8")
-    k2 = pdf_cache.cache_key(pdf, d)
-    assert k1 != k2, "符号词典变了，缓存键却没变"
-
-
-def test_cache_key_depends_on_the_dictionary_path(tmp_path):
-    """两个内容相同、**mtime 也相同**的词典 → 键必须不同（路径本身是键的一部分）。
-
-    ⚠ mtime 必须钉成一样：旧版只算词典的 (mtime_ns, size)，
-      两个词典文件哪怕只差 1ns 的 mtime 也会算出不同的键 →
-      那样这条护栏在旧版上是绿的（假护栏）。钉死 mtime + size 之后，
-      旧版算出**同一个键** → 这条才真的抓得住「路径没进键」。
-    """
-    pdf = tmp_path / "a.pdf"
-    pdf.write_bytes(b"x")
-    d1 = tmp_path / "d1.json"
-    d2 = tmp_path / "d2.json"
-    d1.write_text("{}", encoding="utf-8")
-    d2.write_text("{}", encoding="utf-8")
-    t = time.time()
-    os.utime(d1, (t, t))
-    os.utime(d2, (t, t))
-    assert d1.stat().st_mtime_ns == d2.stat().st_mtime_ns
-    assert d1.stat().st_size == d2.stat().st_size
-    assert pdf_cache.cache_key(pdf, d1) != pdf_cache.cache_key(pdf, d2), \
-        "词典路径没进缓存键 → 换个词典文件会命中旧缓存"
+    d.write_text('{"k": "v"}', encoding="utf-8")   # 词典变了
+    k2 = pdf_cache.cache_key(pdf)
+    assert k1 == k2, (
+        "词典变化让缓存键变了 → 后台每认出一个符号就废掉全库缓存，"
+        "用户打开论文会莫名变慢"
+    )
 
 
 # ===========================================================================
@@ -127,9 +149,9 @@ def test_read_cache_rejects_pages_that_are_not_dicts(tmp_path, monkeypatch):
     monkeypatch.setattr(pdf_cache, "CACHE_DIR", cache_dir)
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
-    key = pdf_cache.cache_key(pdf, None)
+    key = pdf_cache.cache_key(pdf)
     _snapshot(cache_dir, key, {"key": key, "pages": [123]})
-    assert pdf_cache.read_cache(pdf, None) is None, \
+    assert pdf_cache.read_cache(pdf) is None, \
         "结构不合法的快照没有被当成未命中 → 下游会抛 TypeError"
 
 
@@ -139,10 +161,10 @@ def test_read_cache_accepts_a_well_formed_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(pdf_cache, "CACHE_DIR", cache_dir)
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
-    key = pdf_cache.cache_key(pdf, None)
+    key = pdf_cache.cache_key(pdf)
     pages = [{"page": 1, "text": "x", "glyphs": []}]
     _snapshot(cache_dir, key, {"key": key, "pages": pages})
-    assert pdf_cache.read_cache(pdf, None) == pages
+    assert pdf_cache.read_cache(pdf) == pages
 
 
 def test_read_cache_rejects_a_snapshot_whose_text_is_not_a_string(tmp_path, monkeypatch):
@@ -151,9 +173,9 @@ def test_read_cache_rejects_a_snapshot_whose_text_is_not_a_string(tmp_path, monk
     monkeypatch.setattr(pdf_cache, "CACHE_DIR", cache_dir)
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
-    key = pdf_cache.cache_key(pdf, None)
+    key = pdf_cache.cache_key(pdf)
     _snapshot(cache_dir, key, {"key": key, "pages": [{"page": 1, "text": None}]})
-    assert pdf_cache.read_cache(pdf, None) is None
+    assert pdf_cache.read_cache(pdf) is None
 
 
 # ===========================================================================
@@ -171,7 +193,7 @@ def test_concurrent_writes_to_the_same_key_never_fail(tmp_path, monkeypatch, cap
     monkeypatch.setattr(pdf_cache, "CACHE_DIR", cache_dir)
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
-    key = pdf_cache.cache_key(pdf, None)
+    key = pdf_cache.cache_key(pdf)
     pages = [{"page": 1, "text": "hello", "glyphs": []}]
 
     errors = []
@@ -179,7 +201,7 @@ def test_concurrent_writes_to_the_same_key_never_fail(tmp_path, monkeypatch, cap
     def writer():
         try:
             for _ in range(25):
-                pdf_cache.write_cache(pdf, None, pages, key)
+                pdf_cache.write_cache(pdf, pages, key)
         except Exception as exc:      # write_cache 本该自己吞掉异常
             errors.append(exc)
 
@@ -192,7 +214,7 @@ def test_concurrent_writes_to_the_same_key_never_fail(tmp_path, monkeypatch, cap
     assert not errors, "并发写抛了异常: %r" % (errors[:3],)
     err = capsys.readouterr().err
     assert "写缓存失败" not in err, "有缓存写失败了（Windows 的 replace 撞了）:\n%s" % err[-800:]
-    got = pdf_cache.read_cache(pdf, None)
+    got = pdf_cache.read_cache(pdf)
     assert got == pages, "并发写之后缓存读不出来"
 
 
@@ -206,9 +228,9 @@ def test_reading_while_writing_never_raises(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(pdf_cache, "CACHE_DIR", cache_dir)
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
-    key = pdf_cache.cache_key(pdf, None)
+    key = pdf_cache.cache_key(pdf)
     pages = [{"page": 1, "text": "hello", "glyphs": []}]
-    pdf_cache.write_cache(pdf, None, pages, key)
+    pdf_cache.write_cache(pdf, pages, key)
 
     errors = []
     stop = threading.Event()
@@ -216,14 +238,14 @@ def test_reading_while_writing_never_raises(tmp_path, monkeypatch, capsys):
     def reader():
         try:
             while not stop.is_set():
-                pdf_cache.read_cache(pdf, None)
+                pdf_cache.read_cache(pdf)
         except Exception as exc:
             errors.append(exc)
 
     def writer():
         try:
             for _ in range(60):
-                pdf_cache.write_cache(pdf, None, pages, key)
+                pdf_cache.write_cache(pdf, pages, key)
         except Exception as exc:
             errors.append(exc)
 
@@ -238,7 +260,7 @@ def test_reading_while_writing_never_raises(tmp_path, monkeypatch, capsys):
     assert not errors, "读中写抛了异常: %r" % (errors[:3],)
     err = capsys.readouterr().err
     assert "写缓存失败" not in err, "读中写时缓存写失败了:\n%s" % err[-800:]
-    assert pdf_cache.read_cache(pdf, None) == pages
+    assert pdf_cache.read_cache(pdf) == pages
 
 
 # ===========================================================================
@@ -293,8 +315,8 @@ def test_writing_the_cache_prunes_orphans(tmp_path, monkeypatch):
 
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
-    key = pdf_cache.cache_key(pdf, None)
-    pdf_cache.write_cache(pdf, None, [{"page": 1, "text": "x", "glyphs": []}], key)
+    key = pdf_cache.cache_key(pdf)
+    pdf_cache.write_cache(pdf, [{"page": 1, "text": "x", "glyphs": []}], key)
     assert not orphan.exists(), "孤儿文件没人清（L-5）"
 
 
@@ -305,7 +327,7 @@ def test_the_read_path_never_prunes(tmp_path, monkeypatch):
     orphan = _old_file(cache_dir / ("d" * 64 + ".dddd.json"))
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
-    pdf_cache.read_cache(pdf, None)
+    pdf_cache.read_cache(pdf)
     assert orphan.exists(), "读路径上做了清理 → 读会变慢"
 
 

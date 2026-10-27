@@ -45,25 +45,12 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_VAULT = REPO
 
 # 与 tablet/static/tablet/app.js 的 hash() 完全一致的 djb2/base36。
-# 注意 JS 的 s.charCodeAt(i) 取的是 UTF-16 码元，Python 的 ord() 取的是
-# 码点 —— 遇到 emoji（代理对）就对不上了，所以这里按 UTF-16 逐码元算。
-_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
-
-
-def djb2_base36(s: str) -> str:
-    """JS: ((h << 5) + h + s.charCodeAt(i)) >>> 0  ->  h.toString(36)"""
-    h = 5381
-    raw = s.encode("utf-16-le")
-    for i in range(0, len(raw), 2):
-        unit = raw[i] | (raw[i + 1] << 8)
-        h = ((h << 5) + h + unit) & 0xFFFFFFFF
-    if h == 0:
-        return "0"
-    out = []
-    while h:
-        h, r = divmod(h, 36)
-        out.append(_B36[r])
-    return "".join(reversed(out))
+#
+# → 实现已搬到 `microbench/paperid.py`（app.py 也用同一份）。
+#   注意 JS 的 s.charCodeAt(i) 取的是 UTF-16 码元，Python 的 ord() 取的是
+#   码点 —— 遇到 emoji（代理对）就对不上了，所以那里按 UTF-16 逐码元算，
+#   并且带 errors="surrogatepass"（孤立代理项不崩）。
+from .paperid import djb2_base36  # noqa: F401  （保持原有 import 路径可用）
 
 
 # ---------------------------------------------------------------------------

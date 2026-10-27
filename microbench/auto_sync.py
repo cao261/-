@@ -57,6 +57,7 @@ SHA / 备份分支），回退后**校验** HEAD 与工作区 —— 对不上�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -69,10 +70,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
+# 已知的绝对路径只是**兜底**：两台设备都把 PowerShell 7 装在**用户目录**下
+# （%LOCALAPPDATA%\Programs\PowerShell\7\pwsh.exe），路径里的用户名不同。
+# 所以真正可靠的是先问 PATH，再按 %LOCALAPPDATA% 通配 —— 写死某个用户名
+# 会在另一台设备上悄悄失效（实测：本机 25353 跑这脚本时找不到 pwsh，
+# 于是每次都「跳过重打 APK」，而日志里只有一行不像错误的提示）。
 PWSH_CANDIDATES = [
     r"D:\Program Files\PowerShell\7\pwsh.exe",
     r"C:\Program Files\PowerShell\7\pwsh.exe",
-    r"C:\Users\30461\AppData\Local\Programs\PowerShell\7\pwsh.exe",
 ]
 PROXY = "http://127.0.0.1:65532"
 
@@ -260,16 +265,51 @@ def run_tests() -> tuple[bool, list[str]]:
     return (not failures), failures
 
 
+def find_pwsh() -> Path | None:
+    """找到 PowerShell 7 的可执行文件，找不到返回 None。
+
+    顺序（最可靠 → 最不依赖环境）：
+      1. PATH 上的 `pwsh`（两台设备都把用户目录写进了用户级 PATH）
+      2. 程序目录下的绝对路径（系统级安装 / 非标准盘符）
+      3. `%LOCALAPPDATA%\\Programs\\PowerShell\\<版本>\\pwsh.exe` 通配，
+         版本号取**最大的**（同一台机器可能装着 7.4 和 7.6）
+    """
+    exe = shutil.which("pwsh")
+    if exe:
+        p = Path(exe)
+        if p.is_file():
+            return p
+
+    for raw in PWSH_CANDIDATES:
+        p = Path(raw)
+        if p.is_file():
+            return p
+
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        base = Path(local_appdata) / "Programs" / "PowerShell"
+        try:
+            # 按版本号倒序：7.10 > 7.6 > 7.4（字符串排序会把 7.10 排在 7.6 前面，
+            # 但两者都能用，这里只需要「优先新的」，不追求严格语义版本比较）
+            for p in sorted(base.glob("*/pwsh.exe"), reverse=True):
+                if p.is_file():
+                    return p
+        except OSError:
+            pass
+    return None
+
+
 def build_apk() -> tuple[bool, str]:
     """重打平板 APK（脚本末尾自带交付验收）。"""
-    pwsh = next((p for p in PWSH_CANDIDATES if Path(p).exists()), None)
-    if not pwsh:
-        return False, "找不到 PowerShell 7（%s）—— 跳过重打 APK" % ", ".join(PWSH_CANDIDATES)
+    pwsh = find_pwsh()
+    if pwsh is None:
+        return False, ("找不到 PowerShell 7（PATH、程序目录、%LOCALAPPDATA% 都没有）"
+                       "—— 跳过重打 APK")
     script = REPO / "android" / "build_apk.ps1"
     if not script.exists():
         return False, "找不到 android/build_apk.ps1"
-    log("  重打平板 APK（%s）..." % Path(pwsh).name)
-    rc, out = run([pwsh, "-NoProfile", "-File", str(script)], timeout=1800)
+    log("  重打平板 APK（%s）..." % pwsh.name)
+    rc, out = run([str(pwsh), "-NoProfile", "-File", str(script)], timeout=1800)
     if rc != 0:
         return False, "构建失败:\n" + out[-2500:]
     for ln in out.splitlines():
@@ -282,7 +322,6 @@ def apk_fingerprint() -> dict:
     apk = REPO / "MicroBench-平板工作台.apk"
     if not apk.exists():
         return {}
-    import hashlib
     h = hashlib.sha256(apk.read_bytes()).hexdigest().upper()
     return {"path": str(apk), "bytes": apk.stat().st_size, "sha256": h}
 

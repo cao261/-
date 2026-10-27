@@ -413,6 +413,59 @@ def test_known_providers_accept_reasoning_effort():
             f"{cfg['model']} 拿不到 low"
 
 
+# ---------------------------------------------------------------------------
+# 6b) 判定必须看**网关**，不看模型名（2026-10-27 审计对齐平板端）
+# ---------------------------------------------------------------------------
+
+def test_relay_gateway_with_minimax_name_does_not_get_reasoning_effort():
+    """自建/中转网关即使挂着 MiniMax 模型名，也不能发 reasoning_effort。
+
+    用户可以在 .env 里把自己的接口指向**任意** OpenAI 兼容网关，
+    那种网关上照样挂着「MiniMax-M3.1-Flash」这个模型名，
+    但它**不保证**转发 reasoning_effort → 发了就 **HTTP 400（请求直接被拒）**。
+
+    ⚠ 这条是子串匹配的经典漏网场景：base 里含 "minimax" 就会命中。
+    → 判据必须是**精确主机名**。
+    """
+    from microbench import llm
+    for base in ("https://minimax.中转.example.com/v1",
+                 "https://my-relay.example.com/v1",
+                 "https://api.minimaxi.com.evil.example/v1"):
+        cfg = {"model": "MiniMax-M3.1-Flash", "base_url": base, "api_key": "k"}
+        assert llm.reasoning_effort_for(cfg, "low") is None, \
+            f"{base} 误命中白名单 → 会发它不认的参数 → HTTP 400"
+
+
+def test_reasoning_effort_hostname_parsing():
+    """主机名解析要处理端口 / userinfo / 路径。"""
+    from microbench import llm
+    # 带端口 + userinfo 的官方网关 → 仍要认出来
+    cfg = {"model": "deepseek-flash",
+           "base_url": "https://user:pass@api.deepseek.com:443/v1", "api_key": "k"}
+    assert llm.reasoning_effort_for(cfg, "low") == "low", \
+        "带端口/userinfo 的官方网关没被认出来"
+    # 没有协议前缀的裸主机名
+    cfg2 = {"model": "deepseek-flash", "base_url": "api.deepseek.com/v1", "api_key": "k"}
+    assert llm.reasoning_effort_for(cfg2, "low") == "low", \
+        "裸主机名没被认出来"
+
+
+def test_desktop_and_tablet_use_the_same_host_whitelist():
+    """桌面端与平板端的网关白名单必须一致 —— 两端判据不同就会出现「一边 400」。"""
+    import re as _re
+    desktop = set(llm._REASONING_EFFORT_OK_HOSTS)
+    tablet_src = TABLET.read_text(encoding="utf-8")
+    start = tablet_src.index("AI_REASONING_EFFORT_OK_HOSTS")
+    block = tablet_src[start:start + 400]
+    # 白名单是 JS 数组字面量：一行里可能有多个字符串
+    tablet = set(_re.findall(r'"([a-z0-9.\-]+\.[a-z]{2,})"', block))
+    assert tablet, "没从平板端源码里解析出白名单 —— 解析方式要跟着格式改"
+    assert desktop == tablet, \
+        f"两端白名单不一致：桌面端 {desktop} vs 平板端 {tablet}"
+
+
+
+
 def test_stream_model_passes_reasoning_effort_into_payload():
     """_stream_model 必须真的把 reasoning_effort 放进请求体。"""
     src = LLM.read_text(encoding="utf-8")

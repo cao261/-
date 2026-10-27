@@ -23,7 +23,6 @@ AdvP4C4E74 …）在 PDF 里**没有完整的 ToUnicode 映射**，pdfplumber �
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import io
 import json
 import re
@@ -297,6 +296,10 @@ class GlyphDictionary:
         self.path = Path(path) if path else DEFAULT_DICT_PATH
         self.data: dict = {}
         self.dirty = False
+        # load() 发现文件损坏 → 置 True，之后 save() 一律拒绝写。
+        # 否则下一次 put() → save() 会用**空表**覆盖掉那份坏文件：
+        # 本来还能手工抢救的"半截 JSON"被彻底抹掉，跨设备学过的符号全没。
+        self.readonly = False
 
     def load(self) -> "GlyphDictionary":
         try:
@@ -315,12 +318,28 @@ class GlyphDictionary:
                         elif isinstance(v, str) and v:
                             # 旧格式：形状指纹 → 符号
                             self.data[str(k)] = {"sym": v, "shape": ""}
-        except Exception:
+        except Exception as e:
+            # ⚠ 不能静默清空：词典是跨设备共用、靠模型调用攒出来的资产。
+            #   这里把坏文件改名隔离（保留原始字节供人工排查），并置只读，
+            #   确保后面任何一次 save() 都不会用空表覆盖它。
             self.data = {}
+            self.readonly = True
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            quarantine = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+            kept = ""
+            try:
+                self.path.replace(quarantine)
+                kept = f"，已隔离为 {quarantine.name}"
+            except OSError:
+                kept = "，隔离失败（原文件仍在原处，本次运行不再写词典）"
+            print(f"[MicroBench] 符号词典损坏{kept}: {e}", file=sys.stderr)
         return self
 
     def save(self) -> None:
         if not self.dirty:
+            return
+        if self.readonly:
+            # 损坏词典的隔离副本还在，绝不能拿空表盖回去
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

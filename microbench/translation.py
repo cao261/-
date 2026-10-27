@@ -309,7 +309,7 @@ _LATEX_COMMANDS = {
     "leftrightarrow", "Rightarrow", "Leftarrow", "to", "infty", "partial",
     "nabla", "forall", "exists", "propto", "sim", "cong", "doteq",
     "left", "right", "big", "Big", "bigg", "Bigg", "quad", "qquad",
-    "begin", "end", "mathrm", "circ", "degree", "prime", "hbar", "ell",
+    "begin", "end", "circ", "degree", "prime", "hbar", "ell",
 }
 
 # "\/alpha" → "\alpha"：斜杠紧跟一个已知 LaTeX 命令时，它是坏掉的反斜杠。
@@ -523,6 +523,11 @@ def _sanitize_math_segment(text: str) -> str:
                   text, flags=re.DOTALL)
     text = re.sub(r"\\\((.+?)\\\)", lambda m: "$" + m.group(1) + "$",
                   text, flags=re.DOTALL)
+
+    # 3) 修 LaTeX
+    #
+    #    （这里原来还有一个 `_repair(m)` 内部函数，从未被调用 —— 下面的
+    #      内联实现才是生效的那份。已删除，避免后来人以为是两条路径。）
 
     pieces: list[str] = []
     last = 0

@@ -13,7 +13,6 @@ import os
 import sys
 import json
 import re
-import sys
 import hmac
 import hashlib
 import ipaddress
@@ -72,7 +71,7 @@ from .paper_text import (fetch_full_text, split_into_sections,
                           extract_text_from_pdf, extract_page_text_with_glyphs)
 from . import glyphs as glyphs_mod
 from . import pdf_cache
-from . import lan as lan_helpers
+from . import paperid
 from .lan import resolve_token as _resolve_lan_token
 
 
@@ -1404,13 +1403,37 @@ def _real_output_stats() -> dict:
                 note_total += 1
 
     translated_pages = 0
-    snap_dir = _sync_root() / "snapshots"
-    if snap_dir.is_dir():
+    # 统计口径（2026-10-27 修正，两处都是用户可见的"数字不对"）：
+    #
+    # 1) **本地快照目录 + 同步目录取并集**。原来只读同步目录 —— 用户还没
+    #    点过"同步"时同步目录里什么都没有，看板永远是 0（这正是历史上
+    #    "看板怎么都是零"的同型事故，AGENTS.md §4.2）。
+    # 2) 数「**真有译文**的页」，不是 `len(pages)`。pages 里含还没翻的
+    #    占位页，按长度数等于把"总页数"当"已译页数"，数字虚高。
+    #    口径与 /api/pdf/snapshot/list 的 translated_pages 对齐。
+    #
+    # ⚠ 同一篇可能两处都有，且**两份可能不一样**（实测：某篇本地 1 页、
+    #   同步 7 页）。所以必须按 `saved_at` 取更新的那份 ——
+    #   如果改成"先遇到先用"（先读本地），数字会从 69 掉到 63，
+    #   看起来像"数据丢了"，实际是数漏了。
+    best_per_paper: dict[str, tuple[str, int]] = {}
+    for snap_dir in (_snapshot_dir(), _sync_root() / "snapshots"):
+        if not snap_dir.is_dir():
+            continue
         for fp in snap_dir.glob("*.json"):
             data = _safe_read_json(fp) or {}
             pages = data.get("pages")
-            if isinstance(pages, list):
-                translated_pages += len(pages)
+            if not isinstance(pages, list):
+                continue
+            translated = sum(
+                1 for pg in pages
+                if isinstance(pg, dict) and pg.get("translation")
+            )
+            saved_at = str(data.get("saved_at") or "")
+            prev = best_per_paper.get(fp.stem)
+            if prev is None or saved_at > prev[0]:
+                best_per_paper[fp.stem] = (saved_at, translated)
+    translated_pages = sum(n for _, n in best_per_paper.values())
 
     annotation_count = 0
     ann_dir = _sync_root() / "annotations"
@@ -2001,11 +2024,14 @@ async def api_formula_image(
 
     try:
         # ⚠ 必须在线程里跑（M-2）：_pdf_clip_png 会 fitz.open(pdf) + 渲染，
-        #   是**同步的 CPU/IO 工作**。直接在这里调会把事件循环整个卡住
-        #   —— 期间看板计数、3 个 SSE 答疑面板、LAN 平板全部冻结。
+        #   是**同步的 CPU/IO 工作**（几十~几百毫秒）。直接在这里调会把
+        #   事件循环整个卡住 —— 期间看板计数、3 个 SSE 答疑面板、LAN 平板
+        #   全部冻结。
         #   to_thread 丢进 asyncio 默认执行器（上限 = min(32, cpu+4)），
         #   顺带也给了并发上限，不会被开几十个 fitz 实例把内存吃光。
-        png = await asyncio.to_thread(_pdf_clip_png, pdf_path, page, (x0, y0, x1, y1), scale)
+        #   （与 api_read_table 同一处理。）
+        png = await asyncio.to_thread(
+            _pdf_clip_png, pdf_path, page, (x0, y0, x1, y1), scale)
     except ValueError as e:
         msg = str(e)
         code = 404 if "页码越界" in msg else 400
@@ -2329,6 +2355,16 @@ async def api_upload_pdf(
             raise HTTPException(status_code=413, detail="PDF 文件不能超过 40MB")
     pdf_bytes = bytes(buf)
 
+    # 后缀只是"用户以为它是 PDF"。真正决定能不能解析的是文件头魔数 ——
+    # 一个 .pdf 结尾的 zip / html 会被写进 01_Literature，直到几秒后的抽取
+    # 阶段才报"无法识别文字"，错误位置离真因很远，还会在 vault 里留下垃圾。
+    if not pdf_bytes[:5] == b"%PDF-":
+        raise HTTPException(
+            status_code=400,
+            detail="这个文件不是 PDF（文件头不是 %PDF-）。如果是扫描版请先确认格式，"
+                   "如果是浏览器下载失败，重新下载一次再传。",
+        )
+
     try:
         # pdfplumber parsing is CPU-bound and can take seconds on a large
         # paper — keep it off the event loop.
@@ -2473,16 +2509,17 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
         #   pdfplumber 的页面解析是纯 CPU 且不可并行（实测线程池 0.97x），
         #   全库 27 篇抽一遍 = 72 秒、平均 2.7 秒/篇、最慢 9.7 秒
         #   → 唯一有效的优化是「别重复抽」。
-        #   缓存键含 (mtime, size) + EXTRACTOR_VERSION + 符号词典签名
-        #   → 文件改了/算法改了/词典变了都会自动失效（见 microbench/pdf_cache.py）。
-        cached = pdf_cache.read_cache(pdf_path, GLYPH_DICT_PATH)
+        #   缓存键含 (mtime, size) + EXTRACTOR_VERSION
+        #   → 文件改了/算法改了都会自动失效（见 microbench/pdf_cache.py）。
+        #   ⚠ 故意**不含**符号词典签名：抽取层不读词典，含进去会让后台
+        #     认字每保存一次词典就废掉全库缓存（详见该模块文档）。
+        cached = pdf_cache.read_cache(pdf_path)
         if cached is not None:
             pages = cached
         else:
             pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
             try:
-                pdf_cache.write_cache(pdf_path, GLYPH_DICT_PATH, pages,
-                                      pdf_cache.cache_key(pdf_path, GLYPH_DICT_PATH))
+                pdf_cache.write_cache(pdf_path, pages, pdf_cache.cache_key(pdf_path))
             except Exception:
                 pass
     except Exception as e:
@@ -3017,6 +3054,78 @@ def _translation_max_tokens(src_len: int, model: str = "") -> int:
     return base
 
 
+async def _translate_chunks(chunks: list[str],
+                            build_user_msg,
+                            model: str,
+                            m_name: str,
+                            m_fallback: bool,
+                            deadline: float,
+                            call_info: dict | None = None) -> tuple[list[str], str]:
+    """把若干分块依次翻完，返回 (译文片段列表, 停止原因)。
+
+    为什么不自己写循环：章节翻译和按页翻译的循环**逐行几乎一样**
+    （分块 → 查剩余时间 → 拼提示词 → 调 llm.chat → 收集结果），
+    只有三处不同：
+      - 提示词措辞（"论文章节" vs "第 N 页"）→ 由 `build_user_msg` 回调提供
+      - 实际用了哪个模型的回填 → `call_info` 字典（llm.chat 的 `ret=` 参数，
+        调用方传 None 就不回填）
+      - 出错时的提示文案（"LLM 翻译失败" vs "按页翻译失败"）→ 由调用方
+        在自己的 except 里处理（这里只抛 LLMError，不转 HTTPException）
+
+    ⚠ 三条不能改的细节（都踩过坑）：
+      1. `.strip()` 必须作用在 **await 之后的结果**上。
+         写成 `await asyncio.to_thread(...).strip()` 会把 .strip() 绑到
+         协程对象上 → "'coroutine' object has no attribute 'strip'"
+         → 两个翻译端点**全部失效**。
+      2. 单次调用的超时取「剩余时间的一半」：截断后 llm 层可能抬高预算
+         重试一次，留一半给它，整条链路才不会越过总时限。
+      3. llm.chat 是**同步**的 requests 调用，必须丢线程池
+         （直接调会占住事件循环整整一个往返）。
+    """
+    parts: list[str] = []
+    stopped_reason = ""
+    for idx, chunk in enumerate(chunks):
+        remaining = deadline - time.monotonic()
+        if remaining <= 5:
+            stopped_reason = "deadline"
+            break
+        user_msg = build_user_msg(idx, chunk, len(chunks))
+        call_timeout = int(max(20, min(300, remaining / 2)))
+        try:
+            translated = await asyncio.to_thread(
+                llm.chat,
+                messages=[
+                    {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=_translation_max_tokens(len(chunk), model),
+                # 翻译要的是「同一段原文 → 同一份译文」，temperature 必须为 0；
+                # 否则每次点「重新翻译」措辞都变，混着未译的元信息看着像时翻时不翻。
+                temperature=0.0,
+                # 强制思考的模型（M3.1-Flash）单次要跑 100~200s，超时要放开；
+                # 但不能超过这次请求的剩余时间，否则会越过总时限。
+                timeout=call_timeout,
+                # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
+                disable_thinking=llm.translation_disable_thinking(),
+                # 翻译专用模型（LLM_TRANSLATION_MODEL）；用户手动换了模型时以用户的为准
+                model_name=m_name or llm.translation_model_name(),
+                force_fallback=m_fallback,
+                # 整条链路（重试 + 抬预算重试）都受这个时限约束
+                deadline=deadline,
+                # 回填实际用的模型（自定义模型连不上会自动退回）
+                # → llm.chat 用 `ret=` 字典回填（不是 call_info 参数）
+                ret=call_info,
+            )
+        except llm.LLMError:
+            # 前面已经翻完了几段 → 返回部分结果，别把整篇的成果丢掉
+            if parts:
+                stopped_reason = "error"
+                break
+            raise
+        parts.append((translated or "").strip())
+    return parts, stopped_reason
+
+
 @app.post("/api/paper/translate_section")
 async def api_translate_section(req: TranslateRequest):
     """
@@ -3062,73 +3171,17 @@ async def api_translate_section(req: TranslateRequest):
     deadline = time.monotonic() + _translation_deadline_seconds(req.model)
     stopped_reason = ""
 
+    def _build_user_msg(idx: int, chunk: str, total: int) -> str:
+        if was_segmented:
+            return (
+                f"翻译以下学术论文章节 (标题: {req.section_title}, "
+                f"第 {idx + 1}/{total} 段):\n\n{chunk}"
+            )
+        return f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}"
+
     try:
-        for idx, chunk in enumerate(chunks):
-            remaining = deadline - time.monotonic()
-            if remaining <= 5:
-                stopped_reason = "deadline"
-                break
-            if was_segmented:
-                user_msg = (
-                    f"翻译以下学术论文章节 (标题: {req.section_title}, "
-                    f"第 {idx + 1}/{len(chunks)} 段):\n\n{chunk}"
-                )
-            else:
-                user_msg = (
-                    f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}"
-                )
-            # llm.chat() is a *synchronous* requests-based call with a 120s
-            # timeout. Calling it straight from this async def pins the event
-            # loop for the whole round trip, so every other endpoint (stats,
-            # feed, model probe) stalls while one section translates — and this
-            # loop can do it once per chunk. Hand it to a worker thread.
-            #
-            # NOTE: the `.strip()` must apply to the RESULT, not to the
-            # coroutine object returned by asyncio.to_thread. Writing
-            # `await asyncio.to_thread(...).strip()` binds .strip() to the
-            # coroutine and raises
-            #   "'coroutine' object has no attribute 'strip'"
-            # — which broke both translation endpoints completely.
-            #
-            # 单次调用的超时取「剩余时间的一半」：截断后 llm 层还可能抬高预算
-            # 重试一次，留一半给它，整条链路才不会越过总时限。
-            call_timeout = int(max(20, min(300, remaining / 2)))
-            try:
-                translated = await asyncio.to_thread(
-                    llm.chat,
-                    messages=[
-                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    # 输出预算按分块长度自适应（见 _translation_max_tokens）：
-                    # 思考型模型的推理 token 与正文共用同一个 max_tokens 池，固定
-                    # 4000 正好是最容易被截断的档位，截断了译文就断在半句。
-                    max_tokens=_translation_max_tokens(len(chunk), model),
-                    # 翻译要的是「同一段原文 → 同一份译文」，temperature 必须为 0；
-                    # 否则每次点「重新翻译」措辞都变，混着未译的元信息看着像时翻时不翻。
-                    temperature=0.0,
-                    # Generous timeout — MiniMax thinking mode can take 60s
-                    # per chunk; multi-chunk translations need headroom.
-                    # 强制思考的模型（M3.1-Flash）单次要跑 100~200s，120s 会把
-                    # 它砍在半路（砍掉之后拿到的还是残缺译文）。
-                    timeout=call_timeout,
-                    # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
-                    disable_thinking=llm.translation_disable_thinking(),
-                    # 翻译专用模型（LLM_TRANSLATION_MODEL）：M3.1-Flash 强制思考，
-                    # 直译会又慢又断句，单独指定一个能关思考的模型更稳。
-                    # 用户手动换了模型时以用户的为准。
-                    model_name=_m_name or llm.translation_model_name(),
-                    force_fallback=_m_fallback,
-                    # 整条链路（重试 + 抬预算重试）都受这个时限约束
-                    deadline=deadline,
-                )
-            except llm.LLMError:
-                # 前面已经翻完了几段 -> 返回部分结果，别把整节的成果丢掉
-                if translated_parts:
-                    stopped_reason = "error"
-                    break
-                raise
-            translated_parts.append((translated or "").strip())
+        translated_parts, stopped_reason = await _translate_chunks(
+            chunks, _build_user_msg, model, _m_name, _m_fallback, deadline)
     except llm.LLMError as e:
         msg = str(e)
         if ("时限" in msg or "timed out" in msg.lower()
@@ -3166,42 +3219,23 @@ async def api_translate_section(req: TranslateRequest):
             file=sys.stderr,
         )
         try:
-            retry_parts: list[str] = []
-            for idx, chunk in enumerate(chunks):
-                hint = ""
-                if leaked:
-                    hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
-                            + "\n".join(x[:200] for x in leaked[:5]))
+            hint = ""
+            if leaked:
+                hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
+                        + "\n".join(x[:200] for x in leaked[:5]))
+
+            def _build_retry_msg(idx: int, chunk: str, total: int) -> str:
                 if was_segmented:
-                    user_msg = (
+                    return (
                         f"翻译以下学术论文章节 (标题: {req.section_title}, "
-                        f"第 {idx + 1}/{len(chunks)} 段):\n\n{chunk}{hint}"
+                        f"第 {idx + 1}/{total} 段):\n\n{chunk}{hint}"
                     )
-                else:
-                    user_msg = (
-                        f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}{hint}"
-                    )
-                retry_parts.append(
-                    (
-                        await asyncio.to_thread(
-                            llm.chat,
-                            messages=[
-                                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                                {"role": "user", "content": user_msg},
-                            ],
-                            max_tokens=_translation_max_tokens(len(chunk), model),
-                            temperature=0.0,
-                            # 重译同样受总时限约束，别让「重译一次」再拖一轮
-                            timeout=int(max(20, min(300, max(1.0, deadline - time.monotonic()) / 2))),
-                            disable_thinking=llm.translation_disable_thinking(),
-                            # 必须用同一个翻译模型：主模型和翻译模型措辞风格不同，
-                            # 混用会让"重译版"看起来像另一份译文
-                            model_name=_m_name or llm.translation_model_name(),
-                            force_fallback=_m_fallback,
-                            deadline=deadline,
-                        )
-                    ).strip()
-                )
+                return f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}{hint}"
+
+            retry_parts, _ = await _translate_chunks(
+                chunks, _build_retry_msg, model, _m_name, _m_fallback, deadline,
+                call_info=None,
+            )
             retry_text = sanitize_translation(merge_translation_parts(retry_parts))
             if retry_text and len(retry_text) >= len(translation) * 0.9:
                 translation = retry_text
@@ -3746,7 +3780,11 @@ def _extract_page_cached(pdf_path, page_no: int) -> tuple[str, list]:
     缓存里的 `⟦G:n⟧` 标记下标也仍然对得上。
     """
     try:
-        cached = pdf_cache.read_cache(pdf_path, GLYPH_DICT_PATH)
+        # ⚠ 单参数调用（与 api_open_vault_pdf 的写侧**同一个签名**）：
+        #   缓存键不含符号词典（抽取层不读词典，见 pdf_cache 模块文档），
+        #   若这里多传一个参数 → 两边算出**不同的键** → 一份写一份读
+        #   → 缓存**永远命中不了** → 用户每次都等 2.7~9.7 秒重抽。
+        cached = pdf_cache.read_cache(pdf_path)
     except Exception:
         cached = None
     if cached:
@@ -3796,6 +3834,8 @@ async def api_translate_page(req: TranslatePageRequest):
             # 两步修：
             #   ① 先查磁盘缓存（pdf_cache）→ 命中就是 ~0ms；
             #   ② 没命中就丢进线程 → 事件循环不再被卡（代价不变，只是不再冻结全站）。
+            # ⚠ 缓存的读写两侧必须用**同一个签名**（pdf_cache.cache_key 单一真相），
+            #   否则一份写一份读 → 缓存永远命中不了。
             extracted, page_glyphs = await asyncio.to_thread(
                 _extract_page_cached, pdf_path, req.page)
             if extracted and len(extracted.strip()) >= 100:
@@ -3841,52 +3881,19 @@ async def api_translate_page(req: TranslatePageRequest):
     # 单次翻译请求的总时限（见 api_translate_section 的同名逻辑）
     deadline = time.monotonic() + _translation_deadline_seconds(req.model)
     stopped_reason = ""
+
+    def _build_user_msg(idx: int, chunk: str, total: int) -> str:
+        if total > 1:
+            return (
+                f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{total} 段):\n\n{chunk}"
+            )
+        return f"翻译以下学术论文第 {req.page} 页:\n\n{chunk}"
+
     try:
-        for idx, chunk in enumerate(chunks):
-            remaining = deadline - time.monotonic()
-            if remaining <= 5:
-                stopped_reason = "deadline"
-                break
-            if len(chunks) > 1:
-                user_msg = (
-                    f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{len(chunks)} 段):\n\n{chunk}"
-                )
-            else:
-                user_msg = f"翻译以下学术论文第 {req.page} 页:\n\n{chunk}"
-            # 单次调用的超时取剩余时间的一半，给「截断后抬预算重试」留位置
-            call_timeout = int(max(20, min(300, remaining / 2)))
-            try:
-                translated = await asyncio.to_thread(
-                    llm.chat,
-                    messages=[
-                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    max_tokens=_translation_max_tokens(len(chunk), model),
-                    # 翻译要确定性：同一段原文每次都该得到同一份译文
-                    temperature=0.0,
-                    # 强制思考的模型单次要跑 100~200s，超时要放开；但不能超过
-                    # 这次请求的剩余时间，否则会越过总时限。
-                    timeout=call_timeout,
-                    # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
-                    disable_thinking=llm.translation_disable_thinking(),
-                    # 翻译专用模型（LLM_TRANSLATION_MODEL）；用户手动换了模型时以用户的为准
-                    model_name=_m_name or llm.translation_model_name(),
-                    force_fallback=_m_fallback,
-                    # 整条链路（重试 + 抬预算重试）都受这个时限约束
-                    deadline=deadline,
-                    # 回填实际用的模型（自定义模型连不上会自动退回）
-                    ret=call_info,
-                )
-            except llm.LLMError:
-                # 前面已经翻完了几段 -> 返回部分结果
-                if translated_parts:
-                    stopped_reason = "error"
-                    break
-                raise
-            # `.strip()` must apply to the awaited result, not to the
-            # coroutine (see the same note in api_translate_section).
-            translated_parts.append((translated or "").strip())
+        translated_parts, stopped_reason = await _translate_chunks(
+            chunks, _build_user_msg, model, _m_name, _m_fallback, deadline,
+            call_info=call_info,
+        )
     except llm.LLMError as e:
         msg = str(e)
         if ("时限" in msg or "timed out" in msg.lower()
@@ -3934,38 +3941,23 @@ async def api_translate_page(req: TranslatePageRequest):
             file=sys.stderr,
         )
         try:
-            retry_parts: list[str] = []
-            for idx, chunk in enumerate(chunks):
-                hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
-                        + "\n".join(x[:200] for x in leaked[:5]))
-                if len(chunks) > 1:
-                    user_msg = (
-                        f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{len(chunks)} 段):"
+            hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
+                    + "\n".join(x[:200] for x in leaked[:5]))
+
+            def _build_retry_msg(idx: int, chunk: str, total: int) -> str:
+                if total > 1:
+                    return (
+                        f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{total} 段):"
                         f"\n\n{hint}\n\n{chunk}"
                     )
-                else:
-                    user_msg = f"翻译以下学术论文第 {req.page} 页:\n\n{hint}\n\n{chunk}"
-                retry_parts.append(
-                    (
-                        await asyncio.to_thread(
-                            llm.chat,
-                            messages=[
-                                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                                {"role": "user", "content": user_msg},
-                            ],
-                            max_tokens=_translation_max_tokens(len(chunk), model),
-                            temperature=0.0,
-                            # 重译同样受总时限约束，别让「重译一次」再拖一轮
-                            timeout=int(max(20, min(300, max(1.0, deadline - time.monotonic()) / 2))),
-                            disable_thinking=llm.translation_disable_thinking(),
-                            # 必须用同一个翻译模型：主模型和翻译模型措辞风格不同，
-                            # 混用会让"重译版"看起来像另一份译文
-                            model_name=_m_name or llm.translation_model_name(),
-                            force_fallback=_m_fallback,
-                            deadline=deadline,
-                        )
-                    ).strip()
-                )
+                return f"翻译以下学术论文第 {req.page} 页:\n\n{hint}\n\n{chunk}"
+
+            # call_info=None：不回填 —— 结果里报的是**第一遍**实际用的模型，
+            # 重译只是补救，不该把徽标改成重译那一遍的模型。
+            retry_parts, _ = await _translate_chunks(
+                chunks, _build_retry_msg, model, _m_name, _m_fallback, deadline,
+                call_info=None,
+            )
             retry_text = sanitize_translation(merge_translation_parts(retry_parts))
             if retry_text and len(retry_text) >= len(translation) * 0.9:
                 translation = retry_text
@@ -4196,17 +4188,81 @@ def _ensure_snapshot_dir() -> Path:
 def _snapshot_path(paper_id: str) -> Path:
     # paper_id is computed in JS as `${_paperBase}_${hash}` and is already
     # filename-safe (alphanumeric + underscore). Defensive-normalize anyway.
-    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "snapshot"
+    safe = _safe_paper_key(paper_id, "snapshot")
     return _snapshot_dir() / f"{safe}.json"
 
 
 def _safe_read_json(path: Path) -> Optional[dict]:
+    """宽容读 JSON：文件不存在 / 内容坏掉 → 都返回 None。
+
+    ⚠ 只适用于「读不到就当没有」的场景（列目录、读可选配置）。
+    **写路径上的"读旧值再合并"绝对不能用它** —— 详见
+    `_read_json_or_quarantine()`。
+    """
     try:
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本：先写同目录 `.tmp`，再 `os.replace` 覆盖目标。
+
+    为什么必须（不只是"优雅"）：这些 JSON 都住在**坚果云同步目录**里。
+    直接 `write_text` 时，文件在「已被截断、还没写完」的那一瞬间会被同步
+    客户端抓走并上行，另一台设备拿到半截 JSON → 解析失败 → 用户的批注/
+    进度看起来"没了"。`os.replace` 在同一分区上是原子的，同步端只会看到
+    旧文件或新文件，不会看到中间态。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_json(path: Path, obj, indent: int = 1) -> None:
+    """原子写 JSON（中文原样存，不转 \\uXXXX）。"""
+    _atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent))
+
+
+def _read_json_or_quarantine(path: Path) -> Optional[dict]:
+    """读 JSON；**损坏的文件改名隔离并报错**，不当成"没有"。
+
+    为什么必须区分（2026-10-27）：
+
+    批注保存是「读磁盘旧值 → 按 id 合并 → 写回」。如果旧值是坚果云同步
+    中断/断电留下的**半截 JSON**，`_safe_read_json` 会返回 None
+    → 合并基数变成空列表 → 写回时把磁盘上**其它所有批注**永久抹掉，
+    而用户看到的是"✅ 保存成功"。一条数据都不报错地消失，最难查。
+
+    宁可让这次保存失败并告诉用户"文件损坏，已备份到 X"，也不能静默清空。
+    """
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as e:
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
+        kept = ""
+        try:
+            os.replace(path, quarantine)
+            kept = f"，已隔离为 {quarantine.name}"
+        except OSError:
+            kept = "，且隔离失败（原文件仍在原处）"
+        msg = f"文件内容损坏{kept}: {path.name} ({e})"
+        print(f"[microbench] {msg}", file=sys.stderr)
+        raise ValueError(msg)
 
 
 @app.get("/api/pdf/snapshot/list")
@@ -4282,7 +4338,7 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
     Writes atomically via a .tmp + os.replace to avoid leaving half-files
     if MicroBench is killed mid-write.
     """
-    safe_id = "".join(c for c in req.paper_id if c.isalnum() or c in "_-")[:128]
+    safe_id = _safe_paper_key(req.paper_id, "snapshot")
     if len(safe_id) < 3:
         raise HTTPException(status_code=400, detail="paper_id 非法")
 
@@ -4329,17 +4385,9 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
 
     _ensure_snapshot_dir()   # 写路径才建目录（M-3：读路径不建）
     target = _snapshot_path(safe_id)
-    tmp = target.with_suffix(".json.tmp")
     try:
-        tmp.write_text(serialized, encoding="utf-8")
-        os.replace(tmp, target)
+        _atomic_write_text(target, serialized)
     except Exception as e:
-        # Best-effort cleanup of orphan .tmp
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
         raise HTTPException(status_code=500, detail=f"写盘失败: {_safe_err(e)}")
 
     return {
@@ -4512,9 +4560,36 @@ def _sync_dir(kind: str) -> Path:
     return p
 
 
-def _safe_paper_key(paper_id: str) -> str:
-    """论文 id → 可用作文件名/字典键的安全串。"""
-    return "".join(c for c in (paper_id or "") if c.isalnum() or c in "_-")[:128] or "progress"
+def _safe_paper_key(paper_id: str, default: str = "progress") -> str:
+    """论文 id → 可用作文件名/字典键的安全串。
+
+    `default` 是「整个 id 都被过滤成空」时的回落串。**调用方要显式传自己
+    通道的名字**（快照 "snapshot" / 批注 "annotations"），否则空 id 会在
+    不同通道里撞到同一个文件名（原来是写死 "progress"，批注通道又各抄了
+    一份 "annotations" 的版本）。
+    """
+    return "".join(c for c in (paper_id or "") if c.isalnum() or c in "_-")[:128] or default
+
+
+# 阅读进度是同步目录里**唯一没有大小上限**的落盘 JSON（快照 5MB、批注 2MB
+# 都有闸门），而它是浏览器直接传来的 dict。正常一条只有几百字节，但接口上
+# 没有任何东西阻止它变成几 MB —— 一次异常调用就能把同步目录塞满。
+_PROGRESS_MAX_BYTES = 64 * 1024
+_PROGRESS_CORE_FIELDS = ("paper_id", "page", "mode", "zoom", "scroll_top", "updated_at")
+
+
+def _trim_progress_record(rec: dict) -> dict:
+    """限制阅读进度的体积：超长时只保留"能定位到哪篇哪一页"的核心字段。
+
+    注意是**降级**而不是拒绝 —— 进度丢了，用户下次打开会跳回第一页，
+    比"体积没超"重要得多。
+    """
+    try:
+        if len(json.dumps(rec, ensure_ascii=False).encode("utf-8")) <= _PROGRESS_MAX_BYTES:
+            return rec
+    except (TypeError, ValueError):
+        pass
+    return {k: rec[k] for k in _PROGRESS_CORE_FIELDS if k in rec}
 
 
 # ---------------------------------------------------------------------------
@@ -4539,34 +4614,18 @@ def _safe_paper_key(paper_id: str) -> str:
 
 SYNC_FILE_SUBDIR = "files"
 PDF_MAX_BYTES = 256 * 1024 * 1024
-_JS_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
-
-
-def _js_base36(n: int) -> str:
-    """JS 的 Number.prototype.toString(36)。"""
-    if n == 0:
-        return "0"
-    out = []
-    while n:
-        out.append(_JS_BASE36[n % 36])
-        n //= 36
-    return "".join(reversed(out))
-
-
-def _djb2_base36_utf16(s: str) -> str:
-    """JS 的 djb2 + toString(36)，**按 UTF-16 码元**迭代。
-
-    ⚠ JS 的 s.charCodeAt(i) 取 UTF-16 码元，Python 的 ord(ch) 取码点 ——
-      路径里有 emoji（代理对）时两端算出的哈希不一样，
-      paper_id / 批注 / 快照 / 阅读进度就**静默**对不上。
-      实现与 merge_changes.djb2_base36 保持一致（那边本来就写对了）。
-    """
-    h = 5381
-    raw = s.encode("utf-16-le", errors="surrogatepass")
-    for i in range(0, len(raw), 2):
-        unit = raw[i] | (raw[i + 1] << 8)
-        h = ((h << 5) + h + unit) & 0xFFFFFFFF
-    return _js_base36(h)
+# JS 的 djb2 + toString(36)，**按 UTF-16 码元**迭代。
+#
+# ⚠ JS 的 s.charCodeAt(i) 取 UTF-16 码元，Python 的 ord(ch) 取码点 ——
+#   路径里有 emoji（代理对）时两端算出的哈希不一样，
+#   paper_id / 批注 / 快照 / 阅读进度就**静默**对不上。
+#
+# → 实现已搬到 `microbench/paperid.py`（与 merge_changes 共用同一份；
+#   那边原来少一个 `errors="surrogatepass"`，遇到孤立代理项会抛异常）。
+#   这里直接**别名**，不写包装函数 —— 包装会让"两处是不是同一份实现"
+#   变得没法用 `is` 验证。
+_djb2_base36_utf16 = paperid.djb2_base36
+_js_base36 = paperid.js_base36
 
 
 def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
@@ -4690,14 +4749,9 @@ def _paper_id_for(relative_path: str) -> str:
        Python 的 ord(ch) 取码点（emoji 算 1 个）—— 路径里只要有 emoji
        （或扩展 B 区的汉字），两端算出的 paper_id 就不同，
        批注/快照/阅读进度**静默**认不出来。
-       下面直接复用 merge_changes.djb2_base36 —— 那边已经写对了。
+       → 算法在 `microbench/paperid.py`，与 merge_changes 共用同一份。
     """
-    path = (relative_path or "").replace("\\", "/")
-    base = path.split("/")[-1]
-    if base.lower().endswith(".pdf"):
-        base = base[:-4]
-    base = base[:70] or "paper"
-    return f"{base}_{_djb2_base36_utf16(path)}"
+    return paperid.paper_id_for(relative_path)
 
 
 def _sha256_file(path: Path) -> str:
@@ -4748,13 +4802,11 @@ def _vault_pdfs() -> list:
 def _write_file_meta(safe: str, meta: dict) -> None:
     meta["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
     path = _file_meta_path(safe)
-    # ⚠ 必须 tmp + os.replace。
+    # ⚠ 必须原子写（tmp + os.replace）。
     #   这个目录在坚果云的同步范围内 —— 直接 write_text 的话，
     #   写到一半就被坚果云上传了，另一台设备读到半截 JSON，
     #   _safe_read_json 静默返回 None → 那篇 PDF 的清单凭空消失。
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    _atomic_write_json(path, meta)
 
 
 def _device_id() -> str:
@@ -4774,11 +4826,11 @@ def _device_id() -> str:
         pass
     did = uuid.uuid4().hex[:12]
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(
+        _atomic_write_json(
+            p,
             {"device_id": did,
              "created_at": _dt.datetime.now().isoformat(timespec="seconds")},
-            ensure_ascii=False, indent=1), encoding="utf-8")
+        )
     except OSError:
         pass
     return did
@@ -4978,11 +5030,7 @@ def _read_local_progress() -> dict:
 
 
 def _write_local_progress(data: dict) -> None:
-    p = _local_progress_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, p)
+    _atomic_write_json(_local_progress_path(), data)
 
 
 def _merge_annotation_lists(existing: list, incoming: list, deleted: list) -> list:
@@ -5040,10 +5088,18 @@ def _sync_root_display(root: Path, request: Request | None = None) -> str:
 
 
 @app.post("/api/sync")
-async def api_sync(req: SyncRequest, request: Request):
+def api_sync(req: SyncRequest, request: Request):
     """一键同步：推送本机状态 + 拉取共享目录里的状态（两边都做，幂等）。
 
     两台设备点同一个按钮即可：推的是自己，拉的是对方，最后合并。
+
+    ⚠ **同步 def，不是 async def**（2026-10-27）。整个函数体是**纯同步
+      磁盘 IO**：遍历同步目录、逐个读 JSON、算 sha256（逐 MB 读）、
+      复制 PDF 本体（可能几百 MB）。写在 async def 里会**独占事件循环**
+      整段时间 —— 用户点一次同步，正在跑的翻译 SSE 流和答疑全部卡住。
+
+      改成同步 def → FastAPI 自动丢进 anyio 线程池执行。
+      与 api_stats / api_find_pdf / api_list_vault_pdfs 同一处理。
     """
     _t0 = time.monotonic()
     root = _sync_root()
@@ -5069,9 +5125,7 @@ async def api_sync(req: SyncRequest, request: Request):
                 merged = _merge_snapshot_files(dst, fp)
                 if merged is None:
                     continue
-                tmp = dst.with_suffix(".json.tmp")
-                tmp.write_text(merged, encoding="utf-8")
-                os.replace(tmp, dst)
+                _atomic_write_text(dst, merged)
                 pushed["snapshots"].append(fp.name)
             except OSError:
                 continue
@@ -5098,12 +5152,15 @@ async def api_sync(req: SyncRequest, request: Request):
     if not req.pull_only and req.progress:
         pid = (req.paper_id or req.progress.get("paper_id") or "").strip()
         if pid:
-            safe = "".join(c for c in pid if c.isalnum() or c in "_-")[:128] or "progress"
+            safe = _safe_paper_key(pid, default="progress")
             rec = dict(req.progress)
             rec["paper_id"] = pid
             rec["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-            ( _sync_dir("progress") / f"{safe}.json").write_text(
-                json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+            # 阅读进度是唯一没有大小上限的落盘 JSON（快照 5MB、批注 2MB），
+            # 而它是从浏览器直接传来的。裁掉未知字段并限长，防止一次调用
+            # 把同步目录塞进几十 MB 垃圾。
+            rec = _trim_progress_record(rec)
+            _atomic_write_json(_sync_dir("progress") / f"{safe}.json", rec)
             pushed["progress"].append(safe + ".json")
 
     # ---------- 推送：论文 PDF 本体（增量，只传变化过的） ----------
@@ -5111,8 +5168,9 @@ async def api_sync(req: SyncRequest, request: Request):
         # ⚠ M-B（2026-10-27 审计）：files 通道是**重活**（逐文件 sha256 +
         #   79 MB 拷贝），原来在 async 端点里**同步**执行 →
         #   事件循环被整个占住 → 期间看板计数、3 个 SSE 答疑面板、LAN 平板全卡。
-        #   丢进线程执行（同步语义不变：同一进程内本来就串行）。
-        rep = await asyncio.to_thread(_sync_push_files)
+        #   → 整个端点改成**同步 def**（FastAPI 自动丢进 anyio 线程池），
+        #     这里就直接同步调用，不用再 to_thread。
+        rep = _sync_push_files()
         files_report["push"] = rep
         pushed["files"] = list(rep.get("published", [])) + list(rep.get("updated", []))
 
@@ -5130,9 +5188,7 @@ async def api_sync(req: SyncRequest, request: Request):
                 merged = _merge_snapshot_files(dst, fp)
                 if merged is None:
                     continue
-                tmp = dst.with_suffix(".json.tmp")
-                tmp.write_text(merged, encoding="utf-8")
-                os.replace(tmp, dst)
+                _atomic_write_text(dst, merged)
                 pulled["snapshots"].append(fp.name)
                 snapshot_updated = True
             except OSError:
@@ -5172,7 +5228,7 @@ async def api_sync(req: SyncRequest, request: Request):
         prog = _read_local_progress()
         target_pid = (req.paper_id or "").strip()
         if target_pid:
-            safe = "".join(c for c in target_pid if c.isalnum() or c in "_-")[:128] or "progress"
+            safe = _safe_paper_key(target_pid, "progress")
             src = _sync_dir("progress") / f"{safe}.json"
             remote = _safe_read_json(src)
             if remote and _anno_is_newer(remote.get("updated_at", ""),
@@ -5187,7 +5243,7 @@ async def api_sync(req: SyncRequest, request: Request):
         # ---------- 拉取：论文 PDF 本体（还原到 vault 原来的相对路径） ----------
         if req.include_files and not req.push_only:
             # 同上（M-B）：拉取也是重活（还原 = 拷贝 79 MB）。
-            rep = await asyncio.to_thread(_sync_pull_files)
+            rep = _sync_pull_files()
             files_report["pull"] = rep
             pulled["files"] = list(rep.get("restored", []))
 
@@ -5215,11 +5271,13 @@ class FileReleaseRequest(BaseModel):
 
 
 @app.post("/api/sync/files/release")
-async def api_sync_files_release(req: FileReleaseRequest):
+def api_sync_files_release(req: FileReleaseRequest):
     """释放云端 PDF 实体，腾出坚果云空间。
 
     只删 files/*.pdf 实体，保留清单（files/*.json）以及批注、译文快照、阅读进度
     —— 那些是真正攒下来的东西，PDF 随时能重新下。
+
+    ⚠ 同步 def（删几百 MB 的文件是同步阻塞 IO，不该占着事件循环）。
     """
     files_dir = _files_dir()
     targets = []
@@ -5384,7 +5442,7 @@ def _ensure_annotations_dir() -> Path:
 
 def _legacy_annotation_paths(paper_id: str) -> list:
     """更早的批注存放位置（读时回落，升级不丢数据）。"""
-    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    safe = _safe_paper_key(paper_id, "annotations")
     return [
         _sync_root() / f"{safe}.json",                                   # 扁平布局
         BASE_DIR.joinpath(*ANNOTATION_LEGACY_SUBDIR) / f"{safe}.json",   # 只在本机 logs/ 下
@@ -5392,7 +5450,7 @@ def _legacy_annotation_paths(paper_id: str) -> list:
 
 
 def _annotation_path(paper_id: str) -> Path:
-    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    safe = _safe_paper_key(paper_id, "annotations")
     return _annotations_dir() / f"{safe}.json"
 
 
@@ -5448,7 +5506,7 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
       - deleted 里的 id → 从磁盘上删掉（否则另一台设备会把已删的批注"复活"）
     这样在两台设备上分别标注不会互相覆盖。
     """
-    safe_id = "".join(c for c in req.paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    safe_id = _safe_paper_key(req.paper_id, "annotations")
     now = _dt.datetime.now().isoformat(timespec="seconds")
 
     _ensure_annotations_dir()   # 写路径才建目录（M-3：GET 不再往坚果云根里建目录）
@@ -5468,10 +5526,19 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
     #   和读完时取的那份比对；变了说明**另一台设备刚写过** →
     #   重新读 + 重新合并再来一轮（最多 3 轮）。
     #   窗口从「整个同步往返」缩到「一次文件读」。
+    #
+    # ⚠⚠ 读旧值**必须**用 `_read_json_or_quarantine` 而不是 `_safe_read_json`：
+    #   损坏的文件（坚果云同步中断/断电留下的半截 JSON）若被当成「没有」，
+    #   合并基数就变成空列表 → 写回时把磁盘上**其它所有批注**永久抹掉，
+    #   而用户看到的是「✅ 保存成功」—— 一条数据都不报错地消失，最难查。
+    #   → 损坏时宁可让这次保存失败并告诉用户，也绝不静默清空。
     payload: dict = {}
     serialized = ""
     for _attempt in range(3):
-        existing = _safe_read_json(target)
+        try:
+            existing = _read_json_or_quarantine(target)
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=_safe_err(e))
         if not existing:
             for legacy in _legacy_annotation_paths(safe_id):
                 existing = _safe_read_json(legacy)
@@ -5501,14 +5568,11 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
         # 期间被另一台设备改了 → 下一轮重新读 + 重新合并（不丢对方的批注）
 
     try:
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(serialized, encoding="utf-8")
-        os.replace(tmp, target)
+        # ⚠ 原子写（坚果云同步目录）：先写同目录 .tmp 再 os.replace ——
+        #   同步客户端只会看到旧文件或新文件，不会看到半截 JSON。
+        #   （统一用 `_atomic_write_text`，别再各写一份。）
+        _atomic_write_text(target, serialized)
     except Exception as e:
-        try:
-            tmp.unlink()
-        except Exception:
-            pass
         raise HTTPException(status_code=500, detail=f"批注写盘失败: {_safe_err(e)}")
 
     return {
@@ -5543,10 +5607,7 @@ async def api_pdf_annotations_delete(
         payload["annotations"] = kept
         payload["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-            os.replace(tmp, path)
+            _atomic_write_json(path, payload)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"批注删除失败: {_safe_err(e)}")
     return {"status": "success", "paper_id": paper_id, "deleted": deleted}

@@ -186,12 +186,26 @@ def test_formula_image_clip_runs_in_thread():
     ⚠ 断言必须**限定在 api_formula_image 这个函数里**：
       `_pdf_clip_png` 还被 _read_table_vision（抄表）用着，
       全文件 grep 会两边都命中 → 护栏对该修复零覆盖。
+
+    ⚠ 2026-10-28 合并修正：原来断言的是字面量
+      `"asyncio.to_thread(_pdf_clip_png"`（**单行**），
+      对方设备把同一个调用换行写成
+      `await asyncio.to_thread(\n    _pdf_clip_png, ...)` →
+      **语义完全相同**但字符串不匹配 → 护栏误报（假红）。
+      → 改成断言「`_pdf_clip_png` 的调用出现在 `to_thread(` 之后」
+      （忽略换行/空白），并**排除**裸同步调用。
     """
     import inspect
     from microbench import app as app_mod
 
     src = inspect.getsource(app_mod.api_formula_image)
-    assert "asyncio.to_thread(_pdf_clip_png" in src, src[-800:]
+    # 去掉所有空白后再比对 → 换行写法不再骗过护栏
+    flat = re.sub(r"\s+", "", src)
+    assert "asyncio.to_thread(_pdf_clip_png" in flat, src[-800:]
+    # 反向护栏：不能有绕过 to_thread 的裸调用
+    #   （"to_thread(" 后面紧跟 _pdf_clip_png 已由上面覆盖；
+    #    这里额外确认函数体里没有 "png = _pdf_clip_png" 这种裸调）
+    assert "png=_pdf_clip_png(" not in flat, src[-800:]
 
 
 def test_translate_page_extraction_runs_in_thread():
@@ -210,13 +224,30 @@ def test_translate_page_extraction_runs_in_thread():
 
 
 def test_sync_files_channel_runs_in_thread():
-    """同步的 files 通道（sha256 + 79MB 拷贝）必须 to_thread。"""
+    """同步的 files 通道（sha256 + 79MB 拷贝）不能堵事件循环。
+
+    ⚠ 2026-10-28 合并修正：对方设备把 `/api/sync` 整个改成**同步 def**
+      （函数体全是同步磁盘 IO → FastAPI 自动丢进 anyio 线程池）。
+      原来的断言是字面量 `"asyncio.to_thread(_sync_push_files)"` →
+      端点改成同步 def 之后 `to_thread` 反而**多余**（线程池里再开线程）
+      → 护栏要求的是一个**更差**的实现形态。
+
+    → 改成断言**行为语义**：
+      ① 端点**不是** async def（否则它会独占事件循环）；
+      ② files 通道的重活调用仍被调用到（没被误删）。
+    """
     import inspect
     from microbench import app as app_mod
 
+    # ① 必须是同步端点 → FastAPI 自动丢线程池 → 不冻结事件循环
+    assert not inspect.iscoroutinefunction(app_mod.api_sync), \
+        "api_sync 又变回 async def 了 → 整个同步磁盘 IO 会独占事件循环"
+
     src = inspect.getsource(app_mod.api_sync)
-    assert "asyncio.to_thread(_sync_push_files)" in src
-    assert "asyncio.to_thread(_sync_pull_files)" in src
+    flat = re.sub(r"\s+", "", src)
+    # ② files 通道的重活还在被调用
+    assert "_sync_push_files(" in flat, src[-800:]
+    assert "_sync_pull_files(" in flat, src[-800:]
 
 
 def test_extract_page_cached_uses_disk_cache(monkeypatch):
