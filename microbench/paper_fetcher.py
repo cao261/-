@@ -3,6 +3,7 @@ Paper metadata fetcher for arXiv and Crossref (DOI).
 Provides automated extraction of title, authors, year, abstract, BibTeX, and PDF download.
 """
 
+import os
 import re
 import urllib.parse
 import ipaddress
@@ -12,26 +13,36 @@ import requests
 from . import netutil
 
 
-def _get(url, **kw):
-    """带代理兜底的 GET：环境代理不可用时自动改直连并重试一次。"""
+def _request_with_proxy_fallback(method: str, url, **kw):
+    """带代理兜底的请求：环境代理不可用时自动改直连并重试一次。
+
+    `_get` / `_head` 原来是两份逐字相同的实现（只差 requests.get/head），
+    合并成一份，避免以后只改一边。
+
+    ⚠ 用 `proxies={"http": None, "https": None}` 置空，**不要**换成
+    requests.Session：测试靠 monkeypatch `requests.get/post` 打桩，
+    换 Session 会让桩失效（AGENTS.md §4.9）。
+    ⚠ 用 `{**direct_kwargs(), **kw}` 合并而不是 `**a, **b` —— 后者在调用方
+    自己传了 `proxies=` 时会抛 TypeError: got multiple values。
+    """
+    fn = getattr(requests, method)
     try:
-        return requests.get(url, **netutil.direct_kwargs(), **kw)
+        return fn(url, **{**netutil.direct_kwargs(), **kw})
     except requests.exceptions.ProxyError as e:
         if netutil.proxy_bypassed():
             raise
         netutil.mark_proxy_dead(e)
-        return requests.get(url, **netutil.direct_kwargs(), **kw)
+        return fn(url, **{**netutil.direct_kwargs(), **kw})
+
+
+def _get(url, **kw):
+    """带代理兜底的 GET。"""
+    return _request_with_proxy_fallback("get", url, **kw)
 
 
 def _head(url, **kw):
     """带代理兜底的 HEAD。"""
-    try:
-        return requests.head(url, **netutil.direct_kwargs(), **kw)
-    except requests.exceptions.ProxyError as e:
-        if netutil.proxy_bypassed():
-            raise
-        netutil.mark_proxy_dead(e)
-        return requests.head(url, **netutil.direct_kwargs(), **kw)
+    return _request_with_proxy_fallback("head", url, **kw)
 
 # Use defusedxml to safely parse untrusted XML from external APIs
 # (arXiv Atom feed). Standard xml.etree.ElementTree is vulnerable to
@@ -233,6 +244,10 @@ def download_arxiv_pdf(arxiv_id: str, save_path) -> dict:
     Download PDF from arXiv directly.
     save_path: target Path or str. Caller must ensure parent dir exists & path is safe.
     Returns dict with status/size.
+
+    下载写盘是**原子**的：先写 `<目标>.part`，完整收完才 `os.replace`。
+    半截 PDF 比没有更糟 —— 调用方看到文件存在就当它完整，要等到几秒后的
+    抽取阶段才炸，报错位置离真因（网络断流）很远。
     """
     clean_id = _normalize_arxiv_id(arxiv_id)
     pdf_url = f"https://arxiv.org/pdf/{clean_id}"
@@ -244,31 +259,39 @@ def download_arxiv_pdf(arxiv_id: str, save_path) -> dict:
         stream=True,
         allow_redirects=True,
     )
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
 
-    # Content-Type sanity check
-    content_type = resp.headers.get("Content-Type", "")
-    if "pdf" not in content_type.lower() and "octet-stream" not in content_type.lower():
-        raise ValueError(f"arXiv 返回非 PDF 内容: {content_type}")
+        # Content-Type sanity check
+        content_type = resp.headers.get("Content-Type", "")
+        if "pdf" not in content_type.lower() and "octet-stream" not in content_type.lower():
+            raise ValueError(f"arXiv 返回非 PDF 内容: {content_type}")
 
-    # Stream to disk with size cap
-    save_path = str(save_path)
-    written_bytes = 0
-    cap_bytes = PDF_MAX_SIZE_MB * 1024 * 1024
-    with open(save_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            written_bytes += len(chunk)
-            if written_bytes > cap_bytes:
-                f.close()
-                try:
-                    import os
-                    os.remove(save_path)
-                except OSError:
-                    pass
-                raise ValueError(f"PDF 超过 {PDF_MAX_SIZE_MB}MB 上限, 已中止")
-            f.write(chunk)
+        # Stream to disk with size cap
+        save_path = str(save_path)
+        tmp_path = save_path + ".part"
+        written_bytes = 0
+        cap_bytes = PDF_MAX_SIZE_MB * 1024 * 1024
+        try:
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    written_bytes += len(chunk)
+                    if written_bytes > cap_bytes:
+                        raise ValueError(f"PDF 超过 {PDF_MAX_SIZE_MB}MB 上限, 已中止")
+                    f.write(chunk)
+            os.replace(tmp_path, save_path)
+        except BaseException:
+            # 超限 / 断流 / 磁盘满 → 清掉 .part，绝不留半个文件冒充成品
+            # （也绝不碰 save_path：那里可能是用户原来的好文件）
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+    finally:
+        resp.close()
 
     return {
         "status": "success",

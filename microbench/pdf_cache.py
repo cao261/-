@@ -21,13 +21,31 @@
 
 ## 为什么这个缓存是安全的
 
-缓存键包含三样东西，缺一个就会缓存出脏数据：
+缓存键包含两样东西，缺一个就会缓存出脏数据：
 
 1. **PDF 的 (mtime_ns, size)** —— 文件改了必须失效
 2. **`EXTRACTOR_VERSION`** —— 抽取算法改了必须失效
    （跟译文快照的版本闸门同款思路，AGENTS.md §4.18）
-3. **符号词典的 (mtime_ns, size)** —— 词典认出了新符号，
-   文本里的 ⟦G:n⟧ 标记对应的真实字符会变 → 必须重解
+
+### 为什么**不**把符号词典的签名放进来（2026-10-27 修正）
+
+最初的版本把 `logs/glyph_dict.json` 的 (mtime, size) 也算进了键，理由是
+「词典认出了新符号，文本里的 ⟦G:n⟧ 对应的真实字符会变」。
+
+**这个理由不成立**：这个缓存存的是 `extract_text_from_pdf()` 的**原始输出**，
+而 `paper_text.py` **全程不读词典**（它连 import 都没有）。文本里的
+`⟦G:<下标>⟧` 是**页内 glyphs 列表的下标**，不是词典序号；把标记换成真实
+字符是后面 `_resolve_document_glyphs()` 干的事，那时缓存已经写完了。
+
+代价却是实打实的：后台认字（`_schedule_glyph_backfill`）每认出一个新符号
+就 `save()` 一次词典 → 签名变 → **全库 27 篇的缓存一起失效**，
+下次打开每篇都要重抽 2.7 秒（最慢 9.7 秒）。也就是说「后台认字越勤，
+用户打开论文越慢」—— 正是这个模块要解决的问题本身。
+
+**守住这条结论的前提**：写进缓存的必须始终是 `extract_text_from_pdf()`
+的原始输出（`app.py` 的 `api_open_vault_pdf` 里，`write_cache` 必须在
+`_resolve_document_glyphs` **之前**）。`tests/test_pdf_cache.py` 有一条
+断言钉住「抽取层不依赖词典」。
 
 ## 放哪、为什么不进同步
 
@@ -71,13 +89,16 @@ def _sig(path: Optional[Path]) -> list:
         return [0, 0]
 
 
-def cache_key(pdf_path: Path, dict_path: Optional[Path] = None) -> str:
-    """算这篇 PDF 的缓存键。"""
+def cache_key(pdf_path: Path) -> str:
+    """算这篇 PDF 的缓存键。
+
+    ⚠ **不要**再把符号词典的签名加进来 —— 抽取层不读词典，
+    加进去只会让后台认字每保存一次就废掉全库缓存（见模块文档）。
+    """
     raw = "|".join([
         str(Path(pdf_path).resolve()),
         str(_sig(Path(pdf_path))),
         str(EXTRACTOR_VERSION),
-        str(_sig(Path(dict_path)) if dict_path else [0, 0]),
         str(CACHE_FORMAT_VERSION),
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -87,10 +108,10 @@ def _cache_file(key: str) -> Path:
     return CACHE_DIR / (key + ".json")
 
 
-def read_cache(pdf_path: Path, dict_path: Optional[Path] = None):
+def read_cache(pdf_path: Path):
     """读缓存。命中返回 pages（list），未命中返回 None。"""
     try:
-        key = cache_key(pdf_path, dict_path)
+        key = cache_key(pdf_path)
         f = _cache_file(key)
         if not f.is_file():
             return None
@@ -106,7 +127,34 @@ def read_cache(pdf_path: Path, dict_path: Optional[Path] = None):
         return None
 
 
-def write_cache(pdf_path: Path, dict_path: Optional[Path], pages: list, key: str) -> None:
+# 缓存文件数的软上限。超过就按 mtime 删掉最旧的一批。
+#
+# 为什么要管：缓存键随 (mtime,size) + EXTRACTOR_VERSION 变，一篇论文改一次
+# 就多一份文件，而且**没有任何地方会删旧的**（clear_cache 只有测试在调）。
+# 27 篇 × 几十个版本 = 磁盘上堆几百个 JSON，每个可能几百 KB。
+# 只在上限之上才动手，平时零开销。
+CACHE_MAX_FILES = 200
+_CACHE_PRUNE_BATCH = 40
+
+
+def _prune_old_cache_files() -> None:
+    """缓存文件超过软上限时，删掉最旧的一批（按 mtime）。"""
+    try:
+        files = list(CACHE_DIR.glob("*.json"))
+        if len(files) <= CACHE_MAX_FILES:
+            return
+        files.sort(key=lambda p: p.stat().st_mtime)
+        for f in files[:_CACHE_PRUNE_BATCH]:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    except Exception:
+        # 清理失败不该影响写入
+        pass
+
+
+def write_cache(pdf_path: Path, pages: list, key: str) -> None:
     """写缓存。失败就失败（性能优化，不该影响功能）。"""
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -123,6 +171,7 @@ def write_cache(pdf_path: Path, dict_path: Optional[Path], pages: list, key: str
             except OSError:
                 pass
             raise
+        _prune_old_cache_files()
     except Exception as e:
         print(f"[pdfcache] 写缓存失败（忽略，不影响功能）: {e}", file=sys.stderr)
 

@@ -309,7 +309,7 @@ _LATEX_COMMANDS = {
     "leftrightarrow", "Rightarrow", "Leftarrow", "to", "infty", "partial",
     "nabla", "forall", "exists", "propto", "sim", "cong", "doteq",
     "left", "right", "big", "Big", "bigg", "Bigg", "quad", "qquad",
-    "begin", "end", "mathrm", "circ", "degree", "prime", "hbar", "ell",
+    "begin", "end", "circ", "degree", "prime", "hbar", "ell",
 }
 
 # "\/alpha" → "\alpha"：斜杠紧跟一个已知 LaTeX 命令时，它是坏掉的反斜杠。
@@ -488,12 +488,9 @@ def sanitize_translation(text: str) -> str:
                   text, flags=re.DOTALL)
 
     # 3) 修 LaTeX
-    def _repair(m: re.Match) -> str:
-        body = m.group(1) if m.group(1) is not None else m.group(2)
-        fixed = _fix_overescaped_latex(body)
-        if m.group(1) is not None:
-            return "$$" + fixed + "$$"
-        return "$" + fixed + "$"
+    #
+    #    （这里原来还有一个 `_repair(m)` 内部函数，从未被调用 —— 下面的
+    #      内联实现才是生效的那份。已删除，避免后来人以为是两条路径。）
 
     pieces: list[str] = []
     last = 0

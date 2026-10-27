@@ -516,6 +516,13 @@ class SlidingWindowRateLimiter:
         # must not be used to compute "seconds since the last call" — that
         # would report a negative number.
         self._last_planned_time: float = 0.0
+        # 下一个允许发车的时刻（预占制）。
+        #
+        # 为什么需要它：min_interval 的间隔必须按**预占**算，不能按"上次
+        # 实际调用时间"算 —— 后者只在 sleep 结束后才更新，两个线程同时
+        # 进来时会用同一个旧基准，算出同一个 planned → 一起发车，
+        # 并发下限流形同虚设（app._prepare_tables 就是 gather 并发读表）。
+        self._next_allowed: float = 0.0
 
     def acquire(self) -> float:
         """
@@ -531,9 +538,10 @@ class SlidingWindowRateLimiter:
 
         Correctness of the min-interval spacing is preserved by *reserving*
         the slot under the lock: the planned call time is recorded and
-        `_last_call_time` is advanced before the lock is released, so a
-        second thread arriving during the sleep still sees the reservation
-        and waits its own turn.
+        `_next_allowed` (= planned + min_interval) is advanced before the
+        lock is released, so a second thread arriving during the sleep
+        waits its own full interval instead of piggy-backing on the first
+        thread's slot.
         """
         with self._lock:
             now = time.time()
@@ -544,9 +552,16 @@ class SlidingWindowRateLimiter:
             wait_time = 0.0
 
             # Rule 1: Min interval spacing
+            #
+            # ⚠ 两个基准都要看：
+            #   - `_last_call_time`：上一次**真的**发车了多久之前
+            #   - `_next_allowed`：上一次**预占**的下一个可用时刻
+            # 只看前者会有并发漏洞（见 __init__ 里 `_next_allowed` 的注释）。
             since_last = now - self._last_call_time
             if since_last < self.min_interval:
                 wait_time = max(wait_time, self.min_interval - since_last)
+            if self._next_allowed - now > wait_time:
+                wait_time = self._next_allowed - now
 
             # Rule 2: Sliding window request cap
             if len(self._timestamps) >= self.max_requests:
@@ -555,14 +570,11 @@ class SlidingWindowRateLimiter:
                 if window_wait > wait_time:
                     wait_time = window_wait
 
-            if wait_time > 0:
-                # Reserve the slot atomically, then sleep without the lock.
-                planned = now + wait_time
-                self._timestamps.append(planned)
-                self._last_planned_time = planned
-            else:
-                self._timestamps.append(now)
-                self._last_planned_time = now
+            # 预占本轮的槽位（并把"下一个可用时刻"一起推进），然后放锁去睡。
+            planned = now + wait_time
+            self._timestamps.append(planned)
+            self._last_planned_time = planned
+            self._next_allowed = planned + self.min_interval
 
         if wait_time > 0:
             time.sleep(wait_time)
@@ -1149,12 +1161,31 @@ class DualModelManager:
         )
         has_rate_signal = any(sig in text for sig in rate_only_signals)
         if has_rate_signal:
-            # "rate limit" + a genuine quota word (e.g. "quota exceeded")
-            # is still a quota problem; "rate limit exceeded" alone is not.
-            quota_only = [s for s in quota_signals if s in text]
-            if all(s in ("quota", "exhausted") for s in quota_only):
-                # "quota exceeded" from a rate limiter — still ambiguous,
-                # so treat the rate-limit reading as the safe one.
+            # 只有**明确无歧义**的"额度真的用完了"短语才能盖过限流判定。
+            #
+            # ⚠ 2026-10-27 修正：原来用 quota_signals 整体回查，于是
+            #   "429 billing tier rate limit exceeded" → 命中 "billing"
+            #   → 被当成配额耗尽 → 全局降格 15 分钟。
+            #   用户看到的是"我额度明明还有，怎么一直用备用模型"
+            #   （AGENTS.md 里那类"写死的错误提示比没有提示更糟"）。
+            #
+            #   所以这里只认硬信号；"billing" / "quota" / "exhausted"
+            #   这些**歧义词不算** —— 上游既会用它们表示计费档位限流，
+            #   也会用 "resource exhausted" 表示并发限流。
+            hard_quota_signals = (
+                "token plan",          # MiniMax: "Token Plan limit exceeded"
+                "2056",                # MiniMax 配额错误码
+                "额度", "套餐", "充值", "余额", "欠费",
+                "quota exceeded",
+                "insufficient balance",
+                "insufficient_quota",
+                "out of credit",
+                "credit balance",
+                "resource exhausted",  # Google 风格的配额耗尽
+                "daily limit",
+            )
+            if not any(sig in text for sig in hard_quota_signals):
+                # 纯限流：等几十秒就恢复，**不能**触发 15 分钟的全局降格
                 return False
         return True
 
@@ -1318,8 +1349,11 @@ def _config() -> dict:
     """
     Read current effective LLM config.
     Returns dict with keys: api_key, base_url, model, configured (bool), is_fallback (bool)
+
+    ⚠ 不要在这里调 `model_manager.get_status()`：它是给界面用的**全量**
+    状态（两组模型列表 + 每模型 limiter.stats()），而本函数每个请求都要走
+    一次。原来这里有一行 `st = get_status()`，结果从未被使用 —— 纯浪费。
     """
-    st = model_manager.get_status()
     if model_manager.is_degraded:
         fb = model_manager.get_fallback_config()
         if fb["configured"]:
@@ -1401,7 +1435,11 @@ def translation_active_model() -> str:
     t = translation_model_name()
     if t:
         return t
-    return model_manager.get_status().get("active_model") or "default"
+    # 用 _config() 而不是 get_status()：后者是给界面看的**全量**状态
+    # （两组模型列表 + 每个 limiter 的统计），而这个函数在**每个翻译请求**
+    # 里都要调一次（当缓存键用），白构建一份没人看的字典。
+    # 两者在降格时的取值是一致的（都是当前生效模型的 model 名）。
+    return _config().get("model") or "default"
 
 
 # ---------------------------------------------------------------------------
@@ -1509,6 +1547,47 @@ def _mark_proxy_dead(err: Exception) -> None:
 # ---------------------------------------------------------------------------
 # Core Chat Implementation with Failover & Agnes Rate Limiting
 # ---------------------------------------------------------------------------
+
+def _err_text(resp) -> str:
+    """从错误响应里取出「人话」错误文本（保证不抛、保证返回 str）。
+
+    上游的错误体形状并不统一：
+
+        {"error": {"message": "..."}}   ← OpenAI / MiniMax 标准形状
+        {"error": {"detail": "..."}}
+        {"error": "some string"}        ← 一些网关直接给字符串
+        {"error": null}
+        <html>...</html>                ← 代理 / WAF 错误页
+
+    原来两处都写成 `resp.json().get("error", {}).get("message", ...)`：
+    后三种会让 `.get` 抛 **AttributeError**，而 except 只捕
+    (ValueError, KeyError) → 异常从 `chat()` 里逃出去变成 500，
+    `friendly_error_text()` 根本没机会解释一句人话。
+    """
+    fallback = (getattr(resp, "text", "") or "")[:200]
+    try:
+        body = resp.json()
+    except Exception:
+        return fallback
+    if not isinstance(body, dict):
+        return fallback
+
+    err = body.get("error")
+    if isinstance(err, dict):
+        for key in ("message", "detail", "type"):
+            val = err.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return fallback
+    if isinstance(err, str) and err.strip():
+        return err
+    # 有些上游把错误直接放在顶层
+    for key in ("message", "detail"):
+        val = body.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return fallback
+
 
 def _invoke_model(
     cfg: dict,
@@ -1638,15 +1717,9 @@ def _invoke_model(
             return False, f"请求异常: {_redact_secrets(str(e))}", last_status
 
         if resp.status_code != 200:
-            try:
-                err_body = resp.json().get("error", {})
-                err = (
-                    err_body.get("message", "")
-                    or err_body.get("detail", "")
-                    or getattr(resp, "text", "")[:200]
-                )
-            except (ValueError, KeyError):
-                err = getattr(resp, "text", "")[:200]
+            # 统一解析：上游可能给 dict / 字符串 / null / HTML，
+            # 原来只捕 (ValueError, KeyError) 会让 AttributeError 逃出 chat()
+            err = _err_text(resp)
 
             last_err = err
 
@@ -1928,16 +2001,28 @@ def chat(
         # (被 max_tokens 截断的情况已在 _invoke_with_budget_escalation 内部
         #  抬高预算重试过，这里只兜底"没截断但正文为空"的情况。)
         if _is_empty_content_error(res) and budget[0] > 0:
-            bigger = min(max_tokens * 2, 4096)
-            retry_success, retry_res, _ = _invoke_model(
-                primary, messages, bigger, temperature, timeout, json_mode,
-                max_retries=0, budget=budget, disable_thinking=disable_thinking,
-                deadline=deadline,
-            )
-            if retry_success:
-                _note(primary["model"])
-                return retry_res
-            res = f"{res} (重试 {bigger} tokens 仍为空)"
+            # ⚠ 必须**抬高**预算，绝不能砍。
+            #
+            # max_tokens 是「思考 + 正文」共用的池子：思考吃光就没正文。
+            # 这里原来写死 `min(max_tokens * 2, 4096)` —— 而翻译路径会传
+            # 16000~32000（app._translation_max_tokens）→ 重试反而把预算
+            # **砍到 4096**，必然再空一次，白等一整轮（120~200 秒），
+            # 用户看到的就是"翻译卡了两分钟然后失败"。
+            # 与 _invoke_with_budget_escalation（:1772）和流式路径（:2863）
+            # 对齐：下限 MIN_REASONABLE_MAX_TOKENS，上限 MAX_ESCALATION_MAX_TOKENS。
+            bigger = min(max(max_tokens * 2, MIN_REASONABLE_MAX_TOKENS),
+                         MAX_ESCALATION_MAX_TOKENS)
+            # 已经到顶就别重试了 —— 同样的预算只会得到同样的空正文
+            if bigger > max_tokens:
+                retry_success, retry_res, _ = _invoke_model(
+                    primary, messages, bigger, temperature, timeout, json_mode,
+                    max_retries=0, budget=budget, disable_thinking=disable_thinking,
+                    deadline=deadline,
+                )
+                if retry_success:
+                    _note(primary["model"])
+                    return retry_res
+                res = f"{res} (重试 {bigger} tokens 仍为空)"
 
         # 降级条件有两种：
         #   1) 429 配额耗尽（如 MiniMax 5 小时限额）
@@ -2252,15 +2337,9 @@ async def _invoke_model_async(
             return False, f"请求异常: {_redact_secrets(str(e))}", last_status
 
         if resp.status_code != 200:
-            try:
-                err_body = resp.json().get("error", {})
-                err = (
-                    err_body.get("message", "")
-                    or err_body.get("detail", "")
-                    or getattr(resp, "text", "")[:200]
-                )
-            except (ValueError, KeyError):
-                err = getattr(resp, "text", "")[:200]
+            # 统一解析：上游可能给 dict / 字符串 / null / HTML，
+            # 原来只捕 (ValueError, KeyError) 会让 AttributeError 逃出 chat()
+            err = _err_text(resp)
 
             last_err = err
 

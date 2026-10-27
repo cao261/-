@@ -13,7 +13,6 @@ import os
 import sys
 import json
 import re
-import sys
 import hmac
 import hashlib
 import ipaddress
@@ -72,7 +71,6 @@ from .paper_text import (fetch_full_text, split_into_sections,
                           extract_text_from_pdf, extract_page_text_with_glyphs)
 from . import glyphs as glyphs_mod
 from . import pdf_cache
-from . import lan as lan_helpers
 from .lan import resolve_token as _resolve_lan_token
 
 
@@ -1326,13 +1324,37 @@ def _real_output_stats() -> dict:
                 note_total += 1
 
     translated_pages = 0
-    snap_dir = _sync_root() / "snapshots"
-    if snap_dir.is_dir():
+    # 统计口径（2026-10-27 修正，两处都是用户可见的"数字不对"）：
+    #
+    # 1) **本地快照目录 + 同步目录取并集**。原来只读同步目录 —— 用户还没
+    #    点过"同步"时同步目录里什么都没有，看板永远是 0（这正是历史上
+    #    "看板怎么都是零"的同型事故，AGENTS.md §4.2）。
+    # 2) 数「**真有译文**的页」，不是 `len(pages)`。pages 里含还没翻的
+    #    占位页，按长度数等于把"总页数"当"已译页数"，数字虚高。
+    #    口径与 /api/pdf/snapshot/list 的 translated_pages 对齐。
+    #
+    # ⚠ 同一篇可能两处都有，且**两份可能不一样**（实测：某篇本地 1 页、
+    #   同步 7 页）。所以必须按 `saved_at` 取更新的那份 ——
+    #   如果改成"先遇到先用"（先读本地），数字会从 69 掉到 63，
+    #   看起来像"数据丢了"，实际是数漏了。
+    best_per_paper: dict[str, tuple[str, int]] = {}
+    for snap_dir in (_snapshot_dir(), _sync_root() / "snapshots"):
+        if not snap_dir.is_dir():
+            continue
         for fp in snap_dir.glob("*.json"):
             data = _safe_read_json(fp) or {}
             pages = data.get("pages")
-            if isinstance(pages, list):
-                translated_pages += len(pages)
+            if not isinstance(pages, list):
+                continue
+            translated = sum(
+                1 for pg in pages
+                if isinstance(pg, dict) and pg.get("translation")
+            )
+            saved_at = str(data.get("saved_at") or "")
+            prev = best_per_paper.get(fp.stem)
+            if prev is None or saved_at > prev[0]:
+                best_per_paper[fp.stem] = (saved_at, translated)
+    translated_pages = sum(n for _, n in best_per_paper.values())
 
     annotation_count = 0
     ann_dir = _sync_root() / "annotations"
@@ -1472,7 +1494,7 @@ async def api_save_paper(req: SavePaperRequest):
         res = save_literature_card(req.model_dump())
         return res
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"保存文献卡片失败: {_safe_err(e)}")
 
@@ -1507,7 +1529,7 @@ def api_paper_folders(
         else:
             raise HTTPException(status_code=400, detail=f"不支持的 kind: {kind}")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     if not base.exists():
         return {"topic_category": topic_category, "kind": kind, "folders": []}
     folders = sorted([p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")])
@@ -1523,7 +1545,7 @@ async def api_export_bilingual(req: ExportBilingualRequest):
         res = save_bilingual_reading_card(req.model_dump())
         return res
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"导出双语卡片失败: {_safe_err(e)}")
 
@@ -1537,7 +1559,7 @@ async def api_export_qa(req: ExportQARequest):
         res = save_qa_card(req.model_dump())
         return res
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"导出答疑笔记失败: {_safe_err(e)}")
 
@@ -1614,7 +1636,7 @@ async def api_download_pdf(
             "source": info["source"],
         }
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"下载 PDF 失败: {_safe_err(e)}")
 
@@ -1921,7 +1943,10 @@ async def api_formula_image(
                             detail="公式裁图需要 PyMuPDF (fitz), 请先 pip install pymupdf") from exc
 
     try:
-        png = _pdf_clip_png(pdf_path, page, (x0, y0, x1, y1), scale)
+        # 与 api_read_table 一致：PyMuPDF 渲染一张 4x 的图是几十~几百毫秒的
+        # 同步调用，在 async def 里直接跑会把其它请求（含 SSE 流）一起卡住。
+        png = await asyncio.to_thread(
+            _pdf_clip_png, pdf_path, page, (x0, y0, x1, y1), scale)
     except ValueError as e:
         msg = str(e)
         code = 404 if "页码越界" in msg else 400
@@ -2131,7 +2156,7 @@ async def api_vault_reveal(
 
 
 @app.get("/api/paper/find_pdf")
-async def api_find_pdf(
+def api_find_pdf(
     title: str = Query(..., min_length=1, max_length=300,
                        description="论文标题 (用于模糊匹配本地 PDF)"),
     year: Optional[int] = Query(default=None, ge=1900, le=2100),
@@ -2144,6 +2169,12 @@ async def api_find_pdf(
       - substring overlap on alphanumeric normalized stems
       - keyword token overlap (splits on non-alphanumeric chars)
     Returns the relative path of the best match, or null.
+
+    ⚠ **同步 def，不是 async def**（2026-10-27）。函数体全是同步磁盘
+      IO（`iterdir` + `rglob` 遍历整个文献库），写成 async def 会直接在
+      事件循环里跑，把同时进行的翻译流/状态查询一起卡住。
+      改成同步 def → FastAPI 丢进 anyio 线程池。与 api_stats /
+      api_list_vault_pdfs 同一处理（那两处 2026-10-27 已改）。
     """
     base = BASE_DIR / "01_Literature"
     if not base.exists():
@@ -2228,6 +2259,16 @@ async def api_upload_pdf(
         if len(buf) > MAX_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail="PDF 文件不能超过 40MB")
     pdf_bytes = bytes(buf)
+
+    # 后缀只是"用户以为它是 PDF"。真正决定能不能解析的是文件头魔数 ——
+    # 一个 .pdf 结尾的 zip / html 会被写进 01_Literature，直到几秒后的抽取
+    # 阶段才报"无法识别文字"，错误位置离真因很远，还会在 vault 里留下垃圾。
+    if not pdf_bytes[:5] == b"%PDF-":
+        raise HTTPException(
+            status_code=400,
+            detail="这个文件不是 PDF（文件头不是 %PDF-）。如果是扫描版请先确认格式，"
+                   "如果是浏览器下载失败，重新下载一次再传。",
+        )
 
     try:
         # pdfplumber parsing is CPU-bound and can take seconds on a large
@@ -2363,7 +2404,7 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
     try:
         pdf_path = _safe_path(BASE_DIR, req.relative_path)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"vault 中找不到该 PDF: {req.relative_path}")
 
@@ -2373,16 +2414,17 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
         #   pdfplumber 的页面解析是纯 CPU 且不可并行（实测线程池 0.97x），
         #   全库 27 篇抽一遍 = 72 秒、平均 2.7 秒/篇、最慢 9.7 秒
         #   → 唯一有效的优化是「别重复抽」。
-        #   缓存键含 (mtime, size) + EXTRACTOR_VERSION + 符号词典签名
-        #   → 文件改了/算法改了/词典变了都会自动失效（见 microbench/pdf_cache.py）。
-        cached = pdf_cache.read_cache(pdf_path, GLYPH_DICT_PATH)
+        #   缓存键含 (mtime, size) + EXTRACTOR_VERSION
+        #   → 文件改了/算法改了都会自动失效（见 microbench/pdf_cache.py）。
+        #   ⚠ 故意**不含**符号词典签名：抽取层不读词典，含进去会让后台
+        #     认字每保存一次词典就废掉全库缓存（详见该模块文档）。
+        cached = pdf_cache.read_cache(pdf_path)
         if cached is not None:
             pages = cached
         else:
             pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
             try:
-                pdf_cache.write_cache(pdf_path, GLYPH_DICT_PATH, pages,
-                                      pdf_cache.cache_key(pdf_path, GLYPH_DICT_PATH))
+                pdf_cache.write_cache(pdf_path, pages, pdf_cache.cache_key(pdf_path))
             except Exception:
                 pass
     except Exception as e:
@@ -2462,7 +2504,7 @@ async def api_create_reproduction(req: CreateReproductionRequest):
         res = create_reproduction_workspace(req.model_dump())
         return res
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"创建复现工程失败: {_safe_err(e)}")
 
@@ -2472,7 +2514,7 @@ async def api_add_troubleshoot(req: TroubleshootRequest):
         res = record_troubleshoot(req.model_dump())
         return res
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"记录排错日志失败: {_safe_err(e)}")
 
@@ -2658,7 +2700,7 @@ async def api_plot_extract(
         )
         return {"status": "success", **result}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"图片解析失败: {_safe_err(e)}")
 
@@ -2672,7 +2714,7 @@ async def api_plot_calibrate(req: CalibrateRequest):
         calibrated = calibrate_points(req.pixel_points, req.ref_a, req.ref_b)
         return {"status": "success", "points": calibrated}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"标定失败: {_safe_err(e)}")
 
@@ -2704,7 +2746,7 @@ async def api_plot_compare(req: CompareRequest):
         result = compute_metrics(paper, repro, tolerance=tolerance)
         return {"status": "success", **result}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"对比计算失败: {_safe_err(e)}")
 
@@ -2744,9 +2786,9 @@ def api_fetch_full_text(req: FetchFullRequest):
         if result.get("pdf_bytes"):
             _schedule_glyph_backfill(result["pdf_bytes"])
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=_safe_err(e))
     except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_err(e))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"全文获取失败: {_safe_err(e)}")
 
@@ -3660,7 +3702,13 @@ async def api_translate_page(req: TranslatePageRequest):
         try:
             from .generator import BASE_DIR, _safe_path
             pdf_path = _safe_path(BASE_DIR, req.relative_path)
-            extracted, page_glyphs = extract_page_text_with_glyphs(pdf_path, req.page)
+            # ⚠ 必须丢线程池：pdfplumber 解析单页是**百毫秒级**的同步阻塞调用，
+            #   在 async def 里直接调会冻住整个事件循环 —— 而这一步发生在
+            #   「翻下一页」的必经路径上，用户在翻页时会感觉整个页面卡一下。
+            #   本项目其它抽取调用点（upload / open_vault_pdf）都已走 to_thread，
+            #   这里是漏改的一处。
+            extracted, page_glyphs = await asyncio.to_thread(
+                extract_page_text_with_glyphs, pdf_path, req.page)
             if extracted and len(extracted.strip()) >= 100:
                 page_text = extracted
                 # 解不出的数学符号（× ≈ ≥ …）→ 裁图让多模态认字
@@ -4045,17 +4093,81 @@ def _snapshot_dir() -> Path:
 def _snapshot_path(paper_id: str) -> Path:
     # paper_id is computed in JS as `${_paperBase}_${hash}` and is already
     # filename-safe (alphanumeric + underscore). Defensive-normalize anyway.
-    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "snapshot"
+    safe = _safe_paper_key(paper_id, "snapshot")
     return _snapshot_dir() / f"{safe}.json"
 
 
 def _safe_read_json(path: Path) -> Optional[dict]:
+    """宽容读 JSON：文件不存在 / 内容坏掉 → 都返回 None。
+
+    ⚠ 只适用于「读不到就当没有」的场景（列目录、读可选配置）。
+    **写路径上的"读旧值再合并"绝对不能用它** —— 详见
+    `_read_json_or_quarantine()`。
+    """
     try:
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本：先写同目录 `.tmp`，再 `os.replace` 覆盖目标。
+
+    为什么必须（不只是"优雅"）：这些 JSON 都住在**坚果云同步目录**里。
+    直接 `write_text` 时，文件在「已被截断、还没写完」的那一瞬间会被同步
+    客户端抓走并上行，另一台设备拿到半截 JSON → 解析失败 → 用户的批注/
+    进度看起来"没了"。`os.replace` 在同一分区上是原子的，同步端只会看到
+    旧文件或新文件，不会看到中间态。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_json(path: Path, obj, indent: int = 1) -> None:
+    """原子写 JSON（中文原样存，不转 \\uXXXX）。"""
+    _atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent))
+
+
+def _read_json_or_quarantine(path: Path) -> Optional[dict]:
+    """读 JSON；**损坏的文件改名隔离并报错**，不当成"没有"。
+
+    为什么必须区分（2026-10-27）：
+
+    批注保存是「读磁盘旧值 → 按 id 合并 → 写回」。如果旧值是坚果云同步
+    中断/断电留下的**半截 JSON**，`_safe_read_json` 会返回 None
+    → 合并基数变成空列表 → 写回时把磁盘上**其它所有批注**永久抹掉，
+    而用户看到的是"✅ 保存成功"。一条数据都不报错地消失，最难查。
+
+    宁可让这次保存失败并告诉用户"文件损坏，已备份到 X"，也不能静默清空。
+    """
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as e:
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
+        kept = ""
+        try:
+            os.replace(path, quarantine)
+            kept = f"，已隔离为 {quarantine.name}"
+        except OSError:
+            kept = "，且隔离失败（原文件仍在原处）"
+        msg = f"文件内容损坏{kept}: {path.name} ({e})"
+        print(f"[microbench] {msg}", file=sys.stderr)
+        raise ValueError(msg)
 
 
 @app.get("/api/pdf/snapshot/list")
@@ -4131,7 +4243,7 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
     Writes atomically via a .tmp + os.replace to avoid leaving half-files
     if MicroBench is killed mid-write.
     """
-    safe_id = "".join(c for c in req.paper_id if c.isalnum() or c in "_-")[:128]
+    safe_id = _safe_paper_key(req.paper_id, "snapshot")
     if len(safe_id) < 3:
         raise HTTPException(status_code=400, detail="paper_id 非法")
 
@@ -4360,9 +4472,36 @@ def _sync_dir(kind: str) -> Path:
     return p
 
 
-def _safe_paper_key(paper_id: str) -> str:
-    """论文 id → 可用作文件名/字典键的安全串。"""
-    return "".join(c for c in (paper_id or "") if c.isalnum() or c in "_-")[:128] or "progress"
+def _safe_paper_key(paper_id: str, default: str = "progress") -> str:
+    """论文 id → 可用作文件名/字典键的安全串。
+
+    `default` 是「整个 id 都被过滤成空」时的回落串。**调用方要显式传自己
+    通道的名字**（快照 "snapshot" / 批注 "annotations"），否则空 id 会在
+    不同通道里撞到同一个文件名（原来是写死 "progress"，批注通道又各抄了
+    一份 "annotations" 的版本）。
+    """
+    return "".join(c for c in (paper_id or "") if c.isalnum() or c in "_-")[:128] or default
+
+
+# 阅读进度是同步目录里**唯一没有大小上限**的落盘 JSON（快照 5MB、批注 2MB
+# 都有闸门），而它是浏览器直接传来的 dict。正常一条只有几百字节，但接口上
+# 没有任何东西阻止它变成几 MB —— 一次异常调用就能把同步目录塞满。
+_PROGRESS_MAX_BYTES = 64 * 1024
+_PROGRESS_CORE_FIELDS = ("paper_id", "page", "mode", "zoom", "scroll_top", "updated_at")
+
+
+def _trim_progress_record(rec: dict) -> dict:
+    """限制阅读进度的体积：超长时只保留"能定位到哪篇哪一页"的核心字段。
+
+    注意是**降级**而不是拒绝 —— 进度丢了，用户下次打开会跳回第一页，
+    比"体积没超"重要得多。
+    """
+    try:
+        if len(json.dumps(rec, ensure_ascii=False).encode("utf-8")) <= _PROGRESS_MAX_BYTES:
+            return rec
+    except (TypeError, ValueError):
+        pass
+    return {k: rec[k] for k in _PROGRESS_CORE_FIELDS if k in rec}
 
 
 # ---------------------------------------------------------------------------
@@ -4622,11 +4761,11 @@ def _device_id() -> str:
         pass
     did = uuid.uuid4().hex[:12]
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(
+        _atomic_write_json(
+            p,
             {"device_id": did,
              "created_at": _dt.datetime.now().isoformat(timespec="seconds")},
-            ensure_ascii=False, indent=1), encoding="utf-8")
+        )
     except OSError:
         pass
     return did
@@ -4927,12 +5066,15 @@ async def api_sync(req: SyncRequest):
     if not req.pull_only and req.progress:
         pid = (req.paper_id or req.progress.get("paper_id") or "").strip()
         if pid:
-            safe = "".join(c for c in pid if c.isalnum() or c in "_-")[:128] or "progress"
+            safe = _safe_paper_key(pid, default="progress")
             rec = dict(req.progress)
             rec["paper_id"] = pid
             rec["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-            ( _sync_dir("progress") / f"{safe}.json").write_text(
-                json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+            # 阅读进度是唯一没有大小上限的落盘 JSON（快照 5MB、批注 2MB），
+            # 而它是从浏览器直接传来的。裁掉未知字段并限长，防止一次调用
+            # 把同步目录塞进几十 MB 垃圾。
+            rec = _trim_progress_record(rec)
+            _atomic_write_json(_sync_dir("progress") / f"{safe}.json", rec)
             pushed["progress"].append(safe + ".json")
 
     # ---------- 推送：论文 PDF 本体（增量，只传变化过的） ----------
@@ -4997,7 +5139,7 @@ async def api_sync(req: SyncRequest):
         prog = _read_local_progress()
         target_pid = (req.paper_id or "").strip()
         if target_pid:
-            safe = "".join(c for c in target_pid if c.isalnum() or c in "_-")[:128] or "progress"
+            safe = _safe_paper_key(target_pid, "progress")
             src = _sync_dir("progress") / f"{safe}.json"
             remote = _safe_read_json(src)
             if remote and _anno_is_newer(remote.get("updated_at", ""),
@@ -5196,7 +5338,7 @@ def _annotations_dir() -> Path:
 
 def _legacy_annotation_paths(paper_id: str) -> list:
     """更早的批注存放位置（读时回落，升级不丢数据）。"""
-    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    safe = _safe_paper_key(paper_id, "annotations")
     return [
         _sync_root() / f"{safe}.json",                                   # 扁平布局
         BASE_DIR.joinpath(*ANNOTATION_LEGACY_SUBDIR) / f"{safe}.json",   # 只在本机 logs/ 下
@@ -5204,7 +5346,7 @@ def _legacy_annotation_paths(paper_id: str) -> list:
 
 
 def _annotation_path(paper_id: str) -> Path:
-    safe = "".join(c for c in paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    safe = _safe_paper_key(paper_id, "annotations")
     return _annotations_dir() / f"{safe}.json"
 
 
@@ -5247,11 +5389,14 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
       - deleted 里的 id → 从磁盘上删掉（否则另一台设备会把已删的批注"复活"）
     这样在两台设备上分别标注不会互相覆盖。
     """
-    safe_id = "".join(c for c in req.paper_id if c.isalnum() or c in "_-")[:128] or "annotations"
+    safe_id = _safe_paper_key(req.paper_id, "annotations")
     now = _dt.datetime.now().isoformat(timespec="seconds")
 
     target = _annotation_path(safe_id)
-    existing = _safe_read_json(target)
+    try:
+        existing = _read_json_or_quarantine(target)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=_safe_err(e))
     if not existing:
         for legacy in _legacy_annotation_paths(safe_id):
             existing = _safe_read_json(legacy)

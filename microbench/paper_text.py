@@ -42,6 +42,7 @@ common keywords. Returns list of {title, text, page_start, page_end}.
 import io
 import re
 import sys
+import traceback
 from typing import Optional
 from pathlib import Path
 
@@ -442,44 +443,6 @@ def _unknown_glyphs(page) -> list[dict]:
     return out
 
 
-def _mark_glyph_words(words, glyphs) -> list[dict]:
-    """把 word 文本里的 "(cid:N)" 换成带锚点的标记 ⟦G:<下标>⟧。
-
-    怎么把 word 里的 cid 对回具体字形？靠**位置**：字形的 x 区间落在 word 的
-    x 区间内、top 与 word 同行 → 唯一匹配。word 里有多个 cid 时按 x 顺序
-    一一对应（pdfplumber 的 word 内部也是按 x 排的）。
-
-    匹配不上就保持原样 → 后面 _clean_cid_markers 兜成 "[?]"（宁可空着，
-    也不能指错字形 —— 指错了等于编造）。
-    """
-    if not glyphs:
-        return words
-    for w in words:
-        t = w.get("text") or ""
-        if "(cid:" not in t:
-            continue
-        wx0 = float(w.get("x0", 0.0))
-        wx1 = float(w.get("x1", 0.0))
-        wtop = float(w.get("top", 0.0))
-        # 这个 word 覆盖到的字形（按 x 排）
-        cand = [i for i, g in enumerate(glyphs)
-                 if g["x0"] >= wx0 - 3.0 and g["x1"] <= wx1 + 3.0
-                 and abs(g["top"] - wtop) <= 3.0]
-        cand.sort(key=lambda i: glyphs[i]["x0"])
-        out: list[str] = []
-        pos = 0
-        for k, m in enumerate(_CID_RE.finditer(t)):
-            out.append(t[pos:m.start()])
-            if k < len(cand):
-                out.append(f"⟦G:{cand[k]}⟧")
-            else:
-                out.append("[?]")
-            pos = m.end()
-        out.append(t[pos:])
-        w["text"] = "".join(out)
-    return words
-
-
 def _clean_cid_markers(text: str) -> str:
     """
     Replace pdfplumber's undecodable-character markers with "[?]".
@@ -504,6 +467,11 @@ def _clean_cid_markers(text: str) -> str:
 def _x_cover(words, page_width: float, nb: int) -> list:
     """每个 x 分箱被文字覆盖的宽度。"""
     cover = [0.0] * nb
+    # 畸形页 / page.width 取不到时会传 0 进来。原来直接除 → ZeroDivisionError
+    # 一路冒到 extract_text_from_pdf，**整篇**抽取失败；而正确行为是这一页
+    # 退回普通整页文本（返回全零覆盖 = "找不到栏缝" 的自然降级）。
+    if not page_width or page_width <= 0:
+        return cover
     for w in words:
         a = max(0, min(nb - 1, int(w["x0"] / page_width * nb)))
         b = max(0, min(nb - 1, int(w["x1"] / page_width * nb)))
@@ -1046,21 +1014,37 @@ def _find_vertical_split(words, width, height):
     return 0.0
 
 
-def _extract_page_text_raw(page, out_glyphs: Optional[list] = None) -> str:
-    plain = ""
+def _plain_text(page) -> str:
+    """pdfplumber 的整页文本（双栏会被逐行交错，只在兜底路径用）。"""
     try:
-        plain = page.extract_text(x_tolerance=PDF_X_TOLERANCE) or ""
-    except Exception:
-        plain = ""
+        return page.extract_text(x_tolerance=PDF_X_TOLERANCE) or ""
+    except Exception as e:
+        # ⚠ 必须留痕：静默返回空串 = 这一页正文凭空消失。
+        #   用户只会看到"译文少了一大段"，日志里却什么都没有（§4.13 的教训）。
+        print(f"[paper_text] 页面文本抽取失败，当作空页: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return ""
 
-    # 解不出的数学符号：换成带锚点的标记 ⟦G:n⟧（服务端据此"看图认字"）
+
+def _extract_page_text_raw(page, out_glyphs: Optional[list] = None) -> str:
+    # ⚠ 顺序有意义：先算 glyphs，再决定要不要跑 extract_text。
+    #
+    #   有未解出的数学符号时，下面的 _plain_lines_with_glyphs() 会重新切行、
+    #   输出**带 ⟦G:n⟧ 标记**的文本，把 extract_text() 的结果整个覆盖掉 ——
+    #   那先前那次调用就是白跑一遍 pdfminer layout（单页几十~几百毫秒，
+    #   391 页的库累积起来很可观）。
+    #   输出与原来逐字一致（覆盖关系没变）→ 不需要动 EXTRACTOR_VERSION。
     glyphs = _unknown_glyphs(page)
     if out_glyphs is not None:
         out_glyphs.extend(glyphs)
+
+    plain = ""
     if glyphs:
         marked_plain = _plain_lines_with_glyphs(page, glyphs)
         if marked_plain:
             plain = marked_plain
+    if not plain:
+        plain = _plain_text(page)
 
     try:
         width, height = float(page.width), float(page.height)
@@ -1327,10 +1311,6 @@ def _band_is_table_like(bw, x_mid: float) -> bool:
 # 论文里的表格必有表题（"Table I. Properties of ..." / "TABLE 2" / "表 1"）。
 # **用表题定位表格**，而不是用"有很多数字"—— 公式行也全是数字
 # （"a ¼ 33 31 (2)"），按数字判会把公式当表格（实测 eq (2)/(3) 被误判）。
-_TABLE_CAPTION_RE = re.compile(
-    r"^\s*(table|tab\.|tabelle|tabelle|表)\s*"
-    r"([0-9]+|[ivxlc]+|[A-Z])?\s*[.):、]?", re.IGNORECASE)
-
 
 def _numeric_rows(bw) -> int:
     """这一带里有几行是"数字行"（含 3 个以上数字的短词）。"""

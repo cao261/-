@@ -33,28 +33,59 @@ def test_cache_key_changes_when_the_pdf_changes(tmp_path):
     """PDF 改了（mtime 或 size 变）→ 缓存键必须变。"""
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"hello world")
-    k1 = pdf_cache.cache_key(pdf, None)
+    k1 = pdf_cache.cache_key(pdf)
 
     pdf.write_bytes(b"hello world v2 longer")
-    k2 = pdf_cache.cache_key(pdf, None)
+    k2 = pdf_cache.cache_key(pdf)
     assert k1 != k2, "PDF 内容变了，缓存键却没变 → 会返回旧正文"
 
 
-def test_cache_key_changes_when_the_glyph_dictionary_changes(tmp_path):
-    """符号词典变了 → 缓存键必须变。
+def test_cache_key_ignores_the_glyph_dictionary(tmp_path):
+    """符号词典变了 → 缓存键**不能**变（2026-10-27 修正，原断言是反的）。
 
-    词典认出了新符号，文本里的 ⟦G:n⟧ 对应的真实字符就变了
-    → 必须重新抽取，不能用旧缓存。
+    这个缓存存的是 `extract_text_from_pdf()` 的**原始输出**，而抽取层
+    全程不读词典：文本里的 `⟦G:<下标>⟧` 是**页内** glyphs 列表的下标，
+    不是词典序号。把标记换成真实字符是后面 `_resolve_document_glyphs()`
+    干的事，那时缓存早写完了。
+
+    原来的键里带了词典的 (mtime, size)，后果是：后台认字每认出一个新符号
+    就保存一次词典 → 全库 27 篇的缓存一起失效 → 下次打开每篇重抽 2.7 秒
+    （最慢 9.7 秒）。「认字越勤，打开越慢」正是这个缓存要解决的问题本身。
     """
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
     d1 = tmp_path / "dict.json"
     d1.write_text("{}", encoding="utf-8")
-    k1 = pdf_cache.cache_key(pdf, d1)
+    k1 = pdf_cache.cache_key(pdf)
 
-    d1.write_text('{"k": "v"}', encoding="utf-8")   # 大小变了
-    k2 = pdf_cache.cache_key(pdf, d1)
-    assert k1 != k2, "符号词典变了，缓存键却没变 → 会用到旧的符号解析结果"
+    d1.write_text('{"k": "v"}', encoding="utf-8")   # 词典变了
+    k2 = pdf_cache.cache_key(pdf)
+    assert k1 == k2, (
+        "词典变化让缓存键变了 → 后台每认出一个符号就废掉全库缓存，"
+        "用户打开论文会莫名变慢"
+    )
+
+
+def test_extractor_does_not_need_the_glyph_dictionary():
+    """上面那条等价断言的**前提**：抽取层不依赖词典。
+
+    一旦将来有人把词典读进 `extract_text_from_pdf`（比如想在里面直接把
+    ⟦G:n⟧ 换成真实字符），缓存就必须重新带上词典签名 —— 这条会先红，
+    提醒他回去改 `pdf_cache` 的键和上面那条断言，而不是留着一个脏缓存。
+    """
+    import inspect
+
+    from microbench import paper_text
+
+    params = list(inspect.signature(paper_text.extract_text_from_pdf).parameters)
+    assert params == ["pdf_bytes"], (
+        f"extract_text_from_pdf 多了参数 {params} —— 如果它开始依赖词典，"
+        "pdf_cache 的缓存键必须重新计入词典签名"
+    )
+    src = inspect.getsource(paper_text)
+    assert "glyph_dict" not in src and "GlyphDict" not in src, (
+        "抽取层开始读符号词典了 → 缓存键必须重新计入词典签名"
+    )
 
 
 def test_cache_key_includes_the_extractor_version(tmp_path):
@@ -65,13 +96,13 @@ def test_cache_key_includes_the_extractor_version(tmp_path):
     """
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"x")
-    key = pdf_cache.cache_key(pdf, None)
+    key = pdf_cache.cache_key(pdf)
     # 键是哈希，看不出内容 —— 所以验的是「版本常量确实参与了计算」：
     # 改掉模块里的 EXTRACTOR_VERSION，键必须跟着变。
     orig = pdf_cache.EXTRACTOR_VERSION
     try:
         pdf_cache.EXTRACTOR_VERSION = orig + 1
-        key2 = pdf_cache.cache_key(pdf, None)
+        key2 = pdf_cache.cache_key(pdf)
     finally:
         pdf_cache.EXTRACTOR_VERSION = orig
     assert key != key2, "抽取器版本没参与缓存键 → 算法改了还在用旧抽取结果"
@@ -83,7 +114,7 @@ def test_cache_key_differs_between_different_papers(tmp_path):
     b = tmp_path / "b.pdf"
     a.write_bytes(b"same bytes")
     b.write_bytes(b"same bytes")
-    assert pdf_cache.cache_key(a, None) != pdf_cache.cache_key(b, None), \
+    assert pdf_cache.cache_key(a) != pdf_cache.cache_key(b), \
         "两篇不同的论文用了同一个缓存键 → 会互相串正文"
 
 
@@ -97,9 +128,9 @@ def test_write_then_read_roundtrip(tmp_path, monkeypatch):
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"data")
     pages = [{"page": 1, "text": "hello", "glyphs": []}]
-    key = pdf_cache.cache_key(pdf, None)
-    pdf_cache.write_cache(pdf, None, pages, key)
-    got = pdf_cache.read_cache(pdf, None)
+    key = pdf_cache.cache_key(pdf)
+    pdf_cache.write_cache(pdf, pages, key)
+    got = pdf_cache.read_cache(pdf)
     assert got == pages, "缓存读回来的内容跟写进去的不一样"
 
 
@@ -109,10 +140,10 @@ def test_corrupted_cache_is_treated_as_a_miss(tmp_path, monkeypatch):
     monkeypatch.setattr(pdf_cache, "CACHE_DIR", cache_dir)
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"data")
-    key = pdf_cache.cache_key(pdf, None)
+    key = pdf_cache.cache_key(pdf)
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / (key + ".json")).write_text("{ this is not json", encoding="utf-8")
-    assert pdf_cache.read_cache(pdf, None) is None, \
+    assert pdf_cache.read_cache(pdf) is None, \
         "损坏的缓存没有被当成未命中"
 
 
@@ -121,7 +152,7 @@ def test_read_cache_on_missing_file_returns_none(tmp_path, monkeypatch):
     monkeypatch.setattr(pdf_cache, "CACHE_DIR", tmp_path / "nope")
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"data")
-    assert pdf_cache.read_cache(pdf, None) is None
+    assert pdf_cache.read_cache(pdf) is None
 
 
 def test_write_cache_failure_does_not_raise(tmp_path, monkeypatch):
@@ -130,9 +161,9 @@ def test_write_cache_failure_does_not_raise(tmp_path, monkeypatch):
     monkeypatch.setattr(pdf_cache, "CACHE_DIR", tmp_path / "a" / "b" / "\0bad")
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"data")
-    key = pdf_cache.cache_key(pdf, None)
+    key = pdf_cache.cache_key(pdf)
     # 不抛异常就算过（pytest 默认不允许异常逃出）
-    pdf_cache.write_cache(pdf, None, [{"page": 1, "text": "x", "glyphs": []}], key)
+    pdf_cache.write_cache(pdf, [{"page": 1, "text": "x", "glyphs": []}], key)
 
 
 # ---------------------------------------------------------------------------

@@ -2400,7 +2400,7 @@
           </div>
 
           <div class="form-actions">
-            <button class="btn-pill" onclick="handleCreateRepro()">
+            <button class="btn-pill" id="btn-create-repro" onclick="handleCreateRepro()">
               <span>初始化标准复现工程</span><span class="btn-pill-arrow">→</span>
             </button>
           </div>
@@ -2423,7 +2423,7 @@
           <div class="studio-block">
             <div class="studio-block-label">组会汇报速生</div>
             <p class="studio-block-note">聚合近 7 天新录入文献与复现工程进度，一键生成规范周报草稿。</p>
-            <button class="btn-pill" style="width: 100%;" onclick="handleGenerateWeekly()">
+            <button class="btn-pill" id="btn-generate-weekly" style="width: 100%;" onclick="handleGenerateWeekly()">
               <span>生成本周导师汇报周报</span><span class="btn-pill-arrow">→</span>
             </button>
           </div>
@@ -2454,7 +2454,7 @@
               <textarea id="tb-solution" class="field-textarea" style="min-height: 70px;"
                         placeholder="记录解决该问题的关键配置或命令…"></textarea>
             </div>
-            <button class="btn-pill" style="width: 100%;" onclick="handleSaveTroubleshoot()">
+            <button class="btn-pill" id="btn-save-troubleshoot" style="width: 100%;" onclick="handleSaveTroubleshoot()">
               <span>记录入避坑知识库</span><span class="btn-pill-arrow">→</span>
             </button>
           </div>
@@ -2551,7 +2551,9 @@
   <div id="toast" role="status" aria-live="polite"></div>
 <script>
     let _toastTimer = null;
-    function showToast(msg, isError = false) {
+    // ms：提示停留时长。带排查建议的长文案要传长一点，否则用户还没看完就没了
+    // （历史上 15 处调用都传了第三个参数，但签名只有两个 → 全部被无声忽略）。
+    function showToast(msg, isError = false, ms = 3800) {
       const t = document.getElementById("toast");
       if (!t) return;
       t.innerText = msg;
@@ -2559,7 +2561,7 @@
       t.setAttribute("data-error", isError ? "true" : "false");
       t.style.display = "block";
       clearTimeout(_toastTimer);
-      _toastTimer = setTimeout(() => { t.style.display = "none"; }, 3800);
+      _toastTimer = setTimeout(() => { t.style.display = "none"; }, ms);
     }
 
     function scrollToWork() {
@@ -3147,6 +3149,10 @@
         const originalHTML = btn.innerHTML;
         const controller = new AbortController();
         _activeAsk = { controller, btn, originalHTML };
+        // 必须禁用：不禁用的话用户再点一次会走上面「替换」分支，
+        // 把自己**第一次**请求 abort 掉并弹「已中止上一次请求」——
+        // 用户看到的是"我点了一下，它说取消了一次请求"，像是程序崩了。
+        btn.disabled = true;
         btn.innerHTML = `<span>⏳ 解答中...</span> <button type="button" data-cancel-ask style="margin-left:6px; padding:1px 8px; font-size:11px; background:var(--accent-terracotta); color:#fff; border:0; border-radius:6px; cursor:pointer;">✕ 取消</button>`;
         const cancelBtn = btn.querySelector("[data-cancel-ask]");
         if (cancelBtn) cancelBtn.onclick = cancelActiveAsk;
@@ -3298,24 +3304,45 @@
       // showVaultSaveModal, and any future inline pickers.
       // ---------------------------------------------------------------
       function _wireModalDismissals(overlay, closeFn) {
+        // ⚠ 核心不变量：**任何**关闭路径（Esc / 点遮罩 / 点按钮）都必须摘掉
+        //   挂在 document 上的 keydown。原来 Esc 分支直接调 closeFn，绕过了
+        //   removeEventListener → 每按一次 Esc 关窗就永久留下一个 document
+        //   监听；弹窗开得越多越慢，而且旧监听还会去关已经关掉的弹窗。
+        //   同时加 closed 幂等：Esc / 遮罩 / 按钮 三个动作只生效第一个。
+        //
+        //   上一次没关闭就又调进来（按钮连点两次打开同一个 overlay）时，
+        //   先摘掉上一套，避免叠加。
+        if (typeof overlay._dismissCleanup === "function") {
+          overlay._dismissCleanup();
+        }
+
+        let closed = false;
         const onKey = (e) => {
           if (e.key === "Escape") {
             e.stopPropagation();
-            closeFn(null);
+            fire(null);
           }
         };
         const onClick = (e) => {
           // Only the backdrop itself, not children (inner panel)
-          if (e.target === overlay) closeFn(null);
+          if (e.target === overlay) fire(null);
         };
-        document.addEventListener("keydown", onKey);
-        overlay.addEventListener("click", onClick);
-        const wrapped = (r) => {
+        const cleanup = () => {
           document.removeEventListener("keydown", onKey);
           overlay.removeEventListener("click", onClick);
+          overlay._dismissCleanup = null;
+        };
+        const fire = (r) => {
+          if (closed) return;
+          closed = true;
+          cleanup();
           closeFn(r);
         };
-        return wrapped;
+
+        document.addEventListener("keydown", onKey);
+        overlay.addEventListener("click", onClick);
+        overlay._dismissCleanup = cleanup;
+        return fire;
       }
 
       // ---------------------------------------------------------------
@@ -3492,8 +3519,10 @@
         return;
       }
       const btn = document.getElementById("btn-fetch-paper");
-      btn.disabled = true;
-      btn.innerHTML = '<span>检索中...</span>';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span>检索中...</span>';
+      }
 
       try {
         const res = await fetch("/api/paper/fetch", {
@@ -3623,7 +3652,12 @@
 
     // Re-render preview & refresh subfolder list when topic category changes.
     // Use change event (datalist-driven select needs input + change).
-    document.addEventListener("DOMContentLoaded", () => {
+    //
+    // ⚠ 不能只挂 DOMContentLoaded：用户常常带 `?open_pdf=` / `#paper=` **直达
+    //   打开**，那时 DOMContentLoaded 早已触发过（readyState 已是 interactive），
+    //   监听器再注册就是死的 → 分类变更后子文件夹列表和保存路径预览都不动。
+    //   这就是 AGENTS.md §4.1 那个"看板全是 0"的同型缺陷，别改回去。
+    function _wirePaperFormInputs() {
       const cat = document.getElementById("paper-category");
       if (cat) {
         cat.addEventListener("change", () => { refreshPaperSubfolderList(); updatePaperSavePathPreview(); });
@@ -3636,7 +3670,12 @@
       // Initial render
       refreshPaperSubfolderList();
       updatePaperSavePathPreview();
-    });
+    }
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", _wirePaperFormInputs);
+    } else {
+      _wirePaperFormInputs();
+    }
 
     async function handleCreateRepro() {
       const name = document.getElementById("repro-name").value.trim();
@@ -3652,6 +3691,9 @@
         description: document.getElementById("repro-desc").value.trim()
       };
 
+      // 防重复提交：双击会在磁盘上生成两份复现工程目录
+      const btn = document.getElementById("btn-create-repro");
+      if (btn) btn.disabled = true;
       try {
         const res = await fetch("/api/reproduction/create", {
           method: "POST",
@@ -3664,10 +3706,15 @@
         loadStats();
       } catch (err) {
         showToast("创建工程失败: " + err.message, true);
+      } finally {
+        if (btn) btn.disabled = false;
       }
     }
 
     async function handleGenerateWeekly() {
+      // 防重复提交：双击会生成两份内容相同、时间戳不同的周报
+      const btn = document.getElementById("btn-generate-weekly");
+      if (btn) btn.disabled = true;
       try {
         const res = await fetch("/api/weekly/generate", {
           method: "POST",
@@ -3679,6 +3726,8 @@
         loadStats();
       } catch (err) {
         showToast("生成周报失败: " + err.message, true);
+      } finally {
+        if (btn) btn.disabled = false;
       }
     }
 
@@ -3698,6 +3747,9 @@
         solution: solution
       };
 
+      // 防重复提交：双击会在 03_Knowledge 里写两条一模一样的踩坑记录
+      const btn = document.getElementById("btn-save-troubleshoot");
+      if (btn) btn.disabled = true;
       try {
         const res = await fetch("/api/troubleshoot/add", {
           method: "POST",
@@ -3712,6 +3764,8 @@
         loadStats();
       } catch (err) {
         showToast("记录失败: " + err.message, true);
+      } finally {
+        if (btn) btn.disabled = false;
       }
     }
 
@@ -4064,8 +4118,13 @@
       // Clear URL hash so refresh doesn't auto-reopen
       history.replaceState(null, "", window.location.pathname + window.location.search);
       // Stop PDF.js rendering if active
+      //
+      // `rendering` 上只有 `cancelled` 标志，**没有 cancel() 方法** ——
+      // 原来这里调 `rendering.cancel()`，每次关窗都抛 TypeError 并被
+      // catch 吃掉，真正的取消全靠一个每秒轮询 getComputedStyle 的
+      // interval 兜底（既慢又每秒强制一次样式计算）。现在直接置标志。
       if (_pdfState && _pdfState.rendering) {
-        try { _pdfState.rendering.cancel(); } catch (e) {}
+        _pdfState.rendering.cancelled = true;
       }
       // Hide Copilot elements
       const bubble = document.getElementById("reader-selection-bubble");
@@ -4080,7 +4139,6 @@
     let _readerMode = "section"; // "section" | "pdf"
     let _pdfZoom = 1.0; // user-controlled PDF zoom multiplier (PDF dual-column view)
     let _pdfState = null; // { paperId, paperTitle, relativePath, pdfDoc, pages: [{num, canvas, text, translated}], rendering }
-    let _pdfModalWatcher = null; // single setInterval handle for the modal-close watcher
 
     function switchReaderMode(mode, opts = {}) {
       _readerMode = mode;
@@ -4316,17 +4374,10 @@
         };
         // 打开这篇论文的历史批注（高亮 + 我的笔记），下次进来直接可见
         loadAnnotationsForPaper(paperId);
-        // Mark cancelled flag when modal closes. Only ONE watcher may be
-        // alive — a setInterval per load leaked one timer per PDF load.
-        if (_pdfModalWatcher) clearInterval(_pdfModalWatcher);
-        _pdfModalWatcher = setInterval(() => {
-          if (!document.getElementById("reader-modal") ||
-              getComputedStyle(document.getElementById("reader-modal")).display === "none") {
-            if (_pdfState && _pdfState.rendering) _pdfState.rendering.cancelled = true;
-            clearInterval(_pdfModalWatcher);
-            _pdfModalWatcher = null;
-          }
-        }, 1000);
+        // 这里原来挂了一个每秒轮询 `getComputedStyle(#reader-modal)` 的
+        // interval，只为发现"弹窗被关掉了"。但全项目只有 closeReaderModal()
+        // 会把弹窗藏起来，而它现在已经直接置 rendering.cancelled = true
+        // → 轮询纯属多余（还会在 PDF 打开期间每秒强制一次样式重算）。删掉。
 
         // Render all pages
         listEl.innerHTML = "";
@@ -4345,6 +4396,8 @@
           }
           _pdfState.pages.push(pageData);
         }
+        // 批注徽标一次性刷新（原来在 renderPdfPage 里逐页刷 → O(页数²)）
+        refreshPdfPageAnnoBadges();
         // Start smooth queue (page 1 translates immediately, pages 2..N translate paced at 3.2s)
         // Skip if we're a stale generation — otherwise we'd queue unneeded translates.
         if (_pdfState.rendering.generation === myGen) {
@@ -4777,8 +4830,14 @@
         modal.style.display = "flex";
       }
       // ESC to close
-      const onEsc = (e) => { if (e.key === "Escape") closeSnapshotModal(); };
-      document.addEventListener("keydown", onEsc, { once: true });
+      //
+      // ⚠ 不能只用 `{ once: true }`：它只在**下一次按键**时移除。
+      //   用户多半是点「×」关窗 → 监听器永远留在 document 上，
+      //   每次打开弹窗再加一个 → 越用越多，而且下次按 Esc 会去关
+      //   早已关闭的弹窗。改成显式句柄 + close 里移除（见 closeSnapshotModal）。
+      if (_snapshotEscHandler) document.removeEventListener("keydown", _snapshotEscHandler);
+      _snapshotEscHandler = (e) => { if (e.key === "Escape") closeSnapshotModal(); };
+      document.addEventListener("keydown", _snapshotEscHandler);
       await refreshSnapshotModal();
     }
 
@@ -4847,9 +4906,17 @@
       }
     }
 
+    // Esc 关闭快照弹窗的监听句柄（跨调用保存，close 时移除 —— 见 closeSnapshotModal）
+    let _snapshotEscHandler = null;
+
     function closeSnapshotModal() {
       const m = document.getElementById("snapshot-modal");
       if (m) m.style.display = "none";
+      // 与 showSnapshotModal 里注册的 Esc 句柄配对，避免监听器越积越多
+      if (_snapshotEscHandler) {
+        document.removeEventListener("keydown", _snapshotEscHandler);
+        _snapshotEscHandler = null;
+      }
     }
 
     // Expose to window for inline onclick attribute on the TopNav button
@@ -4931,11 +4998,13 @@
           </div>
         `;
         document.body.appendChild(modal);
-        const onEsc = (e) => { if (e.key === "Escape") closeDiagnoseModal(); };
-        document.addEventListener("keydown", onEsc, { once: true });
       } else {
         modal.style.display = "flex";
       }
+      // Esc 关闭（显式句柄 + close 里移除，同 snapshot 弹窗的理由）
+      if (_diagEscHandler) document.removeEventListener("keydown", _diagEscHandler);
+      _diagEscHandler = (e) => { if (e.key === "Escape") closeDiagnoseModal(); };
+      document.addEventListener("keydown", _diagEscHandler);
       _renderDiagnoseTable();
     }
     function _renderDiagnoseTable() {
@@ -4969,7 +5038,10 @@
           const color = ok ? "#5a8a3e" : "#B25336";
           const icon = ok ? "✓" : "✗";
           const dur = (e.duration_ms / 1000).toFixed(1) + "s";
-          const durColor = e.duration_ms > 30000 ? "#B25336" : (e.duration_ms > 180000 ? "#7a1a1a" : "var(--text-main)");
+          // 判断顺序必须从**大**到小：原来先判 >30000 再判 >180000，
+          // 后者永远已经被前者吞掉 → 超慢请求从不变最深的红色。
+          const durColor = e.duration_ms > 180000 ? "#7a1a1a"
+            : (e.duration_ms > 30000 ? "#B25336" : "var(--text-main)");
           const time = (e.ts || "").slice(11, 19);
           return `
             <div style="display:grid; grid-template-columns: 60px 50px 90px 70px 110px 60px 1fr; gap:6px 12px; padding:8px 10px; border-bottom:1px solid var(--card-border-subtle); align-items:center;">
@@ -4984,9 +5056,16 @@
         }).join('')}
       `;
     }
+    // Esc 关闭诊断弹窗的监听句柄（见 closeDiagnoseModal）
+    let _diagEscHandler = null;
+
     function closeDiagnoseModal() {
       const m = document.getElementById("diag-modal");
       if (m) m.style.display = "none";
+      if (_diagEscHandler) {
+        document.removeEventListener("keydown", _diagEscHandler);
+        _diagEscHandler = null;
+      }
     }
     window.showDiagnoseModal = showDiagnoseModal;
     window.closeDiagnoseModal = closeDiagnoseModal;
@@ -5123,8 +5202,10 @@
       }
 
       // 原文侧已有的批注高亮（缩放重绘后按比例还原）
+      // 注意：**不要**在这里调 refreshPdfPageAnnoBadges() —— 它会
+      // querySelectorAll 全部页块 × 每条批注，在 20 页的循环里被调 20 次
+      // 就是 O(N²)。徽标统一在循环结束后刷一次。
       drawAnnoOverlays(pageNum, canvasWrapper);
-      refreshPdfPageAnnoBadges();
 
       // Add placeholder translation block. A zoom re-render walks every
       // page again, so this append has to be idempotent: if a block for
