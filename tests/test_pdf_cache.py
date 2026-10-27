@@ -108,6 +108,53 @@ def test_cache_key_includes_the_extractor_version(tmp_path):
     assert key != key2, "抽取器版本没参与缓存键 → 算法改了还在用旧抽取结果"
 
 
+def test_cache_key_includes_the_extract_impl_rev(tmp_path):
+    """缓存键必须包含**抽取实现修订号**（与快照闸门分开的那一个）。
+
+    为什么需要它：批次 B 改了 `_is_mathish_line` → 429 页里 10 页的抽取
+    输出变了，但逐页取证证明只有 1 页落在用户已译范围内且那一页是改进
+    → `EXTRACTOR_VERSION` 不动（用户的 75 页译文一页都不用重翻）。
+
+    可缓存里存的是**旧实现**抽出来的文本 → 必须失效。否则会进入一个
+    **没有告警的不一致状态**：同一份 PDF、同一份代码，缓存冷热不同 →
+    结果不同；而前端的逐页 `text_hash` 是按**客户端 pdf.js** 抽的文本
+    算的，服务端抽取变了它检测不到 → 旧译文配新抽取 = 错位。
+
+    → 用这个独立闸门：**只重建缓存（72s），不动用户的译文。**
+    """
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"x")
+    key = pdf_cache.cache_key(pdf)
+    orig = pdf_cache.EXTRACT_IMPL_REV
+    try:
+        pdf_cache.EXTRACT_IMPL_REV = orig + 1
+        key2 = pdf_cache.cache_key(pdf)
+    finally:
+        pdf_cache.EXTRACT_IMPL_REV = orig
+    assert key != key2, (
+        "抽取实现修订号没参与缓存键 → 改了抽取实现还在用旧抽取结果，"
+        "会出现「同一份 PDF、缓存冷热不同结果不同」的静默错位"
+    )
+
+
+def test_cache_rev_is_independent_of_the_snapshot_gate():
+    """两个闸门必须**互相独立**：缓存修订号不许渗进快照的作废判断。
+
+    快照作废 = 用户重翻全部译文（跨设备，代价高）；
+    缓存作废 = 本机重抽一次 72s（便宜）。
+    把它们绑在一起，要么白让用户重翻，要么留着脏缓存。
+
+    判据：快照那一侧的代码里**不许出现** `EXTRACT_IMPL_REV`。
+    """
+    app_src = (REPO / "microbench" / "app.py").read_text(encoding="utf-8")
+    assert "EXTRACT_IMPL_REV" not in app_src, (
+        "app.py 的快照版本闸门引用了缓存修订号 → 改缓存实现会连 user's "
+        "译文快照一起作废（两个闸门必须解耦）"
+    )
+    # 快照那一侧只认 paper_text 的 EXTRACTOR_VERSION
+    assert "EXTRACTOR_VERSION" in app_src
+
+
 def test_cache_key_differs_between_different_papers(tmp_path):
     """不同的论文不能共用一个缓存条目。"""
     a = tmp_path / "a.pdf"

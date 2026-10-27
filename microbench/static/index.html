@@ -2564,6 +2564,68 @@
       _toastTimer = setTimeout(() => { t.style.display = "none"; }, ms);
     }
 
+    // ------------------------------------------------------------------
+    // HTTP helper：先判状态码，再解析 JSON
+    // ------------------------------------------------------------------
+    //
+    // ⚠ 为什么不能写成 `const d = await res.json(); if (!res.ok) throw ...`：
+    //   服务端 500 / 502 / 504 时，返回的往往**不是 JSON**（uvicorn 的
+    //   `{"detail": ...}`、反代返回的 HTML 错误页、网关超时文本）。
+    //   这时 `res.json()` 先抛 SyntaxError：
+    //     - 真实状态码丢失（用户只看到 "Unexpected token '<'"）
+    //     - `res.detail` 拿不到 → 报的是语法错误，不是"保存失败"
+    //   → 排查方向直接被带偏。
+    //
+    // 这两个 helper 把顺序固定下来：**先看 res.ok，再解析**；解析失败时
+    // 用状态码 + 原文片段兜底，永远不会抛 SyntaxError。
+    async function _readJsonSafe(res) {
+      const text = await res.text();
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          data = null;
+        }
+      }
+      return { data, text };
+    }
+
+    function _httpErrorMessage(data, res, text, fallback) {
+      // FastAPI 的校验错误：detail 是数组
+      if (data && Array.isArray(data.detail)) {
+        return data.detail
+          .map(e => `${(e.loc || []).join('.')} — ${e.msg}`)
+          .join('; ');
+      }
+      if (data && typeof data.detail === "string" && data.detail) return data.detail;
+      if (data && typeof data.error === "string" && data.error) return data.error;
+      const snippet = (text || "").trim().slice(0, 200);
+      if (snippet) return `${fallback}（HTTP ${res.status}: ${snippet}）`;
+      return `${fallback}（HTTP ${res.status}）`;
+    }
+
+    /** GET → 返回解析后的 JSON；非 2xx 直接抛 Error（消息可读）。 */
+    async function getJson(url, opts) {
+      const res = await fetch(url, opts);
+      const { data, text } = await _readJsonSafe(res);
+      if (!res.ok) throw new Error(_httpErrorMessage(data, res, text, "请求失败"));
+      return data;
+    }
+
+    /** POST JSON → 返回解析后的 JSON；非 2xx 直接抛 Error（消息可读）。 */
+    async function postJson(url, payload, opts) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload === undefined ? {} : payload),
+        ...(opts || {}),
+      });
+      const { data, text } = await _readJsonSafe(res);
+      if (!res.ok) throw new Error(_httpErrorMessage(data, res, text, "请求失败"));
+      return data;
+    }
+
     function scrollToWork() {
       document.getElementById("workspace-core").scrollIntoView({ behavior: 'smooth' });
     }
@@ -2827,9 +2889,7 @@
       }
       async function feedReveal(relPath) {
         try {
-          const r = await fetch(`/api/vault/reveal?relative_path=${encodeURIComponent(relPath)}`, { method: "POST" });
-          const data = await r.json();
-          if (!r.ok) throw new Error(data.detail || "HTTP " + r.status);
+          const data = await postJson(`/api/vault/reveal?relative_path=${encodeURIComponent(relPath)}`);
           showToast("📁 已唤起文件管理器", false, 2400);
         } catch (err) {
           showToast("打开文件管理器失败: " + err.message, true);
@@ -2843,9 +2903,7 @@
         const ok = confirm(`确定删除文献笔记?\n\n${title}\n\n文件将进入回收站 (send2trash),可手动恢复。`);
         if (!ok) return;
         try {
-          const r = await fetch(`/api/vault/file?relative_path=${encodeURIComponent(relPath)}`, { method: "DELETE" });
-          const data = await r.json();
-          if (!r.ok) throw new Error(data.detail || "HTTP " + r.status);
+          const data = await getJson(`/api/vault/file?relative_path=${encodeURIComponent(relPath)}`, { method: "DELETE" });
           showToast(`🗑️ 已删除: ${data.path}${data.deleted_to === 'permanent' ? ' (永久)' : ''}`, false, 3000);
           // Refresh the feed and the dashboard stats card
           await loadRecentFeed();
@@ -3525,13 +3583,7 @@
       }
 
       try {
-        const res = await fetch("/api/paper/fetch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ identifier: idInput })
-        });
-        const result = await res.json();
-        if (!res.ok) throw new Error(result.detail || "抓取失败");
+        const result = await postJson("/api/paper/fetch", { identifier: idInput });
 
         const p = result.data;
         document.getElementById("paper-title").value = p.title || "";
@@ -3578,13 +3630,7 @@
       const original = btn ? btn.innerHTML : null;
       if (btn) { btn.disabled = true; btn.innerHTML = '<span>⏳ 保存中...</span>'; }
       try {
-        const res = await fetch("/api/paper/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const result = await res.json();
-        if (!res.ok) throw new Error(result.detail || "保存失败");
+        const result = await postJson("/api/paper/save", payload);
         showToast(`✅ 文献卡片已归档: [${result.folder}/${result.file_name}]`, false, 5000);
         // Refresh subfolder list so the new folder (if any) shows in datalist
         refreshPaperSubfolderList();
@@ -3695,13 +3741,7 @@
       const btn = document.getElementById("btn-create-repro");
       if (btn) btn.disabled = true;
       try {
-        const res = await fetch("/api/reproduction/create", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const result = await res.json();
-        if (!res.ok) throw new Error(result.detail || "创建失败");
+        const result = await postJson("/api/reproduction/create", payload);
         showToast(`✅ 复现工程已就绪: [02_Reproduction/${result.project_name}/]`);
         loadStats();
       } catch (err) {
@@ -3716,12 +3756,7 @@
       const btn = document.getElementById("btn-generate-weekly");
       if (btn) btn.disabled = true;
       try {
-        const res = await fetch("/api/weekly/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" }
-        });
-        const result = await res.json();
-        if (!res.ok) throw new Error(result.detail || "生成失败");
+        const result = await postJson("/api/weekly/generate");
         showToast(`✅ 周报已生成至 Obsidian: [04_Weekly_Reports/${result.filename}]`);
         loadStats();
       } catch (err) {
@@ -3751,13 +3786,7 @@
       const btn = document.getElementById("btn-save-troubleshoot");
       if (btn) btn.disabled = true;
       try {
-        const res = await fetch("/api/troubleshoot/add", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const result = await res.json();
-        if (!res.ok) throw new Error(result.detail || "记录失败");
+        const result = await postJson("/api/troubleshoot/add", payload);
         showToast(`✅ 踩坑记录已沉淀至知识库: [03_Knowledge/踩坑与排错日记.md] (${result.keyword})`);
         document.getElementById("tb-keyword").value = "";
         document.getElementById("tb-solution").value = "";
@@ -4083,13 +4112,7 @@
       }
       showToast("正在拆分章节...");
       try {
-        const res = await fetch("/api/paper/split_text", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ raw_text: raw }),
-        });
-        const result = await res.json();
-        if (!res.ok) throw new Error(result.detail || "拆分失败");
+        const result = await postJson("/api/paper/split_text", { raw_text: raw });
         if (!result.sections || result.sections.length === 0) {
           throw new Error("未识别到任何章节, 请确认文本是否含章节标题");
         }
@@ -4107,14 +4130,39 @@
       }
     }
 
+    // Esc 关闭阅读器的监听句柄（见 openReaderModal）
+    let _readerEscHandler = null;
+
     function openReaderModal() {
       document.getElementById("reader-modal").style.display = "flex";
       document.body.style.overflow = "hidden";
+      // Esc 关闭阅读器（2026-10-27）。
+      //
+      //   之前只能点右上角 × 关窗 —— 全屏阅读器却不能按键盘关，
+      //   是很不自然的交互（§7.1）。
+      //   ⚠ 输入框里按 Esc **不能**关窗（用户在输入框里想取消编辑，
+      //     结果整个阅读器被关掉 = 内容全丢）。
+      if (!_readerEscHandler) {
+        _readerEscHandler = (e) => {
+          if (e.key !== "Escape") return;
+          const t = e.target;
+          const tag = (t && t.tagName || "").toLowerCase();
+          if (tag === "input" || tag === "textarea" || tag === "select"
+              || (t && t.isContentEditable)) return;
+          e.stopPropagation();
+          closeReaderModal();
+        };
+        document.addEventListener("keydown", _readerEscHandler);
+      }
       fetchModelStatus();
     }
     function closeReaderModal() {
       document.getElementById("reader-modal").style.display = "none";
       document.body.style.overflow = "";
+      if (_readerEscHandler) {
+        document.removeEventListener("keydown", _readerEscHandler);
+        _readerEscHandler = null;
+      }
       // Clear URL hash so refresh doesn't auto-reopen
       history.replaceState(null, "", window.location.pathname + window.location.search);
       // Stop PDF.js rendering if active
@@ -4722,19 +4770,13 @@
       } catch {}
       if (btn && !silent) btn.innerText = "💾 保存中...";
       try {
-        const r = await fetch("/api/pdf/snapshot/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            paper_id: _pdfState.paperId,
-            paper_title: _pdfState.paperTitle,
-            relative_path: _pdfState.relativePath,
-            paper_mtime: paperMtime,
-            pages: pagesPayload,
-          }),
+        const data = await postJson("/api/pdf/snapshot/save", {
+          paper_id: _pdfState.paperId,
+          paper_title: _pdfState.paperTitle,
+          relative_path: _pdfState.relativePath,
+          paper_mtime: paperMtime,
+          pages: pagesPayload,
         });
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
         if (!silent) {
           showToast(
             `💾 已保存 ${pagesPayload.length}/${_pdfState.pages.length} 页快照 (${(data.bytes / 1024).toFixed(1)} KB · ${data.saved_at.slice(11, 19)})`,
@@ -5046,7 +5088,7 @@
           return `
             <div style="display:grid; grid-template-columns: 60px 50px 90px 70px 110px 60px 1fr; gap:6px 12px; padding:8px 10px; border-bottom:1px solid var(--card-border-subtle); align-items:center;">
               <div style="color:${color}; font-weight:500;">${icon} p${e.page}</div>
-              <div style="color:${color};">${e.status || '—'}</div>
+              <div style="color:${color};">${escapeHtml(e.status || '—')}</div>
               <div style="color:${durColor};">${dur}</div>
               <div>${escapeHtml(e.model || '—')}</div>
               <div>${e.chars_in}→${e.chars_out}</div>
@@ -5568,13 +5610,7 @@
         showToast(`正在拉取全文并拆分章节…（${Math.round((Date.now() - startedAt) / 1000)}s）`);
       }, 3000);
       try {
-        const res = await fetch("/api/paper/fetch_full", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ identifier: idInput }),
-        });
-        const result = await res.json();
-        if (!res.ok) throw new Error(result.detail || "拉取失败");
+        const result = await postJson("/api/paper/fetch_full", { identifier: idInput });
         if (!result.sections || result.sections.length === 0) {
           throw new Error("PDF 解析后未识别到任何章节, 请检查 PDF 是否可读");
         }
@@ -5608,9 +5644,7 @@
       if (!sel) return;
       sel.innerHTML = `<option value="">📂 从仓库论文库打开…</option>`;
       try {
-        const res = await fetch("/api/paper/list_vault_pdfs");
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        const data = await getJson("/api/paper/list_vault_pdfs");
         if (!data.pdfs || data.pdfs.length === 0) {
           sel.innerHTML = `<option value="">📂 仓库里还没有 PDF</option>`;
           showToast("仓库 01_Literature 下还没有 PDF", true);
@@ -5654,13 +5688,10 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ relative_path: relativePath }),
         });
-        const result = await res.json();
+        const { data: result, text: resText } = await _readJsonSafe(res);
         mark("HTTP " + res.status);
         if (!res.ok) {
-          let msg = result.detail;
-          if (Array.isArray(msg)) msg = msg.map(e => (e.loc || []).join('.') + " — " + e.msg).join('; ');
-          else if (typeof msg !== 'string') msg = JSON.stringify(msg);
-          throw new Error(msg || `HTTP ${res.status}`);
+          throw new Error(_httpErrorMessage(result, res, resText, "打开失败"));
         }
 
         _readerState.title = result.title || "";
@@ -5721,12 +5752,9 @@
           method: "POST",
           body: formData,
         });
-        const result = await res.json();
+        const { data: result, text: resText } = await _readJsonSafe(res);
         if (!res.ok) {
-          let msg = result.detail;
-          if (Array.isArray(msg)) msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
-          else if (typeof msg !== 'string') msg = JSON.stringify(msg);
-          throw new Error(msg || `HTTP ${res.status}`);
+          throw new Error(_httpErrorMessage(result, res, resText, "上传失败"));
         }
 
         // Fill metadata into form if blank
@@ -6276,15 +6304,9 @@
           }),
           signal: _aiSecAbort.signal,
         });
-        const result = await res.json();
+        const { data: result, text: resText } = await _readJsonSafe(res);
         if (!res.ok) {
-          let msg = result.detail;
-          if (Array.isArray(msg)) {
-            msg = msg.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
-          } else if (typeof msg !== 'string') {
-            msg = JSON.stringify(msg);
-          }
-          throw new Error(msg || `HTTP ${res.status}`);
+          throw new Error(_httpErrorMessage(result, res, resText, "翻译失败"));
         }
         _readerState.translations[idx] = result.translation;
         _readerState.translationModels = _readerState.translationModels || {};
@@ -6511,13 +6533,7 @@
           subfolder: dest.subfolder || "",
           filename_override: finalFilename,
         };
-        const res = await fetch("/api/paper/export_bilingual", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "导出失败");
+        const data = await postJson("/api/paper/export_bilingual", payload);
         const qaCountNotice = (_sessionQAList && _sessionQAList.length) ? ` (已整合 ${_sessionQAList.length} 条划词答疑)` : "";
         showToast(
           `✅ 双语笔记已导出 (${renderedSections} 章节已 KaTeX 排版): [${data.folder}/${data.file_name}]${qaCountNotice}`,
@@ -6606,7 +6622,13 @@
       showToast("正在探测 MiniMax 主模型额度状态...");
       try {
         const res = await fetch("/api/llm/probe", { method: "POST" });
-        const data = await res.json();
+        // 先判状态码再解析：探针失败时后端可能返回 HTML 错误页，
+        // 直接 res.json() 会抛 SyntaxError → 用户看到的是语法错误，
+        // 而不是"探测失败"（排查方向被带偏）。
+        const { data, text } = await _readJsonSafe(res);
+        if (!res.ok) {
+          throw new Error(_httpErrorMessage(data, res, text, "探测失败"));
+        }
         if (data.success) {
           showToast(`🚀 ${data.message}`);
         } else {
@@ -6764,8 +6786,23 @@
         el.innerHTML = `<div style="color:var(--text-subtle); font-size:12px; padding:8px;">本论文章节数 < 2, 无法跨章节问答</div>`;
         return;
       }
+      // ⚠ 保留用户的勾选状态（2026-10-27）。
+      //
+      //   这个选择器在每次 renderReader() 时都会重建 —— 而 renderReader()
+      //   在**切换章节**时也会跑 → 用户取消勾选几个章节后随便点一下别的章节，
+      //   勾选就回到默认值了，之前的选择白做。
+      //
+      //   做法：重建前先把当前勾选的 data-idx 读出来，重建后套回去。
+      //   首次渲染（页面里还没有这些 checkbox）时用默认规则。
+      const oldBoxes = el.querySelectorAll("input.cross-qa-section-cb");
+      const prevChecked = new Set();
+      oldBoxes.forEach(cb => { if (cb.checked) prevChecked.add(cb.dataset.idx); });
+      const hasPrev = oldBoxes.length > 0;
+
       el.innerHTML = sections.map((s, i) => {
-        const checked = s.section !== "references" && s.section !== "full_text";
+        const checked = hasPrev
+          ? prevChecked.has(String(i))
+          : (s.section !== "references" && s.section !== "full_text");
         return `<label style="display:flex; align-items:center; gap:6px; padding:4px 0; font-size:12px; color:var(--text-soft); cursor:pointer;">
           <input type="checkbox" class="cross-qa-section-cb" data-idx="${i}" ${checked ? "checked" : ""} style="accent-color: var(--accent-olive);">
           <span>${escapeHtml(s.section)}</span>
@@ -7272,13 +7309,7 @@
         "（PDF 内容没变的话，以后同步也不会再自动传回去）");
       if (!ok) return;
       try {
-        const r = await fetch("/api/sync/files/release", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ all: true }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+        const d = await postJson("/api/sync/files/release", { all: true });
         showToast(`已释放 ${d.released} 篇云端 PDF，腾出 ${((d.freed_bytes || 0) / 1048576).toFixed(1)} MB`);
         await refreshSyncFilesInfo();
       } catch (e) {
@@ -8884,13 +8915,7 @@
           subfolder: dest.subfolder || "",
           filename_override: dest.filename || "",
         };
-        const res = await fetch("/api/paper/export_qa", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "导出失败");
+        const data = await postJson("/api/paper/export_qa", payload);
         showToast(`✅ 答疑已归档: [${data.folder}/${data.file_name}]`, false, 5000);
         loadStats();
       } catch (err) {
@@ -9000,7 +9025,15 @@
       const catSelect = overlay.querySelector("[data-kp-category]");
       const toolInput = overlay.querySelector("[data-kp-tool]");
       kwInput.value = opts.defaultKeyword || "";
-      catSelect.innerHTML = categories.map(c => `<option value="${c}">${c}</option>`).join("");
+      // 用 DOM API 而不是 innerHTML 拼 <option>：分类名一旦改成从接口取，
+      // 未转义的拼接就是注入点（当前 categories 是硬编码常量，所以只是加固）。
+      catSelect.innerHTML = "";
+      categories.forEach(c => {
+        const opt = document.createElement("option");
+        opt.value = c;
+        opt.textContent = c;
+        catSelect.appendChild(opt);
+      });
       catSelect.value = "TCAD仿真收敛";
       toolInput.value = opts.defaultTool || "";
       setTimeout(() => kwInput.focus(), 50);

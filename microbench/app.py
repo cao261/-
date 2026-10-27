@@ -71,6 +71,7 @@ from .paper_text import (fetch_full_text, split_into_sections,
                           extract_text_from_pdf, extract_page_text_with_glyphs)
 from . import glyphs as glyphs_mod
 from . import pdf_cache
+from . import paperid
 from .lan import resolve_token as _resolve_lan_token
 
 
@@ -2955,6 +2956,78 @@ def _translation_max_tokens(src_len: int, model: str = "") -> int:
     return base
 
 
+async def _translate_chunks(chunks: list[str],
+                            build_user_msg,
+                            model: str,
+                            m_name: str,
+                            m_fallback: bool,
+                            deadline: float,
+                            call_info: dict | None = None) -> tuple[list[str], str]:
+    """把若干分块依次翻完，返回 (译文片段列表, 停止原因)。
+
+    为什么不自己写循环：章节翻译和按页翻译的循环**逐行几乎一样**
+    （分块 → 查剩余时间 → 拼提示词 → 调 llm.chat → 收集结果），
+    只有三处不同：
+      - 提示词措辞（"论文章节" vs "第 N 页"）→ 由 `build_user_msg` 回调提供
+      - 实际用了哪个模型的回填 → `call_info` 字典（llm.chat 的 `ret=` 参数，
+        调用方传 None 就不回填）
+      - 出错时的提示文案（"LLM 翻译失败" vs "按页翻译失败"）→ 由调用方
+        在自己的 except 里处理（这里只抛 LLMError，不转 HTTPException）
+
+    ⚠ 三条不能改的细节（都踩过坑）：
+      1. `.strip()` 必须作用在 **await 之后的结果**上。
+         写成 `await asyncio.to_thread(...).strip()` 会把 .strip() 绑到
+         协程对象上 → "'coroutine' object has no attribute 'strip'"
+         → 两个翻译端点**全部失效**。
+      2. 单次调用的超时取「剩余时间的一半」：截断后 llm 层可能抬高预算
+         重试一次，留一半给它，整条链路才不会越过总时限。
+      3. llm.chat 是**同步**的 requests 调用，必须丢线程池
+         （直接调会占住事件循环整整一个往返）。
+    """
+    parts: list[str] = []
+    stopped_reason = ""
+    for idx, chunk in enumerate(chunks):
+        remaining = deadline - time.monotonic()
+        if remaining <= 5:
+            stopped_reason = "deadline"
+            break
+        user_msg = build_user_msg(idx, chunk, len(chunks))
+        call_timeout = int(max(20, min(300, remaining / 2)))
+        try:
+            translated = await asyncio.to_thread(
+                llm.chat,
+                messages=[
+                    {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=_translation_max_tokens(len(chunk), model),
+                # 翻译要的是「同一段原文 → 同一份译文」，temperature 必须为 0；
+                # 否则每次点「重新翻译」措辞都变，混着未译的元信息看着像时翻时不翻。
+                temperature=0.0,
+                # 强制思考的模型（M3.1-Flash）单次要跑 100~200s，超时要放开；
+                # 但不能超过这次请求的剩余时间，否则会越过总时限。
+                timeout=call_timeout,
+                # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
+                disable_thinking=llm.translation_disable_thinking(),
+                # 翻译专用模型（LLM_TRANSLATION_MODEL）；用户手动换了模型时以用户的为准
+                model_name=m_name or llm.translation_model_name(),
+                force_fallback=m_fallback,
+                # 整条链路（重试 + 抬预算重试）都受这个时限约束
+                deadline=deadline,
+                # 回填实际用的模型（自定义模型连不上会自动退回）
+                # → llm.chat 用 `ret=` 字典回填（不是 call_info 参数）
+                ret=call_info,
+            )
+        except llm.LLMError:
+            # 前面已经翻完了几段 → 返回部分结果，别把整篇的成果丢掉
+            if parts:
+                stopped_reason = "error"
+                break
+            raise
+        parts.append((translated or "").strip())
+    return parts, stopped_reason
+
+
 @app.post("/api/paper/translate_section")
 async def api_translate_section(req: TranslateRequest):
     """
@@ -3000,73 +3073,17 @@ async def api_translate_section(req: TranslateRequest):
     deadline = time.monotonic() + _translation_deadline_seconds(req.model)
     stopped_reason = ""
 
+    def _build_user_msg(idx: int, chunk: str, total: int) -> str:
+        if was_segmented:
+            return (
+                f"翻译以下学术论文章节 (标题: {req.section_title}, "
+                f"第 {idx + 1}/{total} 段):\n\n{chunk}"
+            )
+        return f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}"
+
     try:
-        for idx, chunk in enumerate(chunks):
-            remaining = deadline - time.monotonic()
-            if remaining <= 5:
-                stopped_reason = "deadline"
-                break
-            if was_segmented:
-                user_msg = (
-                    f"翻译以下学术论文章节 (标题: {req.section_title}, "
-                    f"第 {idx + 1}/{len(chunks)} 段):\n\n{chunk}"
-                )
-            else:
-                user_msg = (
-                    f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}"
-                )
-            # llm.chat() is a *synchronous* requests-based call with a 120s
-            # timeout. Calling it straight from this async def pins the event
-            # loop for the whole round trip, so every other endpoint (stats,
-            # feed, model probe) stalls while one section translates — and this
-            # loop can do it once per chunk. Hand it to a worker thread.
-            #
-            # NOTE: the `.strip()` must apply to the RESULT, not to the
-            # coroutine object returned by asyncio.to_thread. Writing
-            # `await asyncio.to_thread(...).strip()` binds .strip() to the
-            # coroutine and raises
-            #   "'coroutine' object has no attribute 'strip'"
-            # — which broke both translation endpoints completely.
-            #
-            # 单次调用的超时取「剩余时间的一半」：截断后 llm 层还可能抬高预算
-            # 重试一次，留一半给它，整条链路才不会越过总时限。
-            call_timeout = int(max(20, min(300, remaining / 2)))
-            try:
-                translated = await asyncio.to_thread(
-                    llm.chat,
-                    messages=[
-                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    # 输出预算按分块长度自适应（见 _translation_max_tokens）：
-                    # 思考型模型的推理 token 与正文共用同一个 max_tokens 池，固定
-                    # 4000 正好是最容易被截断的档位，截断了译文就断在半句。
-                    max_tokens=_translation_max_tokens(len(chunk), model),
-                    # 翻译要的是「同一段原文 → 同一份译文」，temperature 必须为 0；
-                    # 否则每次点「重新翻译」措辞都变，混着未译的元信息看着像时翻时不翻。
-                    temperature=0.0,
-                    # Generous timeout — MiniMax thinking mode can take 60s
-                    # per chunk; multi-chunk translations need headroom.
-                    # 强制思考的模型（M3.1-Flash）单次要跑 100~200s，120s 会把
-                    # 它砍在半路（砍掉之后拿到的还是残缺译文）。
-                    timeout=call_timeout,
-                    # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
-                    disable_thinking=llm.translation_disable_thinking(),
-                    # 翻译专用模型（LLM_TRANSLATION_MODEL）：M3.1-Flash 强制思考，
-                    # 直译会又慢又断句，单独指定一个能关思考的模型更稳。
-                    # 用户手动换了模型时以用户的为准。
-                    model_name=_m_name or llm.translation_model_name(),
-                    force_fallback=_m_fallback,
-                    # 整条链路（重试 + 抬预算重试）都受这个时限约束
-                    deadline=deadline,
-                )
-            except llm.LLMError:
-                # 前面已经翻完了几段 -> 返回部分结果，别把整节的成果丢掉
-                if translated_parts:
-                    stopped_reason = "error"
-                    break
-                raise
-            translated_parts.append((translated or "").strip())
+        translated_parts, stopped_reason = await _translate_chunks(
+            chunks, _build_user_msg, model, _m_name, _m_fallback, deadline)
     except llm.LLMError as e:
         msg = str(e)
         if ("时限" in msg or "timed out" in msg.lower()
@@ -3104,42 +3121,23 @@ async def api_translate_section(req: TranslateRequest):
             file=sys.stderr,
         )
         try:
-            retry_parts: list[str] = []
-            for idx, chunk in enumerate(chunks):
-                hint = ""
-                if leaked:
-                    hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
-                            + "\n".join(x[:200] for x in leaked[:5]))
+            hint = ""
+            if leaked:
+                hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
+                        + "\n".join(x[:200] for x in leaked[:5]))
+
+            def _build_retry_msg(idx: int, chunk: str, total: int) -> str:
                 if was_segmented:
-                    user_msg = (
+                    return (
                         f"翻译以下学术论文章节 (标题: {req.section_title}, "
-                        f"第 {idx + 1}/{len(chunks)} 段):\n\n{chunk}{hint}"
+                        f"第 {idx + 1}/{total} 段):\n\n{chunk}{hint}"
                     )
-                else:
-                    user_msg = (
-                        f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}{hint}"
-                    )
-                retry_parts.append(
-                    (
-                        await asyncio.to_thread(
-                            llm.chat,
-                            messages=[
-                                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                                {"role": "user", "content": user_msg},
-                            ],
-                            max_tokens=_translation_max_tokens(len(chunk), model),
-                            temperature=0.0,
-                            # 重译同样受总时限约束，别让「重译一次」再拖一轮
-                            timeout=int(max(20, min(300, max(1.0, deadline - time.monotonic()) / 2))),
-                            disable_thinking=llm.translation_disable_thinking(),
-                            # 必须用同一个翻译模型：主模型和翻译模型措辞风格不同，
-                            # 混用会让"重译版"看起来像另一份译文
-                            model_name=_m_name or llm.translation_model_name(),
-                            force_fallback=_m_fallback,
-                            deadline=deadline,
-                        )
-                    ).strip()
-                )
+                return f"翻译以下学术论文章节 (标题: {req.section_title}):\n\n{chunk}{hint}"
+
+            retry_parts, _ = await _translate_chunks(
+                chunks, _build_retry_msg, model, _m_name, _m_fallback, deadline,
+                call_info=None,
+            )
             retry_text = sanitize_translation(merge_translation_parts(retry_parts))
             if retry_text and len(retry_text) >= len(translation) * 0.9:
                 translation = retry_text
@@ -3752,52 +3750,19 @@ async def api_translate_page(req: TranslatePageRequest):
     # 单次翻译请求的总时限（见 api_translate_section 的同名逻辑）
     deadline = time.monotonic() + _translation_deadline_seconds(req.model)
     stopped_reason = ""
+
+    def _build_user_msg(idx: int, chunk: str, total: int) -> str:
+        if total > 1:
+            return (
+                f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{total} 段):\n\n{chunk}"
+            )
+        return f"翻译以下学术论文第 {req.page} 页:\n\n{chunk}"
+
     try:
-        for idx, chunk in enumerate(chunks):
-            remaining = deadline - time.monotonic()
-            if remaining <= 5:
-                stopped_reason = "deadline"
-                break
-            if len(chunks) > 1:
-                user_msg = (
-                    f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{len(chunks)} 段):\n\n{chunk}"
-                )
-            else:
-                user_msg = f"翻译以下学术论文第 {req.page} 页:\n\n{chunk}"
-            # 单次调用的超时取剩余时间的一半，给「截断后抬预算重试」留位置
-            call_timeout = int(max(20, min(300, remaining / 2)))
-            try:
-                translated = await asyncio.to_thread(
-                    llm.chat,
-                    messages=[
-                        {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    max_tokens=_translation_max_tokens(len(chunk), model),
-                    # 翻译要确定性：同一段原文每次都该得到同一份译文
-                    temperature=0.0,
-                    # 强制思考的模型单次要跑 100~200s，超时要放开；但不能超过
-                    # 这次请求的剩余时间，否则会越过总时限。
-                    timeout=call_timeout,
-                    # 直译任务关掉思考：更快，且不会在推理里打转导致正文为空
-                    disable_thinking=llm.translation_disable_thinking(),
-                    # 翻译专用模型（LLM_TRANSLATION_MODEL）；用户手动换了模型时以用户的为准
-                    model_name=_m_name or llm.translation_model_name(),
-                    force_fallback=_m_fallback,
-                    # 整条链路（重试 + 抬预算重试）都受这个时限约束
-                    deadline=deadline,
-                    # 回填实际用的模型（自定义模型连不上会自动退回）
-                    ret=call_info,
-                )
-            except llm.LLMError:
-                # 前面已经翻完了几段 -> 返回部分结果
-                if translated_parts:
-                    stopped_reason = "error"
-                    break
-                raise
-            # `.strip()` must apply to the awaited result, not to the
-            # coroutine (see the same note in api_translate_section).
-            translated_parts.append((translated or "").strip())
+        translated_parts, stopped_reason = await _translate_chunks(
+            chunks, _build_user_msg, model, _m_name, _m_fallback, deadline,
+            call_info=call_info,
+        )
     except llm.LLMError as e:
         msg = str(e)
         if ("时限" in msg or "timed out" in msg.lower()
@@ -3845,38 +3810,23 @@ async def api_translate_page(req: TranslatePageRequest):
             file=sys.stderr,
         )
         try:
-            retry_parts: list[str] = []
-            for idx, chunk in enumerate(chunks):
-                hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
-                        + "\n".join(x[:200] for x in leaked[:5]))
-                if len(chunks) > 1:
-                    user_msg = (
-                        f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{len(chunks)} 段):"
+            hint = ("\n\n【注意】上一次翻译漏掉了以下内容，必须完整翻译：\n"
+                    + "\n".join(x[:200] for x in leaked[:5]))
+
+            def _build_retry_msg(idx: int, chunk: str, total: int) -> str:
+                if total > 1:
+                    return (
+                        f"翻译以下学术论文第 {req.page} 页 (第 {idx+1}/{total} 段):"
                         f"\n\n{hint}\n\n{chunk}"
                     )
-                else:
-                    user_msg = f"翻译以下学术论文第 {req.page} 页:\n\n{hint}\n\n{chunk}"
-                retry_parts.append(
-                    (
-                        await asyncio.to_thread(
-                            llm.chat,
-                            messages=[
-                                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
-                                {"role": "user", "content": user_msg},
-                            ],
-                            max_tokens=_translation_max_tokens(len(chunk), model),
-                            temperature=0.0,
-                            # 重译同样受总时限约束，别让「重译一次」再拖一轮
-                            timeout=int(max(20, min(300, max(1.0, deadline - time.monotonic()) / 2))),
-                            disable_thinking=llm.translation_disable_thinking(),
-                            # 必须用同一个翻译模型：主模型和翻译模型措辞风格不同，
-                            # 混用会让"重译版"看起来像另一份译文
-                            model_name=_m_name or llm.translation_model_name(),
-                            force_fallback=_m_fallback,
-                            deadline=deadline,
-                        )
-                    ).strip()
-                )
+                return f"翻译以下学术论文第 {req.page} 页:\n\n{hint}\n\n{chunk}"
+
+            # call_info=None：不回填 —— 结果里报的是**第一遍**实际用的模型，
+            # 重译只是补救，不该把徽标改成重译那一遍的模型。
+            retry_parts, _ = await _translate_chunks(
+                chunks, _build_retry_msg, model, _m_name, _m_fallback, deadline,
+                call_info=None,
+            )
             retry_text = sanitize_translation(merge_translation_parts(retry_parts))
             if retry_text and len(retry_text) >= len(translation) * 0.9:
                 translation = retry_text
@@ -4289,17 +4239,9 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
         )
 
     target = _snapshot_path(safe_id)
-    tmp = target.with_suffix(".json.tmp")
     try:
-        tmp.write_text(serialized, encoding="utf-8")
-        os.replace(tmp, target)
+        _atomic_write_text(target, serialized)
     except Exception as e:
-        # Best-effort cleanup of orphan .tmp
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
         raise HTTPException(status_code=500, detail=f"写盘失败: {_safe_err(e)}")
 
     return {
@@ -4526,34 +4468,18 @@ def _trim_progress_record(rec: dict) -> dict:
 
 SYNC_FILE_SUBDIR = "files"
 PDF_MAX_BYTES = 256 * 1024 * 1024
-_JS_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
-
-
-def _js_base36(n: int) -> str:
-    """JS 的 Number.prototype.toString(36)。"""
-    if n == 0:
-        return "0"
-    out = []
-    while n:
-        out.append(_JS_BASE36[n % 36])
-        n //= 36
-    return "".join(reversed(out))
-
-
-def _djb2_base36_utf16(s: str) -> str:
-    """JS 的 djb2 + toString(36)，**按 UTF-16 码元**迭代。
-
-    ⚠ JS 的 s.charCodeAt(i) 取 UTF-16 码元，Python 的 ord(ch) 取码点 ——
-      路径里有 emoji（代理对）时两端算出的哈希不一样，
-      paper_id / 批注 / 快照 / 阅读进度就**静默**对不上。
-      实现与 merge_changes.djb2_base36 保持一致（那边本来就写对了）。
-    """
-    h = 5381
-    raw = s.encode("utf-16-le", errors="surrogatepass")
-    for i in range(0, len(raw), 2):
-        unit = raw[i] | (raw[i + 1] << 8)
-        h = ((h << 5) + h + unit) & 0xFFFFFFFF
-    return _js_base36(h)
+# JS 的 djb2 + toString(36)，**按 UTF-16 码元**迭代。
+#
+# ⚠ JS 的 s.charCodeAt(i) 取 UTF-16 码元，Python 的 ord(ch) 取码点 ——
+#   路径里有 emoji（代理对）时两端算出的哈希不一样，
+#   paper_id / 批注 / 快照 / 阅读进度就**静默**对不上。
+#
+# → 实现已搬到 `microbench/paperid.py`（与 merge_changes 共用同一份；
+#   那边原来少一个 `errors="surrogatepass"`，遇到孤立代理项会抛异常）。
+#   这里直接**别名**，不写包装函数 —— 包装会让"两处是不是同一份实现"
+#   变得没法用 `is` 验证。
+_djb2_base36_utf16 = paperid.djb2_base36
+_js_base36 = paperid.js_base36
 
 
 def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
@@ -4677,14 +4603,9 @@ def _paper_id_for(relative_path: str) -> str:
        Python 的 ord(ch) 取码点（emoji 算 1 个）—— 路径里只要有 emoji
        （或扩展 B 区的汉字），两端算出的 paper_id 就不同，
        批注/快照/阅读进度**静默**认不出来。
-       下面直接复用 merge_changes.djb2_base36 —— 那边已经写对了。
+       → 算法在 `microbench/paperid.py`，与 merge_changes 共用同一份。
     """
-    path = (relative_path or "").replace("\\", "/")
-    base = path.split("/")[-1]
-    if base.lower().endswith(".pdf"):
-        base = base[:-4]
-    base = base[:70] or "paper"
-    return f"{base}_{_djb2_base36_utf16(path)}"
+    return paperid.paper_id_for(relative_path)
 
 
 def _sha256_file(path: Path) -> str:
@@ -4735,13 +4656,11 @@ def _vault_pdfs() -> list:
 def _write_file_meta(safe: str, meta: dict) -> None:
     meta["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
     path = _file_meta_path(safe)
-    # ⚠ 必须 tmp + os.replace。
+    # ⚠ 必须原子写（tmp + os.replace）。
     #   这个目录在坚果云的同步范围内 —— 直接 write_text 的话，
     #   写到一半就被坚果云上传了，另一台设备读到半截 JSON，
     #   _safe_read_json 静默返回 None → 那篇 PDF 的清单凭空消失。
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    _atomic_write_json(path, meta)
 
 
 def _device_id() -> str:
@@ -4965,11 +4884,7 @@ def _read_local_progress() -> dict:
 
 
 def _write_local_progress(data: dict) -> None:
-    p = _local_progress_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, p)
+    _atomic_write_json(_local_progress_path(), data)
 
 
 def _merge_annotation_lists(existing: list, incoming: list, deleted: list) -> list:
@@ -5008,10 +4923,18 @@ class SyncRequest(BaseModel):
 
 
 @app.post("/api/sync")
-async def api_sync(req: SyncRequest):
+def api_sync(req: SyncRequest):
     """一键同步：推送本机状态 + 拉取共享目录里的状态（两边都做，幂等）。
 
     两台设备点同一个按钮即可：推的是自己，拉的是对方，最后合并。
+
+    ⚠ **同步 def，不是 async def**（2026-10-27）。整个函数体是**纯同步
+      磁盘 IO**：遍历同步目录、逐个读 JSON、算 sha256（逐 MB 读）、
+      复制 PDF 本体（可能几百 MB）。写在 async def 里会**独占事件循环**
+      整段时间 —— 用户点一次同步，正在跑的翻译 SSE 流和答疑全部卡住。
+
+      改成同步 def → FastAPI 自动丢进 anyio 线程池执行。
+      与 api_stats / api_find_pdf / api_list_vault_pdfs 同一处理。
     """
     _t0 = time.monotonic()
     root = _sync_root()
@@ -5037,9 +4960,7 @@ async def api_sync(req: SyncRequest):
                 merged = _merge_snapshot_files(dst, fp)
                 if merged is None:
                     continue
-                tmp = dst.with_suffix(".json.tmp")
-                tmp.write_text(merged, encoding="utf-8")
-                os.replace(tmp, dst)
+                _atomic_write_text(dst, merged)
                 pushed["snapshots"].append(fp.name)
             except OSError:
                 continue
@@ -5097,9 +5018,7 @@ async def api_sync(req: SyncRequest):
                 merged = _merge_snapshot_files(dst, fp)
                 if merged is None:
                     continue
-                tmp = dst.with_suffix(".json.tmp")
-                tmp.write_text(merged, encoding="utf-8")
-                os.replace(tmp, dst)
+                _atomic_write_text(dst, merged)
                 pulled["snapshots"].append(fp.name)
                 snapshot_updated = True
             except OSError:
@@ -5181,11 +5100,13 @@ class FileReleaseRequest(BaseModel):
 
 
 @app.post("/api/sync/files/release")
-async def api_sync_files_release(req: FileReleaseRequest):
+def api_sync_files_release(req: FileReleaseRequest):
     """释放云端 PDF 实体，腾出坚果云空间。
 
     只删 files/*.pdf 实体，保留清单（files/*.json）以及批注、译文快照、阅读进度
     —— 那些是真正攒下来的东西，PDF 随时能重新下。
+
+    ⚠ 同步 def（删几百 MB 的文件是同步阻塞 IO，不该占着事件循环）。
     """
     files_dir = _files_dir()
     targets = []
@@ -5428,16 +5349,8 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
         )
 
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(serialized, encoding="utf-8")
-        os.replace(tmp, target)
+        _atomic_write_text(target, serialized)
     except Exception as e:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
         raise HTTPException(status_code=500, detail=f"批注写盘失败: {_safe_err(e)}")
 
     return {
@@ -5469,10 +5382,7 @@ async def api_pdf_annotations_delete(
         payload["annotations"] = kept
         payload["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-            os.replace(tmp, path)
+            _atomic_write_json(path, payload)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"批注删除失败: {_safe_err(e)}")
     return {"status": "success", "paper_id": paper_id, "deleted": deleted}

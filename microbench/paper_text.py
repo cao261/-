@@ -516,6 +516,108 @@ _RELATION_RE = re.compile(r"[=≈≤≥¼]")
 # 数学残片常见符号：括号(乱码) / 分数 / 上下标数字
 _FRAGMENT_CHARS = "ðÞ[]()"
 
+# 连续公式碎片行的**最大长度**（行数）。
+#
+# 超过这个数就不当成"一段坏公式"处理 —— 因为这么多行连续都是"数学行"，
+# 更可能是一整块表格或一整段正文被误判，而不是一条被拆碎的公式。
+#
+# ⚠⚠ 这里有**两个**阈值，**故意不一样**（2026-10-27 取证后拆回来的）：
+#
+#   _MAX_BROKEN_FORMULA_RUN_LINES = 10  → _mark_broken_formulas
+#       「这段是坏掉的公式」→ 整段替换成 ⟦FORMULA⟧ 占位符（没有坐标，
+#       前端裁不出图）。阈值小一点更保守：宁可少判也别把一整块表格毁掉。
+#
+#   _MAX_FORMULA_SPAN_LINES = 12      → _formula_spans
+#       「这段是一整条公式」→ 定位它的 bbox，交给前端从 PDF 原页裁图。
+#       阈值必须够大：**实测 2024_1f_noise_TMR_sensor_bath_corre 第 6 页
+#       的式 (A1) 整整 11 行**（积分上下限 + 求和号 + 分式被拆成多行）。
+#       把它压到 10 → 公式块定位失败 → 11 行碎片直接进 prompt
+#       → 模型会照着编出一条不存在的公式（§4.6：错公式比没公式危险得多）。
+#       用 fitz 裁图比对确认过：旧阈值（12）裁出来的是完整的式 (A1)，
+#       新阈值（10）裁不出图、只剩乱码文本。
+#
+# 所以这两个数**不是重复，是两条不同的判据**：一个管"要不要作废"，
+# 一个管"能不能定位"。合并成一个会静悄悄弄坏 11 行的长公式。
+_MAX_BROKEN_FORMULA_RUN_LINES = 10
+_MAX_FORMULA_SPAN_LINES = 12
+
+# 英文常用短词表（用于区分「正文残行」和「公式碎片」）。
+#
+# 为什么要这张表：`_is_mathish_line` 原来有一条
+#     if len(letters) <= 2 and len(s) <= 12: return True
+# 把 "in" / "of" / "as" 这类**栏缝裁下来的英文残行**判成公式行。
+# 后果是正文整句消失（见 _is_mathish_line 的说明）。
+#
+# 但不能一刀切"有字母就不算公式" —— 公式碎片本身就长这样：
+#     "ndm gp"   ← PDF 数学字体抽出来的分子分母碎片
+#     "x"        ← 孤立的变量
+# 一旦把它们判成正文，公式就会散架、碎片直接进 prompt（模型会瞎编）。
+#
+# 所以只排除「整行都是这些常用英文词」的情况。
+# 词表刻意保守：只收学术论文里高频、且**不可能**是数学符号的词。
+_ENGLISH_SHORT_WORDS = frozenset({
+    # 介词 / 连词 / 冠词 / 常用动词
+    "a", "an", "the", "and", "or", "but", "nor", "for", "yet", "so",
+    "in", "on", "at", "to", "of", "by", "with", "from", "into", "onto",
+    "over", "under", "above", "below", "near", "than", "then", "thus",
+    "as", "is", "are", "was", "were", "be", "been", "being", "am",
+    "it", "its", "we", "us", "our", "they", "them", "their", "he", "she",
+    "this", "that", "these", "those", "there", "here", "not", "no",
+    "if", "do", "does", "did", "can", "could", "may", "might", "must",
+    "shall", "should", "will", "would", "has", "have", "had", "also",
+    "which", "who", "whom", "whose", "when", "where", "why", "how",
+    "all", "any", "each", "both", "few", "more", "most", "other",
+    "some", "such", "only", "own", "same", "so", "too", "very",
+    "can", "one", "two", "via", "per", "etc", "vs",
+})
+
+
+def _is_english_short_words(s: str) -> bool:
+    """这一行是不是「整行都是英文常用短词」（→ 正文残行，不是公式）。
+
+    判据：
+      - 字母串全部是 1~3 个字母的**词**
+      - 每个词都在 `_ENGLISH_SHORT_WORDS` 里
+      - 行里没有数字、公式符号（"ðÞ[]()"）
+
+    对照：
+      "in of as"  → in/of/as 都在表里 → True  → 正文残行 ✓
+      "ndm gp"    → ndm/gp 不在表里 → False → 公式碎片 ✓（保持原判定）
+      "x"         → x 不在表里     → False → 公式碎片 ✓
+      "Z−∞"       → 有公式符号     → False → 公式 ✓
+    """
+    if any(ch.isdigit() for ch in s):
+        return False
+    if any(ch in _FRAGMENT_CHARS for ch in s):
+        return False
+    words = re.findall(r"[A-Za-z]+", s)
+    if not words:
+        return False
+    if not all(len(w) <= 3 for w in words):
+        return False
+    return all(w.lower() in _ENGLISH_SHORT_WORDS for w in words)
+
+# 分栏所需的最小词数。
+#
+# ⚠ 2026-10-27：这里**曾经**被从 40（全页）/ 30（标题区以下）降到 12/10，
+#   理由是"原阈值没挡住任何真问题"。**这个理由是错的，已回退。**
+#
+# 取证（全库 27 篇 / 429 页）：
+#   - words < 40 的页有 3 个，其中 **1 个不是"一页一张图的短页"**：
+#     `2024_Fe_MgO_Fe_DMFT_TMR_first_princ.pdf` 第 20 页 —— 那是
+#     **双栏论文的最后一页**，整页只有一条横跨两栏的参考文献
+#     （"A. Cebollada, ... Applied Physics Letters 79, ..."）
+#     加右上角的页码。
+#   - 降阈值后这一页进了分栏路径，而栏缝恰好落在连字符上
+#     （"Ap-" | "plied"）→ 参考文献被从中间劈开、页码"20"楔进两半之间。
+#     用 fitz 渲染原页确认过：这条参考文献本来是**跨栏整行**。
+#
+#   → 词数少 ≠ 不可能分栏。**保守阈值是对的**：词数不够就别猜栏。
+#   真正的双栏判断交给栏缝探测（`_longest_gap` + `_vote_column_gap`），
+#   探不到就退回 plain。
+_MIN_WORDS_FOR_COLUMNS = 40
+_MIN_BELOW_WORDS_FOR_COLUMNS = 30
+
 
 def _is_mathish_line(line: str) -> bool:
     """判断一行是不是「公式或公式碎片」而不是正文句子。
@@ -563,12 +665,43 @@ def _is_mathish_line(line: str) -> bool:
     # 纯符号行："− ×"、"Z−∞"、"∞"、"× −" —— 公式的积分上下限、乘号残留。
     # 这类行不含 4 字母词，但也不含数字/括号，很容易被当成正文，
     # 一断行公式就被切成好几段（实测 eq (12) 被切成 3 块）。
+    #
+    # ⚠ 2026-10-27 修正：原来第一条是
+    #     letters = re.findall(r"[A-Za-z]", s)
+    #     if len(letters) <= 2 and len(s) <= 12:
+    #         return True
+    # → "in" / "of" / "as" / "to" 这些**孤立的英文短词**全部满足
+    #   「≤2 个字母 且 ≤12 字符」→ 被判成公式行。
+    #
+    #   后果不是"多认了一个公式"，而是**正文整句消失**：
+    #   _mark_broken_formulas 按「连续的公式碎片行」成段判定 —— 一个孤立的
+    #   "in" 紧挨着真正带 [?] 的公式行时会被并进那一段 → 整段替换成
+    #   ⟦FORMULA⟧ → 这句正文从译文里不见了。
+    #
+    # 修法（**刻意保守**）：只把「整行都是真实英文短词」的行排除掉，
+    # 其余一律保持原判定。
+    #
+    #   为什么不能一刀切"有字母就不算公式"：公式碎片本身就长这样 ——
+    #     "ndm gp"    ← PDF 数学字体抽出来的分子分母碎片
+    #     "x"         ← 孤立的变量
+    #   把它们判成正文，公式就会散架、碎片直接进 prompt（模型会瞎猜）。
+    #   实测：JACERS 第 2 页的公式 (2) 就是这么散开的。
+    #
+    #   所以用一张**英文常用短词表**来区分：
+    #     "in of as"  → 全是常用词 → 正文残行 → 不是公式
+    #     "ndm gp"    → 不在词表 → 公式碎片 → 照旧
     letters = re.findall(r"[A-Za-z]", s)
     if len(letters) <= 2 and len(s) <= 12:
+        # 整行都是英文常用短词 → 是正文残行（栏缝裁下来的、原本的连接词）
+        if _is_english_short_words(s):
+            return False
         return True
     has_digit = any(ch.isdigit() for ch in s)
     has_special = any(ch in _FRAGMENT_CHARS for ch in s)
     short_words_only = bool(re.fullmatch(r"[A-Za-z]{1,3}(\s+[A-Za-z]{1,3})*", s))
+    if short_words_only and _is_english_short_words(s):
+        # "in of as" 这种整行都是常用英文词 → 正文残行，不是公式
+        return False
     return has_digit or has_special or short_words_only
 
 
@@ -609,7 +742,7 @@ def _mark_broken_formulas(text: str) -> str:
     # 2) 段里同时有 [?] 和关系符号 → 整段是坏掉的公式
     drop: set[int] = set()
     for run in runs:
-        if len(run) > 10:
+        if len(run) > _MAX_BROKEN_FORMULA_RUN_LINES:
             continue
         seg = "\n".join(lines[i] for i in run)
         has_unk = ("[?]" in seg) or bool(GLYPH_MARKER_RE.search(seg))
@@ -849,7 +982,7 @@ def _formula_spans(lines: list[dict], attached: list[bool]) -> list[tuple[int, i
 
     out: list[tuple[int, int]] = []
     for run in runs:
-        if len(run) > 12:
+        if len(run) > _MAX_FORMULA_SPAN_LINES:
             continue
         seg = "\n".join(lines[i]["text"] for i in run)
         height = (lines[run[-1]]["bottom"] - lines[run[0]]["top"])
@@ -1054,14 +1187,24 @@ def _extract_page_text_raw(page, out_glyphs: Optional[list] = None) -> str:
     except Exception:
         return plain
 
-    if len(words) < 40:
+    # 词数下限：**原来**是 40 / 30（硬编码的魔法数字）。
+    #
+    # ⚠ 2026-10-27 取证（全库 27 篇 / 429 页）：
+    #   words < 40 的页只有 3 个（21 词 / 2 词 / 2 词）—— 全是真正的短页
+    #   （一整页只有一张图或一段图注），退回 plain 是**对的**。
+    #   below < 30 但 words >= 40 的页只有 1 个，而那一页的栏缝检测返回 None
+    #   （整宽内容，本来也测不出双栏）→ 降阈值救不了它。
+    #
+    # 所以：**不靠词数决定是否双栏**，而是先探栏缝，探到了才走双栏路径。
+    # 词数只作为"太少就不可能分栏"的兜底（真正分栏至少要每栏几个词）。
+    if len(words) < _MIN_WORDS_FOR_COLUMNS:
         return plain
 
     # 1) 垂直方向：找到双栏开始的 y（整宽标题区结束的位置）
     y_split = _find_vertical_split(words, width, height)
 
     below = [w for w in words if w["top"] >= y_split]
-    if len(below) < 30:
+    if len(below) < _MIN_BELOW_WORDS_FOR_COLUMNS:
         return plain
 
     # 2) 水平方向：在双栏区域找栏间空白
