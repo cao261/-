@@ -2169,13 +2169,25 @@
       top: 0; left: 0; right: 0;
       z-index: 1200;
       transform: translateY(-101%);
-      transition: transform .2s var(--ease);
+      /* ⚠ HIGH-4（2026-10-27 审计，实测复现）：transform **不会**把元素
+         移出焦点序。只靠 translateY 藏起来的话，工具条里 23 个可聚焦控件
+         仍然能用 Tab 走到 —— 而且它们的 boundingClientRect.top 是 -90
+         （在视口上方，屏幕上看不见）→ 键盘/读屏用户掉进一个看不见的
+         工具条里。visibility:hidden 才是真正的「藏」：同时移出焦点序
+         和可访问性树，而且不影响滑出/滑回的过渡动画。
+         收起时延迟 0.2s 再隐藏（等 transform 动画走完），展开时立即可见。 */
+      visibility: hidden;
+      transition: transform .2s var(--ease), visibility 0s linear .2s;
       max-height: 56vh;
       overflow-y: auto;
       overscroll-behavior: contain;
       box-shadow: 0 12px 32px rgba(0, 0, 0, .22);
     }
-    #reader-modal.zen.zen-bar-open .reader-topbar { transform: translateY(0); }
+    #reader-modal.zen.zen-bar-open .reader-topbar {
+      transform: translateY(0);
+      visibility: visible;
+      transition: transform .2s var(--ease), visibility 0s;
+    }
 
     /* 章节导航：默认收起，只留论文页 + 译文页 */
     #reader-modal.zen .reader-nav { display: none; }
@@ -3450,6 +3462,37 @@
       }
 
       // ---------------------------------------------------------------
+      // Modal Esc dismissal (no click-outside).
+      //
+      // ⚠ 旧写法 `document.addEventListener("keydown", onEsc, { once: true })`
+      //   有三个坑（2026-10-27 审计 HIGH-2，全部实测复现）：
+      //   ① { once: true } 的语义是「**任意**键按一次就摘掉监听器」，
+      //      不是「Esc 才摘」→ 弹窗开着时先按了字母键，Esc 就再也关不掉它；
+      //   ② 诊断弹窗的监听器只在 `if (!modal)` 里挂一次 →
+      //      关掉再打开后 Esc **永久失效**；
+      //   ③ 快照弹窗每打开一次就多挂一个 keydown 监听器（实测 3 次 → 3 个）。
+      //
+      // 这里统一：只认 Esc、关掉时摘干净、并且 stopPropagation
+      // —— 否则专注模式的 Esc 会和弹窗的 Esc 一起响应 → 两边都不响应
+      // （zen 的让路逻辑 `if (_zenOverlayOpen()) return;` 会把 Esc 让给弹窗，
+      //   而弹窗自己的 Esc 已经被别的键吃掉了 → 键盘陷阱）。
+      // ---------------------------------------------------------------
+      function _wireModalEsc(overlay, closeFn) {
+        if (!overlay) return;
+        if (overlay._escDismiss) overlay._escDismiss();
+        const onKey = (e) => {
+          if (e.key !== "Escape") return;
+          e.stopPropagation();
+          if (overlay._escDismiss) overlay._escDismiss();
+          closeFn();
+        };
+        document.addEventListener("keydown", onKey);
+        overlay._escDismiss = () => {
+          document.removeEventListener("keydown", onKey);
+        };
+      }
+
+      // ---------------------------------------------------------------
       // Vault save modal: pick subfolder + filename before exporting
       // bilingual notes or QA cards. Returns Promise<{subfolder, filename}|
       // null (user cancelled).
@@ -4457,6 +4500,15 @@
     function toggleZenNav() {
       const modal = _zenModal();
       if (!modal) return;
+      // ⚠ HIGH-3（2026-10-27 审计，实测复现）：窄屏（<860px）下 CSS 里
+      //   `#reader-modal.zen.zen-nav-open .reader-nav { display: none; }`
+      //   会把刚打开的导航又关掉 → 按钮点了**什么都没发生**：
+      //   实测 display=none、元素 0×0、也没有任何提示 → 用户以为按钮坏了。
+      //   专注模式本来就是给小屏用的，所以这里必须**如实说明**而不是白点。
+      if (window.matchMedia && window.matchMedia("(max-width: 860px)").matches) {
+        showToast("小屏放不下章节导航 —— 专注模式请用「提问」，或退出专注看目录", true, 3600);
+        return;
+      }
       if (_zenEnsureSectionView()) {
         modal.classList.add("zen-nav-open");
         showToast("已切到章节视图（章节导航只在章节视图里有）", false, 2600);
@@ -5270,9 +5322,8 @@
       } else {
         modal.style.display = "flex";
       }
-      // ESC to close
-      const onEsc = (e) => { if (e.key === "Escape") closeSnapshotModal(); };
-      document.addEventListener("keydown", onEsc, { once: true });
+      // ESC to close —— 走 _wireModalEsc（旧写法 {once:true} 有坑，见其注释）
+      _wireModalEsc(modal, closeSnapshotModal);
       await refreshSnapshotModal();
     }
 
@@ -5344,6 +5395,7 @@
     function closeSnapshotModal() {
       const m = document.getElementById("snapshot-modal");
       if (m) m.style.display = "none";
+      if (m && m._escDismiss) { m._escDismiss(); m._escDismiss = null; }
     }
 
     // Expose to window for inline onclick attribute on the TopNav button
@@ -5425,11 +5477,12 @@
           </div>
         `;
         document.body.appendChild(modal);
-        const onEsc = (e) => { if (e.key === "Escape") closeDiagnoseModal(); };
-        document.addEventListener("keydown", onEsc, { once: true });
       } else {
         modal.style.display = "flex";
       }
+      // ESC to close —— 必须放在 if/else **外面**：旧写法挂在 `if (!modal)` 里，
+      // 弹窗第一次创建时才挂一次 → 关掉再打开 Esc 永久失效（实测复现）。
+      _wireModalEsc(modal, closeDiagnoseModal);
       _renderDiagnoseTable();
     }
     function _renderDiagnoseTable() {
@@ -5481,6 +5534,7 @@
     function closeDiagnoseModal() {
       const m = document.getElementById("diag-modal");
       if (m) m.style.display = "none";
+      if (m && m._escDismiss) { m._escDismiss(); m._escDismiss = null; }
     }
     window.showDiagnoseModal = showDiagnoseModal;
     window.closeDiagnoseModal = closeDiagnoseModal;
@@ -6236,7 +6290,7 @@
           <div class="reader-section-header">
             <div class="reader-section-title">📝 中文翻译</div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <span class="reader-section-meta">${modelName ? `[${modelName}] · ` : ""}${translated.length} 字</span>
+              <span class="reader-section-meta">${modelName ? `[${escapeHtml(modelName)}] · ` : ""}${translated.length} 字</span>
               <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copySectionTranslation(${idx})">📋 复制译文</button>
               <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="translateSection(${idx}, true)">🔄 重新翻译</button>
             </div>
@@ -8502,6 +8556,11 @@
     }
 
     function initAnnotationFeatures() {
+      // ⚠ 监听器只能挂一次：这个函数在**每次打开论文**时都会被调用，
+      //   而 document 级的 click 监听器挂一次就常驻 → 开 N 篇论文就有 N 个
+      //   监听器，每次点批注都会触发 N 次 openAnnotationEditor。
+      if (window.__mbAnnoFeaturesInited) return;
+      window.__mbAnnoFeaturesInited = true;
       // 点高亮 → 编辑对应批注
       document.addEventListener("click", (e) => {
         const mark = e.target.closest(".anno-mark");
@@ -8515,9 +8574,27 @@
       const list = document.getElementById("pdf-translations-list");
       if (list && list.dataset.annoObs !== "1") {
         list.dataset.annoObs = "1";
+        // ⚠ 这里**必须防抖**，否则就是自激循环（2026-10-27 审计 CRITICAL-1，已实测复现）：
+        //   reapplyAnnotations 自己会改 DOM（_clearAnnoMarks 清标记 + _wrapTextWithMark
+        //   重新包 <mark>），而这个 DOM 正在被观察 →
+        //   改 DOM → 触发 observer → 再排一次 setTimeout → 再改 DOM → …
+        //   实测：只要有一条能匹配上的批注，就会以 ~10.7 次/秒 无限重放，永不停止。
+        // 后果不是"有点卡"，而是**每 80ms 洗一次译文栏的文本选区** →
+        //   用户的划词选区被清空 → 划词答疑读不到 getSelection() → 核心工作流断掉。
+        //
+        // 两条防线：
+        //   ① clearTimeout 真防抖（旧的写法是"每次变更都排队"，不是防抖）；
+        //   ② 用户正在划词时**不动 DOM**（选区非折叠就跳过这一轮）。
+        let _annoReplayTimer = null;
         const obs = new MutationObserver(() => {
           if (!_annoState.items.length) return;
-          setTimeout(reapplyAnnotations, 80);
+          clearTimeout(_annoReplayTimer);
+          _annoReplayTimer = setTimeout(() => {
+            _annoReplayTimer = null;
+            const sel = window.getSelection();
+            if (sel && !sel.isCollapsed && sel.rangeCount) return;  // 用户正在划词 → 跳过
+            reapplyAnnotations();
+          }, 200);
         });
         obs.observe(list, { childList: true, subtree: true, characterData: true });
       }

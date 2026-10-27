@@ -137,7 +137,10 @@ public class SettingsActivity extends Activity {
     void saveIfOk(String user, String pass, String vaultRoot, String syncRoot) {
         prefs.setDav(user, pass);
         prefs.setDavVaultRoot(vaultRoot);
-        if (syncRoot != null && !syncRoot.isEmpty()) {
+        // ⚠ 同步根**无效就不覆盖旧值**（审计 H-3）——
+        //   探测失败时宁可沿用上次配好的，也不能把共享目录的指向写坏
+        //   （写坏了译文/批注就与电脑端脱钩了，而且不报错）。
+        if (syncRoot != null && !syncRoot.trim().isEmpty()) {
             prefs.setDavSyncRoot(syncRoot);
         }
     }
@@ -235,7 +238,14 @@ public class SettingsActivity extends Activity {
             String detected = vault;
             // 同步根（译文快照 + 批注所在）—— vault 根的兄弟目录。
             // 声明在 try 外面：try 里探测出来的值后面还要用。
-            String sync = vault;
+            //
+            // ⚠ 2026-10-27 审计 H-3：原来这里写的是 `String sync = vault;` ——
+            //   用户手填 vault 位置时 sync 非空 → 下面的探测**永不执行**
+            //   → 同步根被写成 vault 根 → 平板从 <vault>/snapshots 找译文（空的）、
+            //   把批注写进 <vault>/annotations（不是共享目录）→
+            //   电脑端看不到，而且用户 vault 里多出两个垃圾目录。
+            //   → 初始必须是**空串**：只在探测成功时才赋值。
+            String sync = "";
             try {
                 // 用 prefs 里存的根，而不是写死的 DEFAULT_ROOT ——
                 // 否则自定义根根本没法治。

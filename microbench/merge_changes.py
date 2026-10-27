@@ -19,6 +19,13 @@ is *not* written over it. Instead a new note `..._冲突合并_<时间>.md` is
 created next to the original, holding the tablet version and the vault
 version under separate headings. The user resolves it by hand.
 
+An **empty body** is never written (2026-10-27 audit H-1). A pack is
+untrusted input: `body=""` (tablet editor bug, interrupted sync, or a
+crafted pack) used to overwrite a real note with an empty file, with no
+conflict copy and no backup — and that note lives in the vault, so the
+Nutstore sync carried the loss to the other device as well. Empty (or
+whitespace-only) bodies are counted as `rejected` instead.
+
 Usage:
     python microbench/merge_changes.py <pack.json> [--vault DIR] [--dry-run]
     python microbench/merge_changes.py <dir-with-packs> --watch [SECONDS]
@@ -131,6 +138,19 @@ def merge_pack(pack: dict, vault: Path, dry_run: bool = False) -> dict:
             summary["rejected"].append(rel or "(空)")
             continue
 
+        # ⚠⚠ 空正文**一律不写**（2026-10-27 审计 H-1）。
+        #   旧版：baseHash 命中 + body="" → `current != body` → 直接
+        #   `target.write_text("")` → **把 vault 里的真笔记清空**，
+        #   而且绕过了「两边都改 → 另存合并稿」的保数据策略。
+        #   触发路径很常见：平板端 `body: n.body || ""` —— 用户清空正文、
+        #   编辑器 bug、同步中断、或者恶意构造的包，都会产出空 body。
+        #   该文件在 vault 里 → 经坚果云同步到另一台设备 → **两台设备正文一起丢**。
+        #   → 空/纯空白正文一律计入 `rejected`，一个字都不落盘。
+        #   （非空正文的写入行为**完全不变**。）
+        if not body.strip():
+            summary["rejected"].append(rel or "(空)")
+            continue
+
         target = safe_target(vault, rel)
         if target is None:
             summary["rejected"].append(rel or "(空)")
@@ -205,7 +225,7 @@ def merge_path(path: Path, vault: Path, dry_run: bool = False) -> bool:
           f"新增 {len(s['created'])} 冲突 {len(s['conflicts'])} "
           f"跳过 {len(s['skipped'])} 拒绝 {len(s['rejected'])}")
     for r in s["rejected"]:
-        print(f"      [拒绝] 路径不合法: {r}")
+        print(f"      [拒绝] 未写入（路径不合法或正文为空）: {r}")
     for c in s["conflicts"]:
         print(f"      [冲突] 已另存合并稿，原文件未动: {c}")
     return True

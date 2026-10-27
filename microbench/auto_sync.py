@@ -16,14 +16,26 @@
 2. `git fetch origin`（这台机 GitHub 访问需要默认代理；清代理要重试）
 3. 没有新提交 → 直接结束
 4. 合并 `origin/main`
-   - **有冲突** → `git merge --abort` → 报告 → 结束（**不推**）
+   - **有冲突** → 回退合并 → 报告 → 结束（**不推**）
 5. 跑全套测试（pytest 254 项 + 12 个独立套件）
-   - **有红的** → `git merge --abort` → 报告 → 结束（**不推**）
+   - **有红的** → 回退合并 → 报告 → 结束（**不推**）
      （带病上线比不同步更糟：对方 pull 下来就坏了）
 6. 重打平板 APK（`android/build_apk.ps1`，末尾自带交付验收）
    - 失败 → 报告 → 结束（**不推**）
 7. `git push origin main`（对方设备 pull 就能拿到）
 8. 报告：合了什么、APK 的 SHA-256、要不要重启服务
+
+关于「回退合并」
+--------------
+**快进合并（fast-forward）没有 MERGE_HEAD** → `git merge --abort` 直接
+rc=128「There is no merge to abort」→ **回退无效**，坏代码留在 HEAD 上。
+（2026-10-27 审计 C-1/H-5 实测复现：旧代码在这里不看返回码就报告
+「已回退合并（没有推）」→ 下一轮 `workspace_clean()` 判定「干净」
+→ **坏代码被 push 给对方**。）
+
+→ 所以回退走 `restore_pre_merge()`：abort 失败就 `reset --hard`（合并前的
+SHA / 备份分支），回退后**校验** HEAD 与工作区 —— 对不上就**明确报错**，
+绝不对外报告「已回退」。
 
 关于「自动 push」
 ---------------
@@ -86,6 +98,9 @@ EXTRA_SUITES = [
 
 
 _LOG_FH = None
+
+# 最后一轮的结果（给测试/调用方读；`MB_SYNC_RESULT:` 那行是给定时任务的 agent 读）
+LAST_RESULT: dict = {}
 
 
 def log(msg: str) -> None:
@@ -166,6 +181,56 @@ def workspace_clean() -> tuple[bool, str]:
 def head_short():
     rc, out = git("rev-parse", "--short", "HEAD")
     return out.strip() if rc == 0 else "?"
+
+
+def restore_pre_merge(local_sha: str, backup: str) -> tuple[bool, str]:
+    """把 HEAD 和工作区拉回**合并前**的状态。返回 (成功?, 说明)。
+
+    ⚠⚠ 为什么不能只靠 `git merge --abort`（2026-10-27 审计 C-1 + H-5）：
+
+        **快进合并（fast-forward）根本没有 MERGE_HEAD** ——
+        `git merge --abort` 直接返回 rc=128
+        「fatal: There is no merge to abort (MERGE_HEAD missing)」→ **回退无效**，
+        HEAD 还停在坏提交上，文件内容还是坏版本。
+
+        旧代码在这里不看返回码，直接报告「已回退合并（**没有推**）」→
+        工作区**实际已是坏代码** → 下一轮 `workspace_clean()` 因为 HEAD 已推进
+        而判定「干净」→ **坏代码被 `git push` 推给对方**。
+        （备份分支 `backup-auto-sync-*` 一直在建，但**从来没用过**。）
+
+    → 现在：① 先试 `merge --abort`（真冲突时它是对的）；
+             ② 返回码非 0 就 `reset --hard`（合并前的 SHA → 备份分支）；
+             ③ 回退后**校验** HEAD 与工作区 —— 对不上就**明确报错**，
+                绝不对外报告「已回退」。
+
+    `local_sha` 是合并前的本地 SHA（合并前就取好了）；`backup` 是备份分支名。
+    """
+    steps = []
+    rc, _out = git("merge", "--abort")
+    steps.append("merge --abort rc=%d" % rc)
+    if rc != 0:
+        # 快进（没有 MERGE_HEAD）或 abort 本身失败 → 用合并前的 SHA 直接回退
+        for target in (local_sha, backup):
+            if not target:
+                continue
+            rc2, _out2 = git("reset", "--hard", target)
+            steps.append("reset --hard %s rc=%d" % (str(target)[:7], rc2))
+            if rc2 == 0:
+                break
+
+    # 校验：HEAD 必须等于合并前的 SHA，且工作区必须干净
+    rc_h, head = git("rev-parse", "HEAD")
+    head = head.strip() if rc_h == 0 else ""
+    rc_s, st = git("status", "--porcelain")
+    dirty = (st or "").strip()
+
+    if not local_sha:
+        return False, "; ".join(steps) + " | ⚠ 合并前的 SHA 未知，没法校验"
+    if head == local_sha and not dirty:
+        return True, "; ".join(steps) + " | HEAD 已回到 %s，工作区干净" % local_sha[:7]
+    return False, ("; ".join(steps) +
+                   " | ⚠ 回退未成功: HEAD=%s 脏=%s"
+                   % (head[:7] or "?", dirty[:200] or "无"))
 
 
 def run_tests() -> tuple[bool, list[str]]:
@@ -254,6 +319,8 @@ def main() -> int:
     def finish(**kw):
         result.update(kw)
         result["ok"] = bool(result.get("ok"))
+        LAST_RESULT.clear()
+        LAST_RESULT.update(result)
         print("MB_SYNC_RESULT: " + json.dumps(result, ensure_ascii=False), flush=True)
         return 0 if result["ok"] else 1
 
@@ -319,11 +386,22 @@ def main() -> int:
         for ln in (st or "").splitlines():
             if ln.startswith("UU") or ln.startswith("AA") or ln.startswith("DD"):
                 conflicted.append(ln[3:].strip())
-        git("merge", "--abort")
-        result["action"] = "conflict"
-        result["messages"].append(
-            "合并冲突，已回退（没推）。冲突文件: " + ("、".join(conflicted) or "见 git status"))
-        log("!! 合并冲突，已 abort：\n   " + "\n   ".join(conflicted))
+        ok, detail = restore_pre_merge(local, backup)
+        result["action"] = "conflict" if ok else "conflict_rollback_failed"
+        result["rollback_ok"] = ok
+        if ok:
+            result["messages"].append(
+                "合并冲突，已回退到合并前的提交 %s（没推）。冲突文件: %s"
+                % (local[:7], "、".join(conflicted) or "见 git status"))
+        else:
+            result["messages"].append(
+                "合并冲突，**回退失败**（%s）。工作区可能仍停在冲突状态，"
+                "请手动执行 `git reset --hard %s`（没推）。冲突文件: %s"
+                % (detail, local or "<合并前SHA>",
+                   "、".join(conflicted) or "见 git status"))
+        log("!! 合并冲突，" + ("已回退" if ok else "回退失败") + "：\n   " + "\n   ".join(conflicted))
+        if not ok:
+            log("   " + detail)
         log("   备份分支: " + backup)
         return finish()
 
@@ -335,12 +413,26 @@ def main() -> int:
     log("跑全套测试 ...")
     green, failures = run_tests()
     if not green:
-        git("merge", "--abort")
-        result["action"] = "tests_failed"
-        result["messages"].append(
-            "测试没过，已回退合并（**没有推**）。对方这次提交有问题，"
-            "详情:\n" + "\n".join(failures)[:2500])
-        log("!! 测试没过，已 abort，不推。")
+        # ⚠ 这里原来是 `git merge --abort` —— **快进合并时它无效**（rc=128），
+        #   坏代码留在 HEAD 上，而报告却说「已回退」→ 下一轮直接被 push 给对方。
+        #   → 走 restore_pre_merge：abort 失败就 reset --hard 合并前的 SHA，
+        #   回退后校验，不成功就**明确报错**（见 restore_pre_merge 的注释）。
+        ok, detail = restore_pre_merge(local, backup)
+        result["action"] = "tests_failed" if ok else "tests_failed_rollback_failed"
+        result["rollback_ok"] = ok
+        if ok:
+            result["messages"].append(
+                "测试没过，已回退合并到合并前的提交 %s（**没有推**）。"
+                "对方这次提交有问题，详情:\n%s"
+                % (local[:7], "\n".join(failures)[:2500]))
+        else:
+            result["messages"].append(
+                "测试没过，**回退失败**（%s）。HEAD/工作区可能仍停在坏合并上，"
+                "请手动执行 `git reset --hard %s`（**没有推**）。详情:\n%s"
+                % (detail, local or "<合并前SHA>", "\n".join(failures)[:2500]))
+        log("!! 测试没过，" + ("已回退，不推。" if ok else "回退失败！不推。"))
+        if not ok:
+            log("   " + detail)
         for f in failures:
             log(f[:2000])
         log("   备份分支: " + backup)

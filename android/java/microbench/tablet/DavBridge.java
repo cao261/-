@@ -52,11 +52,25 @@ public class DavBridge {
     private final MainActivity activity;
 
     /**
-     * 所有原生任务走**同一个单线程池**。
+     * **DAV 写操作**的线程池：单线程。
+     *
      * 以前每写一个文件就 new Thread —— 批量推 24 篇笔记就是 24 个线程
      * 各自建一条 TLS 连接，机器直接卡住。
+     *
+     * ⚠ 必须**单线程**：写操作要保序（同一个文件覆盖写不能乱序，
+     *   否则「先写新内容再写旧内容」会把新内容盖掉）。
      */
-    private static final ExecutorService POOL = Executors.newSingleThreadExecutor();
+    private static final ExecutorService POOL_DAV = Executors.newSingleThreadExecutor();
+
+    /**
+     * **AI 请求**的线程池：与 DAV **分开**，最多 2 个并发。
+     *
+     * ⚠ 2026-10-27 审计 H-1：原来 AI 代理与云盘写入共用**同一个**单线程池
+     *   → AI 答疑最长跑 360 s，期间用户点「保存笔记」「写批注」全排在后面
+     *   → 前端 150 s 超时先到 → 只弹一句「已存本地，但写回云盘失败」。
+     *   → 拆成两个池：AI 再慢也不挡云盘写入。
+     */
+    private static final ExecutorService POOL_AI = Executors.newFixedThreadPool(2);
 
     public DavBridge(Prefs prefs, WebView webView, MainActivity activity) {
         this.prefs = prefs;
@@ -101,7 +115,7 @@ public class DavBridge {
             post(callbackId, false, "{\"ok\":false,\"error\":\"路径为空\"}");
             return;
         }
-        POOL.execute(new DavTask(this, path, text == null ? "" : text, callbackId, false));
+        POOL_DAV.execute(new DavTask(this, path, text == null ? "" : text, callbackId, false));
     }
 
     /** 删一个文件。 */
@@ -111,7 +125,7 @@ public class DavBridge {
             post(callbackId, false, "{\"ok\":false,\"error\":\"路径为空\"}");
             return;
         }
-        POOL.execute(new DavTask(this, path, null, callbackId, true));
+        POOL_DAV.execute(new DavTask(this, path, null, callbackId, true));
     }
 
     /**
@@ -126,23 +140,53 @@ public class DavBridge {
             post(callbackId, false, "{\"ok\":false,\"error\":\"路径为空\"}");
             return;
         }
-        POOL.execute(new SyncPutTask(this, path, text == null ? "" : text, callbackId));
+        POOL_DAV.execute(new SyncPutTask(this, path, text == null ? "" : text, callbackId));
+    }
+
+    /**
+     * 登记一个「用户自己配置的 AI 网关」主机。
+     *
+     * ⚠ 为什么要它：AI 网关地址存在**网页的 IndexedDB** 里，原生侧读不到；
+     *   而 httpPost 的目标主机必须是白名单（审计 C-1）。
+     *   → 页面在用户保存 AI 设置时调用这个方法，把主机名登记进原生白名单。
+     *
+     * ⚠ 只收公网 DNS 名（IP 字面量 / 内网名一律拒绝）——
+     *   否则「把平板当跳板打用户内网」这条路就又通了。
+     *
+     * @param base 网关地址（形如 https://api.minimaxi.com/v1）
+     * @return 登记成功返回 true
+     */
+    @JavascriptInterface
+    public boolean allowAiHost(String base) {
+        return prefs.allowAiHost(base);
     }
 
     /**
      * 代理一次 HTTP POST（给 AI 接口用）。
      *
-     * 只有 https 放行 —— 明文 HTTP 会把 API Key 裸奔出去。
+     * ⚠ 2026-10-27 审计 C-1：目标主机必须是**白名单**里的 ——
+     *   原来只校验「https://」前缀 = 开放代理：
+     *   页面里的任何脚本都能让平板代它发请求（尤其能拿平板当跳板
+     *   去打用户内网的 https 服务）。
+     *   → 白名单见 {@link Prefs#DEFAULT_ALLOWED_HOSTS}，
+     *     用户自己的网关由 {@link #allowAiHost(String)} 登记。
      *
      * @param auth 形如 "Bearer xxx"，为空就不加 Authorization 头
      */
     @JavascriptInterface
     public void httpPost(String url, String body, String auth, String callbackId) {
-        if (url == null || !url.toLowerCase().startsWith("https://")) {
+        String host = Prefs.hostOf(url);
+        if (host == null) {
             post(callbackId, false, "{\"ok\":false,\"error\":\"只允许 https\"}");
             return;
         }
-        POOL.execute(new HttpTask(this, url, body == null ? "" : body,
+        if (!prefs.isAiHostAllowed(host)) {
+            post(callbackId, false, "{\"ok\":false,\"error\":\"网关域名不在白名单："
+                    + jsonEscape(host)
+                    + "（平板版需要在「设置」里保存一次 AI 网关地址）\"}");
+            return;
+        }
+        POOL_AI.execute(new HttpTask(this, url, body == null ? "" : body,
                 auth == null ? "" : auth, callbackId));
     }
 

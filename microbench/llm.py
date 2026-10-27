@@ -22,6 +22,7 @@ import json
 import re
 import time
 import asyncio
+import inspect
 import weakref
 from pathlib import Path
 
@@ -358,18 +359,33 @@ def _friendly_http_error(code: int, quota_probe_text: str) -> str:
     if code == 429:
         # 配额耗尽（5 小时窗口 / 余额）和 速率限制（每分钟上限）是两回事：
         # 前者只能等额度恢复，后者等几十秒就行 —— 提示必须分开。
+        #
+        # ⚠️ 这里要分**三态**，不是两态（2026-10-27 审计 L-9）：
+        #   True  = 确认额度耗尽
+        #   False = 确认**不是**额度耗尽（是每分钟限流）
+        #   None  = **判定失败/未知**（探测本身抛异常）
+        # 旧代码把 except 归到 False → 无论真相如何都说成「请求太频繁」，
+        # 于是「额度用完」被说成「等几十秒就好」→ 用户一直干等；
+        # 这与分类文案契约（quota / rate_limit / no_output 三类）相悖。
         try:
             is_quota = model_manager.is_quota_exhausted_error(429, quota_probe_text or "")
         except Exception:
-            is_quota = False
-        if is_quota:
+            is_quota = None      # 未知 ≠ 没耗尽
+        if is_quota is True:
             return (
                 "模型额度用完了（HTTP 429 · 配额耗尽）：套餐/余额额度已用尽，"
                 "现在重试也一样。等额度恢复再试，或在 .env 里配一个你自己的模型。"
             )
+        if is_quota is False:
+            return (
+                "请求太频繁（HTTP 429 · 限流）：刚发出的请求超过了该模型的每分钟上限。"
+                "等几十秒再试，或换一个模型/拉长间隔。"
+            )
+        # 判定失败：不能替上游下结论（也不能说"没耗尽"）。
         return (
-            "请求太频繁（HTTP 429 · 限流）：刚发出的请求超过了该模型的每分钟上限。"
-            "等几十秒再试，或换一个模型/拉长间隔。"
+            "模型返回 HTTP 429，但暂时分不清是配额耗尽还是每分钟请求数超限"
+            "（额度判定失败）。先等几十秒再试；若反复出现，请检查 .env 里的"
+            "模型额度与同时进行的请求数。"
         )
     if code == 401:
         return (
@@ -496,9 +512,18 @@ class SlidingWindowRateLimiter:
 
         Correctness of the min-interval spacing is preserved by *reserving*
         the slot under the lock: the planned call time is recorded and
-        `_last_call_time` is advanced before the lock is released, so a
+        `_last_planned_time` is advanced before the lock is released, so a
         second thread arriving during the sleep still sees the reservation
         and waits its own turn.
+
+        ⚠️ 间隔判据必须读**预留时间**（`_last_planned_time`），不能读
+        **实际触发时间**（`_last_call_time`）——
+        `_last_call_time` 是 sleep **之后**才更新的，N 个并发调用者会
+        全部看到「上次还没触发」→ 全部 sleep 同一个 min_interval →
+        **齐射**（实测 5 线程 min_interval=6.0：
+        gaps=['6.00','0.00','0.00','0.00']）→ 打到上游每分钟上限 →
+        被误判成「配额耗尽」→ mark_degraded 全局降格 15 分钟
+        （用户额度其实还有）。
         """
         with self._lock:
             now = time.time()
@@ -508,8 +533,9 @@ class SlidingWindowRateLimiter:
 
             wait_time = 0.0
 
-            # Rule 1: Min interval spacing
-            since_last = now - self._last_call_time
+            # Rule 1: Min interval spacing —— 判据用**预留时间**
+            # （见上面的说明：判实际触发时间会导致并发齐射）
+            since_last = now - self._last_planned_time
             if since_last < self.min_interval:
                 wait_time = max(wait_time, self.min_interval - since_last)
 
@@ -531,14 +557,28 @@ class SlidingWindowRateLimiter:
 
         if wait_time > 0:
             time.sleep(wait_time)
+
         # Record the moment the call actually happened (after the sleep).
-        with self._lock:
-            fired = time.time()
-            self._last_call_time = fired
-            self._actual_times.append(fired)
-            cutoff = fired - self.window_seconds
-            self._actual_times = [t for t in self._actual_times if t > cutoff]
-        return wait_time
+        #
+        # ⚠️ 线程可能被调度延迟唤醒 → **实际**间隔可能小于 min_interval
+        #    （A 睡过头、B 按时醒 → 两者贴在一起发出去）。限流器宁可慢，
+        #    也不能齐射 → 不够就补睡，欠的账在这里还。
+        extra_waited = 0.0
+        while True:
+            with self._lock:
+                fired = time.time()
+                gap = (fired - self._last_call_time) if self._last_call_time \
+                    else self.min_interval
+                if gap >= self.min_interval:
+                    self._last_call_time = fired
+                    self._actual_times.append(fired)
+                    cutoff = fired - self.window_seconds
+                    self._actual_times = [t for t in self._actual_times if t > cutoff]
+                    break
+                extra = self.min_interval - gap
+            time.sleep(extra)
+            extra_waited += extra
+        return wait_time + extra_waited
 
     def stats(self) -> dict:
         with self._lock:
@@ -870,6 +910,17 @@ def redact_secrets(text: str) -> str:
     # `http://user@host` 这种没有密码的也会暴露用户名）
     out = re.sub(r"(://[^:/\s@]+)@", r"\1:***@", out)
     return out
+
+
+def _safe_err(text: object) -> str:
+    """错误文本的**统一出口**：脱敏（凭据）+ 抹本机路径。
+
+    同步链早就这么做了（friendly_error_text / probe_primary），
+    流式链原来没有 —— 上游报错里的 base_url userinfo / Bearer /
+    厂商 key 前缀会跟着错误消息进日志、进 SSE 事件
+    （2026-10-27 审计 L-7）。这里统一一个出口，别再各写各的。
+    """
+    return _mask_paths(_redact_secrets(str(text)))
 
 
 def _degrade_text(kind: str) -> str:
@@ -1684,7 +1735,7 @@ def _invoke_model(
                 ), 200
             return True, content, 200
         except (KeyError, IndexError, ValueError, AttributeError) as e:
-            return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
+            return False, f"LLM 响应格式异常: {_safe_err(e)}; raw={_safe_err(resp.text[:200])}", 200
 
     return False, last_err, last_status
 
@@ -2039,6 +2090,22 @@ _async_client_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 _async_client_lock = Lock()
 
 
+def _accepts_timeout(func) -> bool:
+    """这个 client.stream 收不收 timeout 形参？
+
+    httpx 收；但老的/自造的 client 替身（测试里的 _Client.stream）可能
+    只有 (method, url, json, headers) → 硬传 timeout 会 TypeError。
+    探测一下再传，不改调用形态。
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return True
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "timeout" in params
+
+
 def _get_async_client(default_timeout: int = DEFAULT_TIMEOUT, trust_env: Optional[bool] = None):
     """Return a pooled httpx.AsyncClient for the current event loop.
 
@@ -2053,6 +2120,12 @@ def _get_async_client(default_timeout: int = DEFAULT_TIMEOUT, trust_env: Optiona
     `trust_env=False` makes httpx ignore HTTP_PROXY/HTTPS_PROXY. When the
     environment proxy turns out to be dead we flip to direct connections and
     rebuild the pooled client (the old one is closed asynchronously).
+
+    ⚠️ timeout 也是缓存的一部分（2026-10-27 审计 M-12）：池化客户端的
+    timeout 会被**首次创建者**冻结 —— 第一次 timeout=60，之后所有调用方
+    都拿到 60s（大请求被提前掐断）。现在缓存里记着本次的 timeout，
+    变了就就地更新 `client.timeout`（连接池继续复用），并且每次请求
+    还会**显式**传 timeout（见 _invoke_model_async / _stream_model）。
     """
     if httpx is None:
         raise LLMError("httpx 包未安装, 请先 pip install httpx")
@@ -2072,8 +2145,22 @@ def _get_async_client(default_timeout: int = DEFAULT_TIMEOUT, trust_env: Optiona
         # `is_closed`, and an AttributeError here would abort the request
         # instead of simply creating a fresh client.
         if entry is not None and not getattr(entry[0], "is_closed", False):
-            client, cached_trust_env = entry
+            client, cached_trust_env, cached_timeout = entry
             if cached_trust_env == trust_env:
+                if cached_timeout != default_timeout:
+                    # ⚠️ 池化客户端的 timeout 会被**首次调用冻结**：
+                    #    实测 _get_async_client(timeout=60) 之后再要
+                    #    timeout=300，拿到的仍是 Timeout(60) → 长请求被
+                    #    提前掐断（用户看到"莫名其妙超时"）。
+                    #    这里就地更新默认 timeout（连接池继续复用，不重建），
+                    #    而且每次请求还会**显式**传 timeout
+                    #    （见 _invoke_model_async / _stream_model）→
+                    #    并发不同 timeout 的请求互不干扰。
+                    try:
+                        client.timeout = httpx.Timeout(default_timeout)
+                    except Exception:
+                        pass
+                    _async_client_cache[loop] = (client, trust_env, default_timeout)
                 return client
             # 代理策略变了 → 换一个 client，旧的那个异步关掉
             try:
@@ -2093,7 +2180,7 @@ def _get_async_client(default_timeout: int = DEFAULT_TIMEOUT, trust_env: Optiona
         # A WeakKeyDictionary whose value strongly references its own key
         # keeps the key alive forever, so the entry would never be dropped
         # and the loop + client would leak.
-        _async_client_cache[loop] = (client, trust_env)
+        _async_client_cache[loop] = (client, trust_env, default_timeout)
         return client
 
 
@@ -2141,7 +2228,6 @@ async def _invoke_model_async(
         return False, "httpx 包未安装, 请先 pip install httpx", None
 
     is_agnes = is_agnes_config(cfg)
-    limiter = limiter_for_config(cfg)
 
     url = f"{cfg['base_url']}/chat/completions"
     payload = {
@@ -2186,7 +2272,13 @@ async def _invoke_model_async(
         # Both providers are rate-limited on the async path. The primary
         # limiter used to be missing here, which is how the per-minute cap
         # got hit by the SSE endpoints.
-        await _acquire_limiter_async(is_agnes)
+        # ⚠️ 必须把 cfg 传下去：自定义模型（.env 的 LLM_CUSTOM_N_RPM）
+        #    有自己的限流档，不传就按主模型档限流 → 它自己的 RPM 上限
+        #    形同虚设。三条链路的写法要统一：
+        #      同步 _invoke_model  → limiter_for_config(cfg)
+        #      异步 _invoke_model_async → _acquire_limiter_async(is_agnes, cfg)
+        #      流式 _stream_model      → _acquire_limiter_async(is_agnes, cfg)
+        await _acquire_limiter_async(is_agnes, cfg)
 
         try:
             client = _get_async_client(timeout)
@@ -2295,7 +2387,7 @@ async def _invoke_model_async(
                 ), 200
             return True, content, 200
         except (KeyError, IndexError, ValueError, AttributeError) as e:
-            return False, f"LLM 响应格式异常: {e}; raw={resp.text[:200]}", 200
+            return False, f"LLM 响应格式异常: {_safe_err(e)}; raw={_safe_err(resp.text[:200])}", 200
 
     return False, last_err, last_status
 
@@ -2527,12 +2619,24 @@ async def _stream_model(
     # internal monologue.
     think_buf = ""
     in_think = False
+    # ⚠️ 显式传本次 timeout（2026-10-27 审计 M-12）：
+    #    池化客户端的默认 timeout 是**首次调用**冻结的，不显式传就会
+    #    沿用别人的档（大请求被提前掐断 → 前端拿到半截答案）。
+    #    read 给 3 倍：思考型模型首字节可能要 41-100s
+    #    （M3.1-Flash 实测），read 跟 timeout 一样会把流砍在半路。
+    stream_kwargs = {"json": payload, "headers": headers}
+    if _accepts_timeout(client.stream):
+        stream_kwargs["timeout"] = httpx.Timeout(timeout, read=timeout * 3)
     try:
-        async with client.stream("POST", url, json=payload, headers=headers) as resp:
+        async with client.stream("POST", url, **stream_kwargs) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
+                # ⚠️ 上游报文必须脱敏：里面可能带 base_url 的 userinfo、
+                #    Bearer、厂商 key 前缀（同步链早就在这里脱敏了，
+                #    流式链原来没有 → 凭据跟着错误消息进日志/事件）。
                 err = LLMError(
-                    f"HTTP {resp.status_code}: {body[:200].decode('utf-8', errors='replace')}"
+                    f"HTTP {resp.status_code}: "
+                    f"{_safe_err(body[:200].decode('utf-8', errors='replace'))}"
                 )
                 # Carry the status code so callers can distinguish a
                 # quota exhaustion (429) from a rate-limit (also 429 but
@@ -2624,9 +2728,9 @@ async def _stream_model(
         # 一层无意义的"流式响应异常"前缀 + 一层重复的 "LLMError:" 类名。
         raise
     except httpx.ConnectError as e:
-        raise LLMError(f"网络连接失败: {e}")
+        raise LLMError(f"网络连接失败: {_safe_err(e)}")
     except httpx.TimeoutException as e:
-        raise LLMError(f"请求超时: {e}")
+        raise LLMError(f"请求超时: {_safe_err(e)}")
     except httpx.HTTPError as e:
         # Every other httpx transport/protocol failure (ReadError,
         # RemoteProtocolError, WriteError, CloseError, ProxyError …)
@@ -2638,9 +2742,9 @@ async def _stream_model(
         # answer. The user therefore saw a half-written answer
         # rendered as a complete, confident one. Wrapping it as an
         # LLMError makes the frontend show the error instead.
-        raise LLMError(f"上游连接中断: {type(e).__name__}: {e}")
+        raise LLMError(f"上游连接中断: {type(e).__name__}: {_safe_err(e)}")
     except Exception as e:
-        raise LLMError(f"流式响应异常: {type(e).__name__}: {e}")
+        raise LLMError(f"流式响应异常: {type(e).__name__}: {_safe_err(e)}")
 
 
 async def chat_stream_async(
@@ -2734,7 +2838,7 @@ async def chat_stream_async(
                 # 已经吐了一半内容 → 不能换模型重来（会出现两段答案粘在一起）
                 raise
             print(f"[MicroBench] 自定义模型「{custom_cfg.get('label')}」流式调用失败，"
-                  f"自动退回默认模型链路: {e}", file=sys.stderr)
+                  f"自动退回默认模型链路: {_safe_err(e)}", file=sys.stderr)
             # 继续往下走主/备链路
 
     # 强制走备用模型（用户在界面上选了 Agnes 答疑）

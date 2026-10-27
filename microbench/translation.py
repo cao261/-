@@ -481,19 +481,48 @@ def sanitize_translation(text: str) -> str:
     text = re.sub(r"<think>.*\Z", "", text, flags=re.DOTALL)
     text = text.replace("</think>", "").replace("<think>", "")
 
-    # 2) 定界符归一化：\( ... \) → $ ... $，\[ ... \] → $$ ... $$
+    # 2) 以下所有「数学相关」清洗**只作用于非代码段**（2026-10-27 审计 M-2）。
+    #    ⚠ 代码块里的 $ 是 shell 变量、\( \) 是 LaTeX 字面量 ——
+    #      实测：```bash\nls -la $USER\n``` → `ls -la ＄USER`（shell 变量被毁）
+    #            ```tex\n\( x = 1 \)\n```     → `$ x = 1 $`（LaTeX 被毁）
+    #      科研工作台里用户常贴代码/LaTeX，这是真实损坏。
+    #      export_offline.py 早就有 CODE_SPLIT_RE 这个思路 —— 两边规则必须一致。
+    parts = CODE_SPLIT_RE.split(text)
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            continue        # 代码段 —— 原样保留
+        parts[i] = _sanitize_math_segment(part)
+    out = "".join(parts).strip()
+
+    # 3) 公式标记
+    #    - 带坐标的 ⟦FORMULA:x0,y0,x1,y1⟧：**保留**。前端拿这四个坐标去 PDF
+    #      原页裁一张图，贴进译文里 —— 和论文里长得一模一样，绝不会把分子
+    #      分母装反。模型偶尔在坐标里加空格或抄错位数，这里修一次；
+    #      修不好（数字不成比例）就退回文字提示，绝不放行坏坐标 ——
+    #      那会裁到页面上无关的地方去。
+    #    - 裸的 ⟦FORMULA⟧：没有坐标，裁不了图 → 换成文字提示。
+    out = _normalize_formula_markers(out)
+    return out
+
+
+# 代码块保护：围栏代码块与行内代码里的 $ 不是数学。
+# 与 export_offline.CODE_SPLIT_RE 同款（两边规则必须一致）。
+CODE_SPLIT_RE = re.compile(r"(```[\s\S]*?```|`[^`\n]+`)")
+
+
+def _sanitize_math_segment(text: str) -> str:
+    """对**非代码**的一段文本做数学相关的清洗。
+
+    三件事：定界符归一化（`\\(...\\)` → `$...$`）/ 修 LaTeX / 落单 `$` 换全角。
+    代码段由调用方排除 —— 代码里的 `$` 和 `\\(...\\)` 不是数学。
+    """
+    if not text:
+        return text
+    # 定界符归一化：\( ... \) → $ ... $，\[ ... \] → $$ ... $$
     text = re.sub(r"\\\[(.+?)\\\]", lambda m: "$$" + m.group(1) + "$$",
                   text, flags=re.DOTALL)
     text = re.sub(r"\\\((.+?)\\\)", lambda m: "$" + m.group(1) + "$",
                   text, flags=re.DOTALL)
-
-    # 3) 修 LaTeX
-    def _repair(m: re.Match) -> str:
-        body = m.group(1) if m.group(1) is not None else m.group(2)
-        fixed = _fix_overescaped_latex(body)
-        if m.group(1) is not None:
-            return "$$" + fixed + "$$"
-        return "$" + fixed + "$"
 
     pieces: list[str] = []
     last = 0
@@ -510,18 +539,8 @@ def sanitize_translation(text: str) -> str:
     if tail:
         pieces.append(_wrap_bare_latex(_fix_overescaped_latex(tail)))
 
-    # 4) 落单的 $ 换成全角 ＄（多半是版权行的页价）
-    out = _fix_odd_dollars("".join(pieces)).strip()
-
-    # 5) 公式标记
-    #    - 带坐标的 ⟦FORMULA:x0,y0,x1,y1⟧：**保留**。前端拿这四个坐标去 PDF
-    #      原页裁一张图，贴进译文里 —— 和论文里长得一模一样，绝不会把分子
-    #      分母装反。模型偶尔在坐标里加空格或抄错位数，这里修一次；
-    #      修不好（数字不成比例）就退回文字提示，绝不放行坏坐标 ——
-    #      那会裁到页面上无关的地方去。
-    #    - 裸的 ⟦FORMULA⟧：没有坐标，裁不了图 → 换成文字提示。
-    out = _normalize_formula_markers(out)
-    return out
+    # 落单的 $ 换成全角 ＄（多半是版权行的页价）
+    return _fix_odd_dollars("".join(pieces))
 
 
 # 公式标记（带坐标）—— 前端靠它去 PDF 原页裁图。

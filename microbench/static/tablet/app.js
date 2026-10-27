@@ -165,7 +165,14 @@
     const key = (state && state.ai && state.ai.key) || "";
     if (key.length >= 6) s = s.split(key).join("***");
     s = s.replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-***");
-    s = s.replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*"?)[^"\s,}]+/gi, "$1***");
+    // ⚠⚠ 值那一段必须**连 "Bearer " 一起吃掉**。
+    //   原来的写法 `[:=]\s*"?)([^"\s,}]+)` 只匹配到第一个空白前的词 ——
+    //   "Authorization: Bearer abcdefghij" 被改成
+    //   "Authorization: *** abcdefghij"：**令牌原样留在界面上**（2026-10-27 审计）。
+    //   → 可选的 "bearer\s+" 前缀 + 整个令牌，一起脱敏。
+    s = s.replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*"?)(?:bearer\s+)?[^"\s,}]+/gi, "$1***");
+    // ②b 裸的 Bearer 令牌（不在 "authorization:" 后面 —— 堆栈 / 日志里常见）
+    s = s.replace(/\bbearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, "Bearer ***");
     // ③ 绝对路径（Windows / 安卓 / Linux / macOS）
     s = s.replace(/[A-Za-z]:\\[^\s"'<>|]*/g, "<路径>");
     s = s.replace(/\/(?:data|storage|sdcard|Users|home)\/[^\s"'<>|]*/g, "<路径>");
@@ -247,6 +254,59 @@
     let h = 5381;
     for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
     return h.toString(36);
+  }
+
+  /* ------------------------------------------------------------------
+     带超时的 fetch
+     ------------------------------------------------------------------
+     ⚠ 以前 8 处 fetch **一个超时都没有** ——
+       WebDAV 挂住 / 网关不回，界面就一直转圈，用户只能强杀应用。
+     → 统一走 fetchWithTimeout：到点 abort，并抛出带 .timeout 标记的错误，
+       上层能分辨「超时」和「网络断了」。
+
+     ⚠ AI 请求的时限必须**比答疑时限宽**（AI_QA_TIMEOUT_MS = 300s）：
+       否则 fetch 先超时 → 抛 AbortError → runAI 会当成「用户点了停止」，
+       用户看到的是「已停止」，而不是「等太久了」。
+     ------------------------------------------------------------------ */
+  const FETCH_TIMEOUT_MS = 30000;      // 同步 / 列表这类小请求
+  const AI_FETCH_TIMEOUT_MS = 330000;  // AI 请求（> AI_QA_TIMEOUT_MS）
+
+  function fetchWithTimeout(url, opts, ms) {
+    const o = opts || {};
+    const limit = Number(ms) > 0 ? Number(ms) : FETCH_TIMEOUT_MS;
+    const ctrl = new AbortController();
+    const callerSignal = o.signal;
+    let timedOut = false;
+    let timer = null;
+    const abort = () => { try { ctrl.abort(); } catch (e) { /* ignore */ } };
+    // 调用方自己的 signal（用户点了停止）也要能中止这次请求
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        abort();
+      } else if (callerSignal.addEventListener) {
+        callerSignal.addEventListener("abort", abort, { once: true });
+      }
+    }
+    timer = setTimeout(() => { timedOut = true; abort(); }, limit);
+    const opts2 = Object.assign({}, o, { signal: ctrl.signal });
+    return fetch(url, opts2).then(
+      (r) => { cleanup(); return r; },
+      (e) => {
+        cleanup();
+        if (timedOut) {
+          const err = new Error("请求超时（" + Math.round(limit / 1000) + " 秒没等到回应）");
+          err.timeout = true;
+          throw err;
+        }
+        throw e;
+      }
+    );
+    function cleanup() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (callerSignal && callerSignal.removeEventListener) {
+        callerSignal.removeEventListener("abort", abort);
+      }
+    }
   }
 
   function toast(msg, isError) {
@@ -386,6 +446,22 @@
     },
     deleteNote(id) { return tx("notes", "readwrite", (s) => s.delete(id)); },
     clearNotes() { return tx("notes", "readwrite", (s) => s.clear()); },
+    clearMeta() { return tx("meta", "readwrite", (s) => s.clear()); },
+    clearPdfCache() { return tx("pdfcache", "readwrite", (s) => s.clear()); },
+    /**
+     * 清空**全部**本地数据（2026-10-27 审计 D-4）。
+     *
+     * ⚠ 以前「清空本地数据」只调了 clearNotes() ——
+     *   meta store 里**明文存着 API Key**（state.ai.key 就从那儿读），
+     *   pdfcache store 里躺着**全部原文 PDF（76MB）**，
+     *   两样都留在平板上 → 「清空了」其实没清干净。
+     *   → 三个 store 一起清。
+     */
+    async resetAll() {
+      await this.clearNotes();
+      await this.clearMeta();
+      await this.clearPdfCache();
+    },
     // ---- 本地批注（离线可写可看，联网时同步） ----
     // ⚠ 放在 meta store 里而不是新建 store —— 新建 store 要升 DB_VER，
     //   而升版本会被旧标签页挡住（白屏 + 启动失败）。零风险优先。
@@ -482,6 +558,21 @@
     return { text: parts.join(""), formulas };
   }
 
+  /**
+   * 公式渲染结果的**缓存**。
+   *
+   * ⚠ 为什么必须有（2026-10-27 审计 D-3）：
+   *   AI 流式输出时每来一片就把**全量文本**重新渲染一遍 →
+   *   每片都要重跑一遍 KaTeX。4000 字答案按 20 字一片 ≈ 200 片
+   *   → 200 次全量 Markdown + 全部公式重渲染 → 低端平板主线程冻结数秒。
+   *   同一个公式在同一次输出里会反复出现（"$x$"、"\frac{a}{b}"…），
+   *   → 按「tex + 显示模式」缓存，命中就不用再跑 KaTeX。
+   *
+   * ⚠ 缓存**有上限** —— 公式表无上限增长同样是内存泄漏。
+   */
+  const _mathCache = new Map();
+  const MATH_CACHE_MAX = 400;
+
   function renderMath(formulas) {
     if (!formulas || !formulas.length) return "";
     // 兜底：表里不该有空洞，但万一有，别让整篇笔记渲染不出来
@@ -493,8 +584,12 @@
         `<code class="math-error">${esc(f.tex.trim())}</code>`).join("");
     }
     return list.map((f) => {
+      const ck = (f.display ? "D" : "I") + " " + f.tex;
+      const hit = _mathCache.get(ck);
+      if (hit !== undefined) return hit;
+      let out;
       try {
-        return katex.renderToString(f.tex, {
+        out = katex.renderToString(f.tex, {
           displayMode: f.display, throwOnError: false, strict: "ignore",
           output: "html",
           macros: {
@@ -504,8 +599,15 @@
           }
         });
       } catch (e) {
-        return `<code class="math-error">${esc(f.tex.trim())}</code>`;
+        out = `<code class="math-error">${esc(f.tex.trim())}</code>`;
       }
+      if (_mathCache.size >= MATH_CACHE_MAX) {
+        // 满了就丢最早的一条（Map 保序）
+        const first = _mathCache.keys().next();
+        if (!first.done) _mathCache.delete(first.value);
+      }
+      _mathCache.set(ck, out);
+      return out;
     }).join("");
   }
 
@@ -695,8 +797,9 @@
     dirtyCount: 0,
     pendingSelection: "",  // 从 PDF 里划词带过来的原文
     aiHistory: new Map(),   // noteId -> [{role, content}] 多轮对话上下文
-    trans: new Map(),       // paperId -> {pageNum: 译文}（与电脑端共享）
-    annos: new Map(),       // paperId -> [批注]
+    // ⚠ 以前这里还有 `trans: new Map()` 和 `annos: new Map()` ——
+    //   全文件**从来没有写入过**（译文走 state.transSeed / state.transVer，
+    //   批注走 pdfState.annos 和 DB.getAnnos）→ 纯死状态，删掉。
     transSeed: {},          // 导出版里烤进来的译文 {safeKey: {pageNum: 译文}}
     transVer: null,         // 当前的抽取算法版本（判断译文是不是旧的）
     transStale: false,      // 这篇的译文是旧算法翻的（已作废）
@@ -717,7 +820,7 @@
       raw = JSON.parse(node.textContent);
     } catch (e) { /* ignore */ }
 
-    if (raw && raw.pdfs) state.pdfs = raw.pdfs;
+    if (raw && raw.pdfs) state.pdfs = trimPdfList(raw.pdfs);
     // 导出版里烤进来的译文（还没连云盘时也能看）
     if (raw && raw.trans) state.transSeed = raw.trans;
     // 当前的抽取算法版本 —— 用来判断云盘上的译文是不是旧算法翻的
@@ -771,9 +874,73 @@
   // ------------------------------------------------------------------
   // 目录树
   // ------------------------------------------------------------------
+  /**
+   * 目录树。
+   *
+   * ⚠⚠ **增量**重建（2026-10-27 审计 D-8）：
+   *   以前每搜一下、每存一次笔记都把整个 nav-list 的 DOM 全扔了重建 ——
+   *   几十条笔记时还能忍，几百条时低端平板会明显卡顿（点一下保存要等一下）。
+   *   → 现在**复用**已有的按钮节点，只增删变化的部分。
+   *
+   * ⚠ 复用节点的前提是「id → 节点」的映射一直在（state.navNodes），
+   *   节点本身不重建 —— 所以 onclick 里的 id 不用每次重绑。
+   */
+  const navNodes = new Map();     // note id -> 目录按钮（增量重建时复用）
+  const navGroups = new Map();   // 分组名 -> 分组标题（同样复用）
+
+  function navItemNode(n) {
+    let b = navNodes.get(n.id);
+    if (!b) {
+      b = el("button", "tb-item");
+      b.__title = document.createTextNode("");
+      b.appendChild(b.__title);
+      b.__sub = el("span", "tb-item-sub", "");
+      b.appendChild(b.__sub);
+      b.onclick = () => openNote(n.id);
+      navNodes.set(n.id, b);
+    }
+    if (b.__title) b.__title.nodeValue = n.title || n.id;
+    if (b.__sub) b.__sub.textContent = n.rel || "";
+    let cls = "tb-item";
+    if (n.id === state.currentId) cls += " is-active";
+    if (n.dirty) cls += " is-dirty";
+    b.className = cls;
+    return b;
+  }
+
+  function navGroupNode(g) {
+    let n = navGroups.get(g);
+    if (!n) {
+      n = el("div", "tb-group", g);
+      navGroups.set(g, n);
+    }
+    return n;
+  }
+
+  /** 把 list 调整成「按 wanted 的顺序、且只包含 wanted 的节点」。 */
+  function reconcileNav(list, wanted) {
+    const keep = new Set(wanted);
+    // ① 摘掉不再要的
+    Array.from(list.children).forEach((c) => {
+      if (keep.has(c)) return;
+      try {
+        if (c.remove) c.remove();
+        else if (c.parentNode) c.parentNode.removeChild(c);
+      } catch (e) { /* ignore */ }
+    });
+    // ② 按顺序对齐（insertBefore 会把已在表里的节点**移动**过去）
+    let i = 0;
+    wanted.forEach((node) => {
+      const have = list.children[i];
+      if (have === node) { i++; return; }
+      list.insertBefore(node, have || null);
+      i++;
+    });
+  }
+
   function buildNav() {
     const list = $("nav-list");
-    list.innerHTML = "";
+    if (!list) return;
     const q = state.filter.trim().toLowerCase();
 
     const byGroup = new Map();
@@ -787,24 +954,30 @@
     });
 
     if (!byGroup.size) {
+      list.innerHTML = "";
       list.appendChild(el("div", "tb-empty", q ? "没有匹配的笔记" : "还没有笔记"));
       return;
     }
 
     const groups = FOLDERS.filter((f) => byGroup.has(f))
       .concat([...byGroup.keys()].filter((k) => FOLDERS.indexOf(k) < 0).sort());
+    // ① 先算出这次要显示的节点序列
+    const wanted = [];
     groups.forEach((g) => {
-      list.appendChild(el("div", "tb-group", g));
+      wanted.push(navGroupNode(g));
       byGroup.get(g).sort((a, b) => (a.title || "").localeCompare(b.title || "", "zh"))
         .forEach((n) => {
-          const b = el("button", "tb-item");
-          if (n.id === state.currentId) b.classList.add("is-active");
-          if (n.dirty) b.classList.add("is-dirty");
-          b.appendChild(document.createTextNode(n.title || n.id));
-          b.appendChild(el("span", "tb-item-sub", n.rel || ""));
-          b.onclick = () => openNote(n.id);
-          list.appendChild(b);
+          wanted.push(navItemNode(n));
         });
+    });
+    // ② 增量对齐（复用旧节点）
+    reconcileNav(list, wanted);
+    // ③ 回收已经不存在的笔记的节点
+    navNodes.forEach((node, id) => {
+      if (!state.notes.has(id)) navNodes.delete(id);
+    });
+    navGroups.forEach((node, g) => {
+      if (!byGroup.has(g)) navGroups.delete(g);
     });
   }
 
@@ -1039,8 +1212,21 @@
     const w = _nativeWaiters[cbId];
     if (!w) return;
     delete _nativeWaiters[cbId];
-    if (ok) w.resolve(payload);
-    else w.reject(new Error((payload && payload.error) || "原生调用失败"));
+    if (ok) {
+      w.resolve(payload);
+      return;
+    }
+    // ⚠⚠ **必须把 status 带出来**（2026-10-27 审计 D-1）。
+    //   Java 侧回的包是 {"ok":false,"status":429,"error":"..."}
+    //   （DavBridge.java:314-316 确实带了 status）——
+    //   原来这里 `new Error(payload.error)` 把 status **整个丢了** →
+    //   上层 `Number(e1.status) || 0` 恒为 0 →
+    //   「429 换模型」「400 剥参数」两条兜底**永远不命中**，
+    //   APK 上用户看到的是上游的原始英文报错。
+    const p = payload || {};
+    const err = new Error(p.error || "原生调用失败");
+    err.status = Number(p.status) || 0;
+    w.reject(err);
   };
   /**
    * 原生调用的超时兜底（毫秒），**按方法分别给**。
@@ -1150,7 +1336,7 @@
     dav: {
       mode: "dav",
       async list(dir) {
-        const r = await fetch(davUrl("list", dir));
+        const r = await fetchWithTimeout(davUrl("list", dir), {}, FETCH_TIMEOUT_MS);
         if (!r.ok) {
           // ⚠ 把服务端说的原因带上来 —— 否则「HTTP 500」这种话
           //   用户完全看不懂（限流时的提示是「请求太频繁」）。
@@ -1162,7 +1348,7 @@
         return Array.isArray(arr) ? arr : [];
       },
       async readText(path) {
-        const r = await fetch(davUrl("file", path));
+        const r = await fetchWithTimeout(davUrl("file", path), {}, FETCH_TIMEOUT_MS);
         if (!r.ok) return null;
         return r.text();
       },
@@ -1170,7 +1356,7 @@
         // 本地缓存优先 —— 缓存过的离线也能翻
         const cached = await DB.getCachedPdf(path);
         if (cached) return cached;
-        const r = await fetch(davUrl("file", path));
+        const r = await fetchWithTimeout(davUrl("file", path), {}, FETCH_TIMEOUT_MS);
         if (!r.ok) return null;
         return r.blob();
       },
@@ -1403,6 +1589,24 @@
     return { notes, pdfs };
   }
 
+  /**
+   * 原文清单**要有上限**（2026-10-27 审计 D-7）。
+   *
+   * ⚠ 以前 `state.pdfs` 只 merge 不剪枝 → 云盘里论文越加越多，
+   *   这张表（连带文献库分组的渲染）会一直变大，占内存不释放。
+   * → 只留最近扫描到的 N 篇（对象的键序 = 插入序，末尾最新）。
+   */
+  const PDF_LIST_MAX = 50;
+
+  function trimPdfList(list) {
+    const out = list || {};
+    const keys = Object.keys(out);
+    if (keys.length <= PDF_LIST_MAX) return out;
+    const keep = {};
+    keys.slice(keys.length - PDF_LIST_MAX).forEach((k) => { keep[k] = out[k]; });
+    return keep;
+  }
+
   async function pullFromDir(quiet) {
     const backend = currentBackend();
     if (!backend) return;
@@ -1425,7 +1629,7 @@
     // 旧的不删 —— 扫到一半失败时不至于把已有的原文从列表里抹掉。
     const merged = Object.assign({}, state.pdfs || {});
     Object.keys(scan.pdfs || {}).forEach((id) => { merged[id] = scan.pdfs[id]; });
-    state.pdfs = merged;
+    state.pdfs = trimPdfList(merged);
 
     for (const f of files) {
       const text = f.text;
@@ -1739,6 +1943,9 @@
   const AI_HISTORY_TURNS = 3;
   /** 历史里每条答案最多留这么多字，免得 token 越滚越大 */
   const AI_HISTORY_MAX_CHARS = 1200;
+  /** ⚠ 同时保留**多少篇笔记**的对话（2026-10-27 审计 D-7）——
+   *  以前只增不减，翻几十篇笔记就攒几十份对话，内存不回收。 */
+  const AI_HISTORY_MAX_NOTES = 100;
 
   // ------------------------------------------------------------------
   // 思考预算与时限（2026-10-27 抄电脑端 AGENTS.md §4.38 / §4.39）
@@ -1928,6 +2135,14 @@
     if (!h) {
       h = [];
       state.aiHistory.set(noteId, h);
+      // ⚠ 对话历史**只增不减**（2026-10-27 审计 D-7）——
+      //   用得越久、翻的笔记越多，内存里攒的对话越多，从不回收。
+      // → 只留最近 AI_HISTORY_MAX_NOTES 篇笔记的对话（Map 保序，丢最早的）。
+      while (state.aiHistory.size > AI_HISTORY_MAX_NOTES) {
+        const oldest = state.aiHistory.keys().next();
+        if (oldest.done) break;
+        state.aiHistory.delete(oldest.value);
+      }
     }
     return h;
   }
@@ -2003,7 +2218,20 @@
     // **fetch 必被 CORS 打死**。走原生代理就没有跨域问题。
     // 代价：原生代理拿不到流式增量，只能一次性拿回完整 SSE 文本。
     if (nativeBridge && typeof nativeBridge.httpPost === "function") {
-      const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${cfg.key}`]);
+      let r = null;
+      try {
+        r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${cfg.key}`]);
+      } catch (e) {
+        // ⚠ 原生桥**失败**（HTTP 非 2xx）时，桥是 reject 的，
+        //   状态码在 e.status 里（__mbNativeResolve 已经挂上）。
+        //   → 这里必须把它转成「友好中文 + 带 status 的 Error」，
+        //     否则上层既看不到 429（换不了模型），用户也只能看到英文原文。
+        const st = Number(e && e.status) || 0;
+        const raw = String((e && e.message) || "");
+        const err = new Error(friendlyHttpError(st, raw));
+        err.status = st;
+        throw err;
+      }
       if (signal && signal.aborted) {
         return { content: "", reasoning: "", aborted: true };
       }
@@ -2020,7 +2248,7 @@
       return parsed;
     }
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2028,7 +2256,7 @@
       },
       body: bodyStr,
       signal: signal || undefined,
-    });
+    }, AI_FETCH_TIMEOUT_MS);
     if (!res.ok) {
       const t = await res.text().catch(() => "");
       const err = new Error(friendlyHttpError(res.status, t));
@@ -2261,6 +2489,12 @@
     //   没有已用时，用户只能盯着一个不动的光标猜是不是死了。
     const t0 = Date.now();
     let gotFirstDelta = false;
+    // ⚠ 节流渲染的状态必须在 try **外面**声明 ——
+    //   finally 里要收掉那个定时器（try 块里的 let/const 在块外看不见，
+    //   在 finally 里引用会直接 ReferenceError）。
+    let pendingText = null;
+    let renderTimer = null;
+    let lastRenderAt = 0;
     const tick = setInterval(() => {
       if (gotFirstDelta) return;
       const s = Math.floor((Date.now() - t0) / 1000);
@@ -2276,10 +2510,33 @@
       const altModel = (kind === "translate")
         ? (cfg.model || "")
         : (cfg.modelT || "");
-      const onDelta = (txt) => {
-        if (!gotFirstDelta) { gotFirstDelta = true; clearInterval(tick); }
+      /**
+       * ⚠ 流式渲染**必须节流**（2026-10-27 审计 D-3）。
+       *   onDelta 收到的是**全量累积文本**，每来一片就整段重渲染 = O(n²)：
+       *   4000 字答案按 20 字/片 ≈ 200 片 → 200 次全量 Markdown
+       *   + 全部公式重渲染 → 低端平板主线程冻结数秒（界面看着像「卡死了」）。
+       *   → 最多每 100ms 渲染一次。
+       *   ⚠ **最终输出内容不变**：收尾时仍然用 renderMarkdown(answer) 整段渲染一次，
+       *     节流只影响「打字过程中」的中间帧。
+       */
+      const AI_RENDER_THROTTLE_MS = 100;
+      const flushRender = () => {
+        if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+        if (pendingText == null) return;
+        const txt = pendingText;
+        pendingText = null;
+        lastRenderAt = Date.now();
         buf.innerHTML = renderMarkdown(txt);
         if (out) out.scrollTop = out.scrollHeight;
+      };
+      const onDelta = (txt) => {
+        if (!gotFirstDelta) { gotFirstDelta = true; clearInterval(tick); }
+        pendingText = txt;
+        const wait = AI_RENDER_THROTTLE_MS - (Date.now() - lastRenderAt);
+        if (wait <= 0) { flushRender(); return; }
+        if (!renderTimer) {
+          renderTimer = setTimeout(() => { renderTimer = null; flushRender(); }, wait);
+        }
       };
       /**
        * 发一次请求（自带三层兜底）。
@@ -2374,6 +2631,8 @@
           ? "正文为空 → 关掉思考重试…"
           : "正文为空（预算被思考吃光）→ 把预算抬到 " + payload.max_tokens + " 重试…";
         buf.innerHTML = "";
+        pendingText = null;
+        if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
         gotFirstDelta = false;
         const res2 = await sendOnce();
         if (res2 && res2.aborted) {
@@ -2420,6 +2679,9 @@
     } finally {
       clearInterval(tick);
       clearTimeout(timeoutTimer);
+      // 节流渲染的尾巴也要收掉 —— 否则收尾后还会再渲染一次旧文本。
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      pendingText = null;
       // ⚠ 只有**当前请求**才能碰共享状态（停止按钮 / 多轮上下文）。
       //   旧请求收尾时把新请求的停止按钮藏掉 → 用户没法停止新请求了。
       if (isCurrent()) {
@@ -2451,7 +2713,22 @@
       });
       // APK 里走原生代理（页面的 fetch 会被 CORS 打死）
       if (nativeBridge && typeof nativeBridge.httpPost === "function") {
-        const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${state.ai.key}`]);
+        let r = null;
+        try {
+          r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${state.ai.key}`]);
+        } catch (e) {
+          // ⚠ APK 里**没有跨域问题**（请求走原生代理）——
+          //   原来一律说「可能是浏览器跨域限制」，是在误导用户。
+          //   → 按状态码区分：401/403 说 key 不对，429 说额度/限流，
+          //     其余才说「模型服务没响应」。
+          const st = Number(e && e.status) || 0;
+          hint.textContent = st
+            ? friendlyHttpError(st, String((e && e.message) || ""))
+            : ("连不上模型服务：" + safeErr(e && e.message ? e.message : e)
+               + "（APK 里走的是原生代理，不是跨域问题）");
+          hint.setAttribute("data-error", "1");
+          return;
+        }
         if (r && r.ok) {
           hint.textContent = "连接正常";
           hint.removeAttribute("data-error");
@@ -2462,14 +2739,14 @@
         }
         return;
       }
-      const res = await fetch(url, {
+      const res = await fetchWithTimeout(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${state.ai.key}`,
         },
         body: bodyStr,
-      });
+      }, AI_FETCH_TIMEOUT_MS);
       if (res.ok) { hint.textContent = "连接正常"; hint.removeAttribute("data-error"); }
       else {
         const t = await res.text().catch(() => "");
@@ -2595,7 +2872,7 @@
     }
     // ② 云盘同步根（最新 —— 电脑端翻完同步过来，平板立刻能看）
     try {
-      const r = await fetch(syncUrl("file", "snapshots/" + key + ".json"));
+      const r = await fetchWithTimeout(syncUrl("file", "snapshots/" + key + ".json"), {}, FETCH_TIMEOUT_MS);
       if (r.ok) {
         const data = await r.json();
         // 版本对不上就整份作废 —— 与桌面端同一个判据。
@@ -2638,34 +2915,95 @@
     const dirty = !!(rec && rec.dirty);
     // ② 云端（联网时；离线就跳过，不报错）
     let cloud = [];
+    let cloudDeleted = [];
+    let cloudOk = false;
     try {
-      const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
+      const r = await fetchWithTimeout(syncUrl("file", "annotations/" + key + ".json"), {}, FETCH_TIMEOUT_MS);
       if (r.ok) {
+        cloudOk = true;
         const data = await r.json();
         cloud = Array.isArray(data.annotations) ? data.annotations : [];
+        cloudDeleted = Array.isArray(data.deleted) ? data.deleted : [];
       }
     } catch (e) {
       console.warn("拉批注失败（离线？）", e);
     }
-    if (!cloud.length) {
-      return local;
-    }
-    // ③ 合并
-    //   本地是**干净**的（之前同步过）→ 云端没有的，说明是在别处删掉了，
-    //     本地也跟着删 —— 否则会「删了又复活」。
-    //   本地**有未同步的改动** → 合并，本地那份为准。
-    const merged = dirty ? mergeAnnos(cloud, local) : cloud;
-    await DB.putAnnos(key, { items: merged, dirty: dirty ? 1 : 0, at: Date.now() });
+    // ⚠ 云端**读不到**（离线 / 还没有这个文件）→ 本地优先，直接返回。
+    //   云端读得到但列表是空的 → 那是「电脑端把批注全删了」，要照办（见下面）。
+    if (!cloudOk) return local;
+    // ③ 三方合并：云端 + 本地（本地优先），墓碑**最后**应用。
+    //   墓碑告诉合并逻辑「这些 id 已经被删了」——
+    //   不应用墓碑的话，电脑端删掉的批注会在平板上复活、还会被推回云端。
+    const deleted = annoTombstones(rec, cloud, local, cloudDeleted, cloudOk);
+    const merged = mergeAnnos(cloud, local, deleted);
+    await DB.putAnnos(key, {
+      items: merged,
+      dirty: dirty ? 1 : 0,
+      at: Date.now(),
+      // base = **云端有的** id（平板自己还没同步上去的不算 ——
+      // 算进去的话，下次会把它当成「电脑端删了」→ 自己把自己的批注删了）
+      base: cloud.map((a) => a && a.id).filter(Boolean),
+      deleted: deleted,
+    });
     return merged;
   }
 
-  /** 按 id 合并两份批注（后到的覆盖先到的）。 */
-  function mergeAnnos(base, extra) {
+  /**
+   * 三方合并：云端 / 本地 / 删除墓碑。
+   *
+   * ⚠ 墓碑必须**最后**应用 —— 跟电脑端 `_merge_annotation_lists`
+   *   （microbench/app.py:4875）一个顺序：先按 id 合并，再删墓碑。
+   *   反过来的话，同一个 id 会被 upsert 又加回来。
+   *
+   * ⚠ 同 id 冲突时**本地那条为准**（本地优先是平板端的硬要求）。
+   */
+  function mergeAnnos(base, extra, deleted) {
     const map = new Map();
-    base.forEach((a) => { if (a && a.id) map.set(a.id, a); });
-    extra.forEach((a) => { if (a && a.id) map.set(a.id, a); });
+    (base || []).forEach((a) => { if (a && a.id) map.set(a.id, a); });
+    (extra || []).forEach((a) => { if (a && a.id) map.set(a.id, a); });
+    (deleted || []).forEach((id) => { if (id) map.delete(id); });
     return Array.from(map.values()).sort((a, b) =>
       String(a.created_at || "").localeCompare(String(b.created_at || "")));
+  }
+
+  /**
+   * 算出这次该应用的**删除墓碑**（被删掉的批注 id）。
+   *
+   * ⚠ 为什么不能只看「云端有而本地没有」（2026-10-27 审计 D-2）：
+   *   「我这里没有」有好几种可能，混为一谈就会**删掉别的设备刚加的批注**：
+   *     ① 本地删掉了          → 墓碑（要告诉电脑端）
+   *     ② 电脑端删掉了        → 墓碑（本地也得删，别再推回去）
+   *     ③ 电脑端**刚加的**、平板还没拉 → **不能**当墓碑！
+   *   → 判据要靠 `base`：
+   *     `base` = **上次同步时云端有的**那些 id（不是平板本地的全部）。
+   *     base 里有、这次云端没了 → ② 电脑端删了 → 墓碑。
+   *     base 里没有（电脑端刚加的 / 平板自己还没同步上去的）→ 保留。
+   *
+   * ⚠⚠ `cloudKnown` 必须传对（2026-10-27 审计 D-2 的连带坑）：
+   *   云端**读失败**（离线 / DAV 挂了）时 cloud 是个空数组 ——
+   *   此时若照样按「base - cloud」算墓碑，就会把**平板自己的批注全部**
+   *   当成「被电脑端删了」→ 推上去等于把两边的批注全清空。
+   *   → 云端状态未知时，一条墓碑都不许推算。
+   *
+   * @param rec          本地那条记录（{items, dirty, at, base, deleted}）
+   * @param cloud        云端列表
+   * @param local        本地列表
+   * @param cloudDeleted 云端文件里带的墓碑（别的设备删的）
+   * @param cloudKnown   云端列表**是不是真的读到了**（false = 状态未知）
+   */
+  function annoTombstones(rec, cloud, local, cloudDeleted, cloudKnown) {
+    const tombs = new Set();
+    const add = (id) => { if (id) tombs.add(id); };
+    ((rec && rec.deleted) || []).forEach(add);
+    (cloudDeleted || []).forEach(add);
+    if (cloudKnown) {
+      const cloudIds = new Set((cloud || []).map((a) => a && a.id).filter(Boolean));
+      // base 里有、这次云端没了 → 电脑端删掉了 → 别再推回去
+      ((rec && rec.base) || []).forEach((id) => {
+        if (!cloudIds.has(id)) add(id);
+      });
+    }
+    return Array.from(tombs);
   }
 
   /**
@@ -2676,46 +3014,109 @@
     const key = safePaperKey(paperIdFor(pdfId));
     if (!key) return false;
     // ① 本地先存 —— 硬要求：断网也能改
-    await DB.putAnnos(key, { items: items, dirty: 1, at: Date.now() });
+    const rec = await DB.getAnnos(key);
+    const prevIds = new Set(((rec && rec.items) || []).map((a) => a && a.id).filter(Boolean));
+    const newIds = new Set((items || []).map((a) => a && a.id).filter(Boolean));
+    // ⚠ 本地删掉的 id 要记成墓碑（2026-10-27 审计 D-2）——
+    //   不记的话，电脑端会把这些批注当成「平板还没删」→ 复活。
+    const deleted = ((rec && rec.deleted) || []).slice();
+    prevIds.forEach((id) => {
+      if (!newIds.has(id) && deleted.indexOf(id) < 0) deleted.push(id);
+    });
+    await DB.putAnnos(key, {
+      items: items,
+      dirty: 1,
+      at: Date.now(),
+      base: (rec && rec.base) || [],
+      deleted: deleted,
+    });
     // ② 再同步到云盘
-    const ok = await pushAnnosToCloud(key, items);
-    if (ok) {
-      await DB.putAnnos(key, { items: items, dirty: 0, at: Date.now() });
+    const r = await pushAnnosToCloud(key, items);
+    if (r.ok) {
+      // 云端确认过的墓碑 → 本地也跟着删
+      // （电脑端删掉的批注，别在平板上一直挂着、又被推回去）
+      const gone = new Set(r.deleted || []);
+      const kept = items.filter((a) => !gone.has(a && a.id));
+      await DB.putAnnos(key, {
+        items: kept,
+        dirty: 0,
+        at: Date.now(),
+        // base = **云端现在有的** id（= 刚写上去的那份）
+        base: (r.merged || kept).map((a) => a && a.id).filter(Boolean),
+        deleted: [],
+      });
+      if (kept.length !== items.length && Array.isArray(pdfState.annos)) {
+        pdfState.annos = kept;      // 界面也跟着更新
+      }
     } else if (!silent) {
       toast("已存到平板本地（联网后会自动同步到坚果云）");
     }
-    return ok;
+    return r.ok;
   }
 
-  /** 把批注写到同步根（先读云端合并，再写回 —— 不能整份覆盖）。 */
+  /**
+   * 把批注写到同步根（先读云端合并，再写回 —— 不能整份覆盖）。
+   *
+   * ⚠⚠ 协议字段名必须与电脑端**逐字一致**（2026-10-27 审计 D-2）：
+   *   电脑端 `AnnotationSaveRequest`（microbench/app.py:5221）里有
+   *     `deleted: list[str]`  —— 「本次删除掉的批注 id（跨设备合并不复活）」
+   *   而 `_merge_annotation_lists` 最后会应用这批墓碑。
+   *   平板原来**只写 annotations**，没有墓碑 →
+   *   电脑端删掉的批注在平板上复活、又被推回云端。
+   *   → 这里同样上报 `deleted`，并把墓碑应用在合并结果上。
+   *
+   * @returns {{ok: boolean, merged: Array|null}}
+   */
   async function pushAnnosToCloud(key, items) {
     if (!nativeBridge || typeof nativeBridge.putSync !== "function") {
-      return false;      // 浏览器里没有同步根
+      return { ok: false, merged: null, deleted: [] };      // 浏览器里没有同步根
     }
     try {
       let cloud = [];
+      let cloudDeleted = [];
+      let cloudKnown = false;
+      let readFailed = false;
       try {
-        const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
+        const r = await fetchWithTimeout(syncUrl("file", "annotations/" + key + ".json"), {}, FETCH_TIMEOUT_MS);
         if (r.ok) {
+          cloudKnown = true;
           const d = await r.json();
           cloud = Array.isArray(d.annotations) ? d.annotations : [];
+          cloudDeleted = Array.isArray(d.deleted) ? d.deleted : [];
+        } else if (r.status === 404) {
+          // 云端**还没有**这个文件 → 云端就是空的（不是「读失败」）
+        } else {
+          readFailed = true;      // 其它 HTTP 错误 → 云端状态**未知**
         }
-      } catch (e) { /* 云端读不到就以本地为准 */ }
-      const merged = mergeAnnos(cloud, items);
+      } catch (e) {
+        readFailed = true;        // 网络/超时 → 云端状态**未知**
+      }
+      // ⚠⚠ 云端状态未知时**不能写**（2026-10-27 审计 D-2 的连带坑）：
+      //   写上去的内容是「平板这一份」→ 等于把云端那半边覆盖掉，
+      //   两边都会丢批注。宁可这次不同步（本地那份还在，下次再试）。
+      if (readFailed) {
+        console.warn("读不到云端批注，这轮先不写（本地那份还在）");
+        return { ok: false, merged: null, deleted: [] };
+      }
+      const rec = await DB.getAnnos(key);
+      const deleted = annoTombstones(rec, cloud, items, cloudDeleted, cloudKnown);
+      const merged = mergeAnnos(cloud, items, deleted);
       const payload = {
         paper_id: key,
         updated_at: new Date().toISOString(),
         schema_version: 2,
         annotations: merged,
+        // ⚠ 字段名与电脑端一致（app.py:AnnotationSaveRequest.deleted）
+        deleted: deleted,
       };
       await nativeCall("putSync", [
         "annotations/" + key + ".json",
         JSON.stringify(payload, null, 1),
       ]);
-      return true;
+      return { ok: true, merged: merged, deleted: deleted };
     } catch (e) {
       console.warn("批注同步失败", e);
-      return false;
+      return { ok: false, merged: null, deleted: [] };
     }
   }
 
@@ -3017,6 +3418,23 @@
   }
 
   /**
+   * 手写批注的 id —— **必须 ≤64 字符，且同一篇论文每次都一样**。
+   *
+   * ⚠⚠ id 长度不能超过 64（2026-10-27 审计 D-5）：
+   *   电脑端 `AnnotationItem.id` 是 `Field(..., max_length=64)`
+   *   （microbench/app.py:5202）→ 平板写过去的 id 超长时，
+   *   电脑端回传全量 items 会 **422**，那篇论文在电脑上**再也存不了批注**。
+   *   原来的 "ink_" + key：key = paper_id 去噪后的名字，
+   *   最长 70 + 1 + 7 = **78** 字符 → 必然超。
+   *   → "ink_" + hash(paper_id)：djb2 稳定哈希，
+   *     同一篇论文每次算出来都一样（批注不会被当成新的一条），
+   *     长度 = 4 + ≤8 = ≤12 字符。
+   */
+  function inkAnnoId(key) {
+    return "ink_" + hash(String(key || ""));
+  }
+
+  /**
    * 把手写笔迹存成一条批注（跟电脑端共享同一份文件）。
    *
    * ⚠ 先存**本地**（断网也能存），再尽力同步到云盘 ——
@@ -3035,7 +3453,8 @@
     });
     if (!strokes.length) { toast("还没有笔迹"); return; }
 
-    const id = "ink_" + key;
+    // ⚠⚠ id 长度**不能超过 64**（见 inkAnnoId 的说明）。
+    const id = inkAnnoId(key);
     const now = new Date().toISOString();
     const items = (pdfState.annos || []).filter((a) => a && a.id !== id);
     items.push({
@@ -3156,13 +3575,6 @@
     // ---- 译文侧 ----
     renderTranslationInto(wrap, n);
 
-    canvas.width = Math.floor(viewport.width * dpr);
-    canvas.height = Math.floor(viewport.height * dpr);
-    canvas.style.width = viewport.width + "px";
-    canvas.style.height = viewport.height + "px";
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
     const body = $("pdf-body");
     // 按页码顺序插入,保证连续阅读时顺序正确
     let before = null;
@@ -3172,7 +3584,7 @@
     }
     body.insertBefore(wrap, before);
 
-    await page.render({ canvasContext: ctx, viewport }).promise;
+    await paintCanvas(canvas, page, viewport, dpr);
 
     // 文本层：PDF.js 3.11 的 renderTextLayer 是**全局函数**（不是 page 的方法），
     // 而且要先拿到 getTextContent() 的结果。参数与桌面版 index.html 保持一致。
@@ -3196,6 +3608,94 @@
     // 手写层要等原文画完（尺寸定了）才能装
     setupInkLayer(inkLayer, n);
     pdfState.rendered.add(n);
+    // ⚠ 离屏页的 canvas 及时释放（见 pruneCanvases）
+    //   ⚠ 以「用户当前所在的页」为中心，不是刚画完的那一页 ——
+    //   预渲染下一页时若按 n 算，会把用户正在看的那一页给释放掉（一片空白）。
+    pruneCanvases(pdfState.currentPage || n);
+  }
+
+  /**
+   * 把一页画到 canvas 上（新建页卡、补画离屏页共用这一段）。
+   */
+  async function paintCanvas(canvas, page, viewport, dpr) {
+    if (!canvas) return;
+    canvas.width = Math.floor(viewport.width * dpr);
+    canvas.height = Math.floor(viewport.height * dpr);
+    canvas.style.width = viewport.width + "px";
+    canvas.style.height = viewport.height + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+  }
+
+  /**
+   * ⚠⚠ 只保留当前页 ±2 的 canvas（2026-10-27 审计 D-7）。
+   *
+   *   dpr=2 时一页 canvas 约 7~8 MB；翻几十页就是几百 MB ——
+   *   低端平板会被系统直接杀掉（用户看到的是「应用自己关了」）。
+   *   以前 `pdfState.rendered` 只增不减，canvas 也从不释放。
+   *
+   * ⚠ **只销毁 canvas，不动页卡节点**：
+   *   删掉节点会改变文档高度 → 滚动位置跳 → 用户正在看的那页被顶走。
+   *   页卡本身（译文栏 / 文本层 / 高亮层）留着，内存占用很小。
+   *   滚回来时由 restoreCanvas() 补画。
+   */
+  const PDF_CANVAS_WINDOW = 2;
+
+  function pruneCanvases(current) {
+    const body = $("pdf-body");
+    if (!body) return;
+    const cur = Number(current) || 1;
+    Array.from(body.children).forEach((child) => {
+      const n = parseInt(child.getAttribute("data-pdf-page") || "0", 10);
+      if (!n) return;
+      if (Math.abs(n - cur) <= PDF_CANVAS_WINDOW) return;
+      if (child.getAttribute && child.getAttribute("data-canvas-released") === "1") return;
+      // ⚠ 只动**原文**那张 canvas —— 手写那张是用户画的，丢了就没了。
+      //   （手写的数据在 inkState.strokes 里，恢复时能重画回来。）
+      const canvas = child.querySelector ? child.querySelector(".tb-pdf-orig canvas") : null;
+      if (!canvas || !canvas.width) return;
+      canvas.width = 0;
+      canvas.height = 0;      // ← 这一步才真的把那几 MB 放掉
+      if (child.setAttribute) child.setAttribute("data-canvas-released", "1");
+    });
+  }
+
+  /**
+   * 离屏页的 canvas 被释放后，滚回来时补画回来。
+   * （笔迹也在 inkState.strokes 里，一起补回来。）
+   */
+  async function restoreCanvas(n) {
+    const wrap = document.querySelector(`[data-pdf-page="${n}"]`);
+    if (!wrap) return;
+    if (!wrap.getAttribute || wrap.getAttribute("data-canvas-released") !== "1") return;
+    const doc = pdfState.doc;
+    if (!doc) return;
+    try {
+      const pdfjsLib = await loadPdfJs();
+      const page = await doc.getPage(n);
+      const viewport = page.getViewport({ scale: pdfFitScale(page) });
+      const dpr = window.devicePixelRatio || 1;
+      const canvas = wrap.querySelector ? wrap.querySelector(".tb-pdf-orig canvas") : null;
+      if (!canvas) return;
+      wrap.removeAttribute("data-canvas-released");
+      await paintCanvas(canvas, page, viewport, dpr);
+      // 手写层也补回来（笔迹数据在 inkState.strokes）
+      const inkCv = wrap.querySelector ? wrap.querySelector(".tb-pdf-ink canvas") : null;
+      if (inkCv) {
+        const layer = inkCv.parentElement;
+        const r = layer && layer.getBoundingClientRect ? layer.getBoundingClientRect() : null;
+        const w = (r && r.width) || inkCv.width || 1;
+        const h = (r && r.height) || inkCv.height || 1;
+        inkCv.width = Math.max(1, Math.floor(w * dpr));
+        inkCv.height = Math.max(1, Math.floor(h * dpr));
+        const ictx = inkCv.getContext("2d");
+        ictx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        drawInkPage(n, inkCv, ictx);
+      }
+    } catch (e) {
+      console.warn("补画离屏页失败", e);
+    }
   }
 
   /** pdf.js 的 renderTextLayer 不可用时的手工兜底（照抄桌面版实现）。 */
@@ -3284,6 +3784,14 @@
         if (current !== pdfState.currentPage) {
           pdfState.currentPage = current;
           $("pdf-pageinfo").textContent = `${current} / ${pdfState.numPages}`;
+        }
+        // ⚠ 离屏页的 canvas 被释放过 → 滚回来时补画（否则是一片空白）
+        if (pdfState.doc) {
+          restoreCanvas(current);
+          restoreCanvas(current + 1);
+          restoreCanvas(current - 1);
+          // 当前位置变了 → 离当前位置更远的 canvas 可以释放了
+          pruneCanvases(current);
         }
         // 滚到接近底部 -> 预渲染下一页, 连续读不用等
         if (body.scrollTop + body.clientHeight > body.scrollHeight - body.clientHeight * 0.8) {
@@ -3401,7 +3909,31 @@
     if (!todo.length) { toast("全部原文已经在本地了（可离线阅读）"); return; }
 
     const total = todo.reduce((a, id) => a + ((state.pdfs[id].size || 0)), 0);
+    // ⚠⚠ 缓存前先**看配额**（2026-10-27 审计 D-7）。
+    //   76MB 原文塞进 IndexedDB，撞上 QuotaExceededError 会被吞成
+    //   一句「失败 24」—— 用户只知道「没成功」，不知道为什么。
+    //   → 先用 navigator.storage.estimate() 估一下，不够就**明说**差多少。
+    if (typeof navigator !== "undefined" && navigator.storage
+        && typeof navigator.storage.estimate === "function") {
+      try {
+        const est = await navigator.storage.estimate();
+        const quota = Number(est && est.quota) || 0;
+        const usage = Number(est && est.usage) || 0;
+        // 留 20% 余量（浏览器自己也要占地方）
+        const need = Math.ceil(total * 1.2);
+        if (quota && usage + need > quota) {
+          const lack = Math.ceil((usage + need - quota) / 1048576);
+          toast("平板可用空间不够：这一批原文约 " + Math.round(total / 1048576)
+            + " MB，但只剩 " + Math.max(0, Math.round((quota - usage) / 1048576))
+            + " MB（还差约 " + lack + " MB）。先在系统设置里清点空间再试。", true);
+          return;
+        }
+      } catch (e) {
+        console.warn("读不到存储配额，继续缓存", e);
+      }
+    }
     let got = 0, ok = 0, fail = 0;
+    let quotaFull = false;
     const t0 = Date.now();
     toast(`开始缓存 ${todo.length} 篇原文（约 ${Math.round(total / 1048576)} MB）…`);
     for (let i = 0; i < todo.length; i++) {
@@ -3418,6 +3950,15 @@
         ok++;
         got += blob.size || 0;
       } catch (e) {
+        // ⚠ 配额用满是**明确的一种失败**，不能跟「下载失败」混为一谈：
+        //   再试多少次都一样，得告诉用户「空间不够」。
+        if (e && (e.name === "QuotaExceededError"
+            || /quota/i.test(String((e && e.message) || "")))) {
+          quotaFull = true;
+          fail++;
+          pdfStatus("存储空间已满，停止缓存");
+          break;
+        }
         fail++;
       }
       if (i % 2 === 0 || i === todo.length - 1) {
@@ -3426,6 +3967,13 @@
     }
     pdfStatus("");
     const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
+    if (quotaFull) {
+      toast("缓存中断：平板存储空间已满（已缓存 " + ok + " 篇 / "
+        + Math.round(got / 1048576) + " MB）。先在系统设置里清点空间，"
+        + "剩下的下次再缓存。", true);
+      await openPdfLib();
+      return;
+    }
     toast(`缓存完成：${ok} 篇 ${Math.round(got / 1048576)} MB，用了 ${secs} 秒` +
           (fail ? `，失败 ${fail}` : "") + "。现在没网也能翻论文了。", fail > 0);
     await openPdfLib();
@@ -3517,11 +4065,41 @@
       `MicroBench 平板工作台 · 本地 ${state.notes.size} 篇 · 待同步 ${state.dirtyCount} 篇`;
   }
 
+  /**
+   * 把 AI 网关地址登记到**原生侧的主机白名单**。
+   *
+   * ⚠ 为什么要登记（2026-10-27 审计 C-1 的接线）：
+   *   原生的 `httpPost` 有目标主机白名单 —— 只放行
+   *   dav.jianguoyun.com / api.minimaxi.com / api.minimax.io /
+   *   apihub.agnes-ai.com / api.deepseek.com / api.openai.com
+   *   （否则平板就是个开放代理：页面里任何脚本都能让它代发请求，
+   *    甚至拿它当跳板去打用户内网的 https）。
+   *   而 **AI 网关地址存在网页的 IndexedDB 里（state.ai.base），原生读不到**
+   *   → 用户配的**自定义网关**必须在这里登记一次，
+   *     否则请求会被原生拒掉（报错：网关域名不在白名单）。
+   *
+   * ⚠ 只传 host 相关的**地址**，**绝不能**把 API key 一起传过去。
+   * ⚠ 原生侧没有这个方法时（老 APK / 浏览器路径）**不能抛异常** ——
+   *   保存设置照常成功。
+   */
+  function allowAiHost(base) {
+    if (!nativeBridge || typeof nativeBridge.allowAiHost !== "function") return false;
+    try {
+      nativeBridge.allowAiHost(String(base || ""));
+      return true;
+    } catch (e) {
+      console.warn("登记 AI 网关白名单失败", e);
+      return false;
+    }
+  }
+
   async function saveSettings() {
     state.ai.base = $("cfg-base").value.trim();
     state.ai.key = $("cfg-key").value.trim();
     state.ai.model = $("cfg-model").value.trim() || "MiniMax-M3.1-Flash";
     state.ai.modelT = $("cfg-model-t").value.trim() || "MiniMax-M3";
+    // ⚠ 登记给原生白名单（自定义网关必须登记，内置网关在默认名单里）
+    allowAiHost(state.ai.base);
     await DB.setMeta("ai", state.ai);
     toast("设置已保存");
   }
@@ -3600,6 +4178,9 @@
     // AI 配置
     const ai = await DB.getMeta("ai", null);
     if (ai) state.ai = Object.assign(state.ai, ai);
+    // ⚠ 恢复设置后**也要登记一次**网关白名单 ——
+    //   这样升级 APK 之后不用重新保存设置就能直接用自定义网关。
+    allowAiHost(state.ai.base);
 
     // 目录句柄（安卓 Chrome 可持久化）/ 坚果云 WebDAV（APK）
     if (nativeBridge) {
@@ -3700,8 +4281,11 @@
     };
     $("btn-reset").onclick = async () => {
       if (!confirm("清空平板上的全部本地数据？云盘里的文件不受影响。")) return;
-      await DB.clearNotes();
-      await DB.setMeta("current_note", null);
+      // ⚠ 三个 store 一起清（2026-10-27 审计 D-4）：
+      //   notes（笔记）+ meta（**API Key**、批注、译文缓存）+ pdfcache（**76MB 原文**）。
+      //   以前只清 notes → Key 和 PDF 全留在机器上。
+      await DB.resetAll();
+      try { localStorage.clear(); } catch (e) { /* 没有 localStorage 也不该白屏 */ }
       location.reload();
     };
     $("btn-import-pack").onclick = () => $("file-pack").click();
@@ -3861,6 +4445,12 @@
       currentBackend: currentBackend,
       refreshSyncUi: refreshSyncUi,
       davVaultRootLabel: davVaultRootLabel,
+      // 原生桥 —— 「回包丢了 status 导致 429 换模型不生效」只能靠单测钉住
+      nativeCall: nativeCall,
+      fetchWithTimeout: fetchWithTimeout,
+      // 设置 —— 「自定义网关没登记到原生白名单」只能靠单测钉住
+      saveSettings: saveSettings,
+      allowAiHost: allowAiHost,
       // AI 面板（输入栏清空、多轮上下文这些行为必须有护栏）
       runAI: runAI,
       aiOnKeyDown: aiOnKeyDown,
@@ -3891,6 +4481,10 @@
       saveAnnotations: saveAnnotations,
       loadAnnotations: loadAnnotations,
       mergeAnnos: mergeAnnos,
+      annoTombstones: annoTombstones,
+      inkAnnoId: inkAnnoId,
+      // 目录树的增量重建（性能护栏）
+      buildNav: buildNav,
       // 译文快照的版本闸门（两端必须一致，否则用户看到旧算法翻的坏译文）
       loadTranslation: loadTranslation,
       transCacheKey: transCacheKey,

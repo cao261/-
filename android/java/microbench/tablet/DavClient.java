@@ -51,10 +51,32 @@ public class DavClient {
     private static final int TIMEOUT_MS = 60_000;
 
     /**
-     * 单次下载的体积上限。原文 PDF 几 MB 到几十 MB, 128 MB 足够 ——
-     * 同时也防住畸形响应（错误的 Content-Length / chunk-size）把内存吃光。
+     * **走内存缓冲**的单次下载上限（字节）。
+     *
+     * ⚠ 2026-10-27 审计 M-1：原来只有一个 128 MB 的上限，而 {@link #get}
+     *   把整份文件读进 byte[] —— 平板内存有限，一个 128 MB 的数组足够把
+     *   应用 OOM 掉（WebView 自己还要留一份）。
+     *   → 分档：进内存的收紧到 32 MB（笔记 / 译文快照 / 目录列表绰绰有余），
+     *     大文件走 {@link #openFile} 的流式通道。
      */
-    private static final long MAX_DOWNLOAD_BYTES = 128L * 1024 * 1024;
+    public static final long MAX_BUFFERED_BYTES = 32L * 1024 * 1024;
+
+    /**
+     * **走流式**的单次下载上限（字节）。
+     *
+     * ⚠ 原文 PDF 最大 9.3 MB，256 MB 足够宽裕；
+     *   超了给**明确错误**（而不是把内存吃光）。
+     */
+    public static final long MAX_STREAM_BYTES = 256L * 1024 * 1024;
+
+    /**
+     * 单行（状态行 / 响应头 / chunk-size）的最大字节数。
+     *
+     * ⚠ 2026-10-27 审计 L-1：原来 readLine() 没有上限 ——
+     *   恶意或被劫持的 DAV 服务端发一行 100 MB 的数据就能把内存吃光。
+     *   8 KB 对 HTTP 来说绰绰有余（状态行几十字节，头行几百字节）。
+     */
+    public static final int MAX_LINE_BYTES = 8 * 1024;
 
     // ------------------------------------------------------------------
     // 限流
@@ -175,18 +197,30 @@ public class DavClient {
         return vaultRoot;
     }
 
+    /**
+     * 归一化 vault 前缀。
+     *
+     * ⚠ 2026-10-27 审计 L-2：**必须过滤 "." / ".."** ——
+     *   原来这里只去首尾斜杠，手填一个「../」就能让请求越出 vault 根
+     *   （比如 ../ 别的目录 → 删掉别人的文件）。
+     *   → 与 {@link #appendPath} 用同一套规则：整段丢掉。
+     */
     private static String normalizeVaultRoot(String p) {
         if (p == null) {
             return "";
         }
         String s = p.trim().replace('\\', '/');
-        while (s.startsWith("/")) {
-            s = s.substring(1);
+        StringBuilder sb = new StringBuilder();
+        for (String seg : s.split("/")) {
+            if (seg.isEmpty() || ".".equals(seg) || "..".equals(seg)) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append('/');
+            }
+            sb.append(seg);
         }
-        while (s.endsWith("/")) {
-            s = s.substring(0, s.length() - 1);
-        }
-        return s;
+        return sb.toString();
     }
 
     public void setVaultRoot(String p) {
@@ -201,9 +235,11 @@ public class DavClient {
     public String urlFor(String path) {
         StringBuilder sb = new StringBuilder(root);
         // 先拼 vault 前缀
+        // ⚠ 同样要过滤 "." / ".."（审计 L-2）：前缀是用户手填的，
+        //   一旦放过 ".."，请求就能越出 vault 根。
         if (!vaultRoot.isEmpty()) {
             for (String seg : vaultRoot.split("/")) {
-                if (!seg.isEmpty()) {
+                if (!seg.isEmpty() && !".".equals(seg) && !"..".equals(seg)) {
                     sb.append(encodeSegment(seg)).append('/');
                 }
             }
@@ -511,9 +547,9 @@ public class DavClient {
                 } catch (NumberFormatException ignored) {
                 }
             }
-            if (n > MAX_DOWNLOAD_BYTES) {
+            if (n > MAX_BUFFERED_BYTES) {
                 throw new IOException("响应体超过上限 "
-                        + (MAX_DOWNLOAD_BYTES / 1048576) + " MB");
+                        + (MAX_BUFFERED_BYTES / 1048576) + " MB");
             }
             if (n > 0) {
                 r.body = readFully(bin, (int) n);
@@ -523,12 +559,20 @@ public class DavClient {
                 //   这时必须**读到 EOF** —— 否则 body 被当成空的,
                 //   PROPFIND 解析出 0 条目, 页面上显示「目录为空」,
                 //   真空目录和解析失败根本分不开。
-                r.body = readAllBytes(bin, MAX_DOWNLOAD_BYTES, 16 * 1024);
+                r.body = readAllBytes(bin, MAX_BUFFERED_BYTES, 16 * 1024);
             }
         }
         return r;
     }
 
+    /**
+     * 读一行（以 \n 结束）。
+     *
+     * ⚠ 2026-10-27 审计 L-1：原来**没有行长上限** ——
+     *   恶意 / 被劫持的 DAV 服务端发一行 100 MB 且不带换行，
+     *   这里就会一直读，内存无限增长（而且是在 UI 线程之外也救不回来）。
+     *   → 超过 {@link #MAX_LINE_BYTES} 直接报错。
+     */
     private static String readLine(InputStream in) throws IOException {
         java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream(128);
         int c;
@@ -540,6 +584,10 @@ public class DavClient {
             }
             if (c != '\r') {
                 bo.write(c);
+            }
+            if (bo.size() > MAX_LINE_BYTES) {
+                throw new IOException("服务器返回了过长的行（超过 "
+                        + (MAX_LINE_BYTES / 1024) + " KB）");
             }
         }
         if (!any && c == -1) {
@@ -583,9 +631,9 @@ public class DavClient {
                 break;
             }
             total += size;
-            if (total > MAX_DOWNLOAD_BYTES) {
+            if (total > MAX_BUFFERED_BYTES) {
                 throw new IOException("响应体超过上限 "
-                        + (MAX_DOWNLOAD_BYTES / 1048576) + " MB");
+                        + (MAX_BUFFERED_BYTES / 1048576) + " MB");
             }
             out.write(readFully(in, size));
             readLine(in);   // 每个 chunk 后面的 CRLF
@@ -641,7 +689,9 @@ public class DavClient {
                         + (err.isEmpty() ? "" : " " + err));
             }
             // Content-Length 预检：太大的直接拒掉, 别把内存吃光。
-            // 原文 PDF 最大的 9.3 MB, 128 MB 的上限绰绰有余。
+            // ⚠ 2026-10-27 审计 M-1：上限从 128 MB 收到 32 MB ——
+            //   这一路是**整份读进内存**的（byte[]），平板扛不住 128 MB。
+            //   要大文件请走 {@link #openFile}（流式）。
             String cl = c.getHeaderField("Content-Length");
             long expect = 0;
             if (cl != null) {
@@ -650,17 +700,139 @@ public class DavClient {
                 } catch (NumberFormatException ignored) {
                 }
             }
-            if (expect > MAX_DOWNLOAD_BYTES) {
+            if (expect > MAX_BUFFERED_BYTES) {
                 c.disconnect();
-                throw new IOException("文件太大（" + (expect / 1048576) + " MB），超过上限");
+                throw new IOException("文件太大（" + (expect / 1048576) + " MB），超过 "
+                        + (MAX_BUFFERED_BYTES / 1048576) + " MB 上限");
             }
             try (InputStream in = new BufferedInputStream(c.getInputStream(), 32 * 1024)) {
-                return readAllBytes(in, MAX_DOWNLOAD_BYTES, (int) Math.min(expect, 8L * 1024 * 1024));
+                return readAllBytes(in, MAX_BUFFERED_BYTES, (int) Math.min(expect, 8L * 1024 * 1024));
             } finally {
                 c.disconnect();
             }
         }
         throw new IOException(RATE_LIMIT_MSG);
+    }
+
+    /**
+     * 打开一个文件用于**流式**读取。
+     *
+     * ⚠ 为什么要有它（2026-10-27 审计 M-1）：
+     *   {@link #get} 把整份文件读进 byte[]，9 MB 的 PDF 就是 9 MB 的数组，
+     *   而 {@link android.webkit.WebResourceResponse} 本来就接受 InputStream ——
+     *   直接把连接流交给它，Java 侧一个字节都不用攒，平板也不会 OOM。
+     *
+     * @return 流；文件不存在（404）返回 null
+     */
+    public DavStream openFile(String path) throws IOException {
+        for (int attempt = 0; attempt <= MAX_RETRY; attempt++) {
+            HttpURLConnection c = open("GET", path, null);
+            int code = c.getResponseCode();
+            if (code == 404) {
+                c.disconnect();
+                return null;
+            }
+            if (code == 503) {
+                String err = readAll(c.getErrorStream());
+                c.disconnect();
+                if (isRateLimited(code, err)) {
+                    if (attempt == MAX_RETRY) {
+                        throw new IOException(RATE_LIMIT_MSG);
+                    }
+                    backoff(attempt);
+                    continue;
+                }
+                throw new IOException("WebDAV GET " + path + " -> HTTP " + code
+                        + (err.isEmpty() ? "" : " " + err));
+            }
+            if (code != 200) {
+                String err = readAll(c.getErrorStream());
+                c.disconnect();
+                throw new IOException("WebDAV GET " + path + " -> HTTP " + code
+                        + (err.isEmpty() ? "" : " " + err));
+            }
+            long expect = 0;
+            String cl = c.getHeaderField("Content-Length");
+            if (cl != null) {
+                try {
+                    expect = Long.parseLong(cl.trim());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (expect > MAX_STREAM_BYTES) {
+                c.disconnect();
+                throw new IOException("文件太大（" + (expect / 1048576) + " MB），超过 "
+                        + (MAX_STREAM_BYTES / 1048576) + " MB 上限");
+            }
+            try {
+                InputStream in = new BufferedInputStream(c.getInputStream(), 64 * 1024);
+                return new DavStream(in, expect, c);
+            } catch (IOException e) {
+                c.disconnect();
+                throw e;
+            }
+        }
+        throw new IOException(RATE_LIMIT_MSG);
+    }
+
+    /**
+     * 一个**流式**的文件响应。
+     *
+     * ⚠ 它必须实现 InputStream —— WebResourceResponse 拿到的就是它，
+     *   WebView 在自己的线程上读；读完（或放弃）会 close()，
+     *   这里顺手把连接断掉（不断就是连接泄漏）。
+     *
+     * ⚠ 同时限死总字节数：Content-Length 是**服务器**说了算的，
+     *   它说 1 KB 却发 1 GB 的畸形响应不能让内存爆掉。
+     */
+    public static class DavStream extends InputStream {
+
+        private final InputStream in;
+        private final HttpURLConnection conn;
+        private final long length;
+        private long total = 0;
+
+        DavStream(InputStream in, long length, HttpURLConnection conn) {
+            this.in = in;
+            this.length = length;
+            this.conn = conn;
+        }
+
+        /** 服务器声明的长度（未知时是 0）。 */
+        public long length() {
+            return length;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n <= 0 ? -1 : (one[0] & 0xFF);
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int n = in.read(b, off, len);
+            if (n > 0) {
+                total += n;
+                if (total > MAX_STREAM_BYTES) {
+                    throw new IOException("响应体超过上限 "
+                            + (MAX_STREAM_BYTES / 1048576) + " MB");
+                }
+            }
+            return n;
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                in.close();
+            } finally {
+                if (conn != null) {
+                    conn.disconnect();
+                }
+            }
+        }
     }
 
     /**
@@ -1264,7 +1436,7 @@ public class DavClient {
     }
 
     private static byte[] readAllBytes(InputStream in) throws IOException {
-        return readAllBytes(in, MAX_DOWNLOAD_BYTES, 16 * 1024);
+        return readAllBytes(in, MAX_BUFFERED_BYTES, 16 * 1024);
     }
 
     /**

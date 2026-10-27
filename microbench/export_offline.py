@@ -472,6 +472,12 @@ def _safe_url(value: str) -> str:
         return ""
     v = value.strip()
     low = v.lower().replace("\t", "").replace("\n", "").replace("\r", "")
+    # ⚠ 协议相对 URL（//evil.com/x）必须拒绝（2026-10-27 审计 M-5）：
+    #   它以 "/" 开头，会被下面的 "/" 前缀放行；但离线 HTML 是用 file:// 打开的，
+    #   点一下就会向**外网**发请求 → 泄露阅读行为 / IP，或被当钓鱼跳转。
+    #   实测：`<a href="//evil.com/x">` 原样进了导出产物。
+    if low.startswith("//"):
+        return "#"
     # javascript: / data: / vbscript: 一律拒绝
     if low.startswith(("javascript:", "data:", "vbscript:", "file:")):
         return "#"

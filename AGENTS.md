@@ -2152,6 +2152,261 @@ invalid params, model "MiniMax-M3.1-Flash" requires adaptive thinking;
 
 ---
 
+### 4.52 批注重放会**自激**：MutationObserver 里的 setTimeout 必须防抖（2026-10-27 审计实测）
+
+**症状**：译文栏的文字**选区会被莫名清空** → 划词答疑读不到 `getSelection()` →
+用户以为是划词功能坏了。
+
+**根因**（`microbench/static/index.html` 的 `initAnnotationFeatures`）：
+
+```js
+const obs = new MutationObserver(() => {
+  if (!_annoState.items.length) return;
+  setTimeout(reapplyAnnotations, 80);      // ← 没有 clearTimeout！
+});
+obs.observe(list, { childList: true, subtree: true, characterData: true });
+```
+
+`reapplyAnnotations` 自己会改 DOM（`_clearAnnoMarks` 清标记 + `_wrapTextWithMark`
+重新包 `<mark>`），而这个 DOM **正在被观察** →
+
+```
+改 DOM → 触发 observer → 再排一次 setTimeout → 再改 DOM → …
+```
+
+**实测**：只要这篇论文有**一条能匹配上的批注**，3 秒内 `reapplyAnnotations` 被调用
+**32 次**（≈10.7 次/秒，永不停止）；译文栏 60 字符的选区在 500ms 内变成 **0**。
+
+**修法**：① `clearTimeout` 真防抖（旧写法是"每次变更都排队"，不是防抖）；
+② **用户正在划词时不动 DOM**（`getSelection()` 非折叠就跳过这一轮）——
+否则重放照样会把选区洗掉。
+
+> **通用教训**：**观察者回调里如果会改被观察的子树，就必须防抖 + 加"正在交互就跳过"的闸门**。
+> 桌面端、平板端、离线导出三套前端都要各自检查一遍。
+
+护栏：`microbench/_test_audit_2026_10_27.js`（node 跑 index.html 里的**真实源码**：
+断言"5 次变更 → 只排 1 个定时器"和"划词中不重放"）+ `tests/test_audit_2026_10_27_core.py`。
+
+---
+
+### 4.53 `{ once: true }` 的语义是「**任意**键按一次就摘掉」，不是「这个键按一次」（2026-10-27 审计实测）
+
+**症状**：弹窗（快照 / 诊断）**按 Esc 关不掉**；关了再打开后 Esc **永久失效**。
+
+**根因**：
+
+```js
+document.addEventListener("keydown", onEsc, { once: true });
+```
+
+`once: true` = "**任意**键按一次就摘掉这个监听器"。所以弹窗开着时先按了 `a` 或 `q`，
+Esc 处理器**已经被消耗掉了** → 后面按 Esc 什么都不会发生。
+诊断弹窗更糟：监听器只在 `if (!modal)` 里挂一次 → 关掉再打开后**再也挂不上**。
+
+**修法**：统一走 `_wireModalEsc(overlay, closeFn)`（只认 Esc、关掉时摘干净、
+并且 `stopPropagation`）。`stopPropagation` 还顺手解决了一个叠加问题：
+专注模式的 Esc 会把 Esc「让给」弹窗（`_zenOverlayOpen()`），
+而弹窗自己的 Esc 又被别的键吃掉了 → **两边都不响应 = 键盘陷阱**。
+
+> **通用教训**：`{ once: true }` 只适合"下一个特定事件"，
+> 想等某个键就用 `removeEventListener` 自己管生命周期。
+
+---
+
+### 4.54 `transform` 藏起来 ≠ 移出焦点序（2026-10-27 审计实测）
+
+**症状**：专注模式下按 Tab 会**跳进一个看不见的工具条**（元素在视口上方 90px，
+`getBoundingClientRect().top === -90`）—— 23 个控件进了焦点序。
+
+**根因**：专注模式用 `transform: translateY(-101%)` 把 `.reader-topbar` 移出视口。
+**`transform` 不会把元素移出焦点序**（不像 `display:none` / `visibility:hidden`）。
+
+**修法**：收起时加 `visibility: hidden`（同时移出焦点序和可访问性树），
+展开时 `visibility: visible`；配 `transition: visibility 0s linear .2s` 让收起
+动画走完再隐藏。
+
+> **通用教训**：**"看不见" 和 "不存在" 是两件事**。
+> 视觉上藏起来的 UI 必须同时问一句"它还能被 Tab 到吗？还能被读屏念到吗？"
+
+---
+
+### 4.55 局域网上的交互式 API 文档 = 免费送给对方的**攻击面说明书**（2026-10-27 审计实测）
+
+**症状**：`/docs` `/redoc` `/openapi.json` 在局域网上**不需要口令**。
+
+**实测**：从 `192.168.1.100` 无口令 `GET /openapi.json` → **200，71386 字节**，
+里面是 **60 条路由 + 全部请求/响应模型**；而同一时刻所有 `/api/*` 都正确返回 401。
+
+**为什么严重**：口令是 LAN 模式**唯一**的防线（vault 里的全部笔记 +
+用户的 LLM 额度 + 跨设备同步目录）。把 API 地图免费送出去，
+等于把「目标系统有多详细」直接告诉攻击者。
+
+**修法**：`_path_needs_token(path)` 把 `/docs` `/redoc` `/openapi.json`
+和 `/api/**` 一并纳入口令保护；`/api/auth/*` 仍然豁免（平板要靠它问"要不要口令"）。
+
+护栏：`tests/test_audit_2026_10_27_core.py::test_lan_openapi_and_docs_require_token`
+（同时断言**本机仍然能看**文档 —— 不能把桌面端也堵死）。
+
+---
+
+### 4.56 鉴权要 **fail-closed**：拿不到对端地址 ≠ 本机（2026-10-27 审计）
+
+**症状**：`_client_is_local(request)` 原来是
+`not _is_remote_peer(client.host if client else "")` ——
+`client` 为 None 时 `host` 是空串 → `_is_remote_peer("")` 返回 False
+→ 判定为「本机」→ **跳过口令校验**。
+
+**为什么危险**：判成本机 = 鉴权整个失效。拿不到对端地址时，正确答案是
+「我不知道你是谁」→ **当成远端**。
+
+**修法**：`client` 为 None 或 host 为空 → 直接 `return False`（远端）。
+Starlette 的 TestClient 填的是 `"testclient"`（不是 IP → 回环分支），
+所以测试不受影响；只有"对端信息完全缺失"这一种异常路径会变。
+
+---
+
+### 4.57 限流器的「预留时间」和「实际触发时间」是两回事（2026-10-27 审计实测）
+
+**症状**：并发起 5 个上游请求 → **4 个同时发出**（间隔判据形同虚设）→ 打到上游每分钟上限
+→ 被误判成「配额耗尽」→ `mark_degraded` **全局降格 15 分钟**（用户额度其实还有）。
+
+**根因**：`llm.py` 限流器里，间隔判据读的是 `_last_call_time`（**实际触发**时间，
+在 sleep **之后**才更新），而**预留**写在 `_last_planned_time` ——
+**间隔判据根本没用预留值**。于是 N 个并发者：第 1 个立即发，
+其余 N-1 个全部 sleep 一个 `min_interval` 后**同时**发出。
+
+**实测**（真实类，5 线程、min_interval=6.0）：
+
+```
+CURRENT   gaps=['6.00','0.00','0.00','0.00']   ← 4/5 同时发出
+FIXED     gaps=['6.00','6.00','6.00','6.00']
+```
+
+**修法**：间隔判据改用 `_last_planned_time`（**预留**时间），
+或预留时同步把 `_last_call_time` 推进到 planned。
+**验收标准是「每一次实际触发间隔 ≥ min_interval」**，不是"总耗时没变"。
+
+> **通用教训**：**"我已经占了这个位置"和"我真的用了它"是两个时间戳**。
+> 凡是"先排队再执行"的限流/排队逻辑，间隔判据必须读**预留**的那个。
+
+---
+
+### 4.58 事件循环上不能做同步重活（2026-10-27 审计实测）
+
+**症状**：翻页 / 打开论文时**全站卡住**（看板计数、3 个 SSE 答疑面板、LAN 平板一起冻）。
+
+**根因**：`async def` 端点里直接调**同步的**重活，而且**没有 await**：
+
+| 端点 | 同步重活 | 实测 |
+|---|---|---|
+| `POST /api/paper/translate_page` | `extract_page_text_with_glyphs`（pdfplumber 解析） | **64~332 ms/页**（中位 264） |
+| `GET /api/paper/find_pdf` | `iterdir()` + `rglob("*.pdf")` 全量扫 vault | 并发 8 时探针 MAX 78.3ms |
+| `GET /api/paper/formula_image` | `_pdf_clip_png`（fitz 渲染） | 跨站可触发、无并发上限 |
+| `POST /api/sync` | files 通道 sha256 + 79MB 拷贝 | 事件循环被占满 |
+
+（`01_Literature` 等目录是**坚果云 junction** → 扫描打的是云端 I/O，断链时更慢。）
+
+**修法**：
+① 重活一律 `await asyncio.to_thread(...)`；
+② 能吃缓存的先吃缓存 —— `pdf_cache` 里的页结构与单页抽取**逐字一致**
+（同一个 `_extract_page_text(page, glyphs)`），所以按页翻译可以直接命中缓存；
+③ 全量扫盘的端点改成**同步 `def`**（FastAPI 会丢进 anyio 线程池，不冻结事件循环）
+—— 与 2026-10-27 那轮已修的 `/api/stats` `/api/vault/literature` `/api/paper/folders` 同理，
+**那一轮漏掉了 `find_pdf`**。
+
+> **通用教训**：`async def` **不等于**"不阻塞"。
+> 只要函数体里有一句**同步的重活**，整个事件循环就在那一刻停住。
+> 判据：这段代码会不会读盘 / 解析 PDF / 算 sha256 / 发同步 HTTP？
+> 会 → 要么 `to_thread`，要么把端点改成同步 `def`。
+
+---
+
+### 4.59 **GET 端点不该建目录**（2026-10-27 审计实测）
+
+**症状**：`GET /api/pdf/annotations/load` 会在**坚果云同步根**里建 `annotations/` 目录
+（还会被坚果云上传）。
+
+**为什么能跨站触发**：GET 属**安全方法** → `csrf_origin_guard` **只管非安全方法**
+→ 跨站一个 `<img>` 就能让服务端建目录。
+
+**修法**：目录创建从**读路径**移到「lifespan 启动时建一次」+「**写**路径显式建」
+（`_ensure_snapshot_dir()` / `_ensure_annotations_dir()`）。
+
+护栏：`test_get_endpoints_do_not_create_directories`（启动后删掉目录，
+GET 之后断言**没被重建**）+ `test_write_paths_still_create_the_directories`
+（写路径不能被改没了）。
+
+---
+
+### 4.60 跨设备共享文件的「读-改-写」要用 **CAS**（2026-10-27 审计）
+
+**症状**：两台设备同时标注同一篇论文 → **其中一条批注被整文件覆盖**。
+
+**根因**：批注 JSON 住在**坚果云共享目录**。A 读 → A 合并 → A 写回，
+这个窗口里 B 写了一次 → A 的写回把 B 的内容**整个覆盖**。
+`_merge_annotation_lists` 只在**内容**层面合并，**救不了整文件覆盖**。
+
+**修法**：乐观 CAS —— 写之前再取一次磁盘指纹 `(st_mtime_ns, st_size)`，
+和读完时取的那份比对；**变了**说明另一台设备刚写过 → 重新读 + 重新合并再来一轮
+（最多 3 轮）。窗口从「整个同步往返」缩到「一次文件读」。
+
+> **通用教训**：**只要文件在两台设备之间共享，"读-改-写"就必须假设中间有人改过**。
+> 光在内容层面合并是不够的 —— 合并要建立在"我合并的是最新版本"这个前提上。
+
+---
+
+### 4.61 依赖 CVE 会随版本漂移：**审计报告不是永久有效的**（2026-10-27 审计实测）
+
+**事实**：2026-10-26 那一轮审计的结论是「`pip-audit` → No known vulnerabilities found」。
+**一天后**（2026-10-27）同一台机器上：
+
+```
+Pillow 12.2.0   → 40+ 个已知 CVE（CVE-2026-96636/96637/96638…、
+                   CVE-2026-112390~112406、GHSA-78g4-xqwv-q3g8…）
+                   **全部在 13.0.0 修复**
+requests 2.32.3 → 2 个（PYSEC-2026-1872 → 2.32.4；PYSEC-2026-2275 → 2.33.0）
+```
+
+**为什么这次是真的**：MicroBench 会用 Pillow 打开**用户上传的 PDF 渲染出来的图**
+和**图表截图**（`glyphs.py` / `plot_compare.py`）→ Pillow 是真实攻击面，
+一张畸形图片就能打这些 CVE。
+
+**修法**：`requirements.txt` 锁下限（`Pillow>=13.0.0` / `requests>=2.33.0`），
+不是锁死版本（锁死会让另一台设备装不上）。
+
+> **通用教训**：
+> - 审计报告里「无 CVE」这种结论**会过期**，隔一段时间要重跑；
+> - **查依赖 CVE 要用「真实已安装版本」**，不要拿 `requirements.txt` 里的
+>   下限去查（那查的是"如果装最低版本会怎样"，不是"现在装的是什么"）；
+> - `pip-audit` 的输出**要限定到本项目的依赖闭包** —— 扫整机环境会得到
+>   几百条无关的噪音（本机 222 条 / 27 个包，其中绝大多数与本项目无关）。
+
+---
+
+### 4.62 护栏的断言要**够窄**（2026-10-27 审计实测）
+
+**这一轮 18 条修复的破坏性验证里，5 条护栏一开始是「零覆盖」** ——
+把修复改回去，护栏**居然还是绿的**。四种典型：
+
+| 坏护栏 | 为什么零覆盖 | 改法 |
+|---|---|---|
+| 断言 `app.py` 全文含 `asyncio.to_thread(_pdf_clip_png` | 同一个函数还被**抄表**路径用着 → 改一处还剩一处 | 断言**限定在那个函数体内**（`inspect.getsource`） |
+| 断言全文含 `asyncio.to_thread(_extract_page_cached` | 那个词的**文档字符串**里也写着它 | 同上 |
+| 断言 `hasattr(mod, "_REAL_STATS_LOCK")` | 把锁赋成 `None` 也算"有锁" | 断言它是 `threading.Lock` **实例** |
+| 断言 `"onEsc, { once: true }" not in src` | 换个变量名就绕过去了 | 扫**所有** `addEventListener("keydown"` 调用点，逐个看有没有 `once: true` |
+
+**教训（接 §4.51）**：§4.51 说"变异要改**被调方**"；这一轮补上另一半 ——
+**"变异"还要让护栏真的能红**。判据：
+1. 护栏必须**限定在被测的那段逻辑**里，不能全文 grep；
+2. 护栏必须能区分"改对了"和"改成了另一个样子"；
+3. **每条护栏都要做一次破坏性验证**（改回去 → 必须红 → 复原 → 必须绿），
+   否则它只是一条**看起来像**护栏的断言。
+
+破坏性验证脚本：`C:\Users\30461\.minimax\tmp\audit_20261027\destructive_verify.py`
+（18 条变异 → 18/18 护栏变红 → 复原后 29 条全绿）。
+
+---
+
 ## 5. 通用教训（从上面提炼的原则）
 1. **先定位根因，再改代码。** 拿不准就在可疑位置加 `console.log` 探针 + 用浏览器的
    `query(kind=console)` 看，比盯着代码猜快得多。

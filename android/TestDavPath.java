@@ -177,6 +177,39 @@ public class TestDavPath {
                 "vault 和同步根是两个不同的目录: "
                         + p6.davVaultRoot() + " vs " + p6.davSyncRoot());
 
+        System.out.println("[21] 手填路径里的 .. 必须被过滤");
+        // ⚠ 2026-10-27 审计 L-2：vault 前缀 / 同步根都是用户手填的，
+        //   不过滤 ".." 就能越出 vault 根（删得掉别人的文件）。
+        CountingPrefs p7 = newPrefs(root, "我的坚果云/../别的目录", "我的坚果云/../同步");
+        check(!p7.davVaultRoot().contains(".."),
+                "vault 前缀里的 .. 被过滤: " + p7.davVaultRoot());
+        check(!p7.davSyncRoot().contains(".."),
+                "同步根里的 .. 被过滤: " + p7.davSyncRoot());
+
+        System.out.println("[22] AI 网关主机白名单（原生代理不能变成开放代理）");
+        // ⚠ 2026-10-27 审计 C-1：httpPost 原来只校验 https:// 前缀
+        //   → 页面里的脚本能让平板代它发请求（还能拿平板当跳板打内网）。
+        CountingPrefs p8 = newPrefs(root, null, null);
+        check(p8.isAiHostAllowed("api.minimaxi.com"), "MiniMax 网关在白名单里");
+        check(p8.isAiHostAllowed("apihub.agnes-ai.com"), "Agnes 网关在白名单里");
+        check(p8.isAiHostAllowed("api.deepseek.com"), "DeepSeek 网关在白名单里");
+        check(p8.isAiHostAllowed("dav.jianguoyun.com"), "坚果云在白名单里");
+        check(!p8.isAiHostAllowed("evil.example.com"), "陌生域名不在白名单里");
+        check(!p8.isAiHostAllowed("192.168.1.10"), "内网 IP 不收");
+        check(!p8.isAiHostAllowed("localhost"), "localhost 不收");
+        check(p8.allowAiHost("https://my-gw.example.com/v1"),
+                "用户登记的公网网关能登记");
+        check(p8.isAiHostAllowed("my-gw.example.com"),
+                "登记之后就在白名单里: " + p8.aiHosts());
+        check(!p8.allowAiHost("http://my-gw2.example.com/v1"), "http 网关不收");
+        check(!p8.allowAiHost("https://192.168.1.10/v1"), "内网 IP 不收");
+        check(!p8.allowAiHost("https://intranet/v1"), "单段内网名不收");
+        check(p8.allowAiHost("https://user:secret@gw.example.com/v1")
+                        && p8.isAiHostAllowed("gw.example.com"),
+                "带 userinfo 的地址照样登记主机名（凭据不外泄）");
+        check(!p8.aiHosts().toString().contains("secret"),
+                "白名单里只有主机名，没有凭据: " + p8.aiHosts());
+
         System.out.println();
         System.out.println("PASS " + pass + "  FAIL " + fail);
         System.exit(fail == 0 ? 0 : 1);
