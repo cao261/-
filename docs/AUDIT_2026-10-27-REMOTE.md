@@ -153,6 +153,22 @@ if any(p in hay for p in _REASONING_EFFORT_OK_PROVIDERS):
 | 2 | 桌面端护栏补几条**行为级**断言 | 低 | 对方的 `test_pdf_cache.py` 是范本 |
 | 3 | `/api/stats` 冷启动单独预热 | 低 | 不阻断，先不做 |
 
+### 4.1 ✅ 建议 1 已在本轮实施（审计即修）
+
+审计当天就把桌面端改成与平板端同一套判据：
+
+- `llm._REASONING_EFFORT_OK_HOSTS`（精确主机名）替换子串匹配；
+- 新增 `llm._base_hostname()`：去协议 / userinfo / 端口 / 路径，
+  **裸主机名**（`api.deepseek.com/v1`，用户可能这么填 .env）也认得出；
+- 新增 3 条护栏：
+  - `test_relay_gateway_with_minimax_name_does_not_get_reasoning_effort`
+    （中转站/自建网关不再误命中）
+  - `test_reasoning_effort_hostname_parsing`（端口/userinfo/裸主机名）
+  - `test_desktop_and_tablet_use_the_same_host_whitelist`
+    （**两端白名单必须一致** —— 判据不同就会出现「一边 400」）
+
+实测 9 个场景全对；反向验证 4 处破坏全部变红。
+
 ---
 
 ## 5. 保留决定

@@ -268,26 +268,61 @@ def should_send_thinking_disabled(cfg: dict, disable_thinking: bool) -> bool:
 #   - DeepSeek（api.deepseek.com）：none 有效（思考 73 → 9 字）
 #   - Agnes（apihub.agnes-ai.com）：none 有效
 #   - MiniMax（api.minimaxi.com）：low/minimal 通过校验；none 被拒
-_REASONING_EFFORT_OK_PROVIDERS: tuple[str, ...] = ("deepseek", "agnes", "minimaxi", "minimax")
+#
+# ⚠ 2026-10-27 审计对齐（平板端那边已经改对了）：
+#   判据必须是**精确主机名**，不能用子串匹配。
+#   原因：用户可以在 .env 里把自己的接口指向**任意** OpenAI 兼容网关，
+#   那种网关上照样挂着「MiniMax-M3.1-Flash」这个模型名，
+#   但它**不保证**转发 reasoning_effort → 发了就 **HTTP 400（请求直接被拒）**。
+#   子串匹配还会把 `https://minimax.中转.example.com/v1` 这种
+#   **中转站**地址误判成官方网关。
+#   → 网关才是决定「认不认这个参数」的东西，模型名不是。
+#   （平板端 tablet/app.js 的 acceptsReasoningEffort() 是同一套判据。）
+_REASONING_EFFORT_OK_HOSTS: tuple[str, ...] = (
+    "api.minimaxi.com",
+    "api.minimax.io",
+    "api.deepseek.com",
+    "apihub.agnes-ai.com",
+)
+
+
+def _base_hostname(cfg: dict) -> str:
+    """取 base_url 的主机名（去协议 / userinfo / 端口 / 路径），全小写。
+
+    要处理的几种写法（用户可能这么填 .env）：
+        https://api.deepseek.com/v1        → api.deepseek.com
+        https://api.deepseek.com:443/v1    → api.deepseek.com
+        https://u:p@api.deepseek.com/v1     → api.deepseek.com
+        api.deepseek.com/v1                → api.deepseek.com   （无协议）
+        api.deepseek.com                   → api.deepseek.com
+    """
+    raw = str((cfg or {}).get("base_url") or "").strip().lower()
+    if not raw:
+        return ""
+    host = raw
+    m = re.match(r"^[a-z][a-z0-9+.-]*://([^/?#]+)", host)
+    if m:
+        host = m.group(1)
+    else:
+        # 无协议：先切掉路径（"/" 之后），再切掉 query/fragment
+        host = re.split(r"[/?#]", host, maxsplit=1)[0]
+    host = host.split("@")[-1]     # 去掉 userinfo（https://user:pass@host）
+    host = host.split(":")[0]      # 去掉端口
+    return host.strip()
+
 
 # 强制思考模型**不能**用 none（会 400）。
 def cfg_accepts_reasoning_effort(cfg: dict) -> bool:
     """这个配置能不能接受 reasoning_effort 参数？
 
-    判错的后果是 **HTTP 400**（请求直接被拒，不是静默失败），
+    判错的后果是 **HTTP 400（请求直接被拒，不是静默失败）**，
     所以判定必须保守：不确定就不发。
+
+    判据 = **网关主机名在白名单里**（不看模型名 —— 见上面的说明）。
     """
     if not cfg:
         return False
-    base = (cfg.get("base_url") or "").lower()
-    model = (cfg.get("model") or "").lower()
-    hay = f"{base} {model}"
-    if any(p in hay for p in _REASONING_EFFORT_OK_PROVIDERS):
-        # 强制思考模型不接受 none —— 那等于关掉思考。
-        if model_forces_thinking(cfg.get("model") or ""):
-            return True   # low / minimal 仍然可用
-        return True
-    return False
+    return _base_hostname(cfg) in _REASONING_EFFORT_OK_HOSTS
 
 
 def reasoning_effort_for(cfg: dict, level: str = "low") -> Optional[str]:
