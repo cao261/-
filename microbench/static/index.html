@@ -1628,6 +1628,12 @@
        文字挤成两行、破坏版面。所以改成在画布上叠一层矩形（荧光笔效果），
        矩形坐标按页面归一化存储，缩放时按比例还原。 */
     .anno-overlay-layer { position: absolute; inset: 0; pointer-events: none; z-index: 5; }
+        /* 手写笔迹（平板端画过来的）——SVG 叠加层，不干扰原文 canvas */
+        .anno-ink-svg {
+          position: absolute; inset: 0; width: 100%; height: 100%;
+          overflow: visible; pointer-events: none;
+        }
+        .anno-ink-stroke { pointer-events: none; }
     .anno-overlay {
       position: absolute;
       border-radius: 2px;
@@ -7694,6 +7700,54 @@
         badge.title = a.note ? a.note.slice(0, 120) : "点击查看批注";
         layer.appendChild(badge);
       });
+
+      // ⚠⚠ 手写笔迹（2026-10-28 用户实测：「手写没有任何作用」）。
+      //   平板端手写存进批注的 `strokes` 字段（归一化坐标），每条笔迹自带页码：
+      //     { page: 0, source:"ink", strokes:[ {page: 3, pts:[x,y,x,y,...]}, ... ] }
+      //   ⚠⚠ **批注本身的 `page` 是 0**（一条手写批注可以跨多页），
+      //     所以**不能**按 `a.page === pageNum` 过滤 —— 那会永远匹配不到
+      //     → 要按 `strokes[].page` 判断笔迹属于哪一页。
+      //   桌面端原来**只画 rects**（划词高亮）→ 完全忽略 strokes
+      //   → 平板上画的东西同步到电脑后**一个字都看不到**。
+      //   → 这里用 SVG polyline 画笔迹（不干扰原文 canvas，
+      //     也不需要 dpr 处理 —— SVG 用 viewBox 缩放）。
+      const NS = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("class", "anno-ink-svg");
+      svg.setAttribute("preserveAspectRatio", "none");
+      svg.setAttribute("viewBox", "0 0 1000 1000");
+      let inkCount = 0;
+      (_annoState.items || []).forEach(a => {
+        (a.strokes || []).forEach(s => {
+          const sgPage = (s && s.page != null) ? parseInt(s.page, 10) : NaN;
+          // 页码归属：笔迹自带页码优先；没有就用批注的页码
+          const target = isNaN(sgPage) ? parseInt(a.page, 10) : sgPage;
+          if (target !== pageNum) return;
+          const pts = (s && s.pts) ? s.pts : (Array.isArray(s) ? s : null);
+          if (!pts || pts.length < 4) return;
+          // ⚠ 数据形态有两种（平板历史版本）：
+          //   ① [{page, pts:[x,y,x,y,...]}]  ← 现在这种
+          //   ② [x,y,x,y,...]                  ← 早期直接是点序列
+          const seq = [];
+          for (let i = 0; i + 1 < pts.length; i += 2) {
+            seq.push((Number(pts[i]) || 0) * 1000, (Number(pts[i + 1]) || 0) * 1000);
+          }
+          if (seq.length < 4) return;
+          const poly = document.createElementNS(NS, "polyline");
+          poly.setAttribute("points", seq.join(","));
+          poly.setAttribute("class", "anno-ink-stroke");
+          poly.setAttribute("data-anno-id", a.id || "");
+          poly.setAttribute("fill", "none");
+          poly.setAttribute("stroke", "#D8342A");
+          poly.setAttribute("stroke-width", "4");
+          poly.setAttribute("stroke-linecap", "round");
+          poly.setAttribute("stroke-linejoin", "round");
+          poly.setAttribute("vector-effect", "non-scaling-stroke");
+          svg.appendChild(poly);
+          inkCount++;
+        });
+      });
+      if (inkCount) layer.appendChild(svg);
     }
 
     function drawAllAnnoOverlays() {

@@ -30,6 +30,8 @@ NODE_SUITES = [
     ("microbench/_test_tablet_renderer.js", "渲染器（Markdown / 公式 / 消毒 / hash）"),
     ("microbench/_test_tablet_ai.js", "AI 面板（发送后清空输入栏 / 多轮上下文 / Enter）"),
     ("microbench/_test_tablet_hardening.js", "数据安全（种子不覆盖本地 / XSS / 嵌套公式）"),
+    ("microbench/_test_tablet_pdf_ink.js",
+     "PDF 缩放 + 手写层（放大能滚 / 触摸手势 / 笔迹存取 / 桌面端能看见）"),
 ]
 
 

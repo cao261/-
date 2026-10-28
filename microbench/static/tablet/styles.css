@@ -453,8 +453,20 @@ button { cursor:pointer; }
 }
 .tb-pdf-page {
   position:relative; background:#fff; border-radius:4px;
-  box-shadow:0 10px 40px rgba(0,0,0,.4); overflow:hidden;
-  margin:0 auto 14px; max-width:100%;
+  box-shadow:0 10px 40px rgba(0,0,0,.4);
+  /* ⚠⚠ **不能**用 `max-width:100%` + `overflow:hidden`（2026-10-28 用户实测：
+     「放大之后就只能显示一部分，动不了了」）。
+     放大时原文 canvas 按 zoom 变宽（viewport.width 变大），
+     而页卡被 max-width:100% 夹住 → overflow:hidden 把超出部分**裁掉** →
+     .tb-pdf-body 的滚动宽度没变 → **横向滚不动** → 右半边永远看不到。
+     → 页卡改成 `width:max-content`（跟着内容走，放大后自然超宽），
+       横向滚动交给 .tb-pdf-body。
+     ⚠ 纵向的圆角裁切改用 border-radius 自身完成（不需要 overflow:hidden）。 */
+  /* ⚠ 居中用 auto margin，但**超宽时要靠左**：
+     宽度超过容器时 `margin:0 auto` 不会生效（auto 解析成 0），
+     内容会从左边开始 —— 正好是要看的那一侧。 */
+  margin:0 0 14px; margin-left:auto; margin-right:auto;
+  width:max-content; min-width:100%;
   display:flex; flex-direction:column;
 }
 /* 布局三选一：原文+译文 / 仅原文 / 仅译文。
@@ -465,6 +477,10 @@ button { cursor:pointer; }
 @media (min-width: 900px) {
   .tb-pdf-page.lay-both { flex-direction:row; align-items:flex-start; }
   .tb-pdf-page.lay-both .tb-pdf-orig { border-right:1px solid #E6E1D8; }
+  /* ⚠ 双栏时页卡是 `width:max-content`，flex 子项的 `flex:1 1 auto` 会被
+     max-content 的大小吃掉 → 译文栏宽度不确定（会挤成一条）。
+     → 给译文栏一个**确定宽度**（与原文同宽），两栏才对齐。 */
+  .tb-pdf-page.lay-both .tb-pdf-trans { flex:0 0 auto; width:max-content; min-width:0; }
 }
 .tb-pdf-orig { position:relative; flex:0 0 auto; }
 .tb-pdf-page canvas { display:block; }
@@ -493,7 +509,17 @@ button { cursor:pointer; }
 .tb-pdf-anno[data-color="pink"]  { background:rgba(255,140,170,.30); }
 /* 手写层 */
 .tb-pdf-ink { position:absolute; inset:0; pointer-events:none; }
-.tb-pdf-ink.is-on { pointer-events:auto; cursor:crosshair; }
+.tb-pdf-ink.is-on {
+  pointer-events:auto; cursor:crosshair;
+  /* ⚠⚠ 必须有 touch-action:none（2026-10-28 用户实测：「手写没有任何作用」）。
+     没有它，手指按住画布拖动会被浏览器当成**滚动手势** →
+     pointermove 被 pointercancel 打断 → 这一笔被丢弃 → 画不出东西。
+     ⚠ 划词是**点击**触发的（不是拖动），所以不影响划词。
+        顺带 user-select:none 防止拖动时选中原文（会盖住笔迹）。 */
+  touch-action:none;
+  -webkit-user-select:none; user-select:none;
+  -webkit-tap-highlight-color:transparent;
+}
 .tb-pdf-ink canvas { position:absolute; inset:0; width:100%; height:100%; }
 .tb-pdf-bar {
   flex:0 0 auto; display:flex; align-items:center; justify-content:center; gap:14px;

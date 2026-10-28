@@ -3344,10 +3344,15 @@
     function fit() {
       const r = layer.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
-      cv.width = Math.max(1, Math.floor((r.width || 1) * dpr));
-      cv.height = Math.max(1, Math.floor((r.height || 1) * dpr));
+      // ⚠ 尺寸为 0 时**不要**画到 1×1 的画布上（那等于没画）。
+      //   layer 的尺寸取决于原文 canvas，布局没完成时它是 0。
+      //   → 记下「还没量到尺寸」，等 ResizeObserver / rAF 再来一次。
+      if (!r.width || !r.height) return false;
+      cv.width = Math.max(1, Math.floor(r.width * dpr));
+      cv.height = Math.max(1, Math.floor(r.height * dpr));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       drawInkPage(page, cv, ctx);
+      return true;
     }
 
     function pt(e) {
@@ -3362,6 +3367,10 @@
     layer.addEventListener("pointerdown", (e) => {
       if (!inkState.on) return;
       e.preventDefault();
+      // ⚠ 把这一笔锁定到本元素上：手指划出层边界也继续画，
+      //   不会因为 pointerleave 而中断（那会丢掉半笔）。
+      //   捕获失败（老 WebView 不支持）不影响主流程，忽略即可。
+      try { layer.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
       drawing = true;
       cur = [];
       const p = pt(e);
@@ -3378,7 +3387,9 @@
     const end = (e) => {
       if (!drawing) return;
       drawing = false;
-      if (cur && cur.length >= 4) {
+      try { layer.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      // ⚠ 末尾也允许只有一个点（点一下 = 一个点），不算废笔
+      if (cur && cur.length >= 2) {
         inkStrokes(page).push(cur);
         drawInkPage(page, cv, ctx);
         scheduleInkSave();
@@ -3388,11 +3399,24 @@
     };
     layer.addEventListener("pointerup", end);
     layer.addEventListener("pointercancel", end);
-    layer.addEventListener("pointerleave", end);
+    // ⚠⚠ **不要**监听 pointerleave 来收笔（2026-10-28 用户实测：「手写没有作用」）：
+    //   手指按住稍微一动就可能移出层边界 → pointerleave 提前收笔
+    //   → 这一笔只攒到 1~2 个点 → 被当废笔丢掉 → 用户看到「画了没反应」。
+    //   现在靠 pointer capture 兜住，移出边界也继续画。
 
     // 画布尺寸要等原文画完才知道
     fit();
     if (window.requestAnimationFrame) requestAnimationFrame(fit);
+    // ⚠ 层尺寸会随**缩放 / 布局变化**而变（放大后原文 canvas 变大），
+    //   只在装的时候量一次不够 → 用 ResizeObserver 跟着重测并重画笔迹。
+    if (typeof ResizeObserver !== "undefined") {
+      try {
+        const ro = new ResizeObserver(() => { fit(); });
+        ro.observe(layer);
+        // 页面被移除时断开观察，别泄漏
+        layer._inkRO = ro;
+      } catch (e) { /* ignore */ }
+    }
     pdfState.inkLayers = pdfState.inkLayers || {};
     pdfState.inkLayers[page] = layer;
     layer.classList.toggle("is-on", inkState.on);

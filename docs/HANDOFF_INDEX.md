@@ -64,28 +64,32 @@
 6. [`READER_CONTRACT.md`](READER_CONTRACT.md) —— 改阅读器前必读（页内顺序/公式/批注）。
 
 ### 我负责平板端（Android/iPad 那台）
-1. **[`HANDOFF_2026-10-28-SYNC-AND-TABLET-ADAPT.md`](HANDOFF_2026-10-28-SYNC-AND-TABLET-ADAPT.md)** ← **最新，先看这份**
-   合并对方 `main` 后**平板端逐条适配**：对方那轮 12 处修复**全在桌面端**
-   （平板文件零改动）→ 逐条判哪些要抄（**只有 1 处**：裸 `DOMContentLoaded` 加固）、
-   哪些抄不了、哪些**两端已一致**（网关白名单、paper_id、密钥脱敏、XSS 消毒、
-   答疑预算/序号守卫）。含 paper_id 的**真 JS 引擎对拍**结果。
-2. [`HANDOFF_2026-10-27-TABLET-QA-BUDGET.md`](HANDOFF_2026-10-27-TABLET-QA-BUDGET.md)
+1. **[`HANDOFF_2026-10-28-TABLET-INK-AND-ZOOM.md`](HANDOFF_2026-10-28-TABLET-INK-AND-ZOOM.md)** ← **最新，先看这份**
+   用户实测反馈「**手写没有任何作用**」+「**放大后只显示一部分、动不了**」→
+   查出来是 **3 个独立缺陷**（触屏手势被浏览器抢 / 手指出边界丢掉半笔 /
+   页卡被 `max-width`+`overflow:hidden` 夹住），外加 **1 个跨端缺陷**：
+   平板画的笔迹同步到电脑后**一个字都看不见**（桌面端只画 `rects`）。
+   含 headless Edge **真实渲染**的对照数据（旧 CSS `scrollWidth=605`/内容 1800px
+   → 滚不到；新 CSS 1820 → 完整可滚）+ 4/4 破坏性验证。
+2. **[`HANDOFF_2026-10-28-SYNC-AND-TABLET-ADAPT.md`](HANDOFF_2026-10-28-SYNC-AND-TABLET-ADAPT.md)**
+   合并对方 `main` 后的三点结论撞车怎么判的、平板端逐条适配清单。
+3. [`HANDOFF_2026-10-27-TABLET-QA-BUDGET.md`](HANDOFF_2026-10-27-TABLET-QA-BUDGET.md)
    平板端补齐桌面端 `2216afa` 那轮答疑修复的**其余根因**：
    思考预算按「思考+正文」算（16000）、空正文自动抬预算重试、
    请求序号守卫（重答不死锁）、`reasoning_effort=low`、摘要提示词补能力边界。
    ⚠ 平板的 `reasoning_effort` 判定**只看网关地址不看模型名**（故意的差别，文档里说了为什么）。
    ⚠ **2026-10-28**：桌面端已改成**同一套精确主机名白名单**，两端一致，
    且有护栏 `test_desktop_and_tablet_use_the_same_host_whitelist` 持续钉住。
-3. [`HANDOFF_2026-10-25-TABLET-DAV-FIX.md`](HANDOFF_2026-10-25-TABLET-DAV-FIX.md)
+4. [`HANDOFF_2026-10-25-TABLET-DAV-FIX.md`](HANDOFF_2026-10-25-TABLET-DAV-FIX.md)
    平板端「同步 0 篇 / 24 篇 PDF 全 404」的**根因与修法**：
    vault 前缀是空的，而界面只看账号密码，所以显示「已连接」。
    **空结果必须当成错误** —— 这条最值得抄。
-4. [`HANDOFF_2026-10-25-TABLET-ADAPT.md`](HANDOFF_2026-10-25-TABLET-ADAPT.md)
+5. [`HANDOFF_2026-10-25-TABLET-ADAPT.md`](HANDOFF_2026-10-25-TABLET-ADAPT.md)
    桌面端这轮做的哪些事**平板端要抄、哪些抄不了、哪些不用抄**。
-5. [`HANDOFF_TABLET_2026-10-25.md`](HANDOFF_TABLET_2026-10-25.md) +
+6. [`HANDOFF_TABLET_2026-10-25.md`](HANDOFF_TABLET_2026-10-25.md) +
    [`HANDOFF_TABLET_2026-10-25-B.md`](HANDOFF_TABLET_2026-10-25-B.md) —— 平板端此前的两轮交接。
-6. [`AUDIT_2026-10-25.md`](AUDIT_2026-10-25.md) —— 第二轮全面审计报告。
-7. **平板端必须自查的两件事**（在 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` §8）：
+7. [`AUDIT_2026-10-25.md`](AUDIT_2026-10-25.md) —— 第二轮全面审计报告。
+8. **平板端必须自查的两件事**（在 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` §8）：
    - 离线导出 HTML 的 XSS 面（平板走**另一套** JS 消毒器，桌面端的修复不过去）；
    - 密钥脱敏的盲区（JSON 形态的 key、裸 `Authorization`、URL userinfo…）。
    → **这两条已在 30461 上修完**（见 `HANDOFF_2026-10-25-TABLET-DAV-FIX.md`
@@ -111,6 +115,7 @@
 
 | 文档 | 日期 | 解决什么问题 | 状态 |
 |---|---|---|---|
+| `HANDOFF_2026-10-28-TABLET-INK-AND-ZOOM.md` | 10-28 | **平板手写 + 缩放**：3 个真缺陷（触屏手势 / 出边界丢半笔 / 页卡被裁）+ 桌面端渲染笔迹 | ✅ 最新（平板端） |
 | `HANDOFF_2026-10-28-SYNC-AND-TABLET-ADAPT.md` | 10-28 | **同步 + 平板适配**：合并对方 main 的第二轮审计（25 处冲突）、三点结论撞车的代码事实判据、平板端逐条适配清单 | ✅ 最新 |
 | `AUDIT_2026-10-27.md` | 10-27 | **第四轮全量审计**（安全+性能+代码质量）：2 CRITICAL / 12 HIGH，含批注重放自激、局域网 docs 暴露、限流器并发失效、Pillow CVE | ✅ 最新（**分支 `feat/audit-2026-10-27`，已合并对方 main**） |
 | `AUDIT_2026-10-27-REMOTE-R2.md` | 10-27 | **对方设备（25353）第二轮审计记录**：已改 / 故意没改 / 未审到 | ✅ 最新（远端轮） |
@@ -150,9 +155,11 @@
   以及 `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` 的
   §0（三个最该知道的）、§2（PDF 模式工具条消失）、§3（AI 活动可见性）、
   §4（429 人话化）、§8（安全自查）、§9（降格要说真话）。
-- **平板端 agent** → 读 `HANDOFF_2026-10-28-SYNC-AND-TABLET-ADAPT.md` 的 §4
-  （逐条判 + APK 交付）+ `HANDOFF_2026-10-25-TABLET-ADAPT.md` 全文 +
-  `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` 的 §8（安全自查清单）。
+- **平板端 agent** → 读 `HANDOFF_2026-10-28-TABLET-INK-AND-ZOOM.md` 全文
+  （手写/缩放三个缺陷 + 真实渲染对照数据 + §7 的人工验收清单）
+  ＋ `HANDOFF_2026-10-28-SYNC-AND-TABLET-ADAPT.md` 的 §4
+  ＋ `HANDOFF_2026-10-25-TABLET-ADAPT.md` 全文
+  ＋ `HANDOFF_2026-10-25-BROWSER-VERIFIED-FIXES.md` 的 §8（安全自查清单）。
 - **两台设备都要看** → `AUDIT_2026-10-26.md` 的 §3.1（H-1 测试碰真数据）
   —— **那台设备上 `auto_sync.py` 同样在每 2 小时往共享目录写测试产物**，
   `git pull` 本次提交即自动修好，**不要各自改一遍**。
