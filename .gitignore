@@ -74,6 +74,11 @@ _Templates/
 /_*.log
 /_*.ps1
 
+# A/B 比对用的**临时**旧版抽取层副本（_check_text_unchanged.py 每次运行都会
+# 从 git HEAD 重新生成它）。它不是源码，别入库 —— 否则会有一份"旧版"被
+# 冻结在仓库里，护栏基准从此错位。
+microbench/_paper_text_old_tmp.py
+
 # Audit report produced by security-audit skill (kept locally, never in repo)
 AUDIT_REPORT.md
 

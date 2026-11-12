@@ -35,6 +35,12 @@ PY_SUITES = [
      "平板 PDF 布局（放大后能滚 / 手写层触摸手势 / 笔迹画布尺寸）"),
     ("microbench/_test_desktop_ink_render.py",
      "桌面端渲染手写笔迹（平板画的字电脑上要能看见）"),
+    ("microbench/_test_tablet_region_render.py",
+     "圈选操作条（浮条在手写层上面能点到 / 挂在原文层不跑偏）"),
+    ("microbench/_test_desktop_bilingual_render.py",
+     "桌面端对照模式（左栏译文回左栏 / 右栏回右栏 / 标题公式表格各归各位）"),
+    ("microbench/_test_tablet_bilingual_render.py",
+     "平板端对照模式（译文按原文分栏 / 公式标记不甩坐标 / 没数据时给提示）"),
 ]
 
 

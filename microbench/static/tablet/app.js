@@ -796,6 +796,8 @@
     syncMode: "local",     // local | dir
     dirtyCount: 0,
     pendingSelection: "",  // 从 PDF 里划词带过来的原文
+    pendingRegionImage: "", // 圈选区域裁出来的图（data URL），下次提问自动带上
+    pendingRegionPage: 0,    // 圈选区域在第几页
     aiHistory: new Map(),   // noteId -> [{role, content}] 多轮对话上下文
     // ⚠ 以前这里还有 `trans: new Map()` 和 `annos: new Map()` ——
     //   全文件**从来没有写入过**（译文走 state.transSeed / state.transVer，
@@ -2342,6 +2344,231 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // 圈选区域 → 问 AI（2026-11-12）
+  //
+  // 用户原话："我直接用手写笔圈一部分，然后直接能问 AI"、
+  //             "圈一部分，然后直接能问 AI，这个如果能做到的话会很方便"。
+  //
+  // ⚠ 原来「带上我的手写问 AI」发的是**整页图** ——
+  //   圈的那一小块在整页里又小又糊（整页压到 1200px 宽，
+  //   一栏文字只剩几十像素高），模型基本看不清 → 等于白圈。
+  // → 这里把笔迹的**包围盒**算出来，只裁那一块，
+  //   并且**按该块自己的像素密度**放大到可读尺寸。
+  // ------------------------------------------------------------------
+
+  /**
+   * 某一页所有笔迹的包围盒（归一化 0~1）。没有笔迹返回 null。
+   *
+   * 笔迹本来就是归一化坐标（inkState.strokes[page] = [[x0,y0,x1,y1,…],…]），
+   * 所以直接取极值即可，缩放/换设备都不用重算。
+   */
+  function inkBBox(page) {
+    const strokes = (inkState.strokes && inkState.strokes[page]) || [];
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, any = false;
+    for (const pts of strokes) {
+      if (!pts || pts.length < 2) continue;
+      for (let i = 0; i + 1 < pts.length; i += 2) {
+        const x = pts[i], y = pts[i + 1];
+        if (typeof x !== "number" || typeof y !== "number") continue;
+        if (!isFinite(x) || !isFinite(y)) continue;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+        any = true;
+      }
+    }
+    if (!any) return null;
+    return { x0, y0, x1, y1 };
+  }
+
+  /** 圈选区域占整页的比例。圈得比这还大 = 不是"圈一块"，是乱画 → 退回整页。 */
+  const REGION_MAX_PAGE_RATIO = 0.8;
+  /** 裁出来的小图至少要有这么宽（太窄字太小，模型看不清）。 */
+  const REGION_MIN_WIDTH_PX = 900;
+  /** 最多放大到几倍。放大**不增加细节**，只让糊更糊 → 别贪。 */
+  const REGION_MAX_UPSCALE = 2.5;
+
+  /**
+   * 裁出「圈选区域」：原文那一块 + 用户的笔迹 + 一个高亮框。
+   *
+   * ⚠ 笔迹画布和原文画布的**像素尺寸不一定相同**
+   *   （笔迹层是按自己的 getBoundingClientRect 量出来的），
+   *   所以两段各用各的尺寸换算，别假设 1:1 —— 假设错位会导致圈线跑到别处。
+   *
+   * @returns {{dataUrl:string, bbox:object}|null}
+   */
+  function captureInkRegion(pageNum, bbox) {
+    const wrap = document.querySelector(`[data-pdf-page="${pageNum}"]`);
+    if (!wrap || !wrap.querySelector || !bbox) return null;
+    const orig = wrap.querySelector(".tb-pdf-orig");
+    const src = orig ? orig.querySelector("canvas") : null;
+    if (!src || !src.width || !src.height) return null;
+    const inkCv = wrap.querySelector(".tb-pdf-ink canvas");
+
+    const clamp01 = (v) => Math.max(0, Math.min(1, v));
+    // 圈线本身有宽度 → 往外留一点余量，别把圈到的字切掉
+    const pad = 0.02;
+    const nx0 = clamp01(bbox.x0 - pad), ny0 = clamp01(bbox.y0 - pad);
+    const nx1 = clamp01(bbox.x1 + pad), ny1 = clamp01(bbox.y1 + pad);
+    const sx0 = Math.floor(nx0 * src.width), sy0 = Math.floor(ny0 * src.height);
+    const sx1 = Math.ceil(nx1 * src.width), sy1 = Math.ceil(ny1 * src.height);
+    const cw = Math.max(1, sx1 - sx0), ch = Math.max(1, sy1 - sy0);
+
+    // 放大到可读（但不放太多）
+    let scale = REGION_MIN_WIDTH_PX / cw;
+    if (scale > REGION_MAX_UPSCALE) scale = REGION_MAX_UPSCALE;
+    if (scale < 1) scale = 1;
+
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.floor(cw * scale));
+    cv.height = Math.max(1, Math.floor(ch * scale));
+    const ctx = cv.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    // 原文那一块
+    ctx.drawImage(src, sx0, sy0, cw, ch, 0, 0, cv.width, cv.height);
+    // 笔迹那一块（各用各的尺寸换算）
+    if (inkCv && inkCv.width && inkCv.height) {
+      const ix0 = Math.floor(nx0 * inkCv.width), iy0 = Math.floor(ny0 * inkCv.height);
+      const iw = Math.max(1, Math.ceil(nx1 * inkCv.width) - ix0);
+      const ih = Math.max(1, Math.ceil(ny1 * inkCv.height) - iy0);
+      try {
+        ctx.drawImage(inkCv, ix0, iy0, iw, ih, 0, 0, cv.width, cv.height);
+      } catch (e) { /* 笔迹层还没画好 → 只发原文 */ }
+    }
+    // 高亮框：明确告诉模型「看这一块」
+    try {
+      ctx.save();
+      ctx.strokeStyle = "rgba(250, 204, 21, 0.95)";
+      ctx.lineWidth = Math.max(2, Math.round(cv.width * 0.006));
+      ctx.strokeRect(ctx.lineWidth, ctx.lineWidth,
+        Math.max(1, cv.width - ctx.lineWidth * 2),
+        Math.max(1, cv.height - ctx.lineWidth * 2));
+      ctx.restore();
+    } catch (e) { /* ignore */ }
+    try {
+      return { dataUrl: cv.toDataURL("image/jpeg", 0.88), bbox: bbox };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * 某一页的圈选区域。
+   * @returns {{page:number, bbox:object}|null}
+   */
+  function inkRegionOn(page) {
+    const bbox = inkBBox(page);
+    if (!bbox) return null;
+    const area = (bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0);
+    // 圈了几乎整页 = 没有"圈一块"的意思 → 当作没圈
+    if (!area || area > REGION_MAX_PAGE_RATIO) return null;
+    return { page: page, bbox: bbox };
+  }
+
+  /** 当前页的圈选区域。 */
+  function currentInkRegion() {
+    return inkRegionOn(pdfState.currentPage || 1);
+  }
+
+  /** 隐藏所有页上的圈选操作条。 */
+  function hideRegionBar() {
+    document.querySelectorAll(".tb-pdf-region").forEach((b) => {
+      b.hidden = true;
+    });
+  }
+
+  /**
+   * 圈完一笔 → 在圈的上方浮出操作条（问这块 / 总结这块 / 清除）。
+   *
+   * ⚠ 操作条必须挂在 **.tb-pdf-orig** 里面（不是 .tb-pdf-page）：
+   *   宽屏是「原文 + 译文」并排，页卡的坐标原点跟原文画布**不是同一个**，
+   *   挂错容器 → 按钮会跑到译文那一栏上面去。
+   */
+  function showRegionBar(page) {
+    const wrap = document.querySelector(`[data-pdf-page="${page}"]`);
+    if (!wrap || !wrap.querySelector) return;
+    const orig = wrap.querySelector(".tb-pdf-orig");
+    const bbox = inkBBox(page);
+    if (!orig || !bbox) { hideRegionBar(); return; }
+    const area = (bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0);
+    if (!area || area > REGION_MAX_PAGE_RATIO) { hideRegionBar(); return; }
+
+    let bar = orig.querySelector(".tb-pdf-region");
+    if (!bar) {
+      bar = el("div", "tb-pdf-region");
+      const mk = (label, cls, fn) => {
+        const b = el("button", "tb-btn tb-sm" + (cls ? " " + cls : ""), label);
+        // ⚠ pointerdown 要拦下来：不然这一下会被手写层当成"又画一笔"
+        b.addEventListener("pointerdown", (e) => { e.stopPropagation(); e.preventDefault(); });
+        b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+        return b;
+      };
+      bar.appendChild(mk("✍ 问这块", "tb-btn-primary", () => askRegion(page)));
+      bar.appendChild(mk("总结这块", "", () => summarizeRegion(page)));
+      bar.appendChild(mk("清除", "", () => clearRegionInk(page)));
+      // 挂在原文层里、且排在手写层**之后** → 画在手写层上面、点击先命中它
+      orig.appendChild(bar);
+    }
+    const cx = ((bbox.x0 + bbox.x1) / 2) * 100;
+    const above = bbox.y0 > 0.14;
+    bar.style.left = cx + "%";
+    bar.style.top = (above ? bbox.y0 : bbox.y1) * 100 + "%";
+    bar.style.transform = above ? "translate(-50%, -118%)" : "translate(-50%, 10%)";
+    bar.hidden = false;
+  }
+
+  /** 清掉某一页的笔迹（只清笔迹，不动批注）。 */
+  function clearRegionInk(page) {
+    if (!inkState.strokes[page]) return;
+    inkState.strokes[page] = [];
+    const wrap = document.querySelector(`[data-pdf-page="${page}"]`);
+    const inkCv = wrap && wrap.querySelector ? wrap.querySelector(".tb-pdf-ink canvas") : null;
+    if (inkCv) drawInkPage(page, inkCv, inkCv.getContext("2d"));
+    hideRegionBar();
+    scheduleInkSave();
+  }
+
+  /**
+   * 「✍ 问这块」：把圈选区域带上 → 打开 AI 面板 → 等用户把问题打出来。
+   *
+   * ⚠ 不直接发问：用户还没说他想问什么。带上图 + 聚焦输入框即可。
+   */
+  async function askRegion(page) {
+    // ⚠ 用**浮条所在的那一页**，不是"当前页"——
+    //   用户可能圈完就翻页了，浮条还挂在他圈的那一页上。
+    const region = inkRegionOn(page) || currentInkRegion();
+    if (!region) { toast("先在手写模式下圈一块", true); return; }
+    const shot = captureInkRegion(region.page, region.bbox);
+    if (!shot) { toast("截不到这一块", true); return; }
+    state.pendingRegionImage = shot.dataUrl;
+    state.pendingRegionPage = region.page;
+    hideRegionBar();
+    closePdf();
+    setPane("ai");
+    aiShowContext("已带上圈选区域（第 " + region.page + " 页）");
+    const qb = $("ai-question");
+    if (qb) qb.focus();
+  }
+
+  /** 「总结这块」：直接问 —— 用户要的就是"总结这一部分"。 */
+  async function summarizeRegion(page) {
+    const region = inkRegionOn(page) || currentInkRegion();
+    if (!region) { toast("先在手写模式下圈一块", true); return; }
+    const shot = captureInkRegion(region.page, region.bbox);
+    if (!shot) { toast("截不到这一块", true); return; }
+    hideRegionBar();
+    closePdf();
+    setPane("ai");
+    await runAI("ask", {
+      imageDataUrl: shot.dataUrl,
+      question: "请总结我圈出来的这部分内容：它在讲什么、关键结论是什么、有没有值得警惕的前提。",
+    });
+  }
+
   /** 「带上我的手写问 AI」—— 把手写标注连同问题一起发给模型。 */
   async function askAiWithInk() {
     const pages = Object.keys(inkState.strokes)
@@ -2350,13 +2577,27 @@
       toast("先在手写模式下画几笔，再点这个", true);
       return;
     }
-    const q = ($("ai-question").value || "").trim();
+    const q = (($("ai-question") || {}).value || "").trim();
     if (!q) {
       toast("写下你的问题", true);
       $("ai-question").focus();
       return;
     }
-    const img = await captureInkPage(parseInt(pages[0], 10));
+    // ⚠ 2026-11-12：**优先发圈选区域**（只发那一块，模型才看得清）；
+    //   没圈、或圈了整页 → 才退回整页图。
+    let img = null;
+    const region = currentInkRegion();
+    if (region) {
+      const shot = captureInkRegion(region.page, region.bbox);
+      if (shot) img = shot.dataUrl;
+    }
+    if (!img) {
+      // 整页图用**当前页**（原来用 pages[0] = 第一页有笔迹的那页，
+      // 用户在第 5 页画完一笔，却发的是第 2 页 → 圈的东西根本没发过去）
+      const cur = pdfState.currentPage || 1;
+      const page = (inkState.strokes[cur] && inkState.strokes[cur].length) ? cur : parseInt(pages[0], 10);
+      img = await captureInkPage(page);
+    }
     if (!img) { toast("截不到手写内容", true); return; }
     await runAI("ask", { imageDataUrl: img });
   }
@@ -2381,7 +2622,11 @@
     }
 
     const qBox = $("ai-question");
-    const q = (qBox.value || "").trim();
+    // ⚠ 2026-11-12：允许调用方**直接给问题**（「总结这块」就是一句固定问法，
+    //   不该逼用户先去输入栏打字）。
+    const q = (o.question != null)
+      ? String(o.question || "").trim()
+      : (qBox.value || "").trim();
     if (kind === "ask" && !q) {
       toast("写下你的问题", true);
       if (qBox) qBox.focus();
@@ -2400,8 +2645,19 @@
     aiAppendTurn(kind, q, sel);
 
     const model = kind === "translate" ? (cfg.modelT || cfg.model) : cfg.model;
+    // ⚠ 2026-11-12：带图提问时**不要再塞 4000 字笔记正文**。
+    //   用户圈的是 PDF 上的一块 → 模型该看的是那张图，
+    //   掺一大段无关正文只会把注意力拉走（还会白烧 token）。
+    //
+    // ⚠ 待发的圈选区域图**只跟"提问"走** —— 「翻译选中」「解读选中」
+    //   是针对选中文字的，混进一张图只会让模型分不清在看什么。
+    const imgAttached = kind === "ask"
+      ? !!(o.imageDataUrl || state.pendingRegionImage)
+      : !!o.imageDataUrl;
     const base = PROMPTS[kind](
-      kind === "ask" ? (sel || bodyText.slice(0, 4000)) : (sel || bodyText.slice(0, 6000)),
+      kind === "ask"
+        ? (sel || (imgAttached ? "" : bodyText.slice(0, 4000)))
+        : (sel || bodyText.slice(0, 6000)),
       q);
 
     // 多轮上下文：把这一篇笔记之前的问答带上 —— 追问时模型才知道前文在讲什么。
@@ -2415,16 +2671,24 @@
       messages = [base[0]].concat(ctx, [base[1]]);
     }
 
-    // ⚠ 带上图片（手写标注）—— OpenAI 兼容的 content 数组格式。
+    // ⚠ 带上图片（手写标注 / 圈选区域）—— OpenAI 兼容的 content 数组格式。
     //   手写是图形，文字描述不出来，得让模型直接看图。
-    if (o.imageDataUrl) {
+    // ⚠ 2026-11-12：没有显式传图时，用「已选中的圈选区域」；
+    //   用掉就清掉（免得下一句提问又带上同一张图）。
+    const img = (kind === "ask")
+      ? (o.imageDataUrl || state.pendingRegionImage || "")
+      : (o.imageDataUrl || "");
+    if (img) {
+      // ⚠ 用掉就清掉（不管用的是显式传的还是"已选中的圈选区域"）——
+      //   留着的话，下一句提问会又带上同一张图。
+      state.pendingRegionImage = "";
       const last = messages[messages.length - 1];
       if (last && last.role === "user") {
         messages[messages.length - 1] = {
           role: "user",
           content: [
             { type: "text", text: String(last.content || "") },
-            { type: "image_url", image_url: { url: o.imageDataUrl } },
+            { type: "image_url", image_url: { url: img } },
           ],
         };
       }
@@ -2786,8 +3050,16 @@
     rendered: new Set(),   // 已经画过的页码
     pending: false,
     zoom: 1,               // 用户缩放倍数（1 = 适合宽度）
-    layout: "both",         // both | orig | trans（原文+译文 / 仅原文 / 仅译文）
+    layout: "both",         // both | orig | trans | bilingual（原文+译文 / 仅原文 / 仅译文 / 对照）
     trans: null,           // {pageNum: 译文}
+    // 对照模式（译文按原文排版）的段落数据：{pageNum: {blocks:[…], version:N}}
+    // ⚠ 平板**访问不到电脑端的后端**（没有 baseURL、CSP 与原生桥白名单都拦着）
+    //   → 段落译文只能跟着快照同步过来。
+    blockTrans: null,
+    // 对照模式里整块公式的**原图**（data URL）：{pageNo: {rectKey: dataURL}}
+    //   ⚠ 平板访问不到电脑端的 /api/paper/formula_image（没有 baseURL、
+    //     CSP、原生桥白名单三处拦着）→ 平板自己在本地裁（见 renderFormulaShot）。
+    formulaShots: {},
     annos: [],             // 批注
   };
 
@@ -2847,6 +3119,19 @@
   }
 
   /**
+   * 段落译文（对照模式）的本地缓存键。
+   *
+   * ⚠ 与整页译文的缓存**分开存**：两者生命周期不同 ——
+   *   整页译文跟着 extractor_version 走，段落译文跟着 blocks_version 走
+   *   （段落切分算法一改，块编号就变了 → 旧译文贴上去就是错位）。
+   *   混在一个键里 → 一边作废把另一边也带走了。
+   */
+  function blocksCacheKey(key, ver) {
+    const v = (ver == null) ? "none" : String(ver);
+    return "blocks_v" + v + "_" + key;
+  }
+
+  /**
    * 拉一篇论文的译文快照。返回 {pageNum: 译文}，没有就返回 null。
    *
    * ⚠⚠ 抽取算法版本必须与当前一致。
@@ -2868,7 +3153,14 @@
     // ① 本地缓存 —— 没网也能看译文（键里带版本 → 换版本自动失效）
     if (cur != null) {
       const cached = await DB.getMeta(transCacheKey(key, cur), null);
-      if (cached && Object.keys(cached).length) return cached;
+      if (cached && Object.keys(cached).length) {
+        // 段落译文（对照模式）也取本地缓存 —— 断网也能看对照视图
+        try {
+          const cachedBlocks = await DB.getMeta(blocksCacheKey(key, cur), null);
+          if (cachedBlocks && Object.keys(cachedBlocks).length) pdfState.blockTrans = cachedBlocks;
+        } catch (e) { /* 段落缓存取不到不影响整页译文 */ }
+        return cached;
+      }
     }
     // ② 云盘同步根（最新 —— 电脑端翻完同步过来，平板立刻能看）
     try {
@@ -2882,9 +3174,21 @@
           return null;
         }
         const pages = {};
+        // 对照模式的段落译文：电脑端翻好、跟着快照同步过来的。
+        // ⚠ 平板访问不到电脑端的后端 —— 这是**唯一**的通道。
+        const blocks = {};
         (data.pages || []).forEach((p) => {
           if (p && p.translation) pages[p.page_num] = p.translation;
+          if (p && p.blocks && p.blocks.length) {
+            blocks[p.page_num] = { blocks: p.blocks, version: p.blocks_version };
+          }
         });
+        if (Object.keys(blocks).length) {
+          pdfState.blockTrans = blocks;
+          try { await DB.setMeta(blocksCacheKey(key, cur), blocks); } catch (e) { /* 缓存失败不影响显示 */ }
+        } else {
+          pdfState.blockTrans = null;
+        }
         if (Object.keys(pages).length) {
           await DB.setMeta(transCacheKey(key, cur), pages);
           return pages;
@@ -3260,7 +3564,10 @@
 
   /** 把某页的译文插进页卡。 */
   function renderTranslationInto(wrap, n) {
-    if ((pdfState.layout || "both") === "orig") return;
+    const layout = pdfState.layout || "both";
+    if (layout === "orig") return;
+    // 对照模式：译文按**原文的栏**排（左栏回左栏、右栏回右栏）
+    if (layout === "bilingual") { renderBilingualInto(wrap, n); return; }
     const t = pdfState.trans && pdfState.trans[n];
     if (!t) return;
     const box = el("div", "tb-pdf-trans");
@@ -3270,6 +3577,269 @@
     body.innerHTML = renderMarkdown(t);
     box.appendChild(body);
     wrap.appendChild(box);
+  }
+
+  /**
+   * 对照模式：把这一页的译文按**原文的栏**排出来。
+   *
+   * 数据来自同步过来的快照（pages[].blocks）：每块带 i/kind/col/bbox/translation。
+   *
+   * ⚠ 平板端**没有**原文段落文本 —— 快照里只存了译文和坐标。
+   *   所以这里只排译文；要看原文请切「仅原文」。
+   *   （桌面端有原文，因为它是自己抽的段落块。）
+   *
+   * ⚠ 版本闸门在**电脑端**做（blocks_version 对不上就整份丢弃）。
+   *   平板只管用拿到手的 —— 拿到的就是电脑端验过的。
+   */
+  function renderBilingualInto(wrap, n) {
+    const rec = (pdfState.blockTrans || {})[n];
+    const box = el("div", "tb-pdf-trans tb-bilingual");
+    if (!rec || !rec.blocks || !rec.blocks.length) {
+      box.appendChild(el("div", "tb-pdf-trans-head", `第 ${n} 页 · 对照`));
+      const body = el("div", "tb-pdf-trans-body");
+      body.innerHTML = `<div class="tb-bilingual-empty">这一页还没有对照译文。<br>` +
+        `在电脑端翻好后点「☁ 同步」，这里就会按原文的栏排出来。</div>`;
+      box.appendChild(body);
+      wrap.appendChild(box);
+      return;
+    }
+    const blocks = rec.blocks || [];
+    // 分桶：整宽顶部 / 左栏 / 右栏 / 尾部整宽
+    const firstColIdx = blocks.findIndex((b) => b.col === "L" || b.col === "R");
+    const top = [], left = [], right = [], tail = [];
+    blocks.forEach((b, idx) => {
+      if (b.col === "L") { left.push(b); return; }
+      if (b.col === "R") { right.push(b); return; }
+      if (firstColIdx >= 0 && idx < firstColIdx) top.push(b);
+      else tail.push(b);
+    });
+
+    const mkBlock = (b) => {
+      const d = el("div", "tb-bilingual-block kind-" + (b.kind || "body"));
+      const tr = el("div", "tb-bb-trans");
+      const raw = String(b.translation || "");
+      const rects = formulaRectsOf(raw);
+      if (rects.length) {
+        // 整块公式 → 贴**原图**（平板本地裁，见 renderFormulaShot）。
+        //   以前这里只能显示「【公式：见原文】」—— 用户原话："公式什么的
+        //   也要能正常显示"。坐标不能原样甩给用户看（对他毫无意义）。
+        rects.forEach((rect) => tr.appendChild(formulaHolder(n, rect)));
+        const extra = raw.replace(new RegExp(FORMULA_MARK_RE.source, "g"), "").trim();
+        if (extra) {
+          const md = el("div", "tb-bb-text");
+          md.innerHTML = renderMarkdown(extra);
+          tr.appendChild(md);
+        }
+      } else {
+        // 表格标记：正常情况下服务端已经换成 Markdown 表格了，这里兜底。
+        const txt = raw.replace(/⟦TABLE[^⟧]*⟧/g, "【表格：见原文】");
+        tr.innerHTML = renderMarkdown(txt);
+      }
+      d.appendChild(tr);
+      return d;
+    };
+
+    box.appendChild(el("div", "tb-pdf-trans-head", `第 ${n} 页 · 对照（按原文排版）`));
+    const body = el("div", "tb-pdf-trans-body tb-bilingual-body");
+    if (top.length) {
+      const span = el("div", "tb-bilingual-span");
+      top.forEach((b) => span.appendChild(mkBlock(b)));
+      body.appendChild(span);
+    }
+    if (left.length || right.length) {
+      const cols = el("div", "tb-bilingual-cols");
+      [["L", left], ["R", right]].forEach((pair) => {
+        const arr = pair[1];
+        if (!arr.length) return;
+        const col = el("div", "tb-bilingual-col");
+        col.setAttribute("data-col", pair[0]);
+        arr.forEach((b) => col.appendChild(mkBlock(b)));
+        cols.appendChild(col);
+      });
+      body.appendChild(cols);
+    }
+    if (tail.length) {
+      const span = el("div", "tb-bilingual-span");
+      tail.forEach((b) => span.appendChild(mkBlock(b)));
+      body.appendChild(span);
+    }
+    box.appendChild(body);
+    wrap.appendChild(box);
+    // 公式原图是**异步**裁的（PDF.js 离屏渲染）→ 裁完再贴回对照视图
+    ensureFormulaShots(n);
+  }
+
+  // ------------------------------------------------------------------
+  // 对照模式：整块公式的**原图**（平板本地裁）
+  //
+  // ⚠ 为什么平板要自己裁：
+  //   桌面端那条 /api/paper/formula_image 通道，平板**根本访问不到**
+  //   （没有 baseURL、CSP connect-src、原生桥白名单三处拦着）。
+  //   所以平板用 PDF.js 在本地把那一块**离屏**渲染成 PNG（scale=4，
+  //   与桌面端同倍率 ≈288 DPI），再以 data URL 贴进译文。
+  //
+  // ⚠ 坐标换算（PDF.js 3.11 的 PageViewport，rotation=0）：
+  //     viewBox=[0,0,W,H] → transform = [s, 0, 0, -s, 0, H*s]
+  //     → 以页面**左上角**为原点的 PDF 点 (x, y) 落在画布 (x*s, y*s)
+  //   即 bbox（PDF 点，左上原点）→ 画布像素 = bbox * scale。
+  //   ⚠ **只支持 rotation=0**：旋转页上抽取层的坐标框与 PDF.js 视口
+  //     不是同一套坐标系 → 宁可不裁，也不裁错（错公式比没公式危险）。
+  // ------------------------------------------------------------------
+
+  const FORMULA_SHOT_SCALE = 4;   // ≈288 DPI，与桌面端 formula_image?scale=4 同倍率
+  const FORMULA_MARK_RE = /⟦FORMULA:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧/g;
+
+  /** 从译文里抠出公式坐标框。 */
+  function formulaRectsOf(text) {
+    const out = [];
+    const re = new RegExp(FORMULA_MARK_RE.source, "g");
+    let m;
+    while ((m = re.exec(String(text || ""))) !== null) {
+      out.push([parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), parseFloat(m[4])]);
+    }
+    return out;
+  }
+
+  function formulaKeyOf(rect) {
+    return rect.map((x) => Number(x).toFixed(1)).join(",");
+  }
+
+  /** 整块是不是一片空白（坐标换算错了就会裁到白纸）。 */
+  function isBlankShot(ctx, w, h) {
+    try {
+      const d = ctx.getImageData(0, 0, w, h).data;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i] < 240 || d[i + 1] < 240 || d[i + 2] < 240) return false;
+      }
+      return true;
+    } catch (e) {
+      return false;   // 取不到像素 → 不当成空白（宁可贴一张可能空白的图）
+    }
+  }
+
+  /**
+   * 离屏把一块公式渲染成 PNG（data URL）。失败返回 ""。
+   *
+   * ⚠⚠ **必须用 viewport 的 offset 平移，不能用 render() 的 transform 参数**
+   *   （2026-11-12 实测踩坑）：
+   *     ① `page.render({transform:[1,0,0,1,-x,-y]})` 会把整页画到小画布**外面**
+   *        → 裁出来是空白；
+   *     ② canvas 一旦**小于** viewport，`render().promise` 根本不 resolve
+   *        → 页面表现为「一直转圈」，探针永远等不到结果。
+   *   正解：`page.getViewport({scale, offsetX:-x, offsetY:-y})` —— offset 是
+   *   **画布像素**平移 → 公式那块正好落到 (0,0)，画布只有公式那么大。
+   *   实测（对照电脑端 PyMuPDF 同区域的裁图）：两边**逐像素一致**。
+   */
+  async function renderFormulaShot(page, rect) {
+    if (!page || !rect) return "";
+    if (page.rotate) return "";           // 旋转页：坐标系对不上，不裁
+    const scale = FORMULA_SHOT_SCALE;
+    let vp0;
+    try { vp0 = page.getViewport({ scale }); } catch (e) { return ""; }
+    const t = vp0.transform;              // [s,0,0,-s,0,H*s]
+    const view = page.view || [0, 0, 0, 0];
+    // ⚠ bbox 是**相对 CropBox 左上角**的 PDF 点（PyMuPDF/pdfplumber 的口径），
+    //   而 PDF.js 的用户空间原点在 CropBox 左下角 → 两边差一个 CropBox 原点。
+    //   所以：user_x = view[0] + bbox_x，user_y = view[3] - bbox_y。
+    const ux0 = view[0] + rect[0], uy0 = view[3] - rect[1];
+    const ux1 = view[0] + rect[2], uy1 = view[3] - rect[3];
+    const px0 = t[0] * ux0 + t[2] * uy0 + t[4];
+    const py0 = t[1] * ux0 + t[3] * uy0 + t[5];
+    const px1 = t[0] * ux1 + t[2] * uy1 + t[4];
+    const py1 = t[1] * ux1 + t[3] * uy1 + t[5];
+    const x = Math.floor(Math.min(px0, px1));
+    const y = Math.floor(Math.min(py0, py1));
+    const w = Math.ceil(Math.max(px0, px1) - x);
+    const h = Math.ceil(Math.max(py0, py1) - y);
+    if (w < 2 || h < 2) return "";
+    let vp;
+    try {
+      vp = page.getViewport({ scale, offsetX: -x, offsetY: -y });
+    } catch (e) { return ""; }
+    const cv = document.createElement("canvas");
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext("2d");
+    if (!ctx) return "";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+    try {
+      await page.render({ canvasContext: ctx, viewport: vp, intent: "display" }).promise;
+    } catch (e) {
+      console.warn("公式原图裁取失败", e);
+      return "";
+    }
+    if (isBlankShot(ctx, w, h)) return "";   // 裁到白纸 → 当作失败
+    try { return cv.toDataURL("image/png"); } catch (e) { return ""; }
+  }
+
+  /** 这一页有哪些公式块需要裁图。 */
+  function formulaBlocksOf(n) {
+    const rec = (pdfState.blockTrans || {})[n];
+    if (!rec || !rec.blocks) return [];
+    return rec.blocks.filter((b) => b && b.kind === "formula"
+      && formulaRectsOf(b.translation || "").length);
+  }
+
+  /** 公式图的占位块（裁好之前先占位，裁完再填）。 */
+  function formulaHolder(pageNo, rect) {
+    const key = formulaKeyOf(rect);
+    const h = el("div", "tb-formula-shot");
+    h.setAttribute("data-formula-page", String(pageNo));
+    h.setAttribute("data-formula-key", key);
+    const cache = (pdfState.formulaShots && pdfState.formulaShots[pageNo]) || {};
+    const url = cache[key];
+    if (url) fillFormulaShot(h, url);
+    else if (url === "") h.appendChild(el("div", "tb-formula-fallback", "【公式：见原文】"));
+    else h.appendChild(el("div", "tb-formula-wait", "正在裁取公式原图…"));
+    return h;
+  }
+
+  function fillFormulaShot(holder, dataURL) {
+    holder.innerHTML = "";
+    const img = document.createElement("img");
+    img.className = "tb-formula-img";
+    img.alt = "公式原图（从 PDF 原页裁出，与论文一致）";
+    img.src = dataURL;
+    holder.appendChild(img);
+  }
+
+  /** 把这一页裁好的公式图贴回对照视图。 */
+  function paintFormulaShots(n) {
+    const cache = (pdfState.formulaShots && pdfState.formulaShots[n]) || {};
+    const nodes = document.querySelectorAll('.tb-formula-shot[data-formula-page="' + n + '"]');
+    Array.prototype.forEach.call(nodes, (h) => {
+      const key = h.getAttribute("data-formula-key") || "";
+      const url = cache[key];
+      if (url) fillFormulaShot(h, url);
+      else if (url === "") {
+        h.innerHTML = "";
+        h.appendChild(el("div", "tb-formula-fallback", "【公式：见原文】"));
+      }
+    });
+  }
+
+  /** 裁这一页的公式原图（幂等；裁完贴回视图）。 */
+  async function ensureFormulaShots(n) {
+    const blocks = formulaBlocksOf(n);
+    if (!blocks.length) return;
+    const doc = pdfState.doc;
+    if (!doc) return;
+    if (!pdfState.formulaShots) pdfState.formulaShots = {};
+    const cache = (pdfState.formulaShots[n] = pdfState.formulaShots[n] || {});
+    let page = null;
+    for (const b of blocks) {
+      for (const rect of formulaRectsOf(b.translation || "")) {
+        const key = formulaKeyOf(rect);
+        if (cache[key] !== undefined) continue;   // 已裁过（或已失败）
+        if (!page) {
+          try { page = await doc.getPage(n); } catch (e) { return; }
+        }
+        let url = "";
+        try { url = await renderFormulaShot(page, rect); } catch (e) { url = ""; }
+        cache[key] = url;      // 失败也记成 "" → 不反复重试
+      }
+    }
+    paintFormulaShots(n);
   }
 
   /** 把某页的批注高亮画在原文上。 */
@@ -3393,6 +3963,10 @@
         inkStrokes(page).push(cur);
         drawInkPage(page, cv, ctx);
         scheduleInkSave();
+        // ⚠ 2026-11-12：圈完一笔 → 浮出「问这块 / 总结这块 / 清除」。
+        //   用户原话："我直接用手写笔圈一部分，然后直接能问 AI" ——
+        //   圈完还要自己去找按钮，太绕。
+        try { showRegionBar(page); } catch (e) { /* ignore */ }
       }
       cur = null;
       if (e && e.preventDefault) e.preventDefault();
@@ -3432,7 +4006,9 @@
     });
     const btn = $("pdf-toggle-ink");
     if (btn) btn.classList.toggle("is-active", on);
-    if (on) toast("手写已开启：在原文上直接画。画完点「保存标注」同步到坚果云。");
+    // ⚠ 关掉手写 → 圈选操作条也没用了（它只在手写模式下有意义）
+    if (!on) hideRegionBar();
+    if (on) toast("手写已开启：在原文上直接画。圈一块就能问 AI 或总结这块。");
   }
 
   let _inkSaveTimer = null;
@@ -3785,6 +4361,9 @@
       const ar = anchor1.getBoundingClientRect();
       body.scrollTop = (ar.top - br.top) + ratio * br.height - 8;
     }
+    // ⚠ 2026-11-12：缩放重画会把页卡整个换掉 → 圈选操作条要重新挂出来
+    //   （否则用户缩放一次，按钮就没了，还得重新画一遍）。
+    try { showRegionBar(cur); } catch (e) { /* ignore */ }
     pdfStatus("");
   }
 
@@ -3834,6 +4413,8 @@
     pdfState.doc = null;
     pdfState.rendered.clear();
     $("pdf-body").innerHTML = "";
+    // ⚠ 圈选操作条挂在页卡里 → 关掉阅读器要一起收掉
+    hideRegionBar();
   }
 
   /** 划词气泡：PDF 里选中文字 -> 解读 / 翻译 / 提问 */
@@ -4253,7 +4834,7 @@
     // ⚠ 平板屏幕小，双栏并排看很挤 —— 必须能切成单栏。
     const layBtn = $("pdf-layout");
     if (layBtn) {
-      const LAYOUTS = [["both", "原文+译文"], ["orig", "仅原文"], ["trans", "仅译文"]];
+      const LAYOUTS = [["both", "原文+译文"], ["bilingual", "对照"], ["orig", "仅原文"], ["trans", "仅译文"]];
       const syncLabel = () => {
         const cur = LAYOUTS.find((x) => x[0] === (pdfState.layout || "both")) || LAYOUTS[0];
         layBtn.textContent = cur[1];
@@ -4272,6 +4853,9 @@
     // 保存手写
     $("pdf-save-ink").onclick = () => { saveInk(); };
     // 带上手写问 AI（多模态：把手写标注转成图片发给模型）
+    // ⚠ 2026-11-12：这个按钮现在**优先发圈选区域**（只发圈的那一块），
+    //   没有圈选才退回整页图 —— 工具栏上因此不必再加按钮，
+    //   圈选浮条（问这块/总结这块/清除）是快捷路，这个按钮是兜底路。
     $("btn-ai-ink").onclick = () => { askAiWithInk(); };
     document.querySelectorAll("[data-close-lib]").forEach((b) => {
       b.onclick = () => { $("pdf-lib").hidden = true; };

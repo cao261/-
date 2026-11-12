@@ -497,6 +497,67 @@ button { cursor:pointer; }
 .tb-pdf-trans-body p { margin:0 0 .7em; }
 .tb-pdf-trans-body h1,.tb-pdf-trans-body h2,
 .tb-pdf-trans-body h3 { font-size:15px; margin:.9em 0 .4em; }
+/* ---------- 对照模式：译文按原文排版（2026-11-12）----------
+   用户诉求："原文是双栏，他们也是双栏"。
+   平板端对照 = 把译文按**原文的栏**重排（左栏回左栏、右栏回右栏）。
+   窄屏（竖屏）排不下两栏 → 上下堆叠，但仍然保持左栏在前、右栏在后
+   —— 阅读顺序与原文一致。 */
+.tb-pdf-page.lay-bilingual .tb-pdf-orig { display:none; }
+.tb-bilingual { flex:1 1 auto; min-width:0; }
+.tb-bilingual-body { font-size:14px; line-height:1.85; }
+.tb-bilingual-cols { display:flex; flex-direction:column; gap:14px; }
+.tb-bilingual-col { min-width:0; }
+.tb-bilingual-span { margin:0 0 12px; }
+.tb-bilingual-block { margin:0 0 12px; }
+.tb-bilingual-block:last-child { margin-bottom:0; }
+.tb-bb-trans p { margin:0 0 .6em; }
+.tb-bilingual-block.kind-heading .tb-bb-trans { font-weight:600; }
+.tb-bilingual-block.kind-formula { text-align:center; }
+.tb-bilingual-block.kind-formula .tb-bb-trans p { margin:0; }
+.tb-bilingual-empty {
+  color:#8A8279; font-size:13px; line-height:1.8; text-align:center;
+  padding:18px 10px;
+}
+@media (min-width:900px) {
+  /* 宽屏才并排（竖屏塞不下两栏，硬挤会挤成一条缝） */
+  .tb-bilingual-cols { flex-direction:row; gap:18px; }
+  .tb-bilingual-col { flex:1 1 0; }
+  .tb-bilingual-col + .tb-bilingual-col {
+    border-left:1px solid #E6E1D8; padding-left:18px;
+  }
+}
+/* ---------- 对照模式里的整块公式（平板本地裁的原图，2026-11-12）----------
+   用户原话："公式什么的也要能正常显示"。
+   公式在 PDF 里是矢量排版（分子一行、分母一行），文本层抽出来是乱序碎片
+   → 硬拼 LaTeX 极容易把分子分母装反。**错公式比没公式危险得多**
+   —— 用户会照着它去算。所以只贴原图，不重排。 */
+.tb-formula-shot {
+  margin:6px 0; text-align:center; line-height:0;
+}
+.tb-formula-img {
+  display:inline-block; max-width:100%; height:auto;
+  background:#fff; padding:2px 0;
+}
+.tb-formula-wait, .tb-formula-fallback {
+  font-size:12px; color:#8A8279; line-height:1.6; text-align:center;
+  padding:6px 4px;
+}
+.tb-formula-fallback { color:#B08A4A; }
+/* 表格：译文栏不在 .tb-doc 里 → .tb-doc table 的样式**套不到**，
+   不补一条的话表格就是一堆没边框的裸文字。 */
+.tb-pdf-trans-body table {
+  width:100%; border-collapse:collapse; margin:.8em 0; font-size:.92em;
+  display:block; overflow-x:auto; -webkit-overflow-scrolling:touch;
+}
+.tb-pdf-trans-body th, .tb-pdf-trans-body td {
+  border:1px solid #E6E1D8; padding:6px 9px; text-align:left; vertical-align:top;
+  white-space:nowrap;
+}
+.tb-pdf-trans-body th { background:#F4F1EA; font-weight:600; }
+/* 行内公式（KaTeX）在译文栏里也要有基础排版 */
+.tb-pdf-trans-body .katex { font-size:1.04em; }
+.tb-pdf-trans-body .katex-display { margin:.8em 0; overflow-x:auto; overflow-y:hidden; }
+.tb-pdf-trans-body .math-error { color:#C4703A; }
 /* 批注高亮层（盖在原文上） */
 .tb-pdf-anno-layer { position:absolute; inset:0; pointer-events:none; }
 .tb-pdf-anno {
@@ -509,6 +570,24 @@ button { cursor:pointer; }
 .tb-pdf-anno[data-color="pink"]  { background:rgba(255,140,170,.30); }
 /* 手写层 */
 .tb-pdf-ink { position:absolute; inset:0; pointer-events:none; }
+/* ⚠⚠ 圈选操作条（2026-11-12）：浮在**原文层**里、排在手写层之后
+   → 画在手写层上面，点它先命中它（不会被当成"又画一笔"）。
+   ⚠ 挂在 .tb-pdf-orig 里（不是 .tb-pdf-page）：
+   宽屏「原文+译文」并排时页卡的原点跟原文画布不是同一个，
+   挂错容器 → 按钮会跑到译文那一栏上面去。 */
+.tb-pdf-region {
+  position:absolute; z-index:40;
+  display:flex; align-items:center; gap:6px;
+  padding:5px 7px; border-radius:999px;
+  background:rgba(28,25,22,.90);
+  box-shadow:0 8px 26px rgba(0,0,0,.38);
+  white-space:nowrap; pointer-events:auto;
+}
+.tb-pdf-region[hidden] { display:none; }
+.tb-pdf-region .tb-btn {
+  pointer-events:auto; border:0; cursor:pointer;
+  min-height:34px; padding:6px 12px; font-size:13px;
+}
 .tb-pdf-ink.is-on {
   pointer-events:auto; cursor:crosshair;
   /* ⚠⚠ 必须有 touch-action:none（2026-10-28 用户实测：「手写没有任何作用」）。

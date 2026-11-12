@@ -1182,6 +1182,25 @@ class TranslatePageRequest(BaseModel):
                                    "否则是 MiniMax 系模型名")
 
 
+class TranslateBlocksRequest(BaseModel):
+    """段落级翻译（双语同位对照模式用）。
+
+    服务端自己抽这一页的**段落块**（bbox + 原文 + 栏归属），
+    一次 LLM 调用把它们全部翻掉，译文按段号回填 → 前端拿得到
+    「第 i 段的译文 + 它在页面上的位置」。
+    """
+    paper_id: str = Field(..., min_length=3, max_length=300)
+    page: int = Field(..., ge=1, le=200, description="1-based page number")
+    relative_path: Optional[str] = Field(
+        default=None, max_length=500,
+        description="PDF 在 vault 中的相对路径（必填：段落块要服务端抽）",
+    )
+    force: bool = Field(default=False, description="忽略缓存强制重译")
+    model: str = Field(default="", max_length=60,
+                       description="临时换模型翻译：空=跟随当前设置, 'agnes'=备用模型, "
+                                   "否则是 MiniMax 系模型名")
+
+
 class TranslationCacheBatchItem(BaseModel):
     section_key: str = Field(default="", max_length=80)
     text: str = Field(default="", max_length=60000)
@@ -1930,6 +1949,44 @@ async def api_read_table(req: ReadTableRequest):
         msg = llm.friendly_error_text(e) if isinstance(e, llm.LLMError) else str(e)
         raise HTTPException(status_code=502, detail=f"表格读取失败: {msg}")
     return {"table": table}
+
+
+@app.get("/api/paper/page_blocks")
+async def api_page_blocks(relative_path: str, page: int = 1):
+    """返回某一页的**段落块**（bbox + 栏归属）—— 「译文按原文排版」的地基。
+
+    每块：{i, kind, col, bbox, text}
+      - col：L 左栏 / R 右栏 / S 整宽或单栏
+      - bbox：[x0, top, x1, bottom]，**页面绝对坐标**（pt，左上角原点）
+        —— 与 ⟦FORMULA:…⟧ / ⟦TABLE:…⟧ 标记**同一套坐标系**，
+           前端拿它就能把译文放回原文的位置（沉浸式翻译那种排版）
+      - kind：body 正文 / formula 公式 / table 表格
+
+    ⚠ 这是**独立抽取**（自己开一次 pdfplumber，单页 64~332ms），
+      还没并进抽取缓存 —— 见 docs/HANDOFF_2026-11-12-REGION-ASK-AND-BILINGUAL-LAYOUT.md §3.6。
+    """
+    from .paper_text import extract_page_blocks
+    try:
+        pdf_path = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
+    if page < 1 or page > 2000:
+        raise HTTPException(status_code=400, detail="页码超出范围")
+    # 抽取是**同步重活**（pdfplumber 解析一页 64~332ms）→ 丢线程池，
+    # 别占着事件循环（AGENTS.md §4.58）
+    blocks = await asyncio.to_thread(extract_page_blocks, pdf_path, page)
+    # 段落译文的版本闸门 —— 前端拿它跟快照里的 blocks_version 比对，
+    # 对不上就说明段落切分算法变了 → 旧段落译文作废（整页译文不受影响）。
+    from .bilingual import BLOCK_TRANSLATION_VERSION
+    from .paper_text import EXTRACTOR_VERSION
+    return {
+        "page": page,
+        "blocks": blocks,
+        "blocks_version": BLOCK_TRANSLATION_VERSION,
+        "extractor_version": EXTRACTOR_VERSION,
+    }
 
 
 async def _prepare_tables(page_text: str, pdf_path, page: int, model: str = "") -> tuple[str, dict]:
@@ -3989,6 +4046,175 @@ async def api_translate_page(req: TranslatePageRequest):
     return result
 
 
+@app.post("/api/paper/translate_blocks")
+async def api_translate_blocks(req: TranslateBlocksRequest):
+    """段落级翻译 —— 「译文按原文排版」的翻译侧。
+
+    返回该页的**段落块**，每块多一个 ``translation`` 字段（它自己的中文译文），
+    外加一份拼接好的整页译文（给原来的整页面板继续用）。
+
+    与 `/api/paper/translate_page` 的关系：
+      - 两条**独立**链路，缓存键不同 → 互不污染，各翻各的；
+      - 段落译文有**独立版本闸门**（`bilingual.BLOCK_TRANSLATION_VERSION`）：
+        段落切分算法改了 → 只作废段落译文，整页译文无恙；
+      - ⚠⚠ **绝对不要动 `paper_text.EXTRACTOR_VERSION`** ——
+        它一动，用户**全部**整页译文作废重翻，而且跨设备同步会波及另一台。
+
+    三类块分别怎么办：
+      - body（正文）：一次 LLM 调用翻整页，模型按 `⟦B7⟧` 编号回 `⟦T7⟧`；
+      - formula（公式）：**不进模型**（碎片会被模型"补全"成不存在的公式），
+        译文填 `⟦FORMULA:x0,y0,x1,y1⟧` → 前端裁原图贴上去；
+      - table（表格）：**不进模型**（文本层数值整行错位），裁图让多模态逐格抄。
+    """
+    if not llm.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="段落翻译需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
+        )
+    if not (req.relative_path or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="段落翻译必须提供 relative_path（段落块要由服务端抽取）。",
+        )
+    try:
+        pdf_path = _safe_path(BASE_DIR, req.relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
+
+    from .bilingual import (BLOCK_TRANSLATION_VERSION, blocks_signature,
+                            concatenate_blocks, translate_blocks)
+    from .paper_text import extract_page_blocks
+    from .translation import get_cache
+
+    # 抽取是**同步重活**（pdfplumber 解析一页 64~332ms）→ 丢线程池，
+    # 别占着事件循环（AGENTS.md §4.58）
+    blocks = await asyncio.to_thread(extract_page_blocks, pdf_path, req.page)
+    if not blocks:
+        raise HTTPException(
+            status_code=422,
+            detail=f"第 {req.page} 页没有抽到段落块（可能是纯图片页或扫描件）。",
+        )
+
+    _m_name, _m_fallback, model = _resolve_translation_model(req.model)
+    cache = get_cache()
+    cache_section_key = f"blocks:{req.paper_id}:{req.page}"
+    # 缓存键的文本部分 = **段落内容签名**（含 blocks_version 与每段原文，
+    # 不含坐标 —— 坐标变了不影响译文内容）。
+    signature = blocks_signature(blocks)
+    if not req.force:
+        cached = cache.get(cache_section_key, signature, model)
+        if cached and cached.get("blocks"):
+            cached["from_cache"] = True
+            return cached
+
+    # ---- 表格块：裁图让多模态逐格抄（与整页翻译同一套机制）----
+    async def _read_table_blocks() -> dict:
+        async def _one(b: dict):
+            idx = int(b.get("i", 0))
+            bbox = [float(v) for v in (b.get("bbox") or [])]
+            if len(bbox) != 4:
+                return idx, "【表格未能读出，请对照原文】"
+            try:
+                md = await _read_table_vision(pdf_path, req.page, tuple(bbox), req.model)
+                return idx, (md or "").strip() or "【表格未能读出，请对照原文】"
+            except Exception as e:
+                print(f"[MicroBench] 第 {req.page} 页表格块 {idx} 读取失败: {e}",
+                      file=sys.stderr)
+                return idx, "【表格未能读出，请对照原文】"
+
+        pairs = await asyncio.gather(
+            *[_one(b) for b in blocks if b.get("kind") == "table"])
+        return {idx: md for idx, md in pairs}
+
+    # ---- 正文段落：一次 LLM 调用翻整页 ----
+    async def _chat(**kwargs):
+        # llm.chat 是**同步**的 requests 调用 → 必须丢线程池（AGENTS.md §4.58）
+        return await asyncio.to_thread(llm.chat, **kwargs)
+
+    call_info: dict = {}
+    deadline = time.monotonic() + _translation_deadline_seconds(req.model)
+    src_len = sum(len(b.get("text") or "") for b in blocks)
+
+    # 表格读图跟正文翻译**并行**（各要 10~30s，串行就翻倍）
+    table_task = asyncio.create_task(_read_table_blocks())
+    try:
+        out_blocks, reason = await translate_blocks(
+            blocks, _chat,
+            model=model,
+            m_name=_m_name or llm.translation_model_name(),
+            m_fallback=_m_fallback,
+            max_tokens=_translation_max_tokens(src_len, model),
+            deadline=deadline,
+            call_info=call_info,
+            disable_thinking=llm.translation_disable_thinking(),
+        )
+    except llm.LLMError as e:
+        table_task.cancel()
+        raise HTTPException(status_code=502,
+                            detail=f"段落翻译失败: {llm.friendly_error_text(e)}")
+    except Exception as e:
+        table_task.cancel()
+        raise HTTPException(status_code=500, detail=f"段落翻译失败: {_safe_err(e)}")
+    try:
+        table_map = await table_task
+    except Exception:
+        table_map = {}
+
+    # ⚠ 模型完全无视编号标记、段数也对不上 → **放弃同位模式**。
+    #   宁可这一页没有译文，也不能把译文贴到错的段落上 —— 那比没有更糟。
+    if reason == "parse":
+        raise HTTPException(
+            status_code=502,
+            detail=("模型没有按段落编号返回译文，无法保证译文与原文一一对应。"
+                    "请重试，或换用更听话的翻译模型（DeepSeek Flash / MiniMax-M3）。"),
+        )
+
+    # 公式块 → 公式原图标记（前端 renderFormulaImages 换成从 PDF 裁下来的原图）
+    for b in out_blocks:
+        kind = b.get("kind")
+        if kind == "formula":
+            bbox = [float(v) for v in (b.get("bbox") or [])]
+            if len(bbox) == 4:
+                b["translation"] = "⟦FORMULA:%.1f,%.1f,%.1f,%.1f⟧" % tuple(bbox)
+            else:
+                b["translation"] = "【公式未能完整提取，请对照左侧 PDF 原文】"
+        elif kind == "table":
+            b["translation"] = (table_map.get(int(b.get("i", 0)))
+                                or "【表格未能读出，请对照原文】")
+
+    translation = concatenate_blocks(out_blocks)
+    if not translation.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="段落翻译结果为空。模型可能把 token 预算耗在推理上没产出正文。",
+        )
+
+    curr_st = llm.get_llm_status()
+    result = {
+        "status": "success",
+        "paper_id": req.paper_id,
+        "page": req.page,
+        "blocks": out_blocks,
+        # 拼接好的整页译文 —— 老的面板继续用它，形态不变
+        "translation": translation,
+        "blocks_version": BLOCK_TRANSLATION_VERSION,
+        "from_cache": False,
+        "model": call_info.get("model") or model,
+        "model_fell_back": bool(call_info.get("fallback_used")),
+        "is_degraded": curr_st["is_degraded"],
+        # 部分完成：有段落没译出来（逐段提示里会标出来）
+        "partial": bool(reason),
+        "stopped_reason": reason,
+        "block_count": len(out_blocks),
+        "translated_blocks": sum(
+            1 for b in out_blocks if (b.get("translation") or "").strip()),
+    }
+    cache.put(cache_section_key, signature, model, result)
+    return result
+
+
 @app.post("/api/paper/translation_cache_batch_lookup")
 async def api_translation_cache_batch_lookup(req: TranslationCacheBatchRequest):
     """
@@ -4136,6 +4362,27 @@ SNAPSHOT_MAX_BYTES = 5 * 1024 * 1024
 SNAPSHOT_SCHEMA_VERSION = 1
 
 
+class _SnapshotBlockItem(BaseModel):
+    """一页里的**一个段落块**（对照模式用）。
+
+    为什么快照里要存它：平板端**访问不到电脑端的后端**（没有 baseURL、
+    CSP 与原生桥白名单都拦着），它只能读同步过来的快照文件。
+    → 段落译文 + 段落坐标必须**跟着快照走**，平板才能把译文贴回原位。
+
+    ⚠ 这里**不存**原文（text）—— 平板自己渲染 PDF 页就有原文，
+      存了只是让快照白白变大（5MB 上限）。
+    """
+    i: int = Field(..., ge=0, le=2000, description="块序号（阅读顺序）")
+    kind: str = Field(default="body", max_length=16,
+                      description="body 正文 / formula 公式 / table 表格")
+    col: str = Field(default="S", max_length=4,
+                     description="栏归属：L 左栏 / R 右栏 / S 整宽或单栏")
+    bbox: list[float] = Field(default_factory=list, max_length=4,
+                               description="页面绝对坐标 [x0,top,x1,bottom]（pt，左上角原点）")
+    translation: str = Field(default="", max_length=8000,
+                             description="该段的中文译文")
+
+
 class _SnapshotPageItem(BaseModel):
     page_num: int = Field(..., ge=1, le=2000)
     text_hash: str = Field(..., min_length=4, max_length=64,
@@ -4145,6 +4392,16 @@ class _SnapshotPageItem(BaseModel):
     translation: str = Field(..., min_length=1, max_length=30000)
     model: Optional[str] = Field(default="", max_length=64)
     translated_at: Optional[str] = Field(default="", max_length=40)
+    # ---- 段落级译文（对照模式）----
+    #
+    # ⚠ **独立版本闸门**：段落切分算法一改（bilingual.BLOCK_TRANSLATION_VERSION
+    #   +1），这些块的编号/坐标就全变了 → 旧译文贴到新段落上就是**错位**。
+    #   → 前端加载时比对版本，对不上就**只丢掉 blocks**，
+    #     整页译文（translation）继续用 —— 两者的生命周期必须分开。
+    blocks: Optional[list[_SnapshotBlockItem]] = Field(default=None, max_length=500,
+                                                       description="段落级译文（对照模式）")
+    blocks_version: Optional[int] = Field(default=None, ge=0, le=9999,
+                                          description="段落译文版本闸门")
 
 
 class SnapshotSaveRequest(BaseModel):

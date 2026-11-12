@@ -270,6 +270,37 @@ def extract_page_text_with_glyphs(pdf_path, page_no: int) -> tuple[str, list]:
     return text, glyphs
 
 
+def extract_page_blocks(pdf_path, page_no: int) -> list[dict]:
+    """抽一页的**段落块**（每块带坐标）—— 「译文按原文排版」的地基。
+
+    返回 [{i, kind, col, bbox, text}]：
+      - i：阅读顺序序号（0 起）
+      - kind：body（正文）/ formula（公式）/ table（表格）
+      - col：栏归属 —— "L" 左栏 / "R" 右栏 / "S" 整宽或单栏
+      - bbox：[x0, top, x1, bottom]，**页面绝对坐标**（pt，左上角原点）
+        —— 与 ⟦FORMULA:…⟧ / ⟦TABLE:…⟧ 标记同一套坐标系，
+           前端拿它就能把译文放回原文的位置（沉浸式翻译那种排版）。
+      - text：段落原文（行间用 \\n）
+
+    ⚠ 这是一次**独立**抽取（自己开一次 pdfplumber），
+      不会写进抽取缓存 —— 阶段 0 先证明「段落块抓得准」，
+      确认后再并进 pdf_cache（那样才是零额外解析成本）。
+    """
+    blocks: list[dict] = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(pdf_path)) as doc:
+            if page_no < 1 or page_no > len(doc.pages):
+                return []
+            _extract_page_text(doc.pages[page_no - 1], [], blocks)
+    except Exception:
+        import traceback
+        print(f"[MicroBench] 段落块抽取失败: {traceback.format_exc()}",
+              file=sys.stderr)
+        return []
+    return blocks
+
+
 _PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
 _SENTENCE_END_RE = re.compile(r"[.!?。！？]")
 # 抽取层插入的标记（公式/表格）。页尾截断必须避开它们内部的小数点。
@@ -496,16 +527,20 @@ def _longest_gap(cover, lo: int, hi: int):
     return best_a, best_len
 
 
-def _extract_page_text(page, out_glyphs: Optional[list] = None) -> str:
+def _extract_page_text(page, out_glyphs: Optional[list] = None,
+                       out_blocks: Optional[list] = None) -> str:
     """
     抽取单页文本，按阅读顺序排列：整宽区域(标题/摘要) -> 左栏 -> 右栏。
     任何一步检测不可靠都退回 pdfplumber 的普通抽取（只是空格仍然修好）。
 
     out_glyphs：出参。传入一个 list，本页解不出的字符会按顺序 append 进去
     （含坐标），服务端拿它把 ⟦G:n⟧ 认成真实符号。
+
+    out_blocks：出参。传入一个 list，本页会额外 append **段落块**
+    （每块带 bbox）。这是「译文按原文排版」的地基 —— 见下面那段说明。
     """
     return _mark_broken_formulas(
-        _clean_cid_markers(_extract_page_text_raw(page, out_glyphs)))
+        _clean_cid_markers(_extract_page_text_raw(page, out_glyphs, out_blocks)))
 
 
 # 公式碎片的标记。送给模型前先把碎公式整段替换成它，模型照抄即可。
@@ -1124,6 +1159,414 @@ def _lines_to_text(lines: list[dict], mark_formulas: bool = True,
     return "\n".join(out)
 
 
+# ------------------------------------------------------------------
+# 段落块（2026-11-12）：「译文按原文排版」的地基
+#
+# 用户原话："就像那种翻译插件一样，他们和原文的排版是一模一样的，
+#            没什么区别……原文是双栏，他们也是双栏"。
+#
+# 要做到这件事，抽取层必须给出**段落级的坐标**：
+#   双栏论文里，左栏的段落译文要回到左栏，右栏的回到右栏。
+#
+# 好消息：**行级 bbox 早就算好了**（_crop_lines 返回 x0/x1/top/bottom），
+# 只是在函数返回时被丢掉 —— 这里把它捡回来，按段落合并成块。
+#
+# ⚠ 判据是实测出来的（2026-11-12，27 篇 PDF 的双栏页）：
+#   · 段落起点 = 首行缩进 ≥ 3pt **或** 行间距 ≥ 5pt（两个信号取「或」）
+#     单用缩进会漏掉「无缩进但空行」的模板（ACS）；
+#     单用行距会漏掉「只缩进不空行」的模板（Elsevier）。
+#   · 栏左边界用**中位数**，不能用 min(x0)（异常行会把边界带偏）
+#   · 上标/下标在文本层里是**独立的一行** → 先并回父行（_mark_attached_lines）
+# ------------------------------------------------------------------
+
+# 首行缩进 ≥ 这个值（pt）→ 认为是新段落的开头
+_BLOCK_INDENT_MIN = 3.0
+# 首行缩进 > 这个值（pt）→ **不是**段落开头，是行尾碎片（上标/下标/尾巴）
+#
+# ⚠ 这个上限是踩出来的（2026-11-12，JACERS 第 3 页实测）：
+#   一行的上标 "2 4" 被单独抽成一行，它的 x0 在**行尾**（286pt），
+#   缩进算出来是 225pt → 被当成"缩进段落" → 把一段话切成两半，
+#   而且两个块在 y 上重叠（因为上标把上一行的 bottom 撑大了）。
+#   → 缩进过大的一律当成"碎片"，并进当前段落。
+_BLOCK_INDENT_MAX = 40.0
+# 行间距 ≥ 这个值（pt）→ 认为是新段落的开头
+_BLOCK_GAP_MIN = 5.0
+
+
+# --------------------------------------------------------------------------
+# 章节标题：从段落里**切出来**（2026-11-12）
+#
+# 为什么要切：对照模式是「一个原文段落 → 一个译文框」。
+#   标题和它下面的正文挤在同一个块里 → 译文框会把标题的译文和
+#   第一段正文的译文糊在一起，读起来像一段话（实测 JACERS 第 3 页：
+#   "(3) Ceramic and Terfenol-D (or Galfenol) Alloy ME Composites"
+#   和它下面的整段正文是同一块）。
+#
+# ⚠ 只在**块层**切，**不碰页级文本** → 不需要动 EXTRACTOR_VERSION
+#   （动它 = 用户全部译文作废重翻 + 波及另一台设备）。
+#
+# 判据故意**保守**：
+#   · 标题行要有编号前缀（"(3) " / "3. " / "IV. "）；
+#   · 标题行要**短**且**不以句末标点结尾**（正文句子几乎都带句号）；
+#   · 续行（标题折行，如 "…Alloy ME" / "Composites"）要短、
+#     不以连字符结尾（正文折行以 "-" 结尾）、不是全大写。
+#   宁可漏切（标题和正文同块，只是框大一点）也不误切
+#   （误切的代价只是多一个框，文字不会丢）。
+# --------------------------------------------------------------------------
+_HEADING_START_RE = re.compile(r"^\(?\d{1,2}(?:\.\d{1,2})*\)?\.?\s+[A-Z(]")
+_HEADING_ROMAN_START_RE = re.compile(r"^\(?[IVXLC]{1,6}\)?\.?\s+[A-Z]")
+# 标题行的长度上限（pt 无关，按字符数）
+_HEADING_MAX_LEN = 85
+# 标题续行的长度上限
+_HEADING_CONT_MAX_LEN = 70
+# 标题**续行**的词数上限（2026-11-12）
+#
+# 为什么要有：长度上限挡不住"正文的**第一行**"被当成标题折行吞进去。
+#   实测 JACERS 第 2 页：
+#     标题行 "(1) Individual Phases in ME Composites"（6 词，真标题）
+#     下一行 "The first ME composites reported by Philips3,4 used BaTiO3 as"
+#     （10 词、60 字符、句首大写、不以连字符结尾）→ **全中长度那条判据**
+#     → 正文第一行被并进标题块 → 对照视图里标题的译文后面粘着一句正文。
+#   真标题的折行都很短（"Composites"、"Alloy ME"、"and Related Works"），
+#   卡 6 词足够，真标题一个都不误伤。
+_HEADING_CONT_MAX_WORDS = 6
+# 标题的**词数**上限
+#
+# 为什么要有：这一条挡掉了三误伤（实测全库 261 页扫出来的）：
+#   · 参考文献条目 "(1) Azevedo, F. A. C.; et al. Equal Numbers of Neuronal and"
+#     （11 词）→ 词数超 → 不切 ✓
+#   · 正文句子 "V. The remarkable ME tunability comes from voltage induced
+#     extra FM ordering in Pt"（13 词，这里的 V. 是电压变量不是章节号）
+#     → 词数超 → 不切 ✓
+#   · 目录条目 "I. INTRODUCTION. . . . . . . 2" → 点线过滤 + 词数 → 不切 ✓
+# 真标题都很短："(3) Ceramic and Terfenol-D (or Galfenol) Alloy ME" = 8 词。
+# ⚠ 上限卡 8 是实测出来的：卡 9 时，有一句正文正好 9 词
+#   （"V. The remarkable ME tunability comes from voltage induced extra FM
+#   ordering in Pt"）被判成了标题 —— 那里的 "V." 是电压变量不是章节号。
+_HEADING_MAX_WORDS = 8
+
+
+def _heading_prefix_len(lines: list[dict]) -> int:
+    """这个块开头的几行是不是**章节标题**？是就返回行数，否则返回 0。
+
+    只在块的开头找标题 —— 标题永远是段落的**第一行**，
+    中间出现的 "(3)" 这种是正文里的编号引用，不是标题。
+    """
+    if not lines:
+        return 0
+    first = (lines[0].get("text") or "").strip()
+    if not first or len(first) > _HEADING_MAX_LEN:
+        return 0
+    if not (_HEADING_START_RE.match(first)
+            or _HEADING_ROMAN_START_RE.match(first)):
+        return 0
+    # 正文句子几乎都以句号/逗号结尾；标题不会。
+    if first.endswith((".", ",", ";", "-", ":")):
+        return 0
+    # 词数太多 → 是句子，不是标题（见 _HEADING_MAX_WORDS 的说明）
+    if len(first.split()) > _HEADING_MAX_WORDS:
+        return 0
+    # 目录的点线行（"I. INTRODUCTION. . . . . 2"）
+    if "…" in first or ". . ." in first or " . " in first:
+        return 0
+    # 引文（"C. Fu et al., "Understanding the microwave annealing""）
+    if "et al" in first:
+        return 0
+    n = 1
+    # 标题**最多两行**（第一行 + 一行折行）。
+    #
+    # 为什么卡死 2：实测 ACS 论文里 "II. PRELIMINARIES AND RELATED WORKS"
+    #   下面紧跟 "A. TCAD Simulation" 再下面才是正文 ——
+    #   不卡上限的话，正文的第一行（"TCAD simulation has been widely"）
+    #   也会被当成"标题折行"吞进去（它首字母大写、不以连字符结尾）。
+    #   真标题很少折到三行以上，卡 2 行既够用又不会误吞正文。
+    while n < len(lines) and n < 2:
+        t = (lines[n].get("text") or "").strip()
+        if not t or len(t) > _HEADING_CONT_MAX_LEN:
+            break
+        # ⚠ 词数太多 → 是正文的**第一行**，不是标题折行
+        #   （实测 JACERS 第 2 页："The first ME composites reported by
+        #     Philips3,4 used BaTiO3 as" = 10 词 → 曾被并进标题块）。
+        if len(t.split()) > _HEADING_CONT_MAX_WORDS:
+            break
+        # 以连字符结尾 = 正文在单词中间折行
+        if t.endswith("-"):
+            break
+        # 全大写 = 正文里的缩写（"ME"、"PZT"），不是标题的折行
+        if t.isupper():
+            break
+        # 标题折行以大写字母或括号开头
+        if not (t[0].isupper() or t[0] in "(["):
+            break
+        # 下一行又是一个编号开头 → 那是下一个标题，当前块到此为止
+        if _HEADING_START_RE.match(t) or _HEADING_ROMAN_START_RE.match(t):
+            break
+        n += 1
+    return n
+
+
+def _column_left_margin(lines: list[dict]) -> float:
+    """栏左边界 = 各行 x0 的**中位数**（不是最小值）。
+
+    为什么不用 min：实测某篇出现 268pt 的假缩进（一个异常行），
+    min 会把栏左边界拉到页边 → 所有行都变成"缩进 268pt" → 段落判定全废。
+    中位数对个别异常行免疫。
+    """
+    xs = sorted(float(ln["x0"]) for ln in lines if ln.get("x0") is not None)
+    if not xs:
+        return 0.0
+    return xs[len(xs) // 2]
+
+
+def _group_lines_into_blocks(lines: list[dict], col: str) -> list[dict]:
+    """把若干文本行合并成**段落块**。
+
+    返回 [{kind, col, bbox, text}]：
+      - kind：body（正文）/ formula（公式）
+      - col：栏归属 L / R / S（整宽或单栏）
+      - bbox：页面**绝对**坐标 [x0, top, x1, bottom]（pt，左上角原点）
+        —— 与 ⟦FORMULA:…⟧ / ⟦TABLE:…⟧ 标记同一套坐标系，
+           前端可以直接拿去定位译文。
+      - text：段落原文（行间用 \\n）
+    """
+    if not lines:
+        return []
+    attached = _mark_attached_lines(lines)
+    spans = _formula_spans(lines, attached)
+
+    left = _column_left_margin(lines)
+    blocks: list[dict] = []
+    cur: list[dict] = []
+    prev_bottom: Optional[float] = None
+    # 本块**为什么**另起一段：start（只是带切开了）/ indent（首行缩进）/ gap（空行）
+    # —— 合并时要用（见 _merge_band_fragments）。
+    cur_reason = "start"
+
+    def _flush():
+        if not cur:
+            return
+        # 章节标题单独成块（对照模式里标题的译文要自己一个框）
+        head_n = _heading_prefix_len(cur)
+        if head_n:
+            _emit(cur[:head_n], "heading", "heading")
+            if head_n < len(cur):
+                _emit(cur[head_n:], "body", cur_reason)
+            cur.clear()
+            return
+        _emit(cur, "body", cur_reason)
+        cur.clear()
+
+    def _emit(seg: list[dict], kind: str, split: str):
+        """把一段行变成一个块（带坐标）。"""
+        if not seg:
+            return
+        x0 = min(ln["x0"] for ln in seg)
+        x1 = max(ln["x1"] for ln in seg)
+        top = min(ln["top"] for ln in seg)
+        bottom = max(ln["bottom"] for ln in seg)
+        blocks.append({
+            "kind": kind,
+            "col": col,
+            "split": split,
+            "bbox": [round(x0, 2), round(top, 2), round(x1, 2), round(bottom, 2)],
+            # ⚠ 行与行之间用**空格**接，不是换行（2026-11-12）。
+            #   换行的话，PDF 的「行折」会原样进到模型输入里 → 模型照着回车
+            #   → 译文里下标/上标被拆成单独一行（实测 JACERS 第 2 页：
+            #   "其中，a 为横向 ME 电压系数，v 为整体比\nE,31\nE 表示整个…"）。
+            #   段落块本来就是**一个段落**，行折只是排版 → 合成一句才对。
+            #   ⚠ 只影响段落块；页级文本走 _lines_to_text，不受影响。
+            "text": " ".join(ln["text"] for ln in seg),
+        })
+
+    def _is_vertical(ln: dict) -> bool:
+        """竖排/旋转文字（期刊页边的下载水印）。
+
+        它的行 bbox 是「又窄又高」—— 直接并进段落，
+        整段的 bbox 会被撑成一条巨大的竖条（实测 ACS 页：
+        水印高 568pt → 把左栏正文和右栏正文全吞进同一个块）。
+        → 单独成块，不参与段落合并。
+        """
+        h = float(ln["bottom"]) - float(ln["top"])
+        w = float(ln["x1"]) - float(ln["x0"])
+        return h > 40.0 and h > w * 2.0
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        if _is_vertical(ln):
+            _flush()
+            blocks.append({
+                "kind": "body",
+                "col": col,
+                "split": "vertical",
+                "bbox": [round(float(ln["x0"]), 2), round(float(ln["top"]), 2),
+                         round(float(ln["x1"]), 2), round(float(ln["bottom"]), 2)],
+                "text": ln["text"],
+            })
+            prev_bottom = None
+            i += 1
+            continue
+        if attached[i]:
+            # 上标/下标：它本来就是上一行的一部分，不另起段落。
+            # ⚠ 也不更新 prev_bottom —— 上标会把 bottom 撑大，
+            #   拿它算下一行的行间距会得到负数 → 段落边界就永远测不出来。
+            if cur:
+                cur.append(ln)
+            i += 1
+            continue
+
+        span = next((sp for sp in spans if sp[0] == i), None)
+        if span is not None:
+            a, b = span
+            seg = lines[a:b + 1]
+            _flush()
+            x0 = min(s["x0"] for s in seg)
+            x1 = max(s["x1"] for s in seg)
+            top = min(s["top"] for s in seg)
+            bottom = max(s["bottom"] for s in seg)
+            blocks.append({
+                "kind": "formula",
+                "col": col,
+                "split": "formula",
+                "bbox": [round(x0, 2), round(top, 2), round(x1, 2), round(bottom, 2)],
+                "text": "\n".join(s["text"] for s in seg),
+            })
+            prev_bottom = float(seg[-1]["bottom"])
+            i = b + 1
+            continue
+
+        indent = float(ln["x0"]) - left
+        gap = (float(ln["top"]) - prev_bottom) if prev_bottom is not None else None
+        # 缩进过大 → 行尾碎片（上标/尾巴），并进当前段落，不另起一块
+        is_fragment = indent > _BLOCK_INDENT_MAX
+        if not cur:
+            # 本组（水平带）的第一行：靠缩进判断它是不是新段落开头
+            cur_reason = "indent" if indent >= _BLOCK_INDENT_MIN else "start"
+        elif not is_fragment:
+            # 段落起点 = 缩进 **或** 空行（两个信号取「或」，见上面说明）
+            if indent >= _BLOCK_INDENT_MIN:
+                _flush()
+                cur_reason = "indent"
+            elif gap is not None and gap >= _BLOCK_GAP_MIN:
+                _flush()
+                cur_reason = "gap"
+        cur.append(ln)
+        if not is_fragment:
+            prev_bottom = float(ln["bottom"])
+        i += 1
+    _flush()
+    return blocks
+
+
+def _merge_band_fragments(blocks: list[dict]) -> list[dict]:
+    """把「被水平带切开」的块接回去。
+
+    背景：抽取是按**水平带**（高约 20pt）切的。一段话横跨两个带就会被切成
+    两块 —— 顶部区域尤其明显（那里每带都不许合并，否则左栏的公式碎片会
+    混进右栏正文，见 _extract_top_region 的注释）。
+
+    判据（只接「没有理由另起一段」的块）：
+      · 该块起始原因是 "start"（不是缩进、不是空行 → 它只是被带切开了）
+      · 同一栏
+      · 垂直间距 < 段落空行阈值（说明它们本来就连着）
+      · 两边都是正文（公式/表格不接 —— 它们各有各的位置）
+    """
+    out: list[dict] = []
+    for b in blocks:
+        if out:
+            prev = out[-1]
+            if (b.get("split") == "start"
+                    and prev.get("col") == b.get("col")
+                    and prev.get("kind") == "body" and b.get("kind") == "body"
+                    and float(b["bbox"][1]) - float(prev["bbox"][3]) < _BLOCK_GAP_MIN):
+                prev["text"] = ((prev.get("text") or "") + "\n"
+                                + (b.get("text") or "")).strip()
+                prev["bbox"][2] = max(float(prev["bbox"][2]), float(b["bbox"][2]))
+                prev["bbox"][3] = max(float(prev["bbox"][3]), float(b["bbox"][3]))
+                continue
+        out.append(b)
+    return out
+
+
+def _merge_fragile_blocks(blocks: list[dict]) -> list[dict]:
+    """把「碎片块」并回前一块（孤儿上标/下标）。
+
+    实测（JACERS 第 3 页）：'Pb(Zr,Ti)O' 的下标 '3' 被单独抽成一行，
+    而 'Pb(Zr,Ti)O' 本身长得像公式 → _mark_attached_lines 不把它当上标
+    → 单独成块 → 对照模式下那儿会多出一个空框。
+
+    判据（三个都要满足，宁可漏合并也不误合并）：
+      · 文本 < 4 个字符
+      · 左边界**比前一块更靠右**（碎片挂在上一行的某个位置；
+        独立成段的短句一定贴着左边界）
+      · 同一栏
+    """
+    out: list[dict] = []
+    for b in blocks:
+        txt = (b.get("text") or "").strip()
+        # ⚠ 标题块**不参与**碎片合并 —— 标题有自己的版式位置，
+        #   被并进上一段会让对照模式下标题的译文糊进正文。
+        if out and len(txt) < 4 and b.get("kind") == "body":
+            prev = out[-1]
+            if (prev.get("col") == b.get("col")
+                    and float(b["bbox"][0]) > float(prev["bbox"][0]) + 1.0):
+                prev["text"] = ((prev.get("text") or "") + "\n" + txt).strip()
+                prev["bbox"][2] = max(float(prev["bbox"][2]), float(b["bbox"][2]))
+                prev["bbox"][3] = max(float(prev["bbox"][3]), float(b["bbox"][3]))
+                continue
+        out.append(b)
+    return out
+
+
+def _new_block_parts() -> dict:
+    """段落块的**分区**容器（按阅读顺序分桶，最后再拼）。
+
+    分桶是为了跟现有阅读顺序**逐字对齐**：
+    整宽顶部 → 顶部左栏 → 正文左栏 → 顶部右栏 → 正文右栏 → 跨栏块。
+    """
+    return {"front": [], "topleft": [], "left": [],
+            "topright": [], "right": [], "span": []}
+
+
+def _flatten_block_parts(parts: dict) -> list[dict]:
+    """把分桶按阅读顺序拼成一条，合并碎片块，再给每块编号。
+
+    ⚠ 合并是**全局**的（按阅读顺序连成一条之后再合）：
+      顶部区 ↔ 正文区的分界（y_split）也是**人为**的 —— 它可能正好切在
+      一段话中间（JACERS 第 3 页：一句 "Although ferrite/PZT laminates had
+      giant ME voltage coeffi-cients, the limited magnetostriction …"
+      被 y_split=443.7 从中间劈开）。
+      现有的页级文本**也有**这个断点（译文里同样会断），
+      段落块如果不在这里合上，两边就对不上。
+      跨桶误合的风险由「同一栏 + 垂直间距 < 5pt + 无独立分段理由」三条挡住。
+    """
+    raw: list[dict] = []
+    for key in ("front", "topleft", "left", "topright", "right", "span"):
+        raw.extend(parts.get(key) or [])
+    # ⚠ 跨栏桶（span）按**纵向位置**排一遍（2026-11-12）。
+    #   为什么：表格块是在带抽取**结束之后**统一 append 的（见 _extract_by_bands
+    #   末尾的 out_parts["span"].append({...kind:"table"...}）），
+    #   而表题/脚注是随带抽出来的 → 结果「表题」和「表体」被拆到两头：
+    #   段落下标 11=表题、12=脚注、13=另一个表题、14=表体、15=表体。
+    #   对照视图里就变成「表题 → 脚注 → 表题 → 表 → 表」，跟原文对不上。
+    #   按 bbox.top 排完就是原文的纵向顺序（表题→表体→脚注→表题→表体）。
+    #   ⚠ **只影响段落块**（页级文本走 _join_reading_order，仍是
+    #     「跨栏块整块排在正文之后」的老口径）→ 页级文本一个字都不变
+    #     → EXTRACTOR_VERSION 不用动。
+    span = parts.get("span") or []
+    if len(span) > 1:
+        span = sorted(span, key=lambda b: float((b.get("bbox") or [0, 0])[1]))
+        raw = [b for key in ("front", "topleft", "left", "topright", "right")
+               for b in (parts.get(key) or [])] + list(span)
+    out = _merge_band_fragments(raw)
+    out = _merge_fragile_blocks(out)
+    # ⚠ 先合并再编号 —— 合并会改变块数，编号必须最后给
+    for i, b in enumerate(out):
+        b["i"] = i
+    return out
+
+
 def _find_vertical_split(words, width, height):
     """找到双栏正文开始的 y（整宽标题区结束的位置）；找不到返回 0。
 
@@ -1159,7 +1602,8 @@ def _plain_text(page) -> str:
         return ""
 
 
-def _extract_page_text_raw(page, out_glyphs: Optional[list] = None) -> str:
+def _extract_page_text_raw(page, out_glyphs: Optional[list] = None,
+                           out_blocks: Optional[list] = None) -> str:
     # ⚠ 顺序有意义：先算 glyphs，再决定要不要跑 extract_text。
     #
     #   有未解出的数学符号时，下面的 _plain_lines_with_glyphs() 会重新切行、
@@ -1228,20 +1672,42 @@ def _extract_page_text_raw(page, out_glyphs: Optional[list] = None) -> str:
         #     取众数当栏缝。
         x_mid = _vote_column_gap(words, width, height, y_split)
         if x_mid is None:
+            # ⚠ **单栏论文**（抽不到栏缝）：双栏管线整个走不到。
+            #   段落块仍然要出 —— 整页作一栏切段落（col="S"）。
+            #   （实测 27 篇里有 4 篇是单栏，漏掉它们等于四成论文没有对照模式。）
+            #
+            # ⚠ 裁剪范围是**整页**（不是从 y_split 起）：
+            #   y_split 是「双栏正文起点」—— 在单栏页上它其实是个**图注下方**
+            #   的位置（实测 ACS 大图页：y_split=720.8，而图注在 640~700，
+            #   整段图注都在 y_split 之上）。从 y_split 起裁 → 图注整块丢失，
+            #   而页级文本（走 plain 分支）是**整页**的 → 两边对不上。
+            if out_blocks is not None:
+                parts = _new_block_parts()
+                lines = _crop_lines(page, (0, 0, width, height))
+                parts["span"].extend(_group_lines_into_blocks(lines, "S"))
+                out_blocks.extend(_flatten_block_parts(parts))
             return plain
     else:
         x_mid = (x_gap0 + x_gap1) / 2.0
 
     # 3) 按带分组切页 → 左栏正文 / 右栏正文 / 整宽块
+    parts = _new_block_parts() if out_blocks is not None else None
     left_parts, right_parts, span_units = _extract_by_bands(
-        page, words, width, height, y_split, x_mid, glyphs=glyphs)
+        page, words, width, height, y_split, x_mid, glyphs=glyphs,
+        out_parts=parts)
 
     # 3b) 双栏正文起点以上的区域也要分栏 —— 见 _extract_top_region 的说明。
     #     这一步是「先翻译右边的了」那个 bug 的真正修复点。
     front, top_left, top_right = _extract_top_region(
-        page, words, width, height, y_split, x_mid, glyphs=glyphs)
+        page, words, width, height, y_split, x_mid, glyphs=glyphs,
+        out_parts=parts)
     left_parts = top_left + left_parts
     right_parts = top_right + right_parts
+
+    if out_blocks is not None:
+        # 顺序必须跟 _join_reading_order 一致：
+        #   整宽顶部 → 顶部左栏 → 正文左栏 → 顶部右栏 → 正文右栏 → 跨栏块
+        out_blocks.extend(_flatten_block_parts(parts))
 
     if not left_parts and not right_parts and not span_units and not front:
         return plain
@@ -1273,7 +1739,8 @@ def _band_kind(bw, width: float, x_mid: float, x_bin: int) -> str:
 
 
 def _extract_top_region(page, words, width, height, y_split, x_mid,
-                          glyphs: Optional[list] = None):
+                          glyphs: Optional[list] = None,
+                          out_parts: Optional[dict] = None):
     """把「双栏正文起点以上」的区域按栏拆开。
 
     返回 (整宽块, 左栏段, 右栏段)。
@@ -1317,19 +1784,27 @@ def _extract_top_region(page, words, width, height, y_split, x_mid,
             kind = _band_kind(bw, width, x_mid, x_bin)
             try:
                 if kind == "split":
-                    lt = _lines_to_text(_crop_lines(page, (0, y, x_mid, y1)),
-                                        glyphs=glyphs)
-                    rt = _lines_to_text(_crop_lines(page, (x_mid, y, width, y1)),
-                                        glyphs=glyphs)
+                    lt_lines = _crop_lines(page, (0, y, x_mid, y1))
+                    rt_lines = _crop_lines(page, (x_mid, y, width, y1))
+                    lt = _lines_to_text(lt_lines, glyphs=glyphs)
+                    rt = _lines_to_text(rt_lines, glyphs=glyphs)
                     if lt.strip():
                         left_parts.append(lt.strip())
                     if rt.strip():
                         right_parts.append(rt.strip())
+                    if out_parts is not None:
+                        out_parts["topleft"].extend(
+                            _group_lines_into_blocks(lt_lines, "L"))
+                        out_parts["topright"].extend(
+                            _group_lines_into_blocks(rt_lines, "R"))
                 else:
-                    st = _lines_to_text(_crop_lines(page, (0, y, width, y1)),
-                                        glyphs=glyphs)
+                    span_lines = _crop_lines(page, (0, y, width, y1))
+                    st = _lines_to_text(span_lines, glyphs=glyphs)
                     if st.strip():
                         front.append(st.strip())
+                    if out_parts is not None:
+                        out_parts["front"].extend(
+                            _group_lines_into_blocks(span_lines, "S"))
             except Exception:
                 # 原来这里是 except: pass —— 一带抽取失败就静默跳过，
                 # 结果整页的图注/正文凭空消失（2026-10-25 实测 JACERS 第 4~6 页：
@@ -1518,7 +1993,8 @@ def _find_table_regions(bands, x_mid: float, max_gap: float = 16.0,
 
 
 def _extract_by_bands(page, words, width, height, y_split, x_mid,
-                       glyphs: Optional[list] = None):
+                       glyphs: Optional[list] = None,
+                       out_parts: Optional[dict] = None):
     """按水平带分组切页。
 
     返回 (正文左栏段, 正文右栏段, 整宽单元列表)。
@@ -1600,17 +2076,24 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid,
             if kind == "span":
                 # 跨栏块多半是表格：表格行也长得像公式碎片（"d 31(pC/N) 90 ..."），
                 # 但表格必须保持文本形态交给模型排版，所以这里不标公式。
-                st = _lines_to_text(
-                    _crop_lines(page, (0, gy0, width, gy1)), mark_formulas=False,
-                    glyphs=glyphs)
+                span_lines = _crop_lines(page, (0, gy0, width, gy1))
+                st = _lines_to_text(span_lines, mark_formulas=False, glyphs=glyphs)
                 if st.strip():
                     pending.append(st.strip())
+                if out_parts is not None:
+                    # 跨栏块 → 整宽段落（col="S"）
+                    out_parts["span"].extend(
+                        _group_lines_into_blocks(span_lines, "S"))
                 table_mode = True
                 continue
-            lt = _lines_to_text(_crop_lines(page, (0, gy0, x_mid, gy1)),
-                                glyphs=glyphs)
-            rt = _lines_to_text(_crop_lines(page, (x_mid, gy0, width, gy1)),
-                                glyphs=glyphs)
+            lt_lines = _crop_lines(page, (0, gy0, x_mid, gy1))
+            rt_lines = _crop_lines(page, (x_mid, gy0, width, gy1))
+            lt = _lines_to_text(lt_lines, glyphs=glyphs)
+            rt = _lines_to_text(rt_lines, glyphs=glyphs)
+            if out_parts is not None:
+                # ⚠ 左右栏**各自**成块 —— 双栏论文的译文要能回到原来的栏
+                out_parts["left"].extend(_group_lines_into_blocks(lt_lines, "L"))
+                out_parts["right"].extend(_group_lines_into_blocks(rt_lines, "R"))
             if pending:
                 # 跨栏块（表题之类）自己成一块，不把后面的正文拖进来 ——
                 # 正文必须留在它自己的栏位里（阅读顺序不能乱）。
@@ -1640,6 +2123,17 @@ def _extract_by_bands(page, words, width, height, y_split, x_mid,
         if not tw:
             continue
         units.append([_table_marker(tw, width, height)])
+        if out_parts is not None:
+            # 表格块：坐标跟 ⟦TABLE:…⟧ 标记一致（同一套 _table_marker 口径）
+            out_parts["span"].append({
+                "kind": "table",
+                "col": "S",
+                "bbox": [round(float(min(w["x0"] for w in tw)), 2),
+                         round(float(min(w["top"] for w in tw)), 2),
+                         round(float(max(w["x1"] for w in tw)), 2),
+                         round(float(max(w["bottom"] for w in tw)), 2)],
+                "text": "",
+            })
     return left_parts, right_parts, units
 
 

@@ -32,6 +32,8 @@ NODE_SUITES = [
     ("microbench/_test_tablet_hardening.js", "数据安全（种子不覆盖本地 / XSS / 嵌套公式）"),
     ("microbench/_test_tablet_pdf_ink.js",
      "PDF 缩放 + 手写层（放大能滚 / 触摸手势 / 笔迹存取 / 桌面端能看见）"),
+    ("microbench/_test_tablet_region_ask.js",
+     "圈选区域 → 问 AI（只发圈的那一块 / 浮条位置 / 带图不问无关正文）"),
 ]
 
 

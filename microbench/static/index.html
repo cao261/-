@@ -1239,6 +1239,62 @@
     .pdf-translation-block .page-text p:last-child { margin-bottom: 0; }
     .pdf-translation-loading { padding: var(--s-4); color: var(--fg-subtle); font-size: var(--t-sm); font-style: italic; }
 
+    /* ---------- 对照模式：译文按原文排版 ----------
+       用户诉求（2026-11-12）："像沉浸式翻译那样，译文和原文的排版一模一样，
+       原文是双栏，译文也是双栏"。
+
+       为什么是**重排**而不是把译文贴回 canvas 上：
+       PDF 页在阅读器里是「按栏宽自适应」渲染的（612pt 的页塞进 ~420px 宽的栏，
+       缩放倍率约 0.69）→ 原文正文只有 ~6px 高。译文贴回原位也是 6px，
+       **根本读不了**。所以对照模式改成「按原文的分栏重排」：
+       左栏段落进左栏、右栏段落进右栏，字号恢复正常。
+       代价：图片/图表不在文本层里 → 重排后看不到（切回「原文」视图即可）。
+    */
+    .bilingual-page {
+      box-sizing: border-box;
+      max-width: 1200px;
+      margin: 0 auto var(--s-4) auto;
+      padding: var(--s-5) var(--s-5) var(--s-4) var(--s-5);
+      background: var(--surface-raised);
+      border: 1px solid var(--line-hairline);
+      border-left: 2px solid var(--accent-2);
+      border-radius: var(--r-md);
+    }
+    .bilingual-span { margin: 0 0 var(--s-4) 0; }
+    .bilingual-cols { display: flex; align-items: flex-start; gap: var(--s-5); }
+    .bilingual-col { flex: 1 1 0; min-width: 0; }
+    .bilingual-col + .bilingual-col {
+      border-left: 1px solid var(--line-hairline);
+      padding-left: var(--s-5);
+    }
+    .bilingual-block { margin: 0 0 var(--s-4) 0; }
+    .bilingual-block:last-child { margin-bottom: 0; }
+    .bb-orig {
+      font-family: var(--font-sans);
+      font-size: 0.76rem;
+      line-height: 1.55;
+      color: var(--fg-subtle);
+      margin: 0 0 3px 0;
+    }
+    .bb-trans {
+      font-family: var(--font-cn);
+      font-size: 0.9375rem;
+      line-height: 1.78;
+      color: var(--fg-strong);
+    }
+    .bb-trans p { margin: 0 0 4px 0; text-indent: 0; }
+    .bilingual-block.kind-heading .bb-orig { font-weight: 600; color: var(--fg-muted); }
+    .bilingual-block.kind-heading .bb-trans { font-weight: 600; }
+    .bilingual-block.kind-formula { text-align: center; }
+    .bilingual-block.kind-formula .bb-orig { display: none; }
+    .bilingual-block.kind-table .bb-orig { display: none; }
+    .bilingual-note {
+      padding: var(--s-3) var(--s-4);
+      color: var(--fg-subtle);
+      font-size: var(--t-sm);
+      text-align: center;
+    }
+
     /* PDF.js text layer — must stay transparent so the canvas shows through. */
     .textLayer {
       position: absolute;
@@ -4174,6 +4230,8 @@
           readerMode: _readerMode || "section",
           pdfZoom: _pdfZoom || 1.0,
           zenPref: !!_zenPref,
+          // 对照模式（译文按原文排版）—— 记住偏好，下次打开 PDF 直接是对照视图
+          bilingual: !!_bilingualPref,
         };
         localStorage.setItem(LS_STATE_KEY, JSON.stringify(state));
       } catch (e) {}
@@ -4190,6 +4248,7 @@
         if (s.readerMode === "section" || s.readerMode === "pdf") _readerMode = s.readerMode;
         if (typeof s.pdfZoom === "number") _pdfZoom = s.pdfZoom;
         if (s.zenPref === true) _zenPref = true;
+        if (s.bilingual === true) _bilingualPref = true;
       } catch (e) {
         console.error("[restoreLocalState]", e);
       }
@@ -4374,6 +4433,8 @@
     // ---------------------------------------------------------------------------
     let _readerMode = "section"; // "section" | "pdf"
     let _pdfZoom = 1.0; // user-controlled PDF zoom multiplier (PDF dual-column view)
+    // 对照模式（译文按原文排版）的偏好开关 —— 跨会话记住
+    let _bilingualPref = false;
     let _pdfState = null; // { paperId, paperTitle, relativePath, pdfDoc, pages: [{num, canvas, text, translated}], rendering }
 
     function switchReaderMode(mode, opts = {}) {
@@ -4946,6 +5007,14 @@
                 translation: prev.translation,
                 translation_model: prev.translation_model || "",
                 translated_at: prev.translated_at || "",
+                // 对照模式的段落数据也要带着走 —— 否则缩放一次，
+                // 整篇的段落译文就得重翻一遍（钱和命都是）。
+                blocks: prev.blocks || null,
+                blocksVersion: prev.blocksVersion || 0,
+                blockTranslations: prev.blockTranslations || null,
+                blockTranslated: !!prev.blockTranslated,
+                snapshotBlocks: prev.snapshotBlocks || null,
+                snapshotBlocksVersion: prev.snapshotBlocksVersion,
               });
             }
           }
@@ -4956,6 +5025,8 @@
           relativePath: found.relative_path,
           pdfDoc,
           pages: [],
+          // 对照模式（译文按原文排版）—— 默认关，用户点工具栏的「对照」才开
+          bilingual: !!_bilingualPref,
           rendering: { cancelled: false, generation: myGen },
         };
         // 打开这篇论文的历史批注（高亮 + 我的笔记），下次进来直接可见
@@ -4985,6 +5056,12 @@
               pageData.translation = prev.translation;
               pageData.translation_model = prev.translation_model;
               pageData.translated_at = prev.translated_at;
+              pageData.blocks = prev.blocks;
+              pageData.blocksVersion = prev.blocksVersion;
+              pageData.blockTranslations = prev.blockTranslations;
+              pageData.blockTranslated = prev.blockTranslated;
+              pageData.snapshotBlocks = prev.snapshotBlocks;
+              pageData.snapshotBlocksVersion = prev.snapshotBlocksVersion;
             }
             _pdfState.pages.push(pageData);
           }
@@ -5155,6 +5232,13 @@
       for (const pg of pdfState.pages) {
         const snapPage = (snapshot.pages || []).find(s => s.page_num === pg.num);
         if (!snapPage) continue;
+        // 段落译文（对照模式）：先存着，等段落块抽出来再比对版本闸门
+        // （_applySnapshotBlocks）。版本对不上 = 段落切分算法变了 →
+        // 块编号已错位 → 旧译文一律丢弃，绝不贴到错的段落上。
+        if (snapPage.blocks && snapPage.blocks.length) {
+          pg.snapshotBlocks = snapPage.blocks;
+          pg.snapshotBlocksVersion = snapPage.blocks_version;
+        }
         const curHash = await _sha256Hex16(pg.text || "");
         const hashOk = (curHash === snapPage.text_hash);
         // Two-phase resolve for DOM elements: if getElementById misses (e.g.
@@ -5244,6 +5328,16 @@
         }
       }
       console.log(`[snapshot] ${matched} hydrated, ${stale} stale/fallback out of ${(snapshot.pages || []).length}`);
+      // 对照模式：快照里的段落译文现在才拿得到（上面刚存进 pg.snapshotBlocks），
+      // 而对照视图在 renderPdfPage 阶段就已经画过了（那时快照还没到）→
+      // 这里补一次：比对版本闸门 → 贴回译文 → 重画对照视图。
+      if (_pdfState && _pdfState.bilingual) {
+        for (const pg of pdfState.pages) {
+          if (!pg.snapshotBlocks) continue;
+          _applySnapshotBlocks(pg);
+          renderBilingualPage(pg.num);
+        }
+      }
       // Safety net: kick the queue once more 200ms after hydrate. If hydrate
       // marked translated=true on all pages, this is a no-op (find returns
       // undefined). If any page is still translated=false, it gets picked up.
@@ -5295,6 +5389,8 @@
         return null;
       }
       const translatable = _pdfState.pages.filter(p => p.translated && p.translation);
+      // 每页的段落译文**只算一次**（下面拼 payload 时要用两次：判空 + 取值）
+      translatable.forEach((pg) => { pg.__bilingualBlocks = _bilingualBlocksPayload(pg); });
       if (translatable.length === 0) {
         if (!silent) showToast("当前论文还没有翻译完成的页面,先翻几页再保存", true, 3800);
         return null;
@@ -5310,6 +5406,13 @@
         translation: pg.translation,
         model: pg.translation_model || "",
         translated_at: pg.translated_at || new Date().toISOString(),
+        // 段落级译文（对照模式）。
+        // ⚠ 它有**独立版本闸门**（blocks_version）—— 段落切分算法一改，
+        //   块编号就变了，旧译文贴上去就是错位 → 前端会比对版本，对不上就丢弃。
+        //   整页译文（translation）不受影响，两者的生命周期必须分开。
+        ...(pg.__bilingualBlocks
+            ? { blocks: pg.__bilingualBlocks, blocks_version: pg.blocksVersion || 0 }
+            : {}),
       })));
       // Pull current mtime so load-time check has something to compare
       let paperMtime = 0;
@@ -5343,6 +5446,32 @@
       } finally {
         if (btn && !silent) { btn.disabled = false; btn.innerText = origText; }
       }
+    }
+
+    /**
+     * 这一页的段落译文（存进快照用）。
+     * 没有就返回 null（调用方决定要不要带这个字段）。
+     *
+     * 只存 **i / kind / col / bbox / translation**：
+     * 原文（text）平板自己渲染 PDF 就有，存了只是让快照白白变大
+     * （快照有 5MB 上限）。
+     */
+    function _bilingualBlocksPayload(pg) {
+      if (!pg || !pg.blocks || !pg.blocks.length) return null;
+      const trans = pg.blockTranslations || {};
+      const out = [];
+      pg.blocks.forEach(b => {
+        const t = trans[b.i];
+        if (!t) return;
+        out.push({
+          i: b.i,
+          kind: b.kind || "body",
+          col: b.col || "S",
+          bbox: (b.bbox || []).slice(0, 4),
+          translation: t,
+        });
+      });
+      return out.length ? out : null;
     }
 
     async function listSnapshots() {
@@ -5687,7 +5816,12 @@
       // Bail if a newer paper started its own chain while we were waiting
       if (_pdfChainOwnerPaperId !== _pdfState.paperId) return;
 
-      const nextPage = _pdfState.pages.find(p => !p.translated && !p.translating);
+      // 对照模式 → 找「还没做**段落**翻译」的页；否则找「还没做整页翻译」的页。
+      // ⚠ 两个标志不能混用：段落翻译成功后也会把 translated 置 true
+      //   （快照要收它），所以对照模式下必须按 blockTranslated 找。
+      const nextPage = _pdfState.bilingual
+        ? _pdfState.pages.find(p => !p.blockTranslated && !p.translating)
+        : _pdfState.pages.find(p => !p.translated && !p.translating);
       if (!nextPage) return;
 
       // Ownership of `translating` flag lives in translatePdfPage (it sets
@@ -5695,7 +5829,11 @@
       // would race the dedupe check inside translatePdfPage and cause the
       // inner call to return immediately, freezing page 1 forever with
       // its initial "⏳ 正在翻译本页…" HTML never replaced.
-      await translatePdfPage(nextPage.num, nextPage.text, false);
+      if (_pdfState.bilingual) {
+        await translateBlocksForPage(nextPage.num, false);
+      } else {
+        await translatePdfPage(nextPage.num, nextPage.text, false);
+      }
 
       if (!_pdfState || _pdfState.rendering.cancelled || _pdfQueuePaused) return;
       // After awaiting, the user may have switched papers. Verify ownership
@@ -5753,6 +5891,15 @@
       canvasWrapper.appendChild(textLayerDiv);
 
       wrapper.appendChild(canvasWrapper);
+
+      // 对照模式（译文按原文排版）的容器。
+      // 默认藏起来；开了对照模式才显示（此时 canvasWrapper 也藏起来）。
+      const biHost = document.createElement("div");
+      biHost.className = "bilingual-page";
+      biHost.id = `bilingual-page-${pageNum}`;
+      biHost.style.display = "none";
+      wrapper.appendChild(biHost);
+
       listEl.appendChild(wrapper);
 
       const ctx = canvas.getContext("2d");
@@ -5784,6 +5931,13 @@
       // querySelectorAll 全部页块 × 每条批注，在 20 页的循环里被调 20 次
       // 就是 O(N²)。徽标统一在循环结束后刷一次。
       drawAnnoOverlays(pageNum, canvasWrapper);
+
+      // 对照模式开着 → 这一页也要画对照视图（段落块是异步抽的，不挡渲染）
+      if (_pdfState && _pdfState.bilingual) {
+        canvasWrapper.style.display = "none";
+        biHost.style.display = "";
+        ensurePageBlocks(pageNum).then(() => renderBilingualPage(pageNum));
+      }
 
       // Add placeholder translation block. A zoom re-render walks every
       // page again, so this append has to be idempotent: if a block for
@@ -6122,6 +6276,307 @@
       translatePdfPage(pageNum, null, true, true);
     }
     window.resetAndRetryPdfPage = resetAndRetryPdfPage;
+
+    // =====================================================================
+    // 对照模式：译文按原文排版（2026-11-12）
+    // =====================================================================
+    //
+    // 用户诉求原话：「就像那种翻译插件一样，他们和原文的排版是一模一样的，
+    // 就是没什么区别。原文是双栏，他们也是双栏。」
+    //
+    // 实现要点（改这块之前先读）：
+    //  1. **重排**而不是把译文贴回 canvas。
+    //     PDF 页是按栏宽自适应渲染的（612pt 的页塞进 ~420px 的栏 → 倍率 0.69）
+    //     → 原文正文只有 ~6px 高，贴回原位也读不了。
+    //     所以对照视图改成「按原文分栏重排」：左栏进左栏、右栏进右栏，
+    //     字号恢复正常（可读）。图片/图表不在文本层 → 重排后看不到，
+    //     切回「原文」视图即可。
+    //  2. 段落译文有**独立版本闸门**（服务端返回的 blocks_version）。
+    //     段落切分算法一改 → 块编号变了 → 旧译文贴上去就是错位 → 整份丢弃。
+    //     ⚠ **绝对不要动 paper_text.EXTRACTOR_VERSION** —— 动了用户全部整页
+    //     译文作废重翻，还会波及另一台设备。
+    //  3. 段落译文存进**快照**（pages[].blocks）→ 平板端能同步过去。
+    //     平板访问不到本地后端（没有 baseURL、CSP 与原生桥白名单都拦着），
+    //     快照是它唯一的通道。
+    // =====================================================================
+
+    /** 这一页的对照视图容器。 */
+    function _bilingualHost(pageNum) {
+      return document.getElementById(`bilingual-page-${pageNum}`);
+    }
+
+    /**
+     * 取这一页的段落块（几何：i/kind/col/bbox/text）。
+     * 没有就现抽 —— 服务端抽一页 64~332ms，丢在异步里不挡界面。
+     */
+    async function ensurePageBlocks(pageNum) {
+      if (!_pdfState || !_pdfState.pages) return null;
+      const pg = _pdfState.pages.find(p => p.num === pageNum);
+      if (!pg) return null;
+      if (pg.blocks) { _applySnapshotBlocks(pg); return pg.blocks; }
+      if (pg.blocksPromise) { await pg.blocksPromise; return pg.blocks || null; }
+      pg.blocksPromise = (async () => {
+        try {
+          const url = `/api/paper/page_blocks?relative_path=${encodeURIComponent(_pdfState.relativePath || "")}&page=${pageNum}`;
+          const data = await getJson(url);
+          pg.blocks = data.blocks || [];
+          pg.blocksVersion = data.blocks_version || 0;
+          // 快照里存着的段落译文，版本对得上才复用（对不上 = 段落切分变了）
+          _applySnapshotBlocks(pg);
+        } catch (e) {
+          console.warn(`[bilingual p${pageNum}] 段落块抽取失败`, e);
+          pg.blocks = [];
+        }
+      })();
+      await pg.blocksPromise;
+      pg.blocksPromise = null;
+      return pg.blocks;
+    }
+
+    /** 把快照里的段落译文贴回这一页（版本闸门在这里把关）。 */
+    function _applySnapshotBlocks(pg) {
+      if (!pg || !pg.snapshotBlocks) return;
+      if (pg.snapshotBlocksVersion !== pg.blocksVersion) return;   // 版本对不上 → 丢弃
+      // 块编号必须一致（段数变了说明切分算法变了，编号已经错位）
+      const snapIds = (pg.snapshotBlocks || []).map(b => b.i).join(",");
+      const curIds = (pg.blocks || []).map(b => b.i).join(",");
+      if (snapIds !== curIds) return;
+      const map = {};
+      (pg.snapshotBlocks || []).forEach(b => {
+        if (b.translation) map[b.i] = b.translation;
+      });
+      if (Object.keys(map).length) {
+        pg.blockTranslations = map;
+        pg.blockTranslated = true;
+      }
+    }
+
+    /** 把一段 Markdown 渲染进对照块（公式原图 / 表格 / KaTeX 都走现成那套）。 */
+    function _bilingualRenderInto(el, text, relativePath, pageNum) {
+      el.innerHTML = formatMarkdownLite(text || "");
+      renderFormulaImages(el, relativePath || "", pageNum);
+      if (typeof renderMathIn === "function") renderMathIn(el);
+    }
+
+    /**
+     * 画一页的对照视图。
+     * 结构：整宽块（标题/跨栏表） → [左栏 | 右栏] 两列 → 尾部整宽块。
+     */
+    function renderBilingualPage(pageNum) {
+      const host = _bilingualHost(pageNum);
+      if (!host || !_pdfState || !_pdfState.pages) return;
+      const pg = _pdfState.pages.find(p => p.num === pageNum);
+      const blocks = (pg && pg.blocks) || [];
+      const trans = (pg && pg.blockTranslations) || {};
+      const rel = (_pdfState && _pdfState.relativePath) || "";
+
+      if (!blocks.length) {
+        host.innerHTML = `<div class="bilingual-note">第 ${pageNum} 页没有可对照的段落（纯图片页？）</div>`;
+        host.style.display = _pdfState.bilingual ? "" : "none";
+        return;
+      }
+
+      // 按栏分桶。阅读顺序是「整宽顶部 → 左栏 → 右栏 → 跨栏」，
+      // 所以整宽块按它在序列里的位置拆成「顶部」和「尾部」两段。
+      const firstColIdx = blocks.findIndex(b => b.col === "L" || b.col === "R");
+      const top = [], left = [], right = [], tail = [];
+      blocks.forEach((b, idx) => {
+        if (b.col === "L") { left.push(b); return; }
+        if (b.col === "R") { right.push(b); return; }
+        if (firstColIdx >= 0 && idx < firstColIdx) top.push(b);
+        else tail.push(b);
+      });
+
+      const mkBlock = (b) => {
+        const d = document.createElement("div");
+        d.className = "bilingual-block kind-" + (b.kind || "body");
+        // 原文：公式块是乱序碎片、表格块没有原文 → 不显示
+        if (b.kind === "body" || b.kind === "heading") {
+          const orig = document.createElement("div");
+          orig.className = "bb-orig";
+          orig.textContent = (b.text || "").replace(/\s*\n\s*/g, " ");
+          d.appendChild(orig);
+        }
+        const tr = document.createElement("div");
+        tr.className = "bb-trans";
+        const t = trans[b.i];
+        if (t) {
+          _bilingualRenderInto(tr, t, rel, pageNum);
+        } else {
+          tr.innerHTML = `<span style="color:var(--fg-subtle);">（这一段还没翻）</span>`;
+        }
+        d.appendChild(tr);
+        return d;
+      };
+
+      host.innerHTML = "";
+      if (top.length) {
+        const span = document.createElement("div");
+        span.className = "bilingual-span";
+        top.forEach(b => span.appendChild(mkBlock(b)));
+        host.appendChild(span);
+      }
+      if (left.length || right.length) {
+        const cols = document.createElement("div");
+        cols.className = "bilingual-cols";
+        [["L", left], ["R", right]].forEach(([key, arr]) => {
+          if (!arr.length) return;
+          const col = document.createElement("div");
+          col.className = "bilingual-col";
+          col.dataset.col = key;
+          arr.forEach(b => col.appendChild(mkBlock(b)));
+          cols.appendChild(col);
+        });
+        host.appendChild(cols);
+      }
+      if (tail.length) {
+        const span = document.createElement("div");
+        span.className = "bilingual-span";
+        span.style.marginTop = "var(--s-4)";
+        tail.forEach(b => span.appendChild(mkBlock(b)));
+        host.appendChild(span);
+      }
+      host.style.display = _pdfState.bilingual ? "" : "none";
+    }
+
+    /** 对照模式的段落级翻译（一次 LLM 调用翻整页，按段号回填）。 */
+    async function translateBlocksForPage(pageNum, isPriority = false, force = false, model = null) {
+      if (!_pdfState || !_pdfState.pages) return;
+      const pg = _pdfState.pages.find(p => p.num === pageNum);
+      if (!pg) return;
+      if (pg.translating) return;
+      pg.translating = true;
+
+      const tagEl = document.getElementById(`pdf-page-tag-${pageNum}`);
+      const textEl = document.getElementById(`pdf-page-text-${pageNum}`);
+      if (tagEl) tagEl.textContent = isPriority ? "⚡ 对照翻译中..." : "⏳ 对照翻译中...";
+      if (textEl) textEl.innerHTML = `<span class="pdf-translation-loading">⏳ 正在按段落翻译第 ${pageNum} 页...</span>`;
+
+      const ac = new AbortController();
+      const acTimer = setTimeout(() => ac.abort(), 240000);
+      const t0 = performance.now();
+      try {
+        const r = await fetch("/api/paper/translate_blocks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            paper_id: _pdfState.paperId,
+            page: pageNum,
+            relative_path: (_pdfState && _pdfState.relativePath) || null,
+            force: !!force,
+            model: (model != null ? model : (_pdfTransModel || "")),
+          }),
+          signal: ac.signal,
+        });
+        clearTimeout(acTimer);
+        const data = await r.json();
+        _recordDiag({
+          ts: new Date().toISOString(),
+          page: pageNum,
+          url: "/api/paper/translate_blocks",
+          status: r.status,
+          ok: r.ok,
+          duration_ms: Math.round(performance.now() - t0),
+          model: data?.model || "",
+          chars_in: 0,
+          chars_out: (data?.translation || "").length,
+          error: null,
+        });
+        if (!r.ok) {
+          let detail = data.detail;
+          if (Array.isArray(detail)) {
+            detail = detail.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          } else if (typeof detail !== 'string') {
+            detail = JSON.stringify(detail);
+          }
+          throw new Error(detail || `HTTP ${r.status}`);
+        }
+
+        // 回填：几何 + 每段译文
+        const map = {};
+        (data.blocks || []).forEach(b => {
+          if (b.translation) map[b.i] = b.translation;
+        });
+        pg.blocks = data.blocks || pg.blocks;
+        pg.blocksVersion = data.blocks_version || 0;
+        pg.blockTranslations = map;
+        pg.blockTranslated = true;
+        pg.translated = true;
+        pg.translating = false;
+        pg.failed = false;
+        pg.translation = data.translation || "";
+        pg.translation_model = data.model || "";
+        pg.translated_at = new Date().toISOString();
+
+        // 右栏面板照旧显示整页译文（服务端把段落译文拼好了一起给）
+        if (textEl && pg.translation) {
+          textEl.className = "page-text";
+          textEl.innerHTML = formatMarkdownLite(pg.translation);
+          renderFormulaImages(textEl, (_pdfState && _pdfState.relativePath) || "", pageNum);
+          applyAnnotationsToPage(pageNum, textEl);
+          if (typeof renderMathIn === "function") renderMathIn(textEl);
+        }
+        const modelTag = data.model ? ` · ${data.model}` : "";
+        if (tagEl) {
+          tagEl.textContent = data.partial
+            ? `⚠️ 对照翻译不完整${modelTag}`
+            : `✅ 已对照翻译${modelTag}`;
+        }
+        renderBilingualPage(pageNum);
+        _scheduleAutoSnapshot();
+        fetchModelStatus();
+      } catch (err) {
+        clearTimeout(acTimer);
+        const isAbort = err && (err.name === "AbortError" || /aborted/i.test(err.message || ""));
+        const detail = isAbort ? "请求超时 (>240s)" : (err?.message || "未知错误");
+        console.error(`[translateBlocksForPage#${pageNum}]`, err);
+        if (tagEl) tagEl.textContent = isAbort ? "⏳ 超时" : "❌ 对照翻译失败";
+        if (textEl) {
+          textEl.innerHTML = `<span style="color:#B25336;">❌ 对照翻译失败: ${escapeHtml(detail)}</span>`;
+        }
+        pg.translating = false;
+        pg.failed = true;
+        // 标记成"已处理"，免得队列每 3.2 秒又来翻一次
+        pg.blockTranslated = true;
+      }
+    }
+
+    /** 开关对照模式。 */
+    async function toggleBilingualMode() {
+      if (!_pdfState) return;
+      _pdfState.bilingual = !_pdfState.bilingual;
+      _bilingualPref = !!_pdfState.bilingual;
+      const btn = document.getElementById("pdf-bilingual-toggle");
+      if (btn) {
+        btn.classList.toggle("active", !!_pdfState.bilingual);
+        btn.textContent = _pdfState.bilingual ? "🔀 对照中" : "🔀 对照";
+      }
+      _persistLocalState();
+      const pages = _pdfState.pages || [];
+      if (_pdfState.bilingual) {
+        for (const pg of pages) {
+          await ensurePageBlocks(pg.num);
+          renderBilingualPage(pg.num);
+        }
+        _showBilingualVisibility(true);
+        // 没做段落翻译的页 → 交给队列按段落翻
+        processNextInPdfQueue();
+        showToast("🔀 对照模式：译文按原文分栏排版（左栏回左栏、右栏回右栏）", false, 4200);
+      } else {
+        _showBilingualVisibility(false);
+      }
+    }
+    window.toggleBilingualMode = toggleBilingualMode;
+
+    /** 切换「原文画布 / 对照重排」两者的显隐。 */
+    function _showBilingualVisibility(on) {
+      document.querySelectorAll(".pdf-page-canvas-wrapper").forEach(w => {
+        w.style.display = on ? "none" : "";
+      });
+      document.querySelectorAll(".bilingual-page").forEach(el => {
+        el.style.display = on ? "" : "none";
+      });
+    }
 
 
     let _readerState = {
@@ -8116,6 +8571,13 @@
       const textEl = document.getElementById(`pdf-page-text-${pageNum}`);
       if (tagEl) tagEl.textContent = "🔄 重译中…";
       if (textEl) textEl.className = "page-text pdf-translation-loading";
+      // 对照模式开着 → 重译走**段落**那条路（否则对照视图和右栏会各说各话）
+      if (_pdfState && _pdfState.bilingual) {
+        const pg = _pdfState.pages.find(p => p.num === pageNum);
+        if (pg) { pg.blockTranslated = false; pg.translating = false; }
+        await translateBlocksForPage(pageNum, true, true, _pdfTransModel);
+        return;
+      }
       await translatePdfPage(pageNum, null, true, true, _pdfTransModel);
     }
 
@@ -9731,6 +10193,10 @@
             <span id="pdf-zoom-label" class="seg-value">100%</span>
             <button class="btn-zoom-toggle" onclick="setReaderZoom(1)" title="放大 10%">+</button>
             <button class="btn-zoom-toggle" onclick="setReaderZoom('fit')" title="恢复 100%">适配</button>
+            <span class="seg-divider"></span>
+            <button class="btn-zoom-toggle" id="pdf-bilingual-toggle"
+                    onclick="toggleBilingualMode()"
+                    title="对照模式：译文按原文排版（左栏回左栏、右栏回右栏，段落对段落）">🔀 对照</button>
             <span class="seg-divider"></span>
             <button class="btn-zoom-toggle" id="pdf-queue-pause-btn"
                     onclick="togglePdfQueuePause()" title="暂停 / 继续自动排队翻译">⏸ 暂停排队</button>
