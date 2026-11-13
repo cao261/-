@@ -316,6 +316,115 @@ bbox（PDF 点，相对 CropBox 左上角）→ 用户空间：
 解析后再把模型输出里的**单个换行转成空格**（`_flatten_inline_newlines`，
 双换行保留）—— 两处缺一不可，否则译文里下标会被拆成单独一行。
 
+### 3.13 遗留三项的处理（2026-11-13）
+
+| 遗留 | 结论 | 做法 |
+|---|---|---|
+| ① 纯图页底部两栏被并成宽块 | **当前语料库里已不复现**（ACS 大图页的 L/R 分栏是对的）；根因路径仍在，留了**块层兜底**（加固后**全库 429 页一次都不触发**） | 见 §3.13.1 |
+| ② 对照视图里看不到图片/图表 | **已修**（两端都有「🖼 原页图」开关） | 见 §3.13.2 |
+| ③ 表格脚注原文乱码 | **已修**（不是上游问题，是「PDF 里没有空格字符」） | 见 §3.13.3 |
+
+**本轮验收数字**（2026-11-13 实测）：
+
+| 项 | 结果 |
+|---|---|
+| 页级文本 A/B（红线） | **一致 77 / 不一致 0** → `EXTRACTOR_VERSION` 保持 **5**，用户译文一句都不作废 |
+| 段落块 A/B（全库） | 一致 **416** 页 / 变了 **13** 页 —— **13 页块数全部不变**，只变可读性（空格修复） |
+| 空格修复不变式（全库） | 修复 **22** 行 / **字符被改动 0** 行 |
+| 全量 pytest | **806 passed / 1 skipped / 12 deselected** |
+| 五套渲染护栏 | 25 / 18 / 6 / 8 / 36 —— **全 PASS** |
+| 交付验收 | `_verify_delivery.py` 全部通过；APK 签名证书指纹**未变**（可直接覆盖安装） |
+
+#### 3.13.1 单栏页底部两栏的块层兜底（`_find_bottom_column_split`）
+
+大图页的两栏正文条太短 → 逐带投票（`_vote_column_gap` 要求 ≥3 票）探不到 →
+整页被判成单栏 → 底部两栏被并成一个宽块。
+兜底：单栏分支里**只针对块层**再找一次底部栏缝，认出来就把那一段拆成 L/R。
+
+⚠⚠ **护栏比判据更重要**：「底部中间有条缝」**不等于**「底部是两栏正文」——
+单栏论文底部一张**宽表格**也有缝（那是表格的列分隔线）。
+第一版按「有缝 + 词够多」去拆 → **3 页被误伤**（表格行被劈成两半）；
+第二版加了「够词的每一带都像正文」（`_looks_like_body_text`）→
+仍然误伤这 3 页，因为**「词数不够的带不参与否决」这条逃生口让所有带都逃过了否决**
+（实测三页的带全是「4~7 / 7~20」这种左右极不均衡的分布）。
+
+→ **最终版三道硬约束**（缺一不可）：
+
+| # | 约束 | 挡的是谁 | 实测 |
+|---|---|---|---|
+| ① | 投票的带必须**左右各 ≥8 个词**（`_band_words_both_sides`） | 宽表格的行（词摊在整页上，某一头只有几个词） | 三页全部被挡 |
+| ② | 栏缝必须**跨 ≥3 个带** | 宽表格每行「最宽空隙」位置随机，最多偶然撞 2 次 | 三页的最高票都只有 2 |
+| ③ | 分栏起点以下、**够词的每一带都必须像正文** | 表格行（词短、数字多、没有英文单词） | 兜底 |
+
+护栏：`tests/test_block_layer_fixes.py` 里用**三个真实样本页**
+（`Review of Magnetoelectric Sensors` 第 11 页 /
+`Magnetoelectric Magnetic Field Sensors A Review` 第 16 页 /
+`Current Status of Magnetoelectric Composite Thin Thick Films` 第 6 页）
+做回归 —— 这三页曾被误伤过，以后再改判定逻辑会立刻红。
+
+⚠ 只动块层：页级文本走 plain 分支（整页）→ 一个字都不动 → `EXTRACTOR_VERSION` 不动。
+
+#### 3.13.2 「🖼 原页图」开关（对照模式里同时显示原页）
+
+图片/图表**不在 PDF 文本层里** → 译文重排后页面上只剩文字。
+**不要**想着把图抽出来插进译文栏（矢量图抽不准，且与「重排」的前提冲突）。
+
+正解：**原页 canvas 不藏了**。
+桌面端 `microbench/static/index.html`：工具栏加「🖼 原页图」→
+`_showBilingualVisibility` 在 `bilingualOrig` 打开时不再藏 canvas，
+页卡加 `.bilingual-orig` → 宽屏 grid 两栏（左原页图 / 右对照译文）、窄屏上下堆叠。
+平板端 `microbench/static/tablet/app.js` + `styles.css`：
+页卡加 `.show-orig` → `.lay-bilingual.show-orig .tb-pdf-orig{display:block}`。
+零额外请求（canvas 本来就渲染好了）。
+
+护栏：桌面 `_test_desktop_bilingual_render.py`（25 条，量真实坐标：
+原页图 left=233 / 译文 left=767，横向不重叠）、
+平板 `_test_tablet_bilingual_render.py`（18 条，量 `getComputedStyle(display)`）。
+
+#### 3.13.3 表格脚注的「粘行」：PDF 里没有空格字符
+
+实测 JACERS 综述第 2 页的表格脚注原文是
+`Whered 31andd 33arepiezoelectricconstants;e,dielectricconstant;…`。
+
+**根因不是「上游 PDF 有问题」**：那行字符是**逐个精确摆放**的
+（字母之间间隙 = 0），只有词与词之间有 1.33~1.48pt 的间隙；
+pdfplumber 用**固定** `x_tolerance=1.5` 切词 → 词边界被判成「字母间距」→ 粘住。
+
+修法（**只在块层**）：`_crop_lines` 改成 `return_chars=True` 拿原始字符，
+`_heal_line_spaces` 按位置间隙重新切词；阈值**自适应**（把这一行所有正的间隙
+当候选，每个都切一遍，用「切出来的常见英文词有多少」打分，取分最高的）。
+
+修完：`Where d 31 and d 33 are piezoelectric constants; e, dielectric constant; …`
+
+⚠ 页级文本走 `_lines_to_text`（用 `line["text"]`）→ **一个字都不变**。
+
+##### 3.13.3.1 ⚠ 连字（U+FB01 `ﬁ`）会让空格修复「凭空多出一个 fi」
+
+第一版修完，实测又抓到 4 行坏词：
+`coefficients` → `coeffificients`、`Influence` → `Inflluence`、
+`films` → `fifilms`、`electric-field` → `electric-fifield-`。
+
+**根因**：`pdfplumber` 的 `extract_text_lines(return_chars=True)` 在展开连字
+（U+FB01 `ﬁ` → "fi"）时，会把连字字符在 `chars` 里**重复登记一次**
+（x0/x1 **完全相同**），而 `line["text"]` 只有一份。
+实测 `Magnetoelectric Composites` 第 9 页：`page.chars` 里 'ﬁ' 有 **113** 个，
+`line['chars']` 里变成 **132** 个 → 拿这份 chars 重新切词，每个连字都变成 "fi"+"fi"。
+
+→ 两道修法：
+1. 切词前**去重**（`_dedupe_chars`）：`x0 + x1 + 字符内容` 三者全同 → 同一个字形登记了两次。
+2. **硬不变式**（`_no_ws` 比对）：修复结果去掉所有空白后，必须与原行去掉所有空白后
+   **逐字相同**；对不上就**整行弃修**。
+   → 这一条把「字符丢失/多出」全部挡在外面，以后阈值算法怎么改都不会越界。
+
+护栏：`microbench/_check_heal_invariant.py`（全库扫，输出「修复了 N 行 / 字符被改动 M 行」）
++ `tests/test_block_layer_fixes.py`（合成样本 + 真实样本）。
+**当前实测：全库 22 行被修复，字符被改动 0 行。**
+
+> ⚠ 顺带记一条**假阴性**踩坑：不变式脚本第一版写成
+> 「`with pdfplumber.open(...)` 外面遍历 `doc.pages`」→ 文档一关，page 对象失效，
+> `page.crop()` 抛异常被 `except` 吞掉 → 脚本报「修复了 0 行」，实际明明修了 18 行。
+> **凡是把 `except Exception: continue` 写在循环里，都要同时打印一个「跳过了几页」计数**。
+
 ---
 
 ## 4. 平板端要"跟电脑端对等"这件事的现状
@@ -355,6 +464,17 @@ python microbench/_test_tablet_formula_shot.py
 # ⚠ 改抽取层后**必须**跑这个：拿 git HEAD 的旧版模块做 A/B，
 #   逐字比对页级文本 —— 不一致就别想动 EXTRACTOR_VERSION
 python microbench/_check_text_unchanged.py
+
+# ⚠ 改了**块层**还要跑这个：逐页比对段落块（col/kind/bbox/text），
+#   确认「只影响该影响的页」
+python microbench/_check_blocks_diff.py
+
+# ⚠ 改了空格修复还要跑这个：验证「只加空格、不改字符」的不变式
+#   （输出「修复了 N 行 / 字符被改动 M 行」，M 必须恒为 0）
+python microbench/_check_heal_invariant.py
+
+# 看修复前后长什么样（生成取证图 logs/blockdiag/heal-evidence.png）
+python microbench/_shot_heal_evidence.py
 
 # 全量（⚠ 必须带 -m "not slow"，不带会卡在 arxiv 网络测试上）
 python -m pytest tests -q -m "not slow"
@@ -411,6 +531,13 @@ python microbench/_verify_delivery.py
 | 22 | 标题续行只卡「长度 ≤ 70 字符」 | 正文**第一行**（60 字符）被当标题折行吞进去 → 标题译文后面粘着一句正文。续行还要卡**词数**（≤ 6） |
 | 23 | 抽真代码时丢掉 `async` 前缀 | 非 async 函数里 `await` = SyntaxError → 整页脚本不执行，浏览器里啥也不发生（像"卡住"，实则连报错都没有） |
 | 24 | 抽真代码时漏抽依赖的常量/辅助函数 | `ReferenceError` → 平板 `renderMarkdown` 走 `<pre>` 兜底 → 表格不渲染、行内公式显示成 `$...$` 源码（看着像功能没做） |
+| 25 | 用「底部中间有条缝」判断「底部是两栏正文」 | 单栏论文底部的**宽表格**也有缝（那是列分隔线）→ 表格行被从中间劈开 → 原文与译文全错位（实测 3 页被误伤）。必须再加**三道**约束：投票的带左右各 ≥8 词 / 栏缝跨 ≥3 个带 / 够词的每一带都「像正文」 |
+| 26 | 用固定 `x_tolerance` 切词 | PDF 的文本层可能**根本没有空格字符**（字符逐个精确摆放，词边界只靠位置间隙）→ 词粘成一坨。空格宽度随字号变（7pt≈1.4pt、10pt≈2pt）→ 固定容差必然一边切错、另一边粘住 |
+| 27 | 只按 x 间隙自己切词 | 会漏掉「基线/字号变了就断开」这条规则（上下标 `d31` 该拆成 `d 31`）。要**复用 pdfplumber 自己的切词器**（`pdfplumber.utils.extract_words`） |
+| 28 | 想把图片/图表从 PDF 抽出来插进译文栏 | 矢量图根本没有位图可抽，且与「重排」的前提冲突。正解：**原页 canvas 不藏了** → 宽屏左原页图右对照译文、窄屏上下堆叠（零额外请求） |
+| 29 | 拿 `chars` 重切词前**不检查它和原文是否一致** | pdfplumber 展开连字（U+FB01 `ﬁ`）时会把连字字符在 `chars` 里**重复登记一次**（x0/x1 相同，`line["text"]` 只有一份）→ 切出 `coeffificients` / `fifilms` 这种**凭空多一个 fi** 的坏词。→ 切词前按「x0+x1+字符」去重，并加**硬不变式**：结果去空白后必须与原文逐字相同，否则整行弃修 |
+| 30 | 护栏里写「词数不够就不否决」这种**逃生口** | 当**所有**候选都从这个口溜过去时，护栏等于没写（实测 3 页照样被误伤）。→ 护栏必须用**真实误伤样本**做回归，不能只写合成样本 |
+| 31 | 在 `with pdfplumber.open(...)` **外面**遍历 `doc.pages` | 文档一关 page 对象就失效，`page.crop()` 抛异常被 `except` 吞掉 → 脚本报「修复了 0 行」，实际明明修了 18 行（**假阴性**）。→ `except Exception: continue` 旁边必须打印「跳过了几页」 |
 
 ---
 
@@ -420,9 +547,11 @@ python microbench/_verify_delivery.py
    消掉 `extract_page_blocks` 的二次解析（现在单页 64~332ms）。
    ⚠ 只动 `EXTRACT_IMPL_REV`（只作废磁盘缓存 ≈72s），**译文不丢**；
    **不要**动 `EXTRACTOR_VERSION`（那会让用户全部译文作废重翻）。
-2. **修 §3.3 末尾那条已知局限**：纯图页（ACS 大图页）底部的左右两栏会被并成
-   一个宽块 → 译文位置会横跨两栏。
-   ⚠ 只能在**块层**修（动它会改页级文本 → 要动 `EXTRACTOR_VERSION`）。
-3. **对照视图里看不到图片/图表**（§3.8）：如果用户强烈要求，
-   可以给对照视图加一个「原页图」开关（原图 + 双语重排上下叠）。
+2. ~~**修 §3.3 末尾那条已知局限**：纯图页（ACS 大图页）底部的左右两栏会被并成
+   一个宽块~~ → **2026-11-13 已做**（§3.13.1）：块层加了 `_find_bottom_column_split`
+   兜底，并加固到**全库 429 页一次都不触发**（既不误伤、也不误修）。
+   ⚠ 想收紧或放宽这条判定，先看 §3.13.1 的三道约束表 + `tests/test_block_layer_fixes.py`
+   里那**三个真实误伤样本**。
+3. ~~**对照视图里看不到图片/图表**~~ → **2026-11-13 已做**（§3.13.2）：
+   两端都加了「🖼 原页图」开关（宽屏左原页图右对照译文、窄屏上下堆叠）。
 4. 两台设备**各自**做前端（桌面的改动不过去平板），各自测。

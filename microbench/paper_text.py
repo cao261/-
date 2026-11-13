@@ -889,7 +889,7 @@ def _crop_lines(page, bbox, margin: float = 16.0) -> list[dict]:
         return []
     try:
         raw = cropped.extract_text_lines(
-            x_tolerance=PDF_X_TOLERANCE, return_chars=False)
+            x_tolerance=PDF_X_TOLERANCE, return_chars=True)
     except Exception:
         raw = []
     out: list[dict] = []
@@ -913,6 +913,12 @@ def _crop_lines(page, bbox, margin: float = 16.0) -> list[dict]:
             "x1": lx1,
             "top": top,
             "bottom": bottom,
+            # ⚠ 带上**原始字符**（2026-11-13）：
+            #   有些 PDF 的文本层根本没有空格字符 —— 词边界只靠位置间隙
+            #   （实测 JACERS 综述的表格脚注）。有了 chars 就能在**块层**
+            #   按间隙把词重新切开（见 _heal_line_spaces），
+            #   而页级文本一行都不变（它用的是 line["text"]）。
+            "chars": ln.get("chars") or [],
         })
     return out
 
@@ -1318,6 +1324,191 @@ def _column_left_margin(lines: list[dict]) -> float:
     return xs[len(xs) // 2]
 
 
+# 常见英文词（小表）—— 用来判断「按间隙重切出来的词」像不像真英文。
+# ⚠ 不是词典，只是个快速判据：重切后如果一个常见词都没有，
+#   说明多半把**字母间距**当成了词间距（切碎了）→ 宁可不修。
+_COMMON_EN = frozenset("""
+a an the and or but of to in for with on at by from as is are was were be
+been being it its this that these those there here not no if do does did
+can could may might must shall should will would has have had also which
+who whom whose when where why how all any each both more most other some
+such only own same so too very one two via per etc vs we our they them
+their he she they i you he me my mine ours yours theirs
+we show shown thus hence therefore however moreover furthermore whereas
+""".split())
+
+
+def _dedupe_chars(chars: list) -> list:
+    """去掉**同坐标同字符**的重复字形。
+
+    为什么必须去（2026-11-13 实测）：
+      pdfplumber 的 `extract_text_lines(return_chars=True)` 在展开连字
+      （U+FB01 ﬁ → "fi"）时，会把连字字符在 `chars` 里**重复登记一次**
+      —— 实测 Magnetoelectric Composites 第 9 页：
+        page.chars 里 'ﬁ' 有 113 个，line['chars'] 里变成 132 个，
+        重复项的 x0/x1 与原项**完全相同**。
+      而 `line['text']` 只有一份 → 于是拿这份 chars 重新切词，
+      就会切出 "coeffificients" / "Inflluence" / "fifilms" 这种
+      **多出一个 fi** 的坏词。
+
+      错词比不修危险得多（模型会照着坏词翻译）→ 切词前先去重。
+
+    判据：x0 + x1 + 字符内容三者全同 → 同一个字形被登记了两次。
+      真正重复绘制的粗体字（同一坐标画两遍）也会被去掉，
+      但那种情况 `line['text']` 里同样有两份 → 后面的一致性校验
+      会发现对不上 → 整行弃修（安全的失败）。
+    """
+    out: list = []
+    seen: set = set()
+    for c in chars:
+        t = c.get("text") or ""
+        if not t:
+            continue
+        try:
+            key = (round(float(c.get("x0") or 0.0), 2),
+                   round(float(c.get("x1") or 0.0), 2), t)
+        except (TypeError, ValueError):
+            key = None
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(c)
+    return out
+
+
+def _split_chars_into_words(chars: list, tol: float) -> list[str]:
+    """按给定容差把字符切成词（复用 pdfplumber 自己的切词器）。
+
+    为什么不用自己算间隙：pdfplumber 的切词**不只看 x 间隙**，
+    还会在**基线/字号变了**的地方断开（上下标、下标数字）——
+    自己写会漏掉这些（实测脚注里 "d31" 应该拆成 "d 31"）。
+    """
+    try:
+        from pdfplumber.utils import extract_words
+        words = extract_words(chars, x_tolerance=tol, y_tolerance=3,
+                              keep_blank_chars=False, use_text_flow=False)
+    except Exception:
+        return []
+    return [w.get("text") or "" for w in words if (w.get("text") or "").strip()]
+
+
+def _no_ws(s: str) -> str:
+    """去掉所有空白（做「只加空格」的一致性比对用）。"""
+    return re.sub(r"\s+", "", s or "")
+
+
+def _heal_line_spaces(line: dict) -> str:
+    """把「PDF 里没有空格字符」的行的词边界找回来。
+
+    背景（遗留项）：
+      有些 PDF 的文本层**根本没有空格字符** —— 词与词之间只靠位置间隙。
+      实测 JACERS 综述第 2 页的表格脚注：整行的字符是**逐个精确摆放**的
+      （字母之间间隙 = 0），只有词与词之间有 1.33~1.48pt 的间隙；
+      而 pdfplumber 用固定 x_tolerance=1.5 切词 → 那些 1.33~1.48 的
+      词边界被判成「字母间距」→ 整行粘成一坨：
+        "Whered 31andd 33arepiezoelectricconstants;e,dielectricconstant;..."
+      对照视图里这段原文根本没法读，模型也只好靠上下文猜。
+
+    阈值怎么定（**自适应**，不写死）：
+      空格宽度随字号变（7pt 的空格约 1.4pt、10pt 约 2pt），
+      写死一个容差必然一边切错、另一边粘住。
+      → 把这一行所有正的字符间隙当**候选阈值**，每个候选都切一遍，
+        用「切出来的常见英文词有多少」来打分（**词边界对的地方，
+        切出来的词才像英语**），取分最高的那个。
+
+    **什么时候才认这次重切**（全部要过，宁可不修也不能修坏）：
+      1. 原行里有 token 长 ≥ 14 个字符（说明确实粘住了）；
+      2. 重切后最长的 token 明显变短（且 ≤ 26）；
+      3. 重切后的 token 数比原来多 ≥ 2；
+      4. 重切后的平均 token 长度 ≥ 3（不是被切碎的字母）；
+      5. 重切后的文本里至少有 2 个常见英文词（像英文）；
+      6. **硬不变式**：重切结果去掉所有空白后，必须与原行去掉所有空白后
+         **逐字相同** —— 也就是「只加空格、不改字符」。
+         这一条把连字重复（"coeffificients"）、字符丢失/多出全部挡在外面。
+
+    ⚠ 只在**块层**用（见 `_group_lines_into_blocks`）→ 页级文本逐字不变
+      → EXTRACTOR_VERSION 不动、用户的整页译文不作废。
+    """
+    text = line.get("text") or ""
+    if len(text) < 16:
+        return text
+    chars = line.get("chars") or []
+    if len(chars) < 12:
+        return text
+    # 必须是「像英文」的行：ASCII 为主（中文行没有空格是正常的）
+    ascii_n = sum(1 for c in text if ord(c) < 128)
+    if ascii_n < len(text) * 0.9:
+        return text
+    orig_tokens = text.split()
+    orig_max = max((len(t) for t in orig_tokens), default=0)
+    if orig_max < 14:
+        return text
+    # 原文里已经有多少常见英文词（**基线**）。
+    # ⚠ 必须要求「重切后**比原来多**」—— 否则一行正常英文（只是碰巧有个
+    #   长技术词，比如 "magnetoencephalography"）也会被无意义地切开。
+    hits_orig = sum(1 for t in orig_tokens
+                    if t.strip(".,;:'()[]").lower() in _COMMON_EN)
+
+    cs_all = [c for c in chars if (c.get("text") or "")]
+    cs_all.sort(key=lambda c: float(c.get("x0") or 0.0))
+    if len(cs_all) < 12:
+        return text
+    # 两套候选字符集：先去重的（连字重复的正解），
+    # 实在对不上再退回未去重的（万一原文本里本来就有重复字形）。
+    cs_dedup = _dedupe_chars(cs_all)
+    char_sets = []
+    if cs_dedup and cs_dedup != cs_all:
+        char_sets.append(cs_dedup)
+    char_sets.append(cs_all)
+
+    text_ns = _no_ws(text)
+    best = None
+    for cs in char_sets:
+        sizes = sorted(float(c.get("size") or 0.0) for c in cs if c.get("size"))
+        if not sizes or sizes[len(sizes) // 2] <= 0:
+            continue
+        # 候选阈值 = 这一行所有正的字符间隙（取 0.9 倍，让候选间隙本身也能切开）
+        gaps = set()
+        for i in range(1, len(cs)):
+            try:
+                g = float(cs[i].get("x0") or 0.0) - float(cs[i - 1].get("x1") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if g > 0.05:
+                gaps.add(round(g, 3))
+        if not gaps:
+            continue
+        for g in sorted(gaps):
+            tol = max(0.35, g * 0.9)
+            words = _split_chars_into_words(cs, tol)
+            if not words:
+                continue
+            new_max = max(len(w) for w in words)
+            if new_max >= orig_max or new_max > 26:
+                continue
+            if len(words) < len(orig_tokens) + 2:
+                continue
+            if (sum(len(w) for w in words) / len(words)) < 3.0:
+                continue
+            hits = sum(1 for w in words
+                       if w.strip(".,;:'()[]").lower() in _COMMON_EN)
+            if hits < 2 or hits <= hits_orig:
+                continue
+            healed = " ".join(words)
+            # ⚠ 硬不变式：只加空格，不改字符。
+            #   任何对不上的切法（连字重复、字符丢失、多出字符）一律弃用。
+            if _no_ws(healed) != text_ns:
+                continue
+            # 打分：常见英文词越多越好；同分取**切得更少**的（更保守）
+            key = (hits, -len(words))
+            if best is None or key > best[0]:
+                best = (key, healed)
+    if best is None:
+        return text
+    return best[1]
+
+
 def _group_lines_into_blocks(lines: list[dict], col: str) -> list[dict]:
     """把若干文本行合并成**段落块**。
 
@@ -1375,7 +1566,7 @@ def _group_lines_into_blocks(lines: list[dict], col: str) -> list[dict]:
             #   "其中，a 为横向 ME 电压系数，v 为整体比\nE,31\nE 表示整个…"）。
             #   段落块本来就是**一个段落**，行折只是排版 → 合成一句才对。
             #   ⚠ 只影响段落块；页级文本走 _lines_to_text，不受影响。
-            "text": " ".join(ln["text"] for ln in seg),
+            "text": " ".join(_heal_line_spaces(ln) for ln in seg),
         })
 
     def _is_vertical(ln: dict) -> bool:
@@ -1602,6 +1793,128 @@ def _plain_text(page) -> str:
         return ""
 
 
+def _band_words_both_sides(bw, x_mid: float, need: int = 8) -> bool:
+    """这一带在缝 x_mid 的**左右两边**是否各有 ≥need 个词。
+
+    真两栏的一行：左右两栏都有不少词。
+    宽表格的一行：词是「摊」在整页上的（列很多、列间距窄），
+      某一头往往只有几个词 —— 这就是「表格的列分隔线」和
+      「页面栏缝」最实在的区别。
+    """
+    left_n = sum(1 for w in bw if w["x1"] <= x_mid)
+    right_n = sum(1 for w in bw if w["x0"] >= x_mid)
+    return left_n >= need and right_n >= need
+
+
+def _find_bottom_column_split(words, width, height):
+    """单栏页的**底部**是不是藏着一段两栏正文（大图页的典型形态）。
+
+    返回 (y_top, x_mid) 或 None。
+
+    为什么需要（遗留项，见 docs/HANDOFF_2026-11-12 §3.3）：
+      整页是一张大图、只有底部一条两栏文字时，那条栏缝**太短** ——
+      逐带投票（`_vote_column_gap`）要求 ≥3 个带投同一票、缝两边各 ≥8 个词，
+      底部那两三行根本凑不够 → 整页被判成单栏 →
+      底部两栏被并成**一个宽块** → 对照视图里译文位置横跨两栏。
+
+    ⚠⚠ **护栏比判据更重要**（2026-11-13 实测踩过两次）：
+      「底部中间有条缝」**不等于**「底部是两栏正文」——
+      单栏论文底部一张**宽表格**也有缝（那是表格的列分隔线）！
+      实测 3 页被误伤（Review of Magnetoelectric Sensors 第 11 页、
+      Magnetoelectric Magnetic Field Sensors A Review 第 16 页、
+      Current Status of Magnetoelectric Composite Thin Thick Films 第 6 页：
+      表格行被从中间劈成左右两半 → 原文与译文全错位）。
+
+      → **三道硬约束**（缺一不可）：
+        ① **投票的带必须两头都够词**（左、右各 ≥8 个词）：
+           真两栏的一行左右都有不少词；宽表格的行是「词摊在整页上」，
+           某一头往往只有几个词（实测三页的带全是 4~7 / 7~20 这种分布）。
+        ② **栏缝必须跨 ≥3 个带**才成立：
+           宽表格每一行「最宽空隙」的位置是随机的，最多偶然撞上 2 次；
+           真两栏正文区的栏缝是**对齐的**，会连着很多行都在同一个 x。
+        ③ **分栏起点以下、每一带够词的，都必须像正文**
+           （`_looks_like_body_text`）：表格行「词短、数字多、没有英文单词」
+           → 一票否决。
+           ⚠ 词数不够的带（末带往往只有半行）**不参与否决**，
+             否则一条正常两栏正文也会因为末带词少而被否掉。
+
+    判据：
+      - 只看**底部**（top ≥ height*0.45）；
+      - 竖排水印（又窄又高）先剔掉 —— 它会造出假缝；
+      - 逐带找缝，**≥3 个带**在同一个 x 附近都找到缝 → 认这是一条两栏正文带；
+      - 栏缝必须在页面中间（35%~65%）；
+      - 正文带内缝两边各 ≥ 8 个词。
+
+    ⚠ 只在**块层**用：页级文本走 plain 分支（整页），**一个字都不动**
+      → EXTRACTOR_VERSION 不需要动、用户的译文不会作废。
+    """
+    band_h = max(8.0, height / 40.0)
+    # 剔掉竖排水印：又窄又高的词（期刊页边的下载水印高 568pt）
+    clean = []
+    for w in words:
+        ww = w["x1"] - w["x0"]
+        hh = w["bottom"] - w["top"]
+        if ww < 30 and hh > 2 * max(1.0, ww):
+            continue
+        clean.append(w)
+    if len(clean) < 16:
+        return None
+
+    lo_y = height * 0.45
+    bands: list = []          # (y, 词, 该带自己找到的缝)
+    votes: dict[int, int] = {}
+    band_tops: dict[int, list] = {}
+    y = lo_y
+    while y < height:
+        bw = [w for w in clean if y <= w["top"] < y + band_h]
+        if bw:
+            mid = _band_column_gap(bw, width)
+            bands.append((y, bw, mid))
+            # ⚠ 约束①：投票的带必须**两头都够词**（左、右各 ≥8 个词）。
+            #   真两栏的一行左右都有不少词；
+            #   宽表格的行是「词摊在整页上」，某一头往往只有几个词
+            #   （实测三页误伤样本的带全是 4~7 / 7~20 这种分布）。
+            if mid is not None and _band_words_both_sides(bw, mid):
+                key = int(round(mid / width * _X_BINS))
+                votes[key] = votes.get(key, 0) + 1
+                band_tops.setdefault(key, []).append(y)
+        y += band_h
+    if not votes:
+        return None
+    key, cnt = max(votes.items(), key=lambda kv: kv[1])
+    # ⚠ 约束②：栏缝必须**跨 ≥3 个带**才成立。
+    #   宽表格每一行「最宽空隙」的位置是随机的，最多偶然撞上 2 次；
+    #   真两栏正文区的栏缝是**对齐的**，会连着很多行都落在同一个 x。
+    if cnt < 3:
+        return None
+    x_mid = width * key / _X_BINS
+    # ⚠ 栏缝必须在**页面中间**（±15%）—— 双栏论文的栏缝本来就在中间。
+    #   不加这条约束的话，单栏论文里一条居中的长标题/长图注也会被当成两栏
+    #   → 底部被错劈成左右两半（比不劈更糟）。
+    if not (width * 0.35 <= x_mid <= width * 0.65):
+        return None
+    y_top = min(band_tops[key])
+    # ⚠⚠ 约束③：**分栏起点以下、每一带够词的**，都必须像正文
+    #   —— 这是挡「表格列分隔线」的关键护栏。
+    #   表格行是「词短、数字多、没有像英文单词的东西」→ 判不是正文 → 不劈。
+    #   ⚠ 词数不够的带（末带往往只有半行）**不参与否决** ——
+    #     否则一条正常两栏正文也会因为末带词少而被否掉。
+    for by, bw, _mid in bands:
+        if by < y_top - 0.01:
+            continue
+        if not _band_words_both_sides(bw, x_mid):
+            continue          # 这一带词太少，判不了 → 不否决
+        if not _looks_like_body_text(bw, x_mid):
+            return None
+    # 词数要在**正文带内**数（不是整页）—— 页眉/水印的词不算
+    strip = [w for w in clean if w["top"] >= y_top - 1]
+    left_n = sum(1 for w in strip if w["x1"] <= x_mid + 1)
+    right_n = sum(1 for w in strip if w["x0"] >= x_mid - 1)
+    if left_n < 8 or right_n < 8:
+        return None
+    return y_top, x_mid
+
+
 def _extract_page_text_raw(page, out_glyphs: Optional[list] = None,
                            out_blocks: Optional[list] = None) -> str:
     # ⚠ 顺序有意义：先算 glyphs，再决定要不要跑 extract_text。
@@ -1683,8 +1996,24 @@ def _extract_page_text_raw(page, out_glyphs: Optional[list] = None,
             #   而页级文本（走 plain 分支）是**整页**的 → 两边对不上。
             if out_blocks is not None:
                 parts = _new_block_parts()
-                lines = _crop_lines(page, (0, 0, width, height))
-                parts["span"].extend(_group_lines_into_blocks(lines, "S"))
+                # ⚠ 单栏页也可能**底部**藏着一小段两栏正文（大图页）：
+                #   那条栏缝太短 → 整页投票探不到 → 整页当一栏 →
+                #   底部两栏被并成一个宽块 → 译文位置横跨两栏。
+                #   这里只在**块层**补救（页级文本走 plain，一字不动）。
+                split = _find_bottom_column_split(words, width, height)
+                if split:
+                    y_top, x_mid2 = split
+                    # 上半部分（图 + 整宽图注）→ 整宽块，放进 front 桶
+                    top_lines = _crop_lines(page, (0, 0, width, y_top))
+                    parts["front"].extend(_group_lines_into_blocks(top_lines, "S"))
+                    # 下半部分 → 左右两栏
+                    lt = _crop_lines(page, (0, y_top, x_mid2, height))
+                    rt = _crop_lines(page, (x_mid2, y_top, width, height))
+                    parts["left"].extend(_group_lines_into_blocks(lt, "L"))
+                    parts["right"].extend(_group_lines_into_blocks(rt, "R"))
+                else:
+                    lines = _crop_lines(page, (0, 0, width, height))
+                    parts["span"].extend(_group_lines_into_blocks(lines, "S"))
                 out_blocks.extend(_flatten_block_parts(parts))
             return plain
     else:

@@ -503,6 +503,17 @@ button { cursor:pointer; }
    窄屏（竖屏）排不下两栏 → 上下堆叠，但仍然保持左栏在前、右栏在后
    —— 阅读顺序与原文一致。 */
 .tb-pdf-page.lay-bilingual .tb-pdf-orig { display:none; }
+/* 「🖼 原页图」：对照模式里同时显示原页图（遗留项：对照视图里看不到图片/图表）。
+   图片/图表不在 PDF 文本层里 → 译文重排后只剩文字。
+   开着这个开关 → 原页 canvas 不再被藏：
+     宽屏（横屏）→ 左原页图、右对照译文（跟电脑端一致）；
+     窄屏（竖屏）→ 原页图在上、对照译文在下（默认的 column 布局）。 */
+.tb-pdf-page.lay-bilingual.show-orig .tb-pdf-orig { display:block; }
+@media (min-width: 900px) {
+  .tb-pdf-page.lay-bilingual.show-orig { flex-direction:row; align-items:flex-start; }
+  .tb-pdf-page.lay-bilingual.show-orig .tb-pdf-orig { border-right:1px solid #E6E1D8; }
+  .tb-pdf-page.lay-bilingual.show-orig .tb-pdf-trans { flex:0 0 auto; width:max-content; min-width:0; }
+}
 .tb-bilingual { flex:1 1 auto; min-width:0; }
 .tb-bilingual-body { font-size:14px; line-height:1.85; }
 .tb-bilingual-cols { display:flex; flex-direction:column; gap:14px; }

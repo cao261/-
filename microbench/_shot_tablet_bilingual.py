@@ -59,6 +59,24 @@ def find_browser() -> str | None:
     return shutil.which("msedge") or shutil.which("chrome")
 
 
+def _page_png_data_url(page: int) -> str:
+    """把论文某一页渲染成 PNG 的 data URL（给「原页图」那一栏用）。"""
+    try:
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        from microbench import paper_text as pt
+        pdf = REPO / ("01_Literature/04_Survey_综述/01_论文原文_PDF/"
+                      "2008-JACERS-综述-Magnetoelectric laminate composites "
+                      "An overview.pdf")
+        if not pdf.exists():
+            return ""
+        png = pt.render_page_png(pdf, page, zoom=1.05)
+        return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    except Exception as exc:
+        print("渲染原页图失败（跳过这一栏）: %s" % exc)
+        return ""
+
+
 PROBE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>tablet shot</title>
 <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
@@ -72,8 +90,8 @@ html,body{{margin:0;padding:0;background:#F2EEE7;}}
 </style></head>
 <body>
 <div id="host">
-  <div class="hdr">MicroBench 平板 · 对照模式（第 3 页）· 左栏译文回左栏、右栏回右栏</div>
-  <div class="tb-pdf-page lay-bilingual" id="page"></div>
+  <div class="hdr">MicroBench 平板 · 对照模式（第 3 页）· 左栏译文回左栏、右栏回右栏{orignote}</div>
+  {pagecard}
 </div>
 <script>
 function el(tag, cls, text){{
@@ -171,12 +189,31 @@ def main() -> int:
     ]
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
+    out_path = OUT
+    if "--orig" in sys.argv:
+        out_path = REPO / "logs" / "blockdiag" / "tablet-bilingual-orig-p3.png"
+
+    # ---- 「🖼 原页图」：把原页画在左边（真 app 里那是 PDF.js 的 canvas，
+    #      这里用服务端渲染的整页 PNG 占同一个位置，视觉等价）----
+    pagecard = '<div class="tb-pdf-page lay-bilingual" id="page"></div>'
+    orignote = ""
+    if "--orig" in sys.argv:
+        png_b64 = _page_png_data_url(3)
+        if png_b64:
+            pagecard = (
+                '<div class="tb-pdf-page lay-bilingual show-orig" id="page">'
+                '<div class="tb-pdf-orig" style="width:430px;height:566px;">'
+                '<img src="%s" style="width:430px;height:566px;display:block;">'
+                '</div></div>' % png_b64)
+            orignote = " · 🖼 同时显示原页图"
+
     # ⚠ 页面必须用 **http** 打开：KaTeX（CSS + JS + 字体）要从
     #   /static/vendor/katex 取，file:// 下取不到。
     #   → 探针页临时写进 static/vendor/（那里被挂在 /static/vendor 下）。
     probe = VENDOR / "_shot_tablet_bilingual.html"
     probe.write_text(
         PROBE.format(rules=rules, code=code,
+                     pagecard=pagecard, orignote=orignote,
                      blocks=json.dumps(blocks, ensure_ascii=False),
                      shot=shot),
         encoding="utf-8")
@@ -194,13 +231,13 @@ def main() -> int:
                 print("FAIL: 没生成截图")
                 print(p.stderr.decode("utf-8", "replace")[-800:])
                 return 1
-            shutil.copyfile(png, OUT)
+            shutil.copyfile(png, out_path)
     finally:
         try:
             probe.unlink()
         except OSError:
             pass
-    print(f"✓ {OUT}  ({OUT.stat().st_size // 1024} KB)")
+    print(f"✓ {out_path}  ({out_path.stat().st_size // 1024} KB)")
     return 0
 
 

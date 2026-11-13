@@ -33,6 +33,10 @@ TABLET_MARKS = [
     ("data-formula-key", "公式图占位坐标键"),
     (".tb-pdf-trans-body table", "译文栏的表格样式"),
     ("renderMath", "行内公式 KaTeX 渲染"),
+    # ---- 2026-11-13 这一轮：对照模式里同时显示原页图 ----
+    ("pdf-orig-toggle", "平板「原页图」按钮"),
+    ("show-orig", "平板原页图开关的 class"),
+    ("applyOrigVisibility", "平板原页图开关的函数"),
 ]
 
 DESKTOP_MARKS = [
@@ -41,6 +45,10 @@ DESKTOP_MARKS = [
     ("/api/paper/translate_blocks", "桌面端调段落翻译接口"),
     ("_bilingualBlocksPayload", "桌面端把段落译文存进快照"),
     ("blocks_version", "桌面端的段落译文版本闸门"),
+    # ---- 2026-11-13 这一轮：对照模式里同时显示原页图 ----
+    ("pdf-bilingual-orig-toggle", "桌面「原页图」按钮"),
+    ("toggleBilingualOrig", "桌面原页图开关函数"),
+    ("bilingual-orig", "桌面原页图并排布局的 class"),
 ]
 
 

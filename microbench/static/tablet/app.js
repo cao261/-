@@ -3051,6 +3051,10 @@
     pending: false,
     zoom: 1,               // 用户缩放倍数（1 = 适合宽度）
     layout: "both",         // both | orig | trans | bilingual（原文+译文 / 仅原文 / 仅译文 / 对照）
+    // 对照模式里**同时显示原页图**（遗留项：对照视图里看不到图片/图表）。
+    //   图片/图表不在 PDF 文本层里 → 译文重排后页面上只剩文字。
+    //   开着这个开关 → 原页 canvas 不再被藏起来（宽屏并排、窄屏上下堆叠）。
+    showOrig: false,
     trans: null,           // {pageNum: 译文}
     // 对照模式（译文按原文排版）的段落数据：{pageNum: {blocks:[…], version:N}}
     // ⚠ 平板**访问不到电脑端的后端**（没有 baseURL、CSP 与原生桥白名单都拦着）
@@ -3577,6 +3581,23 @@
     body.innerHTML = renderMarkdown(t);
     box.appendChild(body);
     wrap.appendChild(box);
+  }
+
+  /**
+   * 「🖼 原页图」：给页卡打/摘 `show-orig` 类。
+   *
+   * 为什么单独抽一个函数（而不是内联一行 classList）：
+   *   护栏要**抽真代码**去跑（AGENTS.md §4.76：抄一遍的护栏零保护力）。
+   *   页面渲染函数 `renderPdfPage` 依赖太多（PDF.js / 手写层 / 批注层…），
+   *   整段抽出来跑不起来 → 这个小函数刚好能被护栏单独验证。
+   *
+   * 效果：CSS 里 `.lay-bilingual .tb-pdf-orig{display:none}` 会被
+   *   `.lay-bilingual.show-orig .tb-pdf-orig{display:block}` 覆盖 →
+   *   对照模式下原页 canvas 重新可见（图片/图表看不到了的问题）。
+   */
+  function applyOrigVisibility(wrap, on) {
+    if (wrap && wrap.classList) wrap.classList.toggle("show-orig", !!on);
+    return wrap;
   }
 
   /**
@@ -4155,6 +4176,8 @@
 
     const wrap = el("div", "tb-pdf-page lay-" + (pdfState.layout || "both"));
     wrap.setAttribute("data-pdf-page", String(n));
+    // 「同时显示原页图」开着 → 页卡加 show-orig 类（CSS 据此不再藏原页 canvas）
+    applyOrigVisibility(wrap, pdfState.showOrig);
 
     // ---- 原文侧 ----
     const orig = el("div", "tb-pdf-orig");
@@ -4847,6 +4870,27 @@
         redrawPdf();
       };
       syncLabel();
+    }
+    // 「🖼 原页图」：对照模式里**同时显示原页图**
+    // （遗留项：对照视图里看不到图片/图表 —— 图片/图表不在 PDF 文本层里，
+    //   译文重排后页面上只剩文字。开着这个开关 → 原页 canvas 不藏。）
+    const origBtn = $("pdf-orig-toggle");
+    if (origBtn) {
+      const syncOrigLabel = () => {
+        origBtn.classList.toggle("is-active", !!pdfState.showOrig);
+        origBtn.textContent = pdfState.showOrig ? "🖼 原页图中" : "🖼 原页图";
+      };
+      origBtn.onclick = () => {
+        pdfState.showOrig = !pdfState.showOrig;
+        syncOrigLabel();
+        // ⚠ **不要** redrawPdf()：重画要把所有页的 canvas 重新渲染一遍，
+        //   慢且闪。这个开关只改一个 class —— 直接改已画好的页卡就行；
+        //   之后新画的页在 renderPdfPage 里带上这个 class（见 pdfState.showOrig）。
+        document.querySelectorAll(".tb-pdf-page").forEach((el) => {
+          applyOrigVisibility(el, pdfState.showOrig);
+        });
+      };
+      syncOrigLabel();
     }
     // 手写开关
     $("pdf-toggle-ink").onclick = () => { inkToggle(!inkState.on); };

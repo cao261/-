@@ -87,7 +87,10 @@ def extract_css(css: str) -> str:
     out = []
     for pat in CSS_RULES:
         out.extend(m.group(0) for m in re.finditer(pat, css))
-    media = re.findall(r"@media \(min-width:900px\)\s*\{(?:[^{}]|\{[^{}]*\})*\}", css)
+    # ⚠ @media 的写法在 styles.css 里有两种（`min-width:900px` / `min-width: 900px`）
+    #   —— 两种都要抽到，否则「宽屏并排」的规则整块丢掉。
+    media = re.findall(r"@media\s*\(min-width:\s*900px\)\s*\{(?:[^{}]|\{[^{}]*\})*\}",
+                        css)
     out.extend(media)
     return "\n".join(out)
 
@@ -170,6 +173,38 @@ check('对照模式下原文画布被藏起来（不然两套排版叠着）',
 check('译文不是空的', lBlocks[0] && (lBlocks[0].textContent||'').trim().length>3,
       lBlocks[0]?(lBlocks[0].textContent||'').trim().slice(0,30):'');
 
+// ---------- 「🖼 原页图」开关（遗留项：对照视图里看不到图片/图表）----------
+// 探针页要给一个**真的**原文层，否则 CSS 规则无从验证。
+var origLayer=document.createElement('div');
+origLayer.className='tb-pdf-orig';
+origLayer.style.width='360px';
+origLayer.style.height='480px';
+origLayer.innerHTML='<canvas width="360" height="480"></canvas>';
+var card=document.getElementById('page');
+card.insertBefore(origLayer, card.firstChild);
+
+// ① 不开「原页图」→ 原文层必须藏起来（对照组）
+applyOrigVisibility(card, false);
+var origDisplay=getComputedStyle(origLayer).display;
+check('不开原页图时，对照视图里的原文层是藏着的',
+      origDisplay==='none', 'display='+origDisplay);
+
+// ② 开「原页图」→ 原文层必须**可见**（图片/图表就看得见了）
+applyOrigVisibility(card, true);
+origDisplay=getComputedStyle(origLayer).display;
+check('开原页图时，对照视图里的原文层可见（图看得见了）',
+      origDisplay!=='none', 'display='+origDisplay);
+check('开原页图时页卡带上了 show-orig 类',
+      card.classList.contains('show-orig'), card.className);
+
+// ③ 再关掉 → 恢复藏起来（开关是双向的）
+applyOrigVisibility(card, false);
+check('再关掉原页图 → 原文层重新藏起来',
+      getComputedStyle(origLayer).display==='none',
+      'display='+getComputedStyle(origLayer).display);
+check('再关掉原页图 → show-orig 类被摘掉',
+      !card.classList.contains('show-orig'), card.className);
+
 // 没有段落数据时，要给出"去电脑端翻"的提示，而不是空白
 // ⚠ 探针里要**先清空**：真页面每次都是新建页卡（不会叠加），
 //   这里不清空的话，内容会留着上一轮的 → 断言会"蒙对"。
@@ -237,6 +272,7 @@ def main() -> int:
             extract_function(src, "formulaBlocksOf"),
             extract_function(src, "paintFormulaShots"),
             extract_function(src, "ensureFormulaShots"),
+            extract_function(src, "applyOrigVisibility"),
             extract_function(src, "renderBilingualInto"),
         ])
     except (KeyError, ValueError) as e:

@@ -57,6 +57,23 @@ def find_browser() -> str | None:
     return shutil.which("msedge") or shutil.which("chrome")
 
 
+def _page_png_data_url(rel: str, page: int) -> str:
+    """把论文某一页渲染成 PNG 的 data URL（给「原页图」那一栏用）。"""
+    try:
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        from microbench import paper_text as pt
+        pdf = REPO / rel
+        if not pdf.exists():
+            return ""
+        png = pt.render_page_png(pdf, page, zoom=1.15)
+        import base64
+        return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    except Exception as exc:
+        print("渲染原页图失败（跳过这一栏）: %s" % exc)
+        return ""
+
+
 def api(path: str, payload: dict | None = None) -> dict:
     url = BASE + path
     if payload is None:
@@ -88,8 +105,8 @@ html,body{{margin:0;padding:0;background:#F2EEE7;}}
 </style></head>
 <body>
 <div class="wrap">
-  <div class="hdr">MicroBench · 对照模式（第 {page} 页）· 左栏段落的译文回左栏、右栏回右栏</div>
-  <div class="bilingual-page" id="bilingual-page-{page}"></div>
+  <div class="hdr">MicroBench · 对照模式（第 {page} 页）· 左栏段落的译文回左栏、右栏回右栏{orignote}</div>
+  {body}
 </div>
 <script>
 function showToast(){{}} function _scheduleAutoSnapshot(){{}} function fetchModelStatus(){{}}
@@ -113,6 +130,8 @@ def main() -> int:
     ap.add_argument("--page", type=int, default=3)
     ap.add_argument("--paper-id", default="shot-jacers")
     ap.add_argument("--height", type=int, default=1600)
+    ap.add_argument("--orig", action="store_true",
+                    help="同时显示原页图（对照模式的「🖼 原页图」开关效果）")
     args = ap.parse_args()
 
     browser = find_browser()
@@ -147,6 +166,25 @@ def main() -> int:
     ]
     code = "\n\n".join(parts)
 
+    # ---- 「🖼 原页图」：把原页画在左边（真 app 里那是 PDF.js 的 canvas，
+    #      这里用服务端渲染的整页 PNG 占同一个位置，视觉等价）----
+    body = ('<div class="bilingual-page" id="bilingual-page-%d"></div>'
+            % args.page)
+    orignote = ""
+    if args.orig:
+        png_b64 = _page_png_data_url(args.pdf, args.page)
+        if png_b64:
+            body = (
+                '<div class="pdf-page-block bilingual-orig">'
+                '<div class="pdf-page-label">PAGE %d</div>'
+                '<div class="pdf-page-canvas-wrapper" '
+                'style="width:480px;height:632px;">'
+                '<img class="pdf-page-canvas" src="%s" '
+                'style="width:480px;height:632px;"></div>'
+                '<div class="bilingual-page" id="bilingual-page-%d"></div>'
+                '</div>' % (args.page, png_b64, args.page))
+            orignote = " · 🖼 同时显示原页图"
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     name = Path(rel).stem.replace(" ", "_")[:36]
     out = OUT_DIR / f"bilingual-{name}-p{args.page}.png"
@@ -154,6 +192,7 @@ def main() -> int:
     probe = VENDOR / "_shot_bilingual.html"
     probe.write_text(
         PROBE.format(rules=rules, code=code, page=args.page, rel=rel,
+                     body=body, orignote=orignote,
                      blocks=json.dumps(blocks, ensure_ascii=False),
                      trans=json.dumps(trans, ensure_ascii=False)),
         encoding="utf-8")

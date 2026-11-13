@@ -160,8 +160,18 @@ def extract_css(html: str) -> str:
         r"(?m)^\s*\.bb-orig\s*\{[^}]*\}",
         r"(?m)^\s*\.bb-trans\s*\{[^}]*\}",
         r"(?m)^\s*\.bilingual-note\s*\{[^}]*\}",
+        # 「原页图」并排布局要用到页卡/画布的样式
+        r"(?m)^\s*\.pdf-page-block\s*\{[^}]*\}",
+        r"(?m)^\s*\.pdf-page-canvas-wrapper\s*\{[^}]*\}",
+        r"(?m)^\s*\.pdf-page-canvas\s*\{[^}]*\}",
+        r"(?m)^\s*\.pdf-page-label\s*\{[^}]*\}",
     ]:
         out.extend(m.group(0) for m in re.finditer(pat, html))
+    # 「对照模式 + 原页图」的并排布局在 @media 块里（宽屏才并排）——
+    # 简单正则抽不到，**必须**把整个 @media 块一起抽出来。
+    for m in re.finditer(r"@media[^{]*\{(?:[^{}]|\{[^{}]*\})*\}", html):
+        if "bilingual-orig" in m.group(0):
+            out.append(m.group(0))
     return "\n".join(out)
 
 
@@ -183,7 +193,16 @@ html,body{{margin:0;padding:0;background:#fff;}}
 {rules}
 </style></head>
 <body>
-<div id="host"><div class="bilingual-page" id="bi-page"></div></div>
+<div id="host">
+  <div class="pdf-page-block" id="page-block">
+    <div class="pdf-page-label">PAGE 1</div>
+    <div class="pdf-page-canvas-wrapper" id="canvas-wrap"
+         style="width:520px;height:660px;position:relative;background:#fff;">
+      <canvas class="pdf-page-canvas" style="width:520px;height:660px;"></canvas>
+    </div>
+    <div class="bilingual-page" id="bi-page"></div>
+  </div>
+</div>
 <script>
 // ---- mock：前端那几依赖的外部函数 ----
 function formatMarkdownLite(t){{
@@ -290,6 +309,42 @@ check('译文不是空的（有内容）',
       lBlocks[0] && (lBlocks[0].querySelector('.bb-trans').textContent||'').trim().length>3,
       lBlocks[0]? (lBlocks[0].querySelector('.bb-trans').textContent||'').trim().slice(0,30):'');
 
+// ---------- 「🖼 原页图」开关（遗留项：对照视图里看不到图片/图表）----------
+var pageBlock=document.getElementById('page-block');
+var canvasWrap=document.getElementById('canvas-wrap');
+
+// ① 开着对照、**不**显示原页图 → 原页 canvas 必须藏起来（这是旧行为）
+_pdfState.bilingualOrig=false;
+_showBilingualVisibility(true);
+check('对照模式且不显示原页图 → 原页 canvas 被藏起来',
+      canvasWrap.style.display==='none', 'display='+canvasWrap.style.display);
+check('不显示原页图时页卡没有 bilingual-orig 类',
+      !pageBlock.classList.contains('bilingual-orig'), pageBlock.className);
+
+// ② 开着对照 + 显示原页图 → canvas 必须**可见**
+_pdfState.bilingualOrig=true;
+_showBilingualVisibility(true);
+check('对照模式 + 原页图 → 原页 canvas 可见（图看得见了）',
+      canvasWrap.style.display!=='none', 'display='+canvasWrap.style.display);
+check('页卡带上了 bilingual-orig 类',
+      pageBlock.classList.contains('bilingual-orig'), pageBlock.className);
+
+// ③ 宽屏 → 原页图在左、对照译文在右（并排，不是上下堆叠）
+var cR=canvasWrap.getBoundingClientRect();
+var bR=host.getBoundingClientRect();
+check('宽屏下原页图在左、对照译文在右（并排）',
+      cR.left < bR.left, 'canvas.left='+cR.left.toFixed(0)+' bilingual.left='+bR.left.toFixed(0));
+check('原页图和对照译文横向不重叠',
+      cR.right <= bR.left+2, 'canvas.right='+cR.right.toFixed(0)+' bilingual.left='+bR.left.toFixed(0));
+
+// ④ 关掉对照模式 → 原页 canvas 回到正常显示
+_pdfState.bilingualOrig=false;
+_showBilingualVisibility(false);
+check('关掉对照模式 → 原页 canvas 正常显示',
+      canvasWrap.style.display!=='none', 'display='+canvasWrap.style.display);
+check('关掉对照模式 → 页卡的 bilingual-orig 类被摘掉',
+      !pageBlock.classList.contains('bilingual-orig'), pageBlock.className);
+
 document.title='RESULT:'+JSON.stringify(results);
 </script></body></html>
 """
@@ -342,6 +397,7 @@ def main() -> int:
             extract_function(html, "_bilingualHost"),
             extract_function(html, "_bilingualRenderInto"),
             extract_function(html, "renderBilingualPage"),
+            extract_function(html, "_showBilingualVisibility"),
         ])
     except (KeyError, ValueError) as e:
         print("FAIL: 抽取真代码失败：%s" % e)

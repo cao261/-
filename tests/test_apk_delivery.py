@@ -123,6 +123,8 @@ REQUIREMENTS = [
      ["renderMath", "katex"], None),
     ("⑩ 对照：段落译文有版本闸门（旧译文不乱贴）",
      ["blocks_v"], None),
+    ("⑩ 对照：能同时显示原页图（图片/图表看得见）",
+     ["pdf-orig-toggle", "show-orig", "applyOrigVisibility"], None),
 ]
 
 # 曾经有过、现在必须不在的坏代码

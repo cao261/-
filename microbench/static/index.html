@@ -1295,6 +1295,28 @@
       text-align: center;
     }
 
+    /* ---------- 对照模式 + 原页图（遗留项：对照视图里看不到图片/图表）----------
+       图片/图表不在 PDF 文本层里 → 译文重排后页面上只剩文字。
+       开着「🖼 原页图」→ 原页 canvas 不藏了：
+         宽屏（≥900px）：左「原页图」右「对照译文」并排（像沉浸式翻译）；
+         窄屏：默认的 flex column → 原页图在上、对照译文在下。
+       ⚠ canvas 已经有内联的 px 宽高，**不要**再给它加 max-width ——
+         那会把画布压扁（宽被 max-width 限住、高还是内联 px → 变形）。 */
+    @media (min-width: 900px) {
+      .pdf-page-block.bilingual-orig {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: var(--s-5);
+        align-items: start;
+      }
+      .pdf-page-block.bilingual-orig > .pdf-page-label { grid-column: 1 / -1; }
+      .pdf-page-block.bilingual-orig > .bilingual-page {
+        max-width: none;
+        width: 100%;
+        margin: 0;
+      }
+    }
+
     /* PDF.js text layer — must stay transparent so the canvas shows through. */
     .textLayer {
       position: absolute;
@@ -4232,6 +4254,9 @@
           zenPref: !!_zenPref,
           // 对照模式（译文按原文排版）—— 记住偏好，下次打开 PDF 直接是对照视图
           bilingual: !!_bilingualPref,
+          // 对照模式里**同时显示原页图**（图片/图表在文本层里不在，
+          // 重排后看不到 —— 开着这个开关就还看得见原页）
+          bilingualOrig: !!_bilingualOrigPref,
         };
         localStorage.setItem(LS_STATE_KEY, JSON.stringify(state));
       } catch (e) {}
@@ -4249,6 +4274,7 @@
         if (typeof s.pdfZoom === "number") _pdfZoom = s.pdfZoom;
         if (s.zenPref === true) _zenPref = true;
         if (s.bilingual === true) _bilingualPref = true;
+        if (s.bilingualOrig === true) _bilingualOrigPref = true;
       } catch (e) {
         console.error("[restoreLocalState]", e);
       }
@@ -4435,6 +4461,11 @@
     let _pdfZoom = 1.0; // user-controlled PDF zoom multiplier (PDF dual-column view)
     // 对照模式（译文按原文排版）的偏好开关 —— 跨会话记住
     let _bilingualPref = false;
+    // 对照模式里**同时显示原页图**的偏好开关。
+    // 为什么需要：图片/图表不在 PDF 文本层里 → 译文重排后**看不到图**
+    //   （用户原话："对照视图里看不到图片/图表"）。
+    // 开着这个开关 → 原页 canvas 不再被藏起来（宽屏左右并排、窄屏上下堆叠）。
+    let _bilingualOrigPref = false;
     let _pdfState = null; // { paperId, paperTitle, relativePath, pdfDoc, pages: [{num, canvas, text, translated}], rendering }
 
     function switchReaderMode(mode, opts = {}) {
@@ -5027,10 +5058,14 @@
           pages: [],
           // 对照模式（译文按原文排版）—— 默认关，用户点工具栏的「对照」才开
           bilingual: !!_bilingualPref,
+          // 对照模式里同时显示原页图（默认关）
+          bilingualOrig: !!_bilingualOrigPref,
           rendering: { cancelled: false, generation: myGen },
         };
         // 打开这篇论文的历史批注（高亮 + 我的笔记），下次进来直接可见
         loadAnnotationsForPaper(paperId);
+        // 工具栏的「🖼 原页图」按钮要跟当前状态一致（偏好是跨会话记的）
+        _syncBilingualOrigButton();
         // 这里原来挂了一个每秒轮询 `getComputedStyle(#reader-modal)` 的
         // interval，只为发现"弹窗被关掉了"。但全项目只有 closeReaderModal()
         // 会把弹窗藏起来，而它现在已经直接置 rendering.cancelled = true
@@ -5934,8 +5969,11 @@
 
       // 对照模式开着 → 这一页也要画对照视图（段落块是异步抽的，不挡渲染）
       if (_pdfState && _pdfState.bilingual) {
-        canvasWrapper.style.display = "none";
+        // 「同时显示原页图」开着 → canvas 留着（左右并排 / 上下堆叠）
+        const showOrig = !!_pdfState.bilingualOrig;
+        canvasWrapper.style.display = showOrig ? "" : "none";
         biHost.style.display = "";
+        wrapper.classList.toggle("bilingual-orig", showOrig);
         ensurePageBlocks(pageNum).then(() => renderBilingualPage(pageNum));
       }
 
@@ -6551,6 +6589,7 @@
         btn.classList.toggle("active", !!_pdfState.bilingual);
         btn.textContent = _pdfState.bilingual ? "🔀 对照中" : "🔀 对照";
       }
+      _syncBilingualOrigButton();
       _persistLocalState();
       const pages = _pdfState.pages || [];
       if (_pdfState.bilingual) {
@@ -6568,13 +6607,51 @@
     }
     window.toggleBilingualMode = toggleBilingualMode;
 
+    /**
+     * 开关「对照模式里同时显示原页图」。
+     *
+     * 为什么需要（遗留项：对照视图里看不到图片/图表）：
+     *   图片/图表**不在 PDF 文本层里** → 译文按原文重排后，
+     *   页面上只剩文字，图全没了（用户原话）。
+     *   开着这个开关 → 原页 canvas 不藏了：
+     *     宽屏 → 左「原页图」右「对照译文」并排；
+     *     窄屏 → 原页图在上、对照译文在下（默认的 flex column 布局）。
+     *   零额外请求：canvas 本来就已经渲染好了。
+     */
+    function toggleBilingualOrig() {
+      if (!_pdfState) return;
+      _pdfState.bilingualOrig = !_pdfState.bilingualOrig;
+      _bilingualOrigPref = !!_pdfState.bilingualOrig;
+      _syncBilingualOrigButton();
+      _persistLocalState();
+      _showBilingualVisibility(!!_pdfState.bilingual);
+      showToast(_pdfState.bilingualOrig
+        ? "🖼 对照模式里会显示原页图（图片/图表看得见了）"
+        : "🖼 对照模式只显示重排后的译文", false, 3200);
+    }
+    window.toggleBilingualOrig = toggleBilingualOrig;
+
+    /** 把「原页图」按钮的文案/高亮同步成当前状态。 */
+    function _syncBilingualOrigButton() {
+      const btn = document.getElementById("pdf-bilingual-orig-toggle");
+      if (!btn) return;
+      const on = !!(_pdfState && _pdfState.bilingualOrig);
+      btn.classList.toggle("active", on);
+      btn.textContent = on ? "🖼 原页图中" : "🖼 原页图";
+    }
+
     /** 切换「原文画布 / 对照重排」两者的显隐。 */
     function _showBilingualVisibility(on) {
+      // 「同时显示原页图」开着 → 原页 canvas 留着（左右并排 / 上下堆叠）
+      const showOrig = !!(on && _pdfState && _pdfState.bilingualOrig);
       document.querySelectorAll(".pdf-page-canvas-wrapper").forEach(w => {
-        w.style.display = on ? "none" : "";
+        w.style.display = showOrig ? "" : (on ? "none" : "");
       });
       document.querySelectorAll(".bilingual-page").forEach(el => {
         el.style.display = on ? "" : "none";
+      });
+      document.querySelectorAll(".pdf-page-block").forEach(el => {
+        el.classList.toggle("bilingual-orig", showOrig);
       });
     }
 
@@ -10197,6 +10274,9 @@
             <button class="btn-zoom-toggle" id="pdf-bilingual-toggle"
                     onclick="toggleBilingualMode()"
                     title="对照模式：译文按原文排版（左栏回左栏、右栏回右栏，段落对段落）">🔀 对照</button>
+            <button class="btn-zoom-toggle" id="pdf-bilingual-orig-toggle"
+                    onclick="toggleBilingualOrig()"
+                    title="对照模式里同时显示原页图（图片/图表不在文本层里，重排后看不到；开着这个就还看得见）">🖼 原页图</button>
             <span class="seg-divider"></span>
             <button class="btn-zoom-toggle" id="pdf-queue-pause-btn"
                     onclick="togglePdfQueuePause()" title="暂停 / 继续自动排队翻译">⏸ 暂停排队</button>
