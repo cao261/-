@@ -82,10 +82,22 @@ CSS_RULES = [
     r"(?m)^\s*\.tb-pdf-trans-body \.math-error\s*\{[^}]*\}",
 ]
 
+# 「原页图 / 对照译文」并排布局要用到的规则（2026-11-13 新增）。
+# ⚠ 这些规则**不在 @media 里**了 —— 并排与否由 JS 按**实际可用宽度**决定
+#   （视口宽 ≠ 容器宽，@media 会把译文列挤成 43px）。
+CSS_RULES_SIDE = [
+    r"(?m)^\s*\.tb-pdf-page\s*\{[^}]*\}",
+    r"(?m)^\s*\.tb-pdf-orig\s*\{[^}]*\}",
+    r"(?m)^\s*\.tb-pdf-page\.lay-bilingual[^{]*\{[^}]*\}",
+    r"(?m)^\s*\.tb-pdf-page\.side-cols[^{]*\{[^}]*\}",
+    r"(?m)^\s*\.tb-pdf-page:not\(\.side-cols\)[^{]*\{[^}]*\}",
+    r"(?m)^\s*\.tb-pdf-trans\s*\{[^}]*\}",
+]
 
-def extract_css(css: str) -> str:
+
+def extract_css(css: str, extra: list[str] | None = None) -> str:
     out = []
-    for pat in CSS_RULES:
+    for pat in (CSS_RULES + (extra or [])):
         out.extend(m.group(0) for m in re.finditer(pat, css))
     # ⚠ @media 的写法在 styles.css 里有两种（`min-width:900px` / `min-width: 900px`）
     #   —— 两种都要抽到，否则「宽屏并排」的规则整块丢掉。
@@ -93,6 +105,93 @@ def extract_css(css: str) -> str:
                         css)
     out.extend(media)
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# 探针 2：「原页图 + 对照译文」的**并排 / 堆叠**判定（2026-11-13）
+# --------------------------------------------------------------------------
+# ⚠ 为什么单独一个探针：上面的探针只验「对照译文按原文分栏」，
+#   跟页卡的并排/堆叠是两回事。2026-11-13 真机实测抓到的两个缺陷
+#   （译文列被挤成 43px / 译文栏被 max-content 撑到 6349px）
+#   **上面那个探栏一个都测不到** —— 它压根没渲染页卡布局。
+PROBE_SIDE_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>probe-side</title>
+<style>
+html,body{{margin:0;padding:0;background:#fff;}}
+/* ⚠ 必须带上真实样式表里的全局重置（box-sizing:border-box）：
+     少了它，译文栏的 border box = 设定的宽 + 左右 padding（32px）→
+     量出来的宽度会虚高 32px → 断言全错（2026-11-13 踩过）。
+     ⚠ 注释里**不能**出现单花括号 —— .format() 会把它当占位符。 */
+*{{box-sizing:border-box;}}
+:root{{--line-hairline:#E6E1D8;--font-ui:system-ui,sans-serif;}}
+#host{{width:900px;margin:0 auto;}}
+{rules}
+</style></head>
+<body>
+<div id="host">
+  <div class="tb-pdf-page lay-bilingual show-orig" id="page">
+    <div class="tb-pdf-orig"><canvas style="width:360px;height:480px"></canvas></div>
+    <div class="tb-pdf-trans tb-bilingual">
+      <div class="tb-pdf-trans-body"><p>对照译文栏内容</p></div>
+    </div>
+  </div>
+</div>
+<script>
+{code}
+var results=[];
+function check(n,c,d){{results.push({{name:n,pass:!!c,detail:d||''}});}}
+var hostEl=document.getElementById('host');
+var card=document.getElementById('page');
+var orig=card.querySelector('.tb-pdf-orig');
+var trans=card.querySelector('.tb-pdf-trans');
+function setHost(w){{hostEl.style.width=w+'px';}}
+function R(e){{return e.getBoundingClientRect();}}
+
+// ---------- ① 宽度够 → 并排，译文栏 = 可用宽度 ----------
+setHost(900);
+applyOrigSideLayout(card);
+var o=R(orig), t=R(trans);
+check('宽度够时判定为并排（side-cols）', card.classList.contains('side-cols'), card.className);
+check('并排时译文栏宽度 = 可用宽度（900-360-18=522），不是 max-content',
+      Math.abs(t.width-522)<=2, 'w='+t.width.toFixed(0));
+check('并排时译文栏不超容器宽度', t.width<=hostEl.clientWidth+1,
+      'w='+t.width.toFixed(0)+' host='+hostEl.clientWidth);
+check('并排时原页与译文同排', Math.abs(o.top-t.top)<8,
+      'o.top='+o.top.toFixed(0)+' t.top='+t.top.toFixed(0));
+check('并排时原页与译文不横向重叠', o.right<=t.left+1,
+      'o.r='+o.right.toFixed(0)+' t.l='+t.left.toFixed(0));
+check('并排时译文栏够宽可读（>=320）', t.width>=320, 'w='+t.width.toFixed(0));
+
+// ---------- ② 宽度不够 → 退回堆叠 ----------
+setHost(420);
+applyOrigSideLayout(card);
+o=R(orig); t=R(trans);
+check('宽度不够时退回堆叠（摘掉 side-cols）', !card.classList.contains('side-cols'), card.className);
+check('堆叠时译文栏不超容器宽度', t.width<=hostEl.clientWidth+1,
+      'w='+t.width.toFixed(0)+' host='+hostEl.clientWidth);
+check('堆叠时译文在原页下方（不是同排）', t.top>=o.bottom-1,
+      't.top='+t.top.toFixed(0)+' o.bottom='+o.bottom.toFixed(0));
+
+// ---------- ③ 原页比容器还宽（放大后）→ 译文也不能超屏 ----------
+setHost(300);
+applyOrigSideLayout(card);
+o=R(orig); t=R(trans);
+check('原页超宽时译文栏仍不超容器宽度', t.width<=hostEl.clientWidth+1,
+      'w='+t.width.toFixed(0)+' host='+hostEl.clientWidth);
+check('原页超宽时退回堆叠', !card.classList.contains('side-cols'), card.className);
+
+// ---------- ④ 不开原页图（对照模式默认）→ 只有译文栏，铺满容器 ----------
+setHost(900);
+card.classList.remove('show-orig');
+applyOrigSideLayout(card);
+t=R(trans);
+check('不开原页图时译文栏铺满容器（不超屏）',
+      Math.abs(t.width-hostEl.clientWidth)<=2 && t.width<=hostEl.clientWidth+1,
+      'w='+t.width.toFixed(0)+' host='+hostEl.clientWidth);
+
+document.title='RESULT:'+JSON.stringify(results);
+</script></body></html>
+"""
 
 
 PROBE_HTML = """<!DOCTYPE html>
@@ -228,10 +327,11 @@ def find_browser() -> str | None:
     return shutil.which("msedge") or shutil.which("chrome")
 
 
-def run_probe(browser: str, rules: str, code: str) -> list[dict]:
+def run_probe(browser: str, rules: str, code: str,
+             template: str = PROBE_HTML) -> list[dict]:
     with tempfile.TemporaryDirectory() as td:
         html = Path(td) / "probe.html"
-        html.write_text(PROBE_HTML.format(rules=rules, code=code), encoding="utf-8")
+        html.write_text(template.format(rules=rules, code=code), encoding="utf-8")
         cmd = [browser, "--headless", "--disable-gpu", "--no-sandbox",
                "--window-size=1400,1000",
                "--virtual-time-budget=4000", "--dump-dom",
@@ -259,6 +359,10 @@ def main() -> int:
     if ".tb-bilingual-cols" not in rules:
         print("FAIL: 没从 styles.css 提取到 .tb-bilingual-cols 规则 —— 规则名变了？")
         return 1
+    rules_side = extract_css(css, CSS_RULES_SIDE)
+    if ".side-cols" not in rules_side:
+        print("FAIL: 没从 styles.css 提取到 .side-cols 规则 —— 并排布局的类名变了？")
+        return 1
 
     src = APPJS.read_text(encoding="utf-8")
     try:
@@ -275,12 +379,18 @@ def main() -> int:
             extract_function(src, "applyOrigVisibility"),
             extract_function(src, "renderBilingualInto"),
         ])
+        code_side = "\n\n".join([
+            extract_const(src, "TB_SIDE_MIN_TRANS_WIDTH"),
+            extract_const(src, "TB_SIDE_GAP"),
+            extract_function(src, "applyOrigSideLayout"),
+        ])
     except (KeyError, ValueError) as e:
         print("FAIL: 抽取真代码失败：%s" % e)
         return 1
 
     try:
         results = run_probe(browser, rules, code)
+        results += run_probe(browser, rules_side, code_side, PROBE_SIDE_HTML)
     except Exception as e:
         print("FAIL: 渲染探针失败：%s" % e)
         return 1

@@ -145,6 +145,19 @@ def extract_function(src: str, name: str) -> str:
     return src[m.start():end]
 
 
+def extract_const(src: str, name: str) -> str:
+    """抽一行 const（护栏要抽真代码，不能抄）。
+
+    ⚠ 不能用 `.*?;` —— 行尾注释里没有 `;`，会一路吃到**下一行**的 `;`
+       （实测把两个 const 粘成了一坨）。用 `[^;\\n]*;` 只吃本行。
+    """
+    m = re.search(r"(?m)^[ \t]*(?:const|let|var)\s+" + re.escape(name) + r"\s*=[^;\n]*;",
+                  src)
+    if not m:
+        raise KeyError(f"index.html 里找不到常量 {name}")
+    return m.group(0).strip()
+
+
 def extract_css(html: str) -> str:
     """抽出对照模式用到的 CSS 规则（连同 @media 块）。"""
     out = []
@@ -165,6 +178,11 @@ def extract_css(html: str) -> str:
         r"(?m)^\s*\.pdf-page-canvas-wrapper\s*\{[^}]*\}",
         r"(?m)^\s*\.pdf-page-canvas\s*\{[^}]*\}",
         r"(?m)^\s*\.pdf-page-label\s*\{[^}]*\}",
+        # ⚠ 「原页图 + 对照译文」并排的规则**不在 @media 里**了
+        #   （2026-11-13：并排与否由 JS 按**阅读器栏实际宽度**决定，
+        #    @media 看的是视口宽 → 1600px 视口下阅读器栏只有 790px，
+        #    并排后译文列只剩 43px）。
+        r"(?m)^\s*\.pdf-page-block\.bilingual-orig-wide[^{]*\{[^}]*\}",
     ]:
         out.extend(m.group(0) for m in re.finditer(pat, html))
     # 「对照模式 + 原页图」的并排布局在 @media 块里（宽屏才并排）——
@@ -189,7 +207,7 @@ html,body{{margin:0;padding:0;background:#fff;}}
   --font-sans:system-ui,sans-serif; --s-3:6px; --s-4:10px; --s-5:14px;
   --r-md:8px; --t-sm:12px;
 }}
-#host{{width:900px;margin:0 auto;}}
+#host{{width:1200px;margin:0 auto;}}
 {rules}
 </style></head>
 <body>
@@ -336,6 +354,34 @@ check('宽屏下原页图在左、对照译文在右（并排）',
       cR.left < bR.left, 'canvas.left='+cR.left.toFixed(0)+' bilingual.left='+bR.left.toFixed(0));
 check('原页图和对照译文横向不重叠',
       cR.right <= bR.left+2, 'canvas.right='+cR.right.toFixed(0)+' bilingual.left='+bR.left.toFixed(0));
+check('并排时对照译文列够宽可读（>=380）',
+      bR.width >= 380, 'w='+bR.width.toFixed(0));
+check('并排时页卡带上了 bilingual-orig-wide 类',
+      pageBlock.classList.contains('bilingual-orig-wide'), pageBlock.className);
+
+// ---------- ⑤ 阅读器栏不够宽 → 必须**退回上下堆叠**（2026-11-13 回归）----------
+//   ⚠ 这条是实测算出来的真缺陷：原来并排与否只看**视口**宽（@media 900px），
+//   而 1600px 的窗口里阅读器栏只有 ~790px → 并排后译文列只剩 **43px**，
+//   挤成一条竖线根本没法读。
+document.getElementById('host').style.width='700px';
+_pdfState.bilingualOrig=true;
+_showBilingualVisibility(true);
+var cR2=canvasWrap.getBoundingClientRect();
+var bR2=host.getBoundingClientRect();
+check('阅读器栏不够宽时退回上下堆叠（不再硬挤）',
+      !pageBlock.classList.contains('bilingual-orig-wide'), pageBlock.className);
+check('堆叠时对照译文在原页图**下方**',
+      bR2.top >= cR2.bottom-2,
+      'bi.top='+bR2.top.toFixed(0)+' canvas.bottom='+cR2.bottom.toFixed(0));
+check('堆叠时对照译文列是整栏宽（可读，不是 43px 竖线）',
+      bR2.width >= 600, 'w='+bR2.width.toFixed(0));
+check('堆叠时原页图与译文不横向压在一起',
+      !(bR2.top < cR2.bottom-2 && bR2.left < cR2.right-2 && bR2.right > cR2.left+2),
+      'bi='+bR2.left.toFixed(0)+'..'+bR2.right.toFixed(0)+
+      ' canvas='+cR2.left.toFixed(0)+'..'+cR2.right.toFixed(0));
+document.getElementById('host').style.width='1200px';
+_pdfState.bilingualOrig=false;
+_showBilingualVisibility(false);
 
 // ④ 关掉对照模式 → 原页 canvas 回到正常显示
 _pdfState.bilingualOrig=false;
@@ -394,9 +440,11 @@ def main() -> int:
     # 抽真代码
     try:
         code = "\n\n".join([
+            extract_const(html, "_BILINGUAL_MIN_TRANS_WIDTH"),
             extract_function(html, "_bilingualHost"),
             extract_function(html, "_bilingualRenderInto"),
             extract_function(html, "renderBilingualPage"),
+            extract_function(html, "_applyBilingualOrigLayout"),
             extract_function(html, "_showBilingualVisibility"),
         ])
     except (KeyError, ValueError) as e:

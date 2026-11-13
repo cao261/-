@@ -3601,6 +3601,105 @@
   }
 
   /**
+   * 译文栏宽度 + 「原页图 / 对照译文」到底**并排**还是**上下堆叠**。
+   *
+   * ⚠⚠ 这里两个坑都是 2026-11-13 **真机实测**抓出来的（当时护栏全绿）：
+   *   ① **视口宽 ≠ 容器宽**：原来用 `@media (min-width:900px)` 判断并排，
+   *      1180px 的视口里原页图就占 581px —— 再挤一个译文栏根本放不下，
+   *      而门槛只看视口 → 译文栏被撑到 6349px，横向溢出屏幕，译文没法看。
+   *   ② **`width:max-content` 会把译文栏撑爆**：对照译文是一长段中文，
+   *      max-content = 整段不换行的宽度（实测 6349px），
+   *      页卡 `width:max-content` 跟着变成 6940px → 屏幕外，译文没法看。
+   *
+   * → 现在：**译文栏宽度一律给确定值**（JS 量出来写进 --tb-side-w / --tb-trans-w），
+   *   并排与否也由 JS 按「滚动容器宽 - 原页图宽」决定（类名 side-cols），
+   *   宽度不够就**退回上下堆叠**，绝不把译文挤成一条或撑出屏幕。
+   *
+   * 返回 true = 并排，false = 上下堆叠。
+   */
+  const TB_SIDE_MIN_TRANS_WIDTH = 320;
+  const TB_SIDE_GAP = 18;
+
+  function applyOrigSideLayout(wrap) {
+    if (!wrap || !wrap.classList) return false;
+    wrap.classList.remove("side-cols");
+    wrap.style.removeProperty("--tb-side-w");
+    wrap.style.removeProperty("--tb-trans-w");
+    wrap.style.removeProperty("--tb-card-w");
+    const trans = wrap.querySelector(".tb-pdf-trans");
+    const orig = wrap.querySelector(".tb-pdf-orig");
+    const host = wrap.parentElement;
+    if (!trans || !host) return false;
+    const hostW = host.clientWidth || 0;      // 滚动容器的内宽（**含**左右 padding）
+    if (!hostW) return false;
+    // ⚠ clientWidth 含 padding → 可用宽度要减掉左右 padding，
+    //   否则页卡会比可视区宽一截 → 多出一条横向滚动条。
+    const hcs = window.getComputedStyle ? window.getComputedStyle(host) : null;
+    const padL = (hcs && parseFloat(hcs.paddingLeft)) || 0;
+    const padR = (hcs && parseFloat(hcs.paddingRight)) || 0;
+    const contentW = Math.max(0, hostW - padL - padR);
+    // 译文栏当前不可见（仅原文模式）→ 宽度不用管
+    if (!trans.offsetWidth && !trans.getClientRects().length) return false;
+
+    const isBilingual = wrap.classList.contains("lay-bilingual");
+    const isBoth = wrap.classList.contains("lay-both");
+    const showOrig = wrap.classList.contains("show-orig");
+    // ⚠ 原页宽度要量 **canvas**，不能量 `.tb-pdf-orig` 容器：
+    //   容器是 flex 子项，列布局下会被拉满页卡宽（1180px），
+    //   而 canvas 只有 580px → 量容器会把可用宽度算成 0 → 永远并排不了。
+    const canvas = (orig && orig.querySelector) ? orig.querySelector("canvas") : null;
+    const styleW = (canvas && canvas.style) ? parseFloat(canvas.style.width) : 0;
+    const origW = styleW || ((canvas && canvas.offsetWidth) || 0)
+                  || ((orig && orig.offsetWidth) || 0);
+    const twoCols = origW > 0 && (isBoth || (isBilingual && showOrig));
+
+    let transW = contentW;
+    let side = false;
+    if (twoCols) {
+      const avail = contentW - origW - TB_SIDE_GAP;
+      if (avail >= TB_SIDE_MIN_TRANS_WIDTH) {
+        side = true;
+        transW = avail;
+      } else {
+        // 放不下 → 上下堆叠：译文栏跟原文同宽（且不超过可视宽，
+        // 否则放大状态下译文会跑到屏幕外，还得横向滚才能看）
+        transW = Math.min(origW, contentW);
+      }
+    }
+    if (side) {
+      wrap.classList.add("side-cols");
+      wrap.style.setProperty("--tb-side-w", transW + "px");
+      wrap.style.setProperty("--tb-card-w", (origW + TB_SIDE_GAP + transW) + "px");
+    } else {
+      wrap.style.setProperty("--tb-trans-w", transW + "px");
+      wrap.style.setProperty("--tb-card-w", Math.max(origW, transW) + "px");
+    }
+    return side;
+  }
+
+  /**
+   * 屏幕/窗口尺寸变了 → 可用宽度变了 → 所有页卡的译文栏宽度要重算。
+   * （平板旋转、分屏、窗口缩放都会触发；用节流避免连续触发时抖动。）
+   */
+  let _tbSideLayoutTimer = null;
+  function scheduleSideLayout() {
+    if (_tbSideLayoutTimer) clearTimeout(_tbSideLayoutTimer);
+    _tbSideLayoutTimer = setTimeout(() => {
+      _tbSideLayoutTimer = null;
+      document.querySelectorAll(".tb-pdf-page").forEach((el) => {
+        applyOrigSideLayout(el);
+      });
+    }, 150);
+  }
+  // ⚠ 必须判断 window.addEventListener 存在 —— app.js 也会被 Node 的
+  //   行为级护栏直接 require 进一个**没有 addEventListener 的假 window**，
+  //   直接调会 TypeError → 整套护栏红（2026-11-13 踩过）。
+  if (window && typeof window.addEventListener === "function") {
+    window.addEventListener("resize", scheduleSideLayout);
+    window.addEventListener("orientationchange", scheduleSideLayout);
+  }
+
+  /**
    * 对照模式：把这一页的译文按**原文的栏**排出来。
    *
    * 数据来自同步过来的快照（pages[].blocks）：每块带 i/kind/col/bbox/translation。
@@ -4209,6 +4308,10 @@
 
     await paintCanvas(canvas, page, viewport, dpr);
 
+    // ⚠ 原文画布尺寸定了之后才能量宽度 → 译文栏宽度 / 并排还是堆叠
+    //   （2026-11-13 真机实测修：视口宽≠容器宽、max-content 把译文栏撑到 6349px）
+    applyOrigSideLayout(wrap);
+
     // 文本层：PDF.js 3.11 的 renderTextLayer 是**全局函数**（不是 page 的方法），
     // 而且要先拿到 getTextContent() 的结果。参数与桌面版 index.html 保持一致。
     try {
@@ -4303,6 +4406,8 @@
       if (!canvas) return;
       wrap.removeAttribute("data-canvas-released");
       await paintCanvas(canvas, page, viewport, dpr);
+      // 画布尺寸变了 → 译文栏宽度 / 并排还是堆叠要重算
+      applyOrigSideLayout(wrap);
       // 手写层也补回来（笔迹数据在 inkState.strokes）
       const inkCv = wrap.querySelector ? wrap.querySelector(".tb-pdf-ink canvas") : null;
       if (inkCv) {
@@ -4888,6 +4993,9 @@
         //   之后新画的页在 renderPdfPage 里带上这个 class（见 pdfState.showOrig）。
         document.querySelectorAll(".tb-pdf-page").forEach((el) => {
           applyOrigVisibility(el, pdfState.showOrig);
+          // ⚠ 显隐变了 → 可用宽度也变了 → 并排/堆叠要重算
+          //   （否则译文栏会留着上一次的宽度，或被撑爆）
+          applyOrigSideLayout(el);
         });
       };
       syncOrigLabel();

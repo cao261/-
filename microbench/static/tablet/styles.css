@@ -466,23 +466,27 @@ button { cursor:pointer; }
      宽度超过容器时 `margin:0 auto` 不会生效（auto 解析成 0），
      内容会从左边开始 —— 正好是要看的那一侧。 */
   margin:0 0 14px; margin-left:auto; margin-right:auto;
-  width:max-content; min-width:100%;
+  /* ⚠ 宽度由 JS 定死（--tb-card-w）：`max-content` 会被译文长段撑到几千 px
+     （实测 6349px）→ 横向溢出屏幕，译文没法看。
+     放大时 canvas 会超宽 → JS 量出来就是超宽值 → 照旧能横向滚动。 */
+  width:var(--tb-card-w, max-content); min-width:100%;
   display:flex; flex-direction:column;
 }
 /* 布局三选一：原文+译文 / 仅原文 / 仅译文。
    平板屏幕小，双栏并排看很挤 —— 必须能切成单栏。 */
 .tb-pdf-page.lay-orig .tb-pdf-trans { display:none; }
 .tb-pdf-page.lay-trans .tb-pdf-orig { display:none; }
-/* 宽屏（横屏）双栏才并排 —— 跟电脑端一样 */
-@media (min-width: 900px) {
-  .tb-pdf-page.lay-both { flex-direction:row; align-items:flex-start; }
-  .tb-pdf-page.lay-both .tb-pdf-orig { border-right:1px solid #E6E1D8; }
-  /* ⚠ 双栏时页卡是 `width:max-content`，flex 子项的 `flex:1 1 auto` 会被
-     max-content 的大小吃掉 → 译文栏宽度不确定（会挤成一条）。
-     → 给译文栏一个**确定宽度**（与原文同宽），两栏才对齐。 */
-  .tb-pdf-page.lay-both .tb-pdf-trans { flex:0 0 auto; width:max-content; min-width:0; }
+/* 「原文+译文」并排：同样交给 JS 按**实际宽度**决定（类名 side-cols）。
+   理由与上面「原页图」那条一样：视口宽 ≠ 容器宽，
+   而且 `width:max-content` 会把译文栏撑到几千 px（实测 6349px）→ 没法看。 */
+.tb-pdf-orig {
+  position:relative; flex:0 0 auto;
+  /* ⚠ align-self:flex-start —— **不要**让它被 flex 拉满页卡宽度：
+     页卡宽度由译文栏决定（可能是 1180px），而 canvas 只有 580px；
+     拉满后 `.tb-pdf-anno-layer` / `.tb-pdf-ink`（inset:0）会跟着变成 1180px
+     → **批注高亮和手写笔迹整体错位**（2026-11-13 实测时发现）。 */
+  align-self:flex-start;
 }
-.tb-pdf-orig { position:relative; flex:0 0 auto; }
 .tb-pdf-page canvas { display:block; }
 /* 译文栏 */
 .tb-pdf-trans {
@@ -509,11 +513,19 @@ button { cursor:pointer; }
      宽屏（横屏）→ 左原页图、右对照译文（跟电脑端一致）；
      窄屏（竖屏）→ 原页图在上、对照译文在下（默认的 column 布局）。 */
 .tb-pdf-page.lay-bilingual.show-orig .tb-pdf-orig { display:block; }
-@media (min-width: 900px) {
-  .tb-pdf-page.lay-bilingual.show-orig { flex-direction:row; align-items:flex-start; }
-  .tb-pdf-page.lay-bilingual.show-orig .tb-pdf-orig { border-right:1px solid #E6E1D8; }
-  .tb-pdf-page.lay-bilingual.show-orig .tb-pdf-trans { flex:0 0 auto; width:max-content; min-width:0; }
-}
+/* ⚠⚠ 「并排还是堆叠」**不能**用 @media(min-width:900px) 判断（2026-11-13 真机实测）：
+ *   那是**视口**宽，真正决定放不放得下的是「滚动容器宽 - 原页图宽」。
+ *   1180px 的视口里原页图就占 581px，再挤一个译文栏根本放不下。
+ *   → 改成**类名驱动**（side-cols），由 JS 量出实际宽度后决定。
+ * ⚠⚠ 译文栏宽度必须给**确定值**：
+ *   原来写 `width:max-content` —— 对照译文是一长段中文，
+ *   max-content = 整段不换行的宽度 → 实测撑到 **6349px**，
+ *   页卡被撑到 6940px → 横向溢出屏幕，译文在屏幕外根本没法看。
+ *   → 宽度由 JS 量出来后写进 --tb-side-w / --tb-trans-w。 */
+.tb-pdf-page.side-cols { flex-direction:row; align-items:flex-start; }
+.tb-pdf-page.side-cols .tb-pdf-orig { border-right:1px solid #E6E1D8; }
+.tb-pdf-page.side-cols .tb-pdf-trans { flex:0 0 auto; width:var(--tb-side-w, auto); min-width:0; }
+.tb-pdf-page:not(.side-cols) .tb-pdf-trans { width:var(--tb-trans-w, auto); max-width:100%; }
 .tb-bilingual { flex:1 1 auto; min-width:0; }
 .tb-bilingual-body { font-size:14px; line-height:1.85; }
 .tb-bilingual-cols { display:flex; flex-direction:column; gap:14px; }

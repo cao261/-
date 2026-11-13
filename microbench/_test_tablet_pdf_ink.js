@@ -51,9 +51,17 @@ ok("页卡不能用 max-width:100% + overflow:hidden 夹住放大的内容",
   !(/max-width\s*:\s*100%/.test(pageRule) && /overflow\s*:\s*hidden/.test(pageRule)),
   "页卡规则 = " + pageRule.replace(/\s+/g, " ").trim());
 
-ok("页卡宽度跟着内容走（width:max-content），放大后自然超宽",
-  /width\s*:\s*max-content/.test(pageRule),
+// ⚠ 2026-11-13：页卡宽度不再直接写 `width:max-content`，
+//   而是由 JS 按**实测内容宽**写进 --tb-card-w（fallback 仍是 max-content）。
+//   原因：`max-content` 会被译文长段撑到几千 px（实测 6349px）→ 横向溢出屏幕。
+//   → 断言跟着新写法走，但**意图不变**：页卡宽度跟着内容走，放大后自然超宽。
+ok("页卡宽度跟着内容走（width 由内容决定，不是被 max-width:100% 夹死）",
+  /width\s*:\s*max-content/.test(pageRule) ||
+  /width\s*:\s*var\(\s*--tb-card-w\s*,\s*max-content\s*\)/.test(pageRule),
   "页卡规则 = " + pageRule.replace(/\s+/g, " ").trim());
+ok("页卡宽度由 JS 按实测内容宽写入（--tb-card-w），不是退化成 max-content",
+  /setProperty\(\s*["']--tb-card-w["']/.test(src),
+  "app.js 里没找到 setProperty('--tb-card-w', ...) —— 页卡宽度没人管了");
 
 const bodyRule = rule(".tb-pdf-body");
 ok("滚动容器能横向滚动（overflow:auto，且没有 overflow-x:hidden）",
