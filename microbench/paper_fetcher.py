@@ -13,6 +13,12 @@ import requests
 from . import netutil
 
 
+# 出网请求的默认超时（秒）。
+# ⚠️ requests 不给 timeout 就是"无限等"——上游挂起时线程永远不返回，
+#    整个抓取请求卡死（bandit B113）。所有出网调用都必须带 timeout。
+DEFAULT_TIMEOUT = 30
+
+
 def _request_with_proxy_fallback(method: str, url, **kw):
     """带代理兜底的请求：环境代理不可用时自动改直连并重试一次。
 
@@ -24,15 +30,21 @@ def _request_with_proxy_fallback(method: str, url, **kw):
     换 Session 会让桩失效（AGENTS.md §4.9）。
     ⚠ 用 `{**direct_kwargs(), **kw}` 合并而不是 `**a, **b` —— 后者在调用方
     自己传了 `proxies=` 时会抛 TypeError: got multiple values。
+
+    ⚠ timeout 必须**显式**出现在实参里：
+       1) bandit B113 只看显式实参（塞进 **kw 它看不见）；
+       2) 用 kw.pop 取值，调用方自带 timeout 时不会变成
+          "multiple values for keyword argument 'timeout'"（TypeError）。
     """
+    timeout = kw.pop("timeout", DEFAULT_TIMEOUT)
     fn = getattr(requests, method)
     try:
-        return fn(url, **{**netutil.direct_kwargs(), **kw})
+        return fn(url, timeout=timeout, **{**netutil.direct_kwargs(), **kw})
     except requests.exceptions.ProxyError as e:
         if netutil.proxy_bypassed():
             raise
         netutil.mark_proxy_dead(e)
-        return fn(url, **{**netutil.direct_kwargs(), **kw})
+        return fn(url, timeout=timeout, **{**netutil.direct_kwargs(), **kw})
 
 
 def _get(url, **kw):
@@ -136,6 +148,12 @@ def _safe_redirect_chain(url: str, method: str = "GET", max_hops: int = 5,
         resp = requests.request(
             method, current, headers=HEADERS, timeout=timeout,
             allow_redirects=False, stream=(method == "GET"),
+            # ⚠ 2026-10-27 审计 M-4：这里原来直接调 requests.request，
+            #   **绕过了 netutil 的代理兜底**（direct_kwargs）——
+            #   代理死掉时 DOI 跳转链这一步会直接抛 ProxyError，
+            #   而其它出网路径都有兜底 → 兜底在这里断了。
+            #   用的是 requests.request 本身（不是 Session），monkeypatch 仍有效。
+            **netutil.direct_kwargs(),
         )
         try:
             if resp.status_code in (301, 302, 303, 307, 308):

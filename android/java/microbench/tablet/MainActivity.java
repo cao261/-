@@ -6,7 +6,11 @@ import android.content.Intent;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Bundle;
+import android.os.Environment;
+import android.util.Base64;
 import android.webkit.ConsoleMessage;
+import android.webkit.DownloadListener;
+import android.webkit.JavascriptInterface;
 import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -18,6 +22,8 @@ import android.webkit.WebViewClient;
 import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -82,6 +88,11 @@ public class MainActivity extends Activity {
 
         bridge = new DavBridge(prefs, webView, this);
         webView.addJavascriptInterface(bridge, "MicroBench");
+        // 下载落盘用的桥（blob: 下载由页面把内容读出来交回来）。
+        webView.addJavascriptInterface(new DownloadBridge(this), "MicroBenchDownload");
+        // 导出 vault 包 / 变更包走 <a download> → 没有 DownloadListener
+        // 的话点「导出」在 APK 里**什么都不发生**（审计 M-1）。
+        webView.setDownloadListener(new DownloadHandler(this));
 
         // 网页里的 <input type="file">（导入 vault 包）需要 WebChromeClient
         // 配合 —— 没有它, 点那个按钮会**什么都不发生**。
@@ -167,6 +178,43 @@ public class MainActivity extends Activity {
      * NullPointerException（"Cannot invoke String.length()"）。
      */
     private class LocalClient extends WebViewClient {
+
+        /**
+         * 离开 appassets 源的导航**一律拦掉**。
+         *
+         * ⚠⚠ 2026-10-27 审计 C-1（最高优先级）：
+         *   `addJavascriptInterface(bridge, "MicroBench")` 注入的原生桥
+         *   在**当前页面**里是全局对象 —— 页面里任何脚本都能调
+         *   delete("01_Literature/x.pdf") 删原文、put(path, text) 往 vault 写内容
+         *   （会同步回电脑端，污染用户笔记）、httpPost(url, body, auth)
+         *   把平板当跳板去打用户内网的 https。
+         *
+         *   触发路径：笔记 / AI 答案里的外链 `[点我](https://evil)` →
+         *   <a> 没有 target、WebView 又没有 shouldOverrideUrlLoading →
+         *   **顶层导航**到外域 → 恶意页拿到 window.MicroBench。
+         *
+         * → 只有 appassets 源（自己人）留在 WebView 里，
+         *   其余一律交给系统浏览器（Intent.ACTION_VIEW），**绝不**在
+         *   WebView 里加载外域页面。
+         */
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            if (request == null || request.getUrl() == null) {
+                return false;
+            }
+            Uri uri = request.getUrl();
+            if (isAppSource(uri)) {
+                return false;                 // 自己人，放行
+            }
+            if (request.isForMainFrame()) {
+                openExternally(uri);          // 主框架 → 系统浏览器
+            }
+            // ⚠ iframe 也要拦：addJavascriptInterface 注入的对象
+            //   在**每一个** frame 里都有（跨域 iframe 拿得到自己窗口里的那份）。
+            //   不拦的话，外域 iframe 就是一条绕开主框架限制的路。
+            return true;
+        }
+
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view,
                                                           WebResourceRequest request) {
@@ -209,6 +257,167 @@ public class MainActivity extends Activity {
                 handler.cancel();
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 外链处理（审计 C-1）
+    // ------------------------------------------------------------------
+
+    /** 这个 URI 是不是「自己人」（可以留在 WebView 里）。 */
+    private static boolean isAppSource(Uri uri) {
+        if (uri == null) {
+            return false;
+        }
+        String host = uri.getHost();
+        if (host != null && APP_DOMAIN.equalsIgnoreCase(host)) {
+            return true;
+        }
+        // 只放行 about:blank（空白页没有脚本，也不带任何来源）。
+        //
+        // ⚠ **绝不放行 data:** —— data: 页面是 opaque origin，
+        //   而 addJavascriptInterface 注入的对象在**每一个被加载的页面**里都有，
+        //   放行它等于把原生桥交给一个来路不明的页面。
+        return "about:blank".equalsIgnoreCase(uri.toString());
+    }
+
+    /** 把外链交给系统浏览器（**绝不在** WebView 里打开）。 */
+    private void openExternally(Uri uri) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, uri);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception e) {
+            // 没有浏览器 / 打不开 → 告诉用户，别静默失败。
+            toast("打不开这个链接：" + uri);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 下载（导出 vault 包 / 变更包，审计 M-1）
+    // ------------------------------------------------------------------
+
+    /**
+     * 把 blob:/data: 的下载内容从页面取回来。
+     *
+     * ⚠ 为什么必须由页面取：blob: URL 只有**创建它的那个页面**能读
+     *   （原生侧拿到这个 URL 也没用 —— 它不是文件，是页面内存里的对象）。
+     *   → 注入一小段 JS，用 fetch + FileReader 把它变成 base64 交回来。
+     *
+     * ⚠ 分块传：一次 Binder 事务大约 1 MB 上限，
+     *   整个 base64 一次塞过去会 TransactionTooLargeException。
+     *   → 每块 256 KB（4 的倍数，不破坏 base64 编码单元）。
+     */
+    private void fetchBlobAsBase64(String url, String contentDisposition, String mimetype) {
+        if (webView == null) {
+            return;
+        }
+        final String js =
+                "(function(){try{"
+                + "fetch(" + jsString(url) + ").then(function(r){return r.blob();})"
+                + ".then(function(b){return new Promise(function(res,rej){"
+                + "var fr=new FileReader();fr.onload=function(){res(fr.result);};"
+                + "fr.onerror=rej;fr.readAsDataURL(b);});})"
+                + ".then(function(d){var i=d.indexOf(',');"
+                + "if(i<0||!window.MicroBenchDownload){return;}"
+                + "var b64=d.substring(i+1),CH=262144,n=Math.ceil(b64.length/CH);"
+                + "window.MicroBenchDownload.begin(" + jsString(contentDisposition) + ","
+                + jsString(mimetype) + ",n);"
+                + "for(var k=0;k<n;k++){"
+                + "window.MicroBenchDownload.chunk(b64.substring(k*CH,(k+1)*CH));}"
+                + "window.MicroBenchDownload.end();})"
+                + ".catch(function(e){console.error('mb download failed',e);});"
+                + "}catch(e){console.error('mb download failed',e);}})();";
+        webView.evaluateJavascript(js, null);
+    }
+
+    /** 把 base64 内容落盘，并给用户一个看得见的反馈。 */
+    private void writeDownload(String base64, String contentDisposition, String mimetype) {
+        try {
+            if (base64 == null || base64.isEmpty()) {
+                toast("下载内容为空");
+                return;
+            }
+            byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
+            File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+            if (dir == null) {
+                dir = new File(getFilesDir(), "Downloads");
+            }
+            if (!dir.exists() && !dir.mkdirs()) {
+                toast("建不了下载目录：" + dir.getAbsolutePath());
+                return;
+            }
+            File out = new File(dir, safeFileName(contentDisposition));
+            FileOutputStream fos = new FileOutputStream(out);
+            try {
+                fos.write(bytes);
+            } finally {
+                fos.close();
+            }
+            toast("已保存：" + out.getAbsolutePath());
+        } catch (Exception e) {
+            toast("保存失败：" + (e.getMessage() == null ? e.toString() : e.getMessage()));
+        }
+    }
+
+    /** 从 Content-Disposition 里取出文件名（并去掉路径成分）。 */
+    private static String safeFileName(String disposition) {
+        String name = "";
+        if (disposition != null) {
+            String d = disposition.trim();
+            int i = d.toLowerCase().indexOf("filename=");
+            if (i >= 0) {
+                name = d.substring(i + "filename=".length()).trim();
+                if (name.startsWith("\"")) {
+                    int j = name.indexOf('"', 1);
+                    name = j > 0 ? name.substring(1, j) : name.substring(1);
+                } else {
+                    int j = name.indexOf(';');
+                    if (j > 0) {
+                        name = name.substring(0, j);
+                    }
+                }
+            }
+        }
+        name = name.replace('\\', '/');
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) {
+            name = name.substring(slash + 1);
+        }
+        name = name.trim();
+        if (name.isEmpty() || ".".equals(name) || "..".equals(name)) {
+            name = "microbench-导出-" + System.currentTimeMillis() + ".bin";
+        }
+        return name;
+    }
+
+    /** 把字符串转成 JS 里的字符串字面量（含引号）。 */
+    private static String jsString(String s) {
+        if (s == null) {
+            return "\"\"";
+        }
+        StringBuilder sb = new StringBuilder("\"");
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        sb.append('"');
+        return sb.toString();
+    }
+
+    private void toast(String msg) {
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
     }
 
     /** 打开原生设置页（填坚果云账号）。 */
@@ -301,12 +510,84 @@ public class MainActivity extends Activity {
         if (webView != null) {
             // 先摘掉 JS 桥, 不然后台线程回调会打到一个已经销毁的 WebView 上。
             webView.removeJavascriptInterface("MicroBench");
+            webView.removeJavascriptInterface("MicroBenchDownload");
             webView.stopLoading();
             webView.setWebChromeClient(null);
             webView.destroy();
             webView = null;
         }
         super.onDestroy();
+    }
+
+    // ------------------------------------------------------------------
+    // 具名内部类（不用 lambda、不用匿名内部类 —— 见 DavBridge 的注释）
+    // ------------------------------------------------------------------
+
+    /**
+     * 网页里的下载请求。
+     *
+     * ⚠ 导出 vault 包 / 变更包走的是 `URL.createObjectURL` + `<a download>`，
+     *   没有 DownloadListener 的话，在 APK 里点「导出」**什么都不发生**
+     *   （审计 M-1）。
+     */
+    private static class DownloadHandler implements DownloadListener {
+
+        private final MainActivity act;
+
+        DownloadHandler(MainActivity act) {
+            this.act = act;
+        }
+
+        @Override
+        public void onDownloadStart(String url, String userAgent, String contentDisposition,
+                                    String mimetype, long contentLength) {
+            if (url == null || url.trim().isEmpty()) {
+                return;
+            }
+            String u = url.trim();
+            if (u.startsWith("blob:") || u.startsWith("data:")) {
+                // blob:/data: 只有页面自己读得出来 → 让页面交回来。
+                act.fetchBlobAsBase64(u, contentDisposition, mimetype);
+                return;
+            }
+            // http(s) → 交给系统（浏览器 / 下载器）。
+            act.openExternally(Uri.parse(u));
+        }
+    }
+
+    /**
+     * 下载落盘的 JS 桥（分块接收，避免 Binder 1 MB 事务上限）。
+     */
+    public static class DownloadBridge {
+
+        private final MainActivity act;
+        private final StringBuilder buf = new StringBuilder();
+        private String disposition = "";
+        private String mime = "";
+
+        DownloadBridge(MainActivity act) {
+            this.act = act;
+        }
+
+        @JavascriptInterface
+        public void begin(String contentDisposition, String mimetype, int totalChunks) {
+            buf.setLength(0);
+            disposition = contentDisposition == null ? "" : contentDisposition;
+            mime = mimetype == null ? "" : mimetype;
+        }
+
+        @JavascriptInterface
+        public void chunk(String part) {
+            if (part != null) {
+                buf.append(part);
+            }
+        }
+
+        @JavascriptInterface
+        public void end() {
+            act.writeDownload(buf.toString(), disposition, mime);
+            buf.setLength(0);
+        }
     }
 
     // ------------------------------------------------------------------

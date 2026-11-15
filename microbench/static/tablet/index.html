@@ -3,6 +3,34 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<!--
+  ⚠ CSP（2026-10-27 审计 C-1）：APK 里的页面跑在 https://appassets.androidplatform.net，
+  而原生桥（window.MicroBench）能删 vault 文件、往 vault 写内容、代理 HTTPS 请求。
+  一旦有外域页面被加载进来，它就能拿到这个桥 —— CSP 是**第二道**防线
+  （第一道是 WebViewClient.shouldOverrideUrlLoading：外链一律交给系统浏览器）。
+
+  逐条说明：
+  · default-src 'self'      —— 只认自己（assets 与 /dav/* 都是同源）
+  · script-src 'unsafe-inline' —— app.js / pdf.js / katex 都是**内联**的
+  · style-src 'unsafe-inline'  —— 同上（还有 KaTeX 的行内样式）
+  · img-src data: blob: https: —— 笔记里的图片可能是 data: / blob: / 外链
+  · font-src 'self' data:      —— ⚠ KaTeX 的字体是 **base64 data URI**
+                                  （export_offline 把 woff2 内联进去了），
+                                  不给 data: 的话公式会掉字体
+  · connect-src 'self' blob: https: —— /dav/* 走 'self'；blob: 是导出下载
+                                  （fetch blob URL 取内容）；https: 是 AI 网关
+  · worker-src 'self' blob:   —— ⚠ PDF.js 的 worker 是 Blob URL 起来的
+  · frame-src 'none'           —— ⚠ 不许任何 iframe（addJavascriptInterface
+                                  注入的对象在**每个 frame** 里都有）
+  · object-src 'none' / base-uri 'none' —— 堵死插件与 <base> 改写
+
+  ⚠⚠ 这一页**只能有一个** CSP meta：多个 meta 的策略是**叠加**的
+  （取最严的），两个各写各的会把功能打挂 —— 2026-10-27 就出过一次：
+  另一条少了 `connect-src blob:` → PDF.js 的 fetch(blobUrl) 被打死 →
+  **原文根本打不开**。
+  ⚠ 改这一行之前请用真浏览器验一遍（tests/test_audit_2026_10_27_tablet.py）。
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' blob: https:; frame-src 'none'; object-src 'none'; base-uri 'none'; worker-src 'self' blob:; form-action 'none'">
 <title>MicroBench · 平板工作台</title>
 <meta name="theme-color" content="#F7F4ED">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -213,7 +241,9 @@
 </div>
 
 <input type="file" id="file-pack" accept="application/json,.json" hidden>
-<input type="file" id="file-dir" webkitdirectory directory multiple hidden>
+<!-- ⚠ 以前这里还有个 <input id="file-dir" webkitdirectory> ——
+     全文件**从来没被接线**（没有 addEventListener、没有 click()），
+     是个死元素 → 删掉。 -->
 
 <!-- ===================== 文献库（原文 PDF 列表） ===================== -->
 <div class="tb-overlay" id="pdf-lib" hidden>

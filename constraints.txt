@@ -10,7 +10,14 @@
 #     pip freeze | findstr /I "fastapi uvicorn requests ..."   （或手工核对）
 #
 # 约束文件只限制版本、不负责安装；requirements.txt 仍是依赖清单。
-# 下面是本机 25353 在 2026-11-09 实测可用的精确版本。
+# 下面是本机 25353 实测可用的精确版本。
+#
+# ⚠ 2026-11-15 合并云端升级时改过一条：
+#   pillow 12.3.0 → 13.0.0。
+#   云端把 requirements.txt 的 Pillow 下限抬到 13.0.0（40+ 个 CVE 在
+#   13.0.0 修复），而本机还钉在 12.3.0 → `pip install -r requirements.txt
+#   -c constraints.txt` 会直接 ResolutionImpossible，新设备根本装不上。
+#   → 约束文件必须与 requirements.txt 的下限**同时抬**，两边不能各说各话。
 
 defusedxml==0.7.1
 fastapi==0.143.0
@@ -19,7 +26,7 @@ Jinja2==3.1.6
 Markdown==3.11.2
 numpy==2.5.3
 pdfplumber==0.11.10
-pillow==12.3.0
+pillow==13.0.0
 pydantic==2.14.0
 pytest==9.1.1
 python-dotenv==1.2.4

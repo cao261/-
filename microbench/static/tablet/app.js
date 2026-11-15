@@ -165,7 +165,14 @@
     const key = (state && state.ai && state.ai.key) || "";
     if (key.length >= 6) s = s.split(key).join("***");
     s = s.replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-***");
-    s = s.replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*"?)[^"\s,}]+/gi, "$1***");
+    // ⚠⚠ 值那一段必须**连 "Bearer " 一起吃掉**。
+    //   原来的写法 `[:=]\s*"?)([^"\s,}]+)` 只匹配到第一个空白前的词 ——
+    //   "Authorization: Bearer abcdefghij" 被改成
+    //   "Authorization: *** abcdefghij"：**令牌原样留在界面上**（2026-10-27 审计）。
+    //   → 可选的 "bearer\s+" 前缀 + 整个令牌，一起脱敏。
+    s = s.replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"?\s*[:=]\s*"?)(?:bearer\s+)?[^"\s,}]+/gi, "$1***");
+    // ②b 裸的 Bearer 令牌（不在 "authorization:" 后面 —— 堆栈 / 日志里常见）
+    s = s.replace(/\bbearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, "Bearer ***");
     // ③ 绝对路径（Windows / 安卓 / Linux / macOS）
     s = s.replace(/[A-Za-z]:\\[^\s"'<>|]*/g, "<路径>");
     s = s.replace(/\/(?:data|storage|sdcard|Users|home)\/[^\s"'<>|]*/g, "<路径>");
@@ -247,6 +254,59 @@
     let h = 5381;
     for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
     return h.toString(36);
+  }
+
+  /* ------------------------------------------------------------------
+     带超时的 fetch
+     ------------------------------------------------------------------
+     ⚠ 以前 8 处 fetch **一个超时都没有** ——
+       WebDAV 挂住 / 网关不回，界面就一直转圈，用户只能强杀应用。
+     → 统一走 fetchWithTimeout：到点 abort，并抛出带 .timeout 标记的错误，
+       上层能分辨「超时」和「网络断了」。
+
+     ⚠ AI 请求的时限必须**比答疑时限宽**（AI_QA_TIMEOUT_MS = 300s）：
+       否则 fetch 先超时 → 抛 AbortError → runAI 会当成「用户点了停止」，
+       用户看到的是「已停止」，而不是「等太久了」。
+     ------------------------------------------------------------------ */
+  const FETCH_TIMEOUT_MS = 30000;      // 同步 / 列表这类小请求
+  const AI_FETCH_TIMEOUT_MS = 330000;  // AI 请求（> AI_QA_TIMEOUT_MS）
+
+  function fetchWithTimeout(url, opts, ms) {
+    const o = opts || {};
+    const limit = Number(ms) > 0 ? Number(ms) : FETCH_TIMEOUT_MS;
+    const ctrl = new AbortController();
+    const callerSignal = o.signal;
+    let timedOut = false;
+    let timer = null;
+    const abort = () => { try { ctrl.abort(); } catch (e) { /* ignore */ } };
+    // 调用方自己的 signal（用户点了停止）也要能中止这次请求
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        abort();
+      } else if (callerSignal.addEventListener) {
+        callerSignal.addEventListener("abort", abort, { once: true });
+      }
+    }
+    timer = setTimeout(() => { timedOut = true; abort(); }, limit);
+    const opts2 = Object.assign({}, o, { signal: ctrl.signal });
+    return fetch(url, opts2).then(
+      (r) => { cleanup(); return r; },
+      (e) => {
+        cleanup();
+        if (timedOut) {
+          const err = new Error("请求超时（" + Math.round(limit / 1000) + " 秒没等到回应）");
+          err.timeout = true;
+          throw err;
+        }
+        throw e;
+      }
+    );
+    function cleanup() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (callerSignal && callerSignal.removeEventListener) {
+        callerSignal.removeEventListener("abort", abort);
+      }
+    }
   }
 
   function toast(msg, isError) {
@@ -386,6 +446,22 @@
     },
     deleteNote(id) { return tx("notes", "readwrite", (s) => s.delete(id)); },
     clearNotes() { return tx("notes", "readwrite", (s) => s.clear()); },
+    clearMeta() { return tx("meta", "readwrite", (s) => s.clear()); },
+    clearPdfCache() { return tx("pdfcache", "readwrite", (s) => s.clear()); },
+    /**
+     * 清空**全部**本地数据（2026-10-27 审计 D-4）。
+     *
+     * ⚠ 以前「清空本地数据」只调了 clearNotes() ——
+     *   meta store 里**明文存着 API Key**（state.ai.key 就从那儿读），
+     *   pdfcache store 里躺着**全部原文 PDF（76MB）**，
+     *   两样都留在平板上 → 「清空了」其实没清干净。
+     *   → 三个 store 一起清。
+     */
+    async resetAll() {
+      await this.clearNotes();
+      await this.clearMeta();
+      await this.clearPdfCache();
+    },
     // ---- 本地批注（离线可写可看，联网时同步） ----
     // ⚠ 放在 meta store 里而不是新建 store —— 新建 store 要升 DB_VER，
     //   而升版本会被旧标签页挡住（白屏 + 启动失败）。零风险优先。
@@ -482,6 +558,21 @@
     return { text: parts.join(""), formulas };
   }
 
+  /**
+   * 公式渲染结果的**缓存**。
+   *
+   * ⚠ 为什么必须有（2026-10-27 审计 D-3）：
+   *   AI 流式输出时每来一片就把**全量文本**重新渲染一遍 →
+   *   每片都要重跑一遍 KaTeX。4000 字答案按 20 字一片 ≈ 200 片
+   *   → 200 次全量 Markdown + 全部公式重渲染 → 低端平板主线程冻结数秒。
+   *   同一个公式在同一次输出里会反复出现（"$x$"、"\frac{a}{b}"…），
+   *   → 按「tex + 显示模式」缓存，命中就不用再跑 KaTeX。
+   *
+   * ⚠ 缓存**有上限** —— 公式表无上限增长同样是内存泄漏。
+   */
+  const _mathCache = new Map();
+  const MATH_CACHE_MAX = 400;
+
   function renderMath(formulas) {
     if (!formulas || !formulas.length) return "";
     // 兜底：表里不该有空洞，但万一有，别让整篇笔记渲染不出来
@@ -493,8 +584,12 @@
         `<code class="math-error">${esc(f.tex.trim())}</code>`).join("");
     }
     return list.map((f) => {
+      const ck = (f.display ? "D" : "I") + " " + f.tex;
+      const hit = _mathCache.get(ck);
+      if (hit !== undefined) return hit;
+      let out;
       try {
-        return katex.renderToString(f.tex, {
+        out = katex.renderToString(f.tex, {
           displayMode: f.display, throwOnError: false, strict: "ignore",
           output: "html",
           macros: {
@@ -504,8 +599,15 @@
           }
         });
       } catch (e) {
-        return `<code class="math-error">${esc(f.tex.trim())}</code>`;
+        out = `<code class="math-error">${esc(f.tex.trim())}</code>`;
       }
+      if (_mathCache.size >= MATH_CACHE_MAX) {
+        // 满了就丢最早的一条（Map 保序）
+        const first = _mathCache.keys().next();
+        if (!first.done) _mathCache.delete(first.value);
+      }
+      _mathCache.set(ck, out);
+      return out;
     }).join("");
   }
 
@@ -694,9 +796,12 @@
     syncMode: "local",     // local | dir
     dirtyCount: 0,
     pendingSelection: "",  // 从 PDF 里划词带过来的原文
+    pendingRegionImage: "", // 圈选区域裁出来的图（data URL），下次提问自动带上
+    pendingRegionPage: 0,    // 圈选区域在第几页
     aiHistory: new Map(),   // noteId -> [{role, content}] 多轮对话上下文
-    trans: new Map(),       // paperId -> {pageNum: 译文}（与电脑端共享）
-    annos: new Map(),       // paperId -> [批注]
+    // ⚠ 以前这里还有 `trans: new Map()` 和 `annos: new Map()` ——
+    //   全文件**从来没有写入过**（译文走 state.transSeed / state.transVer，
+    //   批注走 pdfState.annos 和 DB.getAnnos）→ 纯死状态，删掉。
     transSeed: {},          // 导出版里烤进来的译文 {safeKey: {pageNum: 译文}}
     transVer: null,         // 当前的抽取算法版本（判断译文是不是旧的）
     transStale: false,      // 这篇的译文是旧算法翻的（已作废）
@@ -717,7 +822,7 @@
       raw = JSON.parse(node.textContent);
     } catch (e) { /* ignore */ }
 
-    if (raw && raw.pdfs) state.pdfs = raw.pdfs;
+    if (raw && raw.pdfs) state.pdfs = trimPdfList(raw.pdfs);
     // 导出版里烤进来的译文（还没连云盘时也能看）
     if (raw && raw.trans) state.transSeed = raw.trans;
     // 当前的抽取算法版本 —— 用来判断云盘上的译文是不是旧算法翻的
@@ -771,9 +876,73 @@
   // ------------------------------------------------------------------
   // 目录树
   // ------------------------------------------------------------------
+  /**
+   * 目录树。
+   *
+   * ⚠⚠ **增量**重建（2026-10-27 审计 D-8）：
+   *   以前每搜一下、每存一次笔记都把整个 nav-list 的 DOM 全扔了重建 ——
+   *   几十条笔记时还能忍，几百条时低端平板会明显卡顿（点一下保存要等一下）。
+   *   → 现在**复用**已有的按钮节点，只增删变化的部分。
+   *
+   * ⚠ 复用节点的前提是「id → 节点」的映射一直在（state.navNodes），
+   *   节点本身不重建 —— 所以 onclick 里的 id 不用每次重绑。
+   */
+  const navNodes = new Map();     // note id -> 目录按钮（增量重建时复用）
+  const navGroups = new Map();   // 分组名 -> 分组标题（同样复用）
+
+  function navItemNode(n) {
+    let b = navNodes.get(n.id);
+    if (!b) {
+      b = el("button", "tb-item");
+      b.__title = document.createTextNode("");
+      b.appendChild(b.__title);
+      b.__sub = el("span", "tb-item-sub", "");
+      b.appendChild(b.__sub);
+      b.onclick = () => openNote(n.id);
+      navNodes.set(n.id, b);
+    }
+    if (b.__title) b.__title.nodeValue = n.title || n.id;
+    if (b.__sub) b.__sub.textContent = n.rel || "";
+    let cls = "tb-item";
+    if (n.id === state.currentId) cls += " is-active";
+    if (n.dirty) cls += " is-dirty";
+    b.className = cls;
+    return b;
+  }
+
+  function navGroupNode(g) {
+    let n = navGroups.get(g);
+    if (!n) {
+      n = el("div", "tb-group", g);
+      navGroups.set(g, n);
+    }
+    return n;
+  }
+
+  /** 把 list 调整成「按 wanted 的顺序、且只包含 wanted 的节点」。 */
+  function reconcileNav(list, wanted) {
+    const keep = new Set(wanted);
+    // ① 摘掉不再要的
+    Array.from(list.children).forEach((c) => {
+      if (keep.has(c)) return;
+      try {
+        if (c.remove) c.remove();
+        else if (c.parentNode) c.parentNode.removeChild(c);
+      } catch (e) { /* ignore */ }
+    });
+    // ② 按顺序对齐（insertBefore 会把已在表里的节点**移动**过去）
+    let i = 0;
+    wanted.forEach((node) => {
+      const have = list.children[i];
+      if (have === node) { i++; return; }
+      list.insertBefore(node, have || null);
+      i++;
+    });
+  }
+
   function buildNav() {
     const list = $("nav-list");
-    list.innerHTML = "";
+    if (!list) return;
     const q = state.filter.trim().toLowerCase();
 
     const byGroup = new Map();
@@ -787,24 +956,30 @@
     });
 
     if (!byGroup.size) {
+      list.innerHTML = "";
       list.appendChild(el("div", "tb-empty", q ? "没有匹配的笔记" : "还没有笔记"));
       return;
     }
 
     const groups = FOLDERS.filter((f) => byGroup.has(f))
       .concat([...byGroup.keys()].filter((k) => FOLDERS.indexOf(k) < 0).sort());
+    // ① 先算出这次要显示的节点序列
+    const wanted = [];
     groups.forEach((g) => {
-      list.appendChild(el("div", "tb-group", g));
+      wanted.push(navGroupNode(g));
       byGroup.get(g).sort((a, b) => (a.title || "").localeCompare(b.title || "", "zh"))
         .forEach((n) => {
-          const b = el("button", "tb-item");
-          if (n.id === state.currentId) b.classList.add("is-active");
-          if (n.dirty) b.classList.add("is-dirty");
-          b.appendChild(document.createTextNode(n.title || n.id));
-          b.appendChild(el("span", "tb-item-sub", n.rel || ""));
-          b.onclick = () => openNote(n.id);
-          list.appendChild(b);
+          wanted.push(navItemNode(n));
         });
+    });
+    // ② 增量对齐（复用旧节点）
+    reconcileNav(list, wanted);
+    // ③ 回收已经不存在的笔记的节点
+    navNodes.forEach((node, id) => {
+      if (!state.notes.has(id)) navNodes.delete(id);
+    });
+    navGroups.forEach((node, g) => {
+      if (!byGroup.has(g)) navGroups.delete(g);
     });
   }
 
@@ -1039,8 +1214,21 @@
     const w = _nativeWaiters[cbId];
     if (!w) return;
     delete _nativeWaiters[cbId];
-    if (ok) w.resolve(payload);
-    else w.reject(new Error((payload && payload.error) || "原生调用失败"));
+    if (ok) {
+      w.resolve(payload);
+      return;
+    }
+    // ⚠⚠ **必须把 status 带出来**（2026-10-27 审计 D-1）。
+    //   Java 侧回的包是 {"ok":false,"status":429,"error":"..."}
+    //   （DavBridge.java:314-316 确实带了 status）——
+    //   原来这里 `new Error(payload.error)` 把 status **整个丢了** →
+    //   上层 `Number(e1.status) || 0` 恒为 0 →
+    //   「429 换模型」「400 剥参数」两条兜底**永远不命中**，
+    //   APK 上用户看到的是上游的原始英文报错。
+    const p = payload || {};
+    const err = new Error(p.error || "原生调用失败");
+    err.status = Number(p.status) || 0;
+    w.reject(err);
   };
   /**
    * 原生调用的超时兜底（毫秒），**按方法分别给**。
@@ -1150,7 +1338,7 @@
     dav: {
       mode: "dav",
       async list(dir) {
-        const r = await fetch(davUrl("list", dir));
+        const r = await fetchWithTimeout(davUrl("list", dir), {}, FETCH_TIMEOUT_MS);
         if (!r.ok) {
           // ⚠ 把服务端说的原因带上来 —— 否则「HTTP 500」这种话
           //   用户完全看不懂（限流时的提示是「请求太频繁」）。
@@ -1162,7 +1350,7 @@
         return Array.isArray(arr) ? arr : [];
       },
       async readText(path) {
-        const r = await fetch(davUrl("file", path));
+        const r = await fetchWithTimeout(davUrl("file", path), {}, FETCH_TIMEOUT_MS);
         if (!r.ok) return null;
         return r.text();
       },
@@ -1170,7 +1358,7 @@
         // 本地缓存优先 —— 缓存过的离线也能翻
         const cached = await DB.getCachedPdf(path);
         if (cached) return cached;
-        const r = await fetch(davUrl("file", path));
+        const r = await fetchWithTimeout(davUrl("file", path), {}, FETCH_TIMEOUT_MS);
         if (!r.ok) return null;
         return r.blob();
       },
@@ -1403,6 +1591,24 @@
     return { notes, pdfs };
   }
 
+  /**
+   * 原文清单**要有上限**（2026-10-27 审计 D-7）。
+   *
+   * ⚠ 以前 `state.pdfs` 只 merge 不剪枝 → 云盘里论文越加越多，
+   *   这张表（连带文献库分组的渲染）会一直变大，占内存不释放。
+   * → 只留最近扫描到的 N 篇（对象的键序 = 插入序，末尾最新）。
+   */
+  const PDF_LIST_MAX = 50;
+
+  function trimPdfList(list) {
+    const out = list || {};
+    const keys = Object.keys(out);
+    if (keys.length <= PDF_LIST_MAX) return out;
+    const keep = {};
+    keys.slice(keys.length - PDF_LIST_MAX).forEach((k) => { keep[k] = out[k]; });
+    return keep;
+  }
+
   async function pullFromDir(quiet) {
     const backend = currentBackend();
     if (!backend) return;
@@ -1425,7 +1631,7 @@
     // 旧的不删 —— 扫到一半失败时不至于把已有的原文从列表里抹掉。
     const merged = Object.assign({}, state.pdfs || {});
     Object.keys(scan.pdfs || {}).forEach((id) => { merged[id] = scan.pdfs[id]; });
-    state.pdfs = merged;
+    state.pdfs = trimPdfList(merged);
 
     for (const f of files) {
       const text = f.text;
@@ -1739,6 +1945,9 @@
   const AI_HISTORY_TURNS = 3;
   /** 历史里每条答案最多留这么多字，免得 token 越滚越大 */
   const AI_HISTORY_MAX_CHARS = 1200;
+  /** ⚠ 同时保留**多少篇笔记**的对话（2026-10-27 审计 D-7）——
+   *  以前只增不减，翻几十篇笔记就攒几十份对话，内存不回收。 */
+  const AI_HISTORY_MAX_NOTES = 100;
 
   // ------------------------------------------------------------------
   // 思考预算与时限（2026-10-27 抄电脑端 AGENTS.md §4.38 / §4.39）
@@ -1928,6 +2137,14 @@
     if (!h) {
       h = [];
       state.aiHistory.set(noteId, h);
+      // ⚠ 对话历史**只增不减**（2026-10-27 审计 D-7）——
+      //   用得越久、翻的笔记越多，内存里攒的对话越多，从不回收。
+      // → 只留最近 AI_HISTORY_MAX_NOTES 篇笔记的对话（Map 保序，丢最早的）。
+      while (state.aiHistory.size > AI_HISTORY_MAX_NOTES) {
+        const oldest = state.aiHistory.keys().next();
+        if (oldest.done) break;
+        state.aiHistory.delete(oldest.value);
+      }
     }
     return h;
   }
@@ -2003,7 +2220,20 @@
     // **fetch 必被 CORS 打死**。走原生代理就没有跨域问题。
     // 代价：原生代理拿不到流式增量，只能一次性拿回完整 SSE 文本。
     if (nativeBridge && typeof nativeBridge.httpPost === "function") {
-      const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${cfg.key}`]);
+      let r = null;
+      try {
+        r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${cfg.key}`]);
+      } catch (e) {
+        // ⚠ 原生桥**失败**（HTTP 非 2xx）时，桥是 reject 的，
+        //   状态码在 e.status 里（__mbNativeResolve 已经挂上）。
+        //   → 这里必须把它转成「友好中文 + 带 status 的 Error」，
+        //     否则上层既看不到 429（换不了模型），用户也只能看到英文原文。
+        const st = Number(e && e.status) || 0;
+        const raw = String((e && e.message) || "");
+        const err = new Error(friendlyHttpError(st, raw));
+        err.status = st;
+        throw err;
+      }
       if (signal && signal.aborted) {
         return { content: "", reasoning: "", aborted: true };
       }
@@ -2020,7 +2250,7 @@
       return parsed;
     }
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2028,7 +2258,7 @@
       },
       body: bodyStr,
       signal: signal || undefined,
-    });
+    }, AI_FETCH_TIMEOUT_MS);
     if (!res.ok) {
       const t = await res.text().catch(() => "");
       const err = new Error(friendlyHttpError(res.status, t));
@@ -2114,6 +2344,231 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // 圈选区域 → 问 AI（2026-11-12）
+  //
+  // 用户原话："我直接用手写笔圈一部分，然后直接能问 AI"、
+  //             "圈一部分，然后直接能问 AI，这个如果能做到的话会很方便"。
+  //
+  // ⚠ 原来「带上我的手写问 AI」发的是**整页图** ——
+  //   圈的那一小块在整页里又小又糊（整页压到 1200px 宽，
+  //   一栏文字只剩几十像素高），模型基本看不清 → 等于白圈。
+  // → 这里把笔迹的**包围盒**算出来，只裁那一块，
+  //   并且**按该块自己的像素密度**放大到可读尺寸。
+  // ------------------------------------------------------------------
+
+  /**
+   * 某一页所有笔迹的包围盒（归一化 0~1）。没有笔迹返回 null。
+   *
+   * 笔迹本来就是归一化坐标（inkState.strokes[page] = [[x0,y0,x1,y1,…],…]），
+   * 所以直接取极值即可，缩放/换设备都不用重算。
+   */
+  function inkBBox(page) {
+    const strokes = (inkState.strokes && inkState.strokes[page]) || [];
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, any = false;
+    for (const pts of strokes) {
+      if (!pts || pts.length < 2) continue;
+      for (let i = 0; i + 1 < pts.length; i += 2) {
+        const x = pts[i], y = pts[i + 1];
+        if (typeof x !== "number" || typeof y !== "number") continue;
+        if (!isFinite(x) || !isFinite(y)) continue;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+        any = true;
+      }
+    }
+    if (!any) return null;
+    return { x0, y0, x1, y1 };
+  }
+
+  /** 圈选区域占整页的比例。圈得比这还大 = 不是"圈一块"，是乱画 → 退回整页。 */
+  const REGION_MAX_PAGE_RATIO = 0.8;
+  /** 裁出来的小图至少要有这么宽（太窄字太小，模型看不清）。 */
+  const REGION_MIN_WIDTH_PX = 900;
+  /** 最多放大到几倍。放大**不增加细节**，只让糊更糊 → 别贪。 */
+  const REGION_MAX_UPSCALE = 2.5;
+
+  /**
+   * 裁出「圈选区域」：原文那一块 + 用户的笔迹 + 一个高亮框。
+   *
+   * ⚠ 笔迹画布和原文画布的**像素尺寸不一定相同**
+   *   （笔迹层是按自己的 getBoundingClientRect 量出来的），
+   *   所以两段各用各的尺寸换算，别假设 1:1 —— 假设错位会导致圈线跑到别处。
+   *
+   * @returns {{dataUrl:string, bbox:object}|null}
+   */
+  function captureInkRegion(pageNum, bbox) {
+    const wrap = document.querySelector(`[data-pdf-page="${pageNum}"]`);
+    if (!wrap || !wrap.querySelector || !bbox) return null;
+    const orig = wrap.querySelector(".tb-pdf-orig");
+    const src = orig ? orig.querySelector("canvas") : null;
+    if (!src || !src.width || !src.height) return null;
+    const inkCv = wrap.querySelector(".tb-pdf-ink canvas");
+
+    const clamp01 = (v) => Math.max(0, Math.min(1, v));
+    // 圈线本身有宽度 → 往外留一点余量，别把圈到的字切掉
+    const pad = 0.02;
+    const nx0 = clamp01(bbox.x0 - pad), ny0 = clamp01(bbox.y0 - pad);
+    const nx1 = clamp01(bbox.x1 + pad), ny1 = clamp01(bbox.y1 + pad);
+    const sx0 = Math.floor(nx0 * src.width), sy0 = Math.floor(ny0 * src.height);
+    const sx1 = Math.ceil(nx1 * src.width), sy1 = Math.ceil(ny1 * src.height);
+    const cw = Math.max(1, sx1 - sx0), ch = Math.max(1, sy1 - sy0);
+
+    // 放大到可读（但不放太多）
+    let scale = REGION_MIN_WIDTH_PX / cw;
+    if (scale > REGION_MAX_UPSCALE) scale = REGION_MAX_UPSCALE;
+    if (scale < 1) scale = 1;
+
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.floor(cw * scale));
+    cv.height = Math.max(1, Math.floor(ch * scale));
+    const ctx = cv.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    // 原文那一块
+    ctx.drawImage(src, sx0, sy0, cw, ch, 0, 0, cv.width, cv.height);
+    // 笔迹那一块（各用各的尺寸换算）
+    if (inkCv && inkCv.width && inkCv.height) {
+      const ix0 = Math.floor(nx0 * inkCv.width), iy0 = Math.floor(ny0 * inkCv.height);
+      const iw = Math.max(1, Math.ceil(nx1 * inkCv.width) - ix0);
+      const ih = Math.max(1, Math.ceil(ny1 * inkCv.height) - iy0);
+      try {
+        ctx.drawImage(inkCv, ix0, iy0, iw, ih, 0, 0, cv.width, cv.height);
+      } catch (e) { /* 笔迹层还没画好 → 只发原文 */ }
+    }
+    // 高亮框：明确告诉模型「看这一块」
+    try {
+      ctx.save();
+      ctx.strokeStyle = "rgba(250, 204, 21, 0.95)";
+      ctx.lineWidth = Math.max(2, Math.round(cv.width * 0.006));
+      ctx.strokeRect(ctx.lineWidth, ctx.lineWidth,
+        Math.max(1, cv.width - ctx.lineWidth * 2),
+        Math.max(1, cv.height - ctx.lineWidth * 2));
+      ctx.restore();
+    } catch (e) { /* ignore */ }
+    try {
+      return { dataUrl: cv.toDataURL("image/jpeg", 0.88), bbox: bbox };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * 某一页的圈选区域。
+   * @returns {{page:number, bbox:object}|null}
+   */
+  function inkRegionOn(page) {
+    const bbox = inkBBox(page);
+    if (!bbox) return null;
+    const area = (bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0);
+    // 圈了几乎整页 = 没有"圈一块"的意思 → 当作没圈
+    if (!area || area > REGION_MAX_PAGE_RATIO) return null;
+    return { page: page, bbox: bbox };
+  }
+
+  /** 当前页的圈选区域。 */
+  function currentInkRegion() {
+    return inkRegionOn(pdfState.currentPage || 1);
+  }
+
+  /** 隐藏所有页上的圈选操作条。 */
+  function hideRegionBar() {
+    document.querySelectorAll(".tb-pdf-region").forEach((b) => {
+      b.hidden = true;
+    });
+  }
+
+  /**
+   * 圈完一笔 → 在圈的上方浮出操作条（问这块 / 总结这块 / 清除）。
+   *
+   * ⚠ 操作条必须挂在 **.tb-pdf-orig** 里面（不是 .tb-pdf-page）：
+   *   宽屏是「原文 + 译文」并排，页卡的坐标原点跟原文画布**不是同一个**，
+   *   挂错容器 → 按钮会跑到译文那一栏上面去。
+   */
+  function showRegionBar(page) {
+    const wrap = document.querySelector(`[data-pdf-page="${page}"]`);
+    if (!wrap || !wrap.querySelector) return;
+    const orig = wrap.querySelector(".tb-pdf-orig");
+    const bbox = inkBBox(page);
+    if (!orig || !bbox) { hideRegionBar(); return; }
+    const area = (bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0);
+    if (!area || area > REGION_MAX_PAGE_RATIO) { hideRegionBar(); return; }
+
+    let bar = orig.querySelector(".tb-pdf-region");
+    if (!bar) {
+      bar = el("div", "tb-pdf-region");
+      const mk = (label, cls, fn) => {
+        const b = el("button", "tb-btn tb-sm" + (cls ? " " + cls : ""), label);
+        // ⚠ pointerdown 要拦下来：不然这一下会被手写层当成"又画一笔"
+        b.addEventListener("pointerdown", (e) => { e.stopPropagation(); e.preventDefault(); });
+        b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+        return b;
+      };
+      bar.appendChild(mk("✍ 问这块", "tb-btn-primary", () => askRegion(page)));
+      bar.appendChild(mk("总结这块", "", () => summarizeRegion(page)));
+      bar.appendChild(mk("清除", "", () => clearRegionInk(page)));
+      // 挂在原文层里、且排在手写层**之后** → 画在手写层上面、点击先命中它
+      orig.appendChild(bar);
+    }
+    const cx = ((bbox.x0 + bbox.x1) / 2) * 100;
+    const above = bbox.y0 > 0.14;
+    bar.style.left = cx + "%";
+    bar.style.top = (above ? bbox.y0 : bbox.y1) * 100 + "%";
+    bar.style.transform = above ? "translate(-50%, -118%)" : "translate(-50%, 10%)";
+    bar.hidden = false;
+  }
+
+  /** 清掉某一页的笔迹（只清笔迹，不动批注）。 */
+  function clearRegionInk(page) {
+    if (!inkState.strokes[page]) return;
+    inkState.strokes[page] = [];
+    const wrap = document.querySelector(`[data-pdf-page="${page}"]`);
+    const inkCv = wrap && wrap.querySelector ? wrap.querySelector(".tb-pdf-ink canvas") : null;
+    if (inkCv) drawInkPage(page, inkCv, inkCv.getContext("2d"));
+    hideRegionBar();
+    scheduleInkSave();
+  }
+
+  /**
+   * 「✍ 问这块」：把圈选区域带上 → 打开 AI 面板 → 等用户把问题打出来。
+   *
+   * ⚠ 不直接发问：用户还没说他想问什么。带上图 + 聚焦输入框即可。
+   */
+  async function askRegion(page) {
+    // ⚠ 用**浮条所在的那一页**，不是"当前页"——
+    //   用户可能圈完就翻页了，浮条还挂在他圈的那一页上。
+    const region = inkRegionOn(page) || currentInkRegion();
+    if (!region) { toast("先在手写模式下圈一块", true); return; }
+    const shot = captureInkRegion(region.page, region.bbox);
+    if (!shot) { toast("截不到这一块", true); return; }
+    state.pendingRegionImage = shot.dataUrl;
+    state.pendingRegionPage = region.page;
+    hideRegionBar();
+    closePdf();
+    setPane("ai");
+    aiShowContext("已带上圈选区域（第 " + region.page + " 页）");
+    const qb = $("ai-question");
+    if (qb) qb.focus();
+  }
+
+  /** 「总结这块」：直接问 —— 用户要的就是"总结这一部分"。 */
+  async function summarizeRegion(page) {
+    const region = inkRegionOn(page) || currentInkRegion();
+    if (!region) { toast("先在手写模式下圈一块", true); return; }
+    const shot = captureInkRegion(region.page, region.bbox);
+    if (!shot) { toast("截不到这一块", true); return; }
+    hideRegionBar();
+    closePdf();
+    setPane("ai");
+    await runAI("ask", {
+      imageDataUrl: shot.dataUrl,
+      question: "请总结我圈出来的这部分内容：它在讲什么、关键结论是什么、有没有值得警惕的前提。",
+    });
+  }
+
   /** 「带上我的手写问 AI」—— 把手写标注连同问题一起发给模型。 */
   async function askAiWithInk() {
     const pages = Object.keys(inkState.strokes)
@@ -2122,13 +2577,27 @@
       toast("先在手写模式下画几笔，再点这个", true);
       return;
     }
-    const q = ($("ai-question").value || "").trim();
+    const q = (($("ai-question") || {}).value || "").trim();
     if (!q) {
       toast("写下你的问题", true);
       $("ai-question").focus();
       return;
     }
-    const img = await captureInkPage(parseInt(pages[0], 10));
+    // ⚠ 2026-11-12：**优先发圈选区域**（只发那一块，模型才看得清）；
+    //   没圈、或圈了整页 → 才退回整页图。
+    let img = null;
+    const region = currentInkRegion();
+    if (region) {
+      const shot = captureInkRegion(region.page, region.bbox);
+      if (shot) img = shot.dataUrl;
+    }
+    if (!img) {
+      // 整页图用**当前页**（原来用 pages[0] = 第一页有笔迹的那页，
+      // 用户在第 5 页画完一笔，却发的是第 2 页 → 圈的东西根本没发过去）
+      const cur = pdfState.currentPage || 1;
+      const page = (inkState.strokes[cur] && inkState.strokes[cur].length) ? cur : parseInt(pages[0], 10);
+      img = await captureInkPage(page);
+    }
     if (!img) { toast("截不到手写内容", true); return; }
     await runAI("ask", { imageDataUrl: img });
   }
@@ -2153,7 +2622,11 @@
     }
 
     const qBox = $("ai-question");
-    const q = (qBox.value || "").trim();
+    // ⚠ 2026-11-12：允许调用方**直接给问题**（「总结这块」就是一句固定问法，
+    //   不该逼用户先去输入栏打字）。
+    const q = (o.question != null)
+      ? String(o.question || "").trim()
+      : (qBox.value || "").trim();
     if (kind === "ask" && !q) {
       toast("写下你的问题", true);
       if (qBox) qBox.focus();
@@ -2172,8 +2645,19 @@
     aiAppendTurn(kind, q, sel);
 
     const model = kind === "translate" ? (cfg.modelT || cfg.model) : cfg.model;
+    // ⚠ 2026-11-12：带图提问时**不要再塞 4000 字笔记正文**。
+    //   用户圈的是 PDF 上的一块 → 模型该看的是那张图，
+    //   掺一大段无关正文只会把注意力拉走（还会白烧 token）。
+    //
+    // ⚠ 待发的圈选区域图**只跟"提问"走** —— 「翻译选中」「解读选中」
+    //   是针对选中文字的，混进一张图只会让模型分不清在看什么。
+    const imgAttached = kind === "ask"
+      ? !!(o.imageDataUrl || state.pendingRegionImage)
+      : !!o.imageDataUrl;
     const base = PROMPTS[kind](
-      kind === "ask" ? (sel || bodyText.slice(0, 4000)) : (sel || bodyText.slice(0, 6000)),
+      kind === "ask"
+        ? (sel || (imgAttached ? "" : bodyText.slice(0, 4000)))
+        : (sel || bodyText.slice(0, 6000)),
       q);
 
     // 多轮上下文：把这一篇笔记之前的问答带上 —— 追问时模型才知道前文在讲什么。
@@ -2187,16 +2671,24 @@
       messages = [base[0]].concat(ctx, [base[1]]);
     }
 
-    // ⚠ 带上图片（手写标注）—— OpenAI 兼容的 content 数组格式。
+    // ⚠ 带上图片（手写标注 / 圈选区域）—— OpenAI 兼容的 content 数组格式。
     //   手写是图形，文字描述不出来，得让模型直接看图。
-    if (o.imageDataUrl) {
+    // ⚠ 2026-11-12：没有显式传图时，用「已选中的圈选区域」；
+    //   用掉就清掉（免得下一句提问又带上同一张图）。
+    const img = (kind === "ask")
+      ? (o.imageDataUrl || state.pendingRegionImage || "")
+      : (o.imageDataUrl || "");
+    if (img) {
+      // ⚠ 用掉就清掉（不管用的是显式传的还是"已选中的圈选区域"）——
+      //   留着的话，下一句提问会又带上同一张图。
+      state.pendingRegionImage = "";
       const last = messages[messages.length - 1];
       if (last && last.role === "user") {
         messages[messages.length - 1] = {
           role: "user",
           content: [
             { type: "text", text: String(last.content || "") },
-            { type: "image_url", image_url: { url: o.imageDataUrl } },
+            { type: "image_url", image_url: { url: img } },
           ],
         };
       }
@@ -2261,6 +2753,12 @@
     //   没有已用时，用户只能盯着一个不动的光标猜是不是死了。
     const t0 = Date.now();
     let gotFirstDelta = false;
+    // ⚠ 节流渲染的状态必须在 try **外面**声明 ——
+    //   finally 里要收掉那个定时器（try 块里的 let/const 在块外看不见，
+    //   在 finally 里引用会直接 ReferenceError）。
+    let pendingText = null;
+    let renderTimer = null;
+    let lastRenderAt = 0;
     const tick = setInterval(() => {
       if (gotFirstDelta) return;
       const s = Math.floor((Date.now() - t0) / 1000);
@@ -2276,10 +2774,33 @@
       const altModel = (kind === "translate")
         ? (cfg.model || "")
         : (cfg.modelT || "");
-      const onDelta = (txt) => {
-        if (!gotFirstDelta) { gotFirstDelta = true; clearInterval(tick); }
+      /**
+       * ⚠ 流式渲染**必须节流**（2026-10-27 审计 D-3）。
+       *   onDelta 收到的是**全量累积文本**，每来一片就整段重渲染 = O(n²)：
+       *   4000 字答案按 20 字/片 ≈ 200 片 → 200 次全量 Markdown
+       *   + 全部公式重渲染 → 低端平板主线程冻结数秒（界面看着像「卡死了」）。
+       *   → 最多每 100ms 渲染一次。
+       *   ⚠ **最终输出内容不变**：收尾时仍然用 renderMarkdown(answer) 整段渲染一次，
+       *     节流只影响「打字过程中」的中间帧。
+       */
+      const AI_RENDER_THROTTLE_MS = 100;
+      const flushRender = () => {
+        if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+        if (pendingText == null) return;
+        const txt = pendingText;
+        pendingText = null;
+        lastRenderAt = Date.now();
         buf.innerHTML = renderMarkdown(txt);
         if (out) out.scrollTop = out.scrollHeight;
+      };
+      const onDelta = (txt) => {
+        if (!gotFirstDelta) { gotFirstDelta = true; clearInterval(tick); }
+        pendingText = txt;
+        const wait = AI_RENDER_THROTTLE_MS - (Date.now() - lastRenderAt);
+        if (wait <= 0) { flushRender(); return; }
+        if (!renderTimer) {
+          renderTimer = setTimeout(() => { renderTimer = null; flushRender(); }, wait);
+        }
       };
       /**
        * 发一次请求（自带三层兜底）。
@@ -2374,6 +2895,8 @@
           ? "正文为空 → 关掉思考重试…"
           : "正文为空（预算被思考吃光）→ 把预算抬到 " + payload.max_tokens + " 重试…";
         buf.innerHTML = "";
+        pendingText = null;
+        if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
         gotFirstDelta = false;
         const res2 = await sendOnce();
         if (res2 && res2.aborted) {
@@ -2420,6 +2943,9 @@
     } finally {
       clearInterval(tick);
       clearTimeout(timeoutTimer);
+      // 节流渲染的尾巴也要收掉 —— 否则收尾后还会再渲染一次旧文本。
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      pendingText = null;
       // ⚠ 只有**当前请求**才能碰共享状态（停止按钮 / 多轮上下文）。
       //   旧请求收尾时把新请求的停止按钮藏掉 → 用户没法停止新请求了。
       if (isCurrent()) {
@@ -2451,7 +2977,22 @@
       });
       // APK 里走原生代理（页面的 fetch 会被 CORS 打死）
       if (nativeBridge && typeof nativeBridge.httpPost === "function") {
-        const r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${state.ai.key}`]);
+        let r = null;
+        try {
+          r = await nativeCall("httpPost", [url, bodyStr, `Bearer ${state.ai.key}`]);
+        } catch (e) {
+          // ⚠ APK 里**没有跨域问题**（请求走原生代理）——
+          //   原来一律说「可能是浏览器跨域限制」，是在误导用户。
+          //   → 按状态码区分：401/403 说 key 不对，429 说额度/限流，
+          //     其余才说「模型服务没响应」。
+          const st = Number(e && e.status) || 0;
+          hint.textContent = st
+            ? friendlyHttpError(st, String((e && e.message) || ""))
+            : ("连不上模型服务：" + safeErr(e && e.message ? e.message : e)
+               + "（APK 里走的是原生代理，不是跨域问题）");
+          hint.setAttribute("data-error", "1");
+          return;
+        }
         if (r && r.ok) {
           hint.textContent = "连接正常";
           hint.removeAttribute("data-error");
@@ -2462,14 +3003,14 @@
         }
         return;
       }
-      const res = await fetch(url, {
+      const res = await fetchWithTimeout(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${state.ai.key}`,
         },
         body: bodyStr,
-      });
+      }, AI_FETCH_TIMEOUT_MS);
       if (res.ok) { hint.textContent = "连接正常"; hint.removeAttribute("data-error"); }
       else {
         const t = await res.text().catch(() => "");
@@ -2509,8 +3050,16 @@
     rendered: new Set(),   // 已经画过的页码
     pending: false,
     zoom: 1,               // 用户缩放倍数（1 = 适合宽度）
-    layout: "both",         // both | orig | trans（原文+译文 / 仅原文 / 仅译文）
+    layout: "both",         // both | orig | trans | bilingual（原文+译文 / 仅原文 / 仅译文 / 对照）
     trans: null,           // {pageNum: 译文}
+    // 对照模式（译文按原文排版）的段落数据：{pageNum: {blocks:[…], version:N}}
+    // ⚠ 平板**访问不到电脑端的后端**（没有 baseURL、CSP 与原生桥白名单都拦着）
+    //   → 段落译文只能跟着快照同步过来。
+    blockTrans: null,
+    // 对照模式里整块公式的**原图**（data URL）：{pageNo: {rectKey: dataURL}}
+    //   ⚠ 平板访问不到电脑端的 /api/paper/formula_image（没有 baseURL、
+    //     CSP、原生桥白名单三处拦着）→ 平板自己在本地裁（见 renderFormulaShot）。
+    formulaShots: {},
     annos: [],             // 批注
   };
 
@@ -2570,6 +3119,19 @@
   }
 
   /**
+   * 段落译文（对照模式）的本地缓存键。
+   *
+   * ⚠ 与整页译文的缓存**分开存**：两者生命周期不同 ——
+   *   整页译文跟着 extractor_version 走，段落译文跟着 blocks_version 走
+   *   （段落切分算法一改，块编号就变了 → 旧译文贴上去就是错位）。
+   *   混在一个键里 → 一边作废把另一边也带走了。
+   */
+  function blocksCacheKey(key, ver) {
+    const v = (ver == null) ? "none" : String(ver);
+    return "blocks_v" + v + "_" + key;
+  }
+
+  /**
    * 拉一篇论文的译文快照。返回 {pageNum: 译文}，没有就返回 null。
    *
    * ⚠⚠ 抽取算法版本必须与当前一致。
@@ -2591,11 +3153,18 @@
     // ① 本地缓存 —— 没网也能看译文（键里带版本 → 换版本自动失效）
     if (cur != null) {
       const cached = await DB.getMeta(transCacheKey(key, cur), null);
-      if (cached && Object.keys(cached).length) return cached;
+      if (cached && Object.keys(cached).length) {
+        // 段落译文（对照模式）也取本地缓存 —— 断网也能看对照视图
+        try {
+          const cachedBlocks = await DB.getMeta(blocksCacheKey(key, cur), null);
+          if (cachedBlocks && Object.keys(cachedBlocks).length) pdfState.blockTrans = cachedBlocks;
+        } catch (e) { /* 段落缓存取不到不影响整页译文 */ }
+        return cached;
+      }
     }
     // ② 云盘同步根（最新 —— 电脑端翻完同步过来，平板立刻能看）
     try {
-      const r = await fetch(syncUrl("file", "snapshots/" + key + ".json"));
+      const r = await fetchWithTimeout(syncUrl("file", "snapshots/" + key + ".json"), {}, FETCH_TIMEOUT_MS);
       if (r.ok) {
         const data = await r.json();
         // 版本对不上就整份作废 —— 与桌面端同一个判据。
@@ -2605,9 +3174,21 @@
           return null;
         }
         const pages = {};
+        // 对照模式的段落译文：电脑端翻好、跟着快照同步过来的。
+        // ⚠ 平板访问不到电脑端的后端 —— 这是**唯一**的通道。
+        const blocks = {};
         (data.pages || []).forEach((p) => {
           if (p && p.translation) pages[p.page_num] = p.translation;
+          if (p && p.blocks && p.blocks.length) {
+            blocks[p.page_num] = { blocks: p.blocks, version: p.blocks_version };
+          }
         });
+        if (Object.keys(blocks).length) {
+          pdfState.blockTrans = blocks;
+          try { await DB.setMeta(blocksCacheKey(key, cur), blocks); } catch (e) { /* 缓存失败不影响显示 */ }
+        } else {
+          pdfState.blockTrans = null;
+        }
         if (Object.keys(pages).length) {
           await DB.setMeta(transCacheKey(key, cur), pages);
           return pages;
@@ -2638,34 +3219,95 @@
     const dirty = !!(rec && rec.dirty);
     // ② 云端（联网时；离线就跳过，不报错）
     let cloud = [];
+    let cloudDeleted = [];
+    let cloudOk = false;
     try {
-      const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
+      const r = await fetchWithTimeout(syncUrl("file", "annotations/" + key + ".json"), {}, FETCH_TIMEOUT_MS);
       if (r.ok) {
+        cloudOk = true;
         const data = await r.json();
         cloud = Array.isArray(data.annotations) ? data.annotations : [];
+        cloudDeleted = Array.isArray(data.deleted) ? data.deleted : [];
       }
     } catch (e) {
       console.warn("拉批注失败（离线？）", e);
     }
-    if (!cloud.length) {
-      return local;
-    }
-    // ③ 合并
-    //   本地是**干净**的（之前同步过）→ 云端没有的，说明是在别处删掉了，
-    //     本地也跟着删 —— 否则会「删了又复活」。
-    //   本地**有未同步的改动** → 合并，本地那份为准。
-    const merged = dirty ? mergeAnnos(cloud, local) : cloud;
-    await DB.putAnnos(key, { items: merged, dirty: dirty ? 1 : 0, at: Date.now() });
+    // ⚠ 云端**读不到**（离线 / 还没有这个文件）→ 本地优先，直接返回。
+    //   云端读得到但列表是空的 → 那是「电脑端把批注全删了」，要照办（见下面）。
+    if (!cloudOk) return local;
+    // ③ 三方合并：云端 + 本地（本地优先），墓碑**最后**应用。
+    //   墓碑告诉合并逻辑「这些 id 已经被删了」——
+    //   不应用墓碑的话，电脑端删掉的批注会在平板上复活、还会被推回云端。
+    const deleted = annoTombstones(rec, cloud, local, cloudDeleted, cloudOk);
+    const merged = mergeAnnos(cloud, local, deleted);
+    await DB.putAnnos(key, {
+      items: merged,
+      dirty: dirty ? 1 : 0,
+      at: Date.now(),
+      // base = **云端有的** id（平板自己还没同步上去的不算 ——
+      // 算进去的话，下次会把它当成「电脑端删了」→ 自己把自己的批注删了）
+      base: cloud.map((a) => a && a.id).filter(Boolean),
+      deleted: deleted,
+    });
     return merged;
   }
 
-  /** 按 id 合并两份批注（后到的覆盖先到的）。 */
-  function mergeAnnos(base, extra) {
+  /**
+   * 三方合并：云端 / 本地 / 删除墓碑。
+   *
+   * ⚠ 墓碑必须**最后**应用 —— 跟电脑端 `_merge_annotation_lists`
+   *   （microbench/app.py:4875）一个顺序：先按 id 合并，再删墓碑。
+   *   反过来的话，同一个 id 会被 upsert 又加回来。
+   *
+   * ⚠ 同 id 冲突时**本地那条为准**（本地优先是平板端的硬要求）。
+   */
+  function mergeAnnos(base, extra, deleted) {
     const map = new Map();
-    base.forEach((a) => { if (a && a.id) map.set(a.id, a); });
-    extra.forEach((a) => { if (a && a.id) map.set(a.id, a); });
+    (base || []).forEach((a) => { if (a && a.id) map.set(a.id, a); });
+    (extra || []).forEach((a) => { if (a && a.id) map.set(a.id, a); });
+    (deleted || []).forEach((id) => { if (id) map.delete(id); });
     return Array.from(map.values()).sort((a, b) =>
       String(a.created_at || "").localeCompare(String(b.created_at || "")));
+  }
+
+  /**
+   * 算出这次该应用的**删除墓碑**（被删掉的批注 id）。
+   *
+   * ⚠ 为什么不能只看「云端有而本地没有」（2026-10-27 审计 D-2）：
+   *   「我这里没有」有好几种可能，混为一谈就会**删掉别的设备刚加的批注**：
+   *     ① 本地删掉了          → 墓碑（要告诉电脑端）
+   *     ② 电脑端删掉了        → 墓碑（本地也得删，别再推回去）
+   *     ③ 电脑端**刚加的**、平板还没拉 → **不能**当墓碑！
+   *   → 判据要靠 `base`：
+   *     `base` = **上次同步时云端有的**那些 id（不是平板本地的全部）。
+   *     base 里有、这次云端没了 → ② 电脑端删了 → 墓碑。
+   *     base 里没有（电脑端刚加的 / 平板自己还没同步上去的）→ 保留。
+   *
+   * ⚠⚠ `cloudKnown` 必须传对（2026-10-27 审计 D-2 的连带坑）：
+   *   云端**读失败**（离线 / DAV 挂了）时 cloud 是个空数组 ——
+   *   此时若照样按「base - cloud」算墓碑，就会把**平板自己的批注全部**
+   *   当成「被电脑端删了」→ 推上去等于把两边的批注全清空。
+   *   → 云端状态未知时，一条墓碑都不许推算。
+   *
+   * @param rec          本地那条记录（{items, dirty, at, base, deleted}）
+   * @param cloud        云端列表
+   * @param local        本地列表
+   * @param cloudDeleted 云端文件里带的墓碑（别的设备删的）
+   * @param cloudKnown   云端列表**是不是真的读到了**（false = 状态未知）
+   */
+  function annoTombstones(rec, cloud, local, cloudDeleted, cloudKnown) {
+    const tombs = new Set();
+    const add = (id) => { if (id) tombs.add(id); };
+    ((rec && rec.deleted) || []).forEach(add);
+    (cloudDeleted || []).forEach(add);
+    if (cloudKnown) {
+      const cloudIds = new Set((cloud || []).map((a) => a && a.id).filter(Boolean));
+      // base 里有、这次云端没了 → 电脑端删掉了 → 别再推回去
+      ((rec && rec.base) || []).forEach((id) => {
+        if (!cloudIds.has(id)) add(id);
+      });
+    }
+    return Array.from(tombs);
   }
 
   /**
@@ -2676,46 +3318,109 @@
     const key = safePaperKey(paperIdFor(pdfId));
     if (!key) return false;
     // ① 本地先存 —— 硬要求：断网也能改
-    await DB.putAnnos(key, { items: items, dirty: 1, at: Date.now() });
+    const rec = await DB.getAnnos(key);
+    const prevIds = new Set(((rec && rec.items) || []).map((a) => a && a.id).filter(Boolean));
+    const newIds = new Set((items || []).map((a) => a && a.id).filter(Boolean));
+    // ⚠ 本地删掉的 id 要记成墓碑（2026-10-27 审计 D-2）——
+    //   不记的话，电脑端会把这些批注当成「平板还没删」→ 复活。
+    const deleted = ((rec && rec.deleted) || []).slice();
+    prevIds.forEach((id) => {
+      if (!newIds.has(id) && deleted.indexOf(id) < 0) deleted.push(id);
+    });
+    await DB.putAnnos(key, {
+      items: items,
+      dirty: 1,
+      at: Date.now(),
+      base: (rec && rec.base) || [],
+      deleted: deleted,
+    });
     // ② 再同步到云盘
-    const ok = await pushAnnosToCloud(key, items);
-    if (ok) {
-      await DB.putAnnos(key, { items: items, dirty: 0, at: Date.now() });
+    const r = await pushAnnosToCloud(key, items);
+    if (r.ok) {
+      // 云端确认过的墓碑 → 本地也跟着删
+      // （电脑端删掉的批注，别在平板上一直挂着、又被推回去）
+      const gone = new Set(r.deleted || []);
+      const kept = items.filter((a) => !gone.has(a && a.id));
+      await DB.putAnnos(key, {
+        items: kept,
+        dirty: 0,
+        at: Date.now(),
+        // base = **云端现在有的** id（= 刚写上去的那份）
+        base: (r.merged || kept).map((a) => a && a.id).filter(Boolean),
+        deleted: [],
+      });
+      if (kept.length !== items.length && Array.isArray(pdfState.annos)) {
+        pdfState.annos = kept;      // 界面也跟着更新
+      }
     } else if (!silent) {
       toast("已存到平板本地（联网后会自动同步到坚果云）");
     }
-    return ok;
+    return r.ok;
   }
 
-  /** 把批注写到同步根（先读云端合并，再写回 —— 不能整份覆盖）。 */
+  /**
+   * 把批注写到同步根（先读云端合并，再写回 —— 不能整份覆盖）。
+   *
+   * ⚠⚠ 协议字段名必须与电脑端**逐字一致**（2026-10-27 审计 D-2）：
+   *   电脑端 `AnnotationSaveRequest`（microbench/app.py:5221）里有
+   *     `deleted: list[str]`  —— 「本次删除掉的批注 id（跨设备合并不复活）」
+   *   而 `_merge_annotation_lists` 最后会应用这批墓碑。
+   *   平板原来**只写 annotations**，没有墓碑 →
+   *   电脑端删掉的批注在平板上复活、又被推回云端。
+   *   → 这里同样上报 `deleted`，并把墓碑应用在合并结果上。
+   *
+   * @returns {{ok: boolean, merged: Array|null}}
+   */
   async function pushAnnosToCloud(key, items) {
     if (!nativeBridge || typeof nativeBridge.putSync !== "function") {
-      return false;      // 浏览器里没有同步根
+      return { ok: false, merged: null, deleted: [] };      // 浏览器里没有同步根
     }
     try {
       let cloud = [];
+      let cloudDeleted = [];
+      let cloudKnown = false;
+      let readFailed = false;
       try {
-        const r = await fetch(syncUrl("file", "annotations/" + key + ".json"));
+        const r = await fetchWithTimeout(syncUrl("file", "annotations/" + key + ".json"), {}, FETCH_TIMEOUT_MS);
         if (r.ok) {
+          cloudKnown = true;
           const d = await r.json();
           cloud = Array.isArray(d.annotations) ? d.annotations : [];
+          cloudDeleted = Array.isArray(d.deleted) ? d.deleted : [];
+        } else if (r.status === 404) {
+          // 云端**还没有**这个文件 → 云端就是空的（不是「读失败」）
+        } else {
+          readFailed = true;      // 其它 HTTP 错误 → 云端状态**未知**
         }
-      } catch (e) { /* 云端读不到就以本地为准 */ }
-      const merged = mergeAnnos(cloud, items);
+      } catch (e) {
+        readFailed = true;        // 网络/超时 → 云端状态**未知**
+      }
+      // ⚠⚠ 云端状态未知时**不能写**（2026-10-27 审计 D-2 的连带坑）：
+      //   写上去的内容是「平板这一份」→ 等于把云端那半边覆盖掉，
+      //   两边都会丢批注。宁可这次不同步（本地那份还在，下次再试）。
+      if (readFailed) {
+        console.warn("读不到云端批注，这轮先不写（本地那份还在）");
+        return { ok: false, merged: null, deleted: [] };
+      }
+      const rec = await DB.getAnnos(key);
+      const deleted = annoTombstones(rec, cloud, items, cloudDeleted, cloudKnown);
+      const merged = mergeAnnos(cloud, items, deleted);
       const payload = {
         paper_id: key,
         updated_at: new Date().toISOString(),
         schema_version: 2,
         annotations: merged,
+        // ⚠ 字段名与电脑端一致（app.py:AnnotationSaveRequest.deleted）
+        deleted: deleted,
       };
       await nativeCall("putSync", [
         "annotations/" + key + ".json",
         JSON.stringify(payload, null, 1),
       ]);
-      return true;
+      return { ok: true, merged: merged, deleted: deleted };
     } catch (e) {
       console.warn("批注同步失败", e);
-      return false;
+      return { ok: false, merged: null, deleted: [] };
     }
   }
 
@@ -2859,7 +3564,10 @@
 
   /** 把某页的译文插进页卡。 */
   function renderTranslationInto(wrap, n) {
-    if ((pdfState.layout || "both") === "orig") return;
+    const layout = pdfState.layout || "both";
+    if (layout === "orig") return;
+    // 对照模式：译文按**原文的栏**排（左栏回左栏、右栏回右栏）
+    if (layout === "bilingual") { renderBilingualInto(wrap, n); return; }
     const t = pdfState.trans && pdfState.trans[n];
     if (!t) return;
     const box = el("div", "tb-pdf-trans");
@@ -2869,6 +3577,269 @@
     body.innerHTML = renderMarkdown(t);
     box.appendChild(body);
     wrap.appendChild(box);
+  }
+
+  /**
+   * 对照模式：把这一页的译文按**原文的栏**排出来。
+   *
+   * 数据来自同步过来的快照（pages[].blocks）：每块带 i/kind/col/bbox/translation。
+   *
+   * ⚠ 平板端**没有**原文段落文本 —— 快照里只存了译文和坐标。
+   *   所以这里只排译文；要看原文请切「仅原文」。
+   *   （桌面端有原文，因为它是自己抽的段落块。）
+   *
+   * ⚠ 版本闸门在**电脑端**做（blocks_version 对不上就整份丢弃）。
+   *   平板只管用拿到手的 —— 拿到的就是电脑端验过的。
+   */
+  function renderBilingualInto(wrap, n) {
+    const rec = (pdfState.blockTrans || {})[n];
+    const box = el("div", "tb-pdf-trans tb-bilingual");
+    if (!rec || !rec.blocks || !rec.blocks.length) {
+      box.appendChild(el("div", "tb-pdf-trans-head", `第 ${n} 页 · 对照`));
+      const body = el("div", "tb-pdf-trans-body");
+      body.innerHTML = `<div class="tb-bilingual-empty">这一页还没有对照译文。<br>` +
+        `在电脑端翻好后点「☁ 同步」，这里就会按原文的栏排出来。</div>`;
+      box.appendChild(body);
+      wrap.appendChild(box);
+      return;
+    }
+    const blocks = rec.blocks || [];
+    // 分桶：整宽顶部 / 左栏 / 右栏 / 尾部整宽
+    const firstColIdx = blocks.findIndex((b) => b.col === "L" || b.col === "R");
+    const top = [], left = [], right = [], tail = [];
+    blocks.forEach((b, idx) => {
+      if (b.col === "L") { left.push(b); return; }
+      if (b.col === "R") { right.push(b); return; }
+      if (firstColIdx >= 0 && idx < firstColIdx) top.push(b);
+      else tail.push(b);
+    });
+
+    const mkBlock = (b) => {
+      const d = el("div", "tb-bilingual-block kind-" + (b.kind || "body"));
+      const tr = el("div", "tb-bb-trans");
+      const raw = String(b.translation || "");
+      const rects = formulaRectsOf(raw);
+      if (rects.length) {
+        // 整块公式 → 贴**原图**（平板本地裁，见 renderFormulaShot）。
+        //   以前这里只能显示「【公式：见原文】」—— 用户原话："公式什么的
+        //   也要能正常显示"。坐标不能原样甩给用户看（对他毫无意义）。
+        rects.forEach((rect) => tr.appendChild(formulaHolder(n, rect)));
+        const extra = raw.replace(new RegExp(FORMULA_MARK_RE.source, "g"), "").trim();
+        if (extra) {
+          const md = el("div", "tb-bb-text");
+          md.innerHTML = renderMarkdown(extra);
+          tr.appendChild(md);
+        }
+      } else {
+        // 表格标记：正常情况下服务端已经换成 Markdown 表格了，这里兜底。
+        const txt = raw.replace(/⟦TABLE[^⟧]*⟧/g, "【表格：见原文】");
+        tr.innerHTML = renderMarkdown(txt);
+      }
+      d.appendChild(tr);
+      return d;
+    };
+
+    box.appendChild(el("div", "tb-pdf-trans-head", `第 ${n} 页 · 对照（按原文排版）`));
+    const body = el("div", "tb-pdf-trans-body tb-bilingual-body");
+    if (top.length) {
+      const span = el("div", "tb-bilingual-span");
+      top.forEach((b) => span.appendChild(mkBlock(b)));
+      body.appendChild(span);
+    }
+    if (left.length || right.length) {
+      const cols = el("div", "tb-bilingual-cols");
+      [["L", left], ["R", right]].forEach((pair) => {
+        const arr = pair[1];
+        if (!arr.length) return;
+        const col = el("div", "tb-bilingual-col");
+        col.setAttribute("data-col", pair[0]);
+        arr.forEach((b) => col.appendChild(mkBlock(b)));
+        cols.appendChild(col);
+      });
+      body.appendChild(cols);
+    }
+    if (tail.length) {
+      const span = el("div", "tb-bilingual-span");
+      tail.forEach((b) => span.appendChild(mkBlock(b)));
+      body.appendChild(span);
+    }
+    box.appendChild(body);
+    wrap.appendChild(box);
+    // 公式原图是**异步**裁的（PDF.js 离屏渲染）→ 裁完再贴回对照视图
+    ensureFormulaShots(n);
+  }
+
+  // ------------------------------------------------------------------
+  // 对照模式：整块公式的**原图**（平板本地裁）
+  //
+  // ⚠ 为什么平板要自己裁：
+  //   桌面端那条 /api/paper/formula_image 通道，平板**根本访问不到**
+  //   （没有 baseURL、CSP connect-src、原生桥白名单三处拦着）。
+  //   所以平板用 PDF.js 在本地把那一块**离屏**渲染成 PNG（scale=4，
+  //   与桌面端同倍率 ≈288 DPI），再以 data URL 贴进译文。
+  //
+  // ⚠ 坐标换算（PDF.js 3.11 的 PageViewport，rotation=0）：
+  //     viewBox=[0,0,W,H] → transform = [s, 0, 0, -s, 0, H*s]
+  //     → 以页面**左上角**为原点的 PDF 点 (x, y) 落在画布 (x*s, y*s)
+  //   即 bbox（PDF 点，左上原点）→ 画布像素 = bbox * scale。
+  //   ⚠ **只支持 rotation=0**：旋转页上抽取层的坐标框与 PDF.js 视口
+  //     不是同一套坐标系 → 宁可不裁，也不裁错（错公式比没公式危险）。
+  // ------------------------------------------------------------------
+
+  const FORMULA_SHOT_SCALE = 4;   // ≈288 DPI，与桌面端 formula_image?scale=4 同倍率
+  const FORMULA_MARK_RE = /⟦FORMULA:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧/g;
+
+  /** 从译文里抠出公式坐标框。 */
+  function formulaRectsOf(text) {
+    const out = [];
+    const re = new RegExp(FORMULA_MARK_RE.source, "g");
+    let m;
+    while ((m = re.exec(String(text || ""))) !== null) {
+      out.push([parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), parseFloat(m[4])]);
+    }
+    return out;
+  }
+
+  function formulaKeyOf(rect) {
+    return rect.map((x) => Number(x).toFixed(1)).join(",");
+  }
+
+  /** 整块是不是一片空白（坐标换算错了就会裁到白纸）。 */
+  function isBlankShot(ctx, w, h) {
+    try {
+      const d = ctx.getImageData(0, 0, w, h).data;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i] < 240 || d[i + 1] < 240 || d[i + 2] < 240) return false;
+      }
+      return true;
+    } catch (e) {
+      return false;   // 取不到像素 → 不当成空白（宁可贴一张可能空白的图）
+    }
+  }
+
+  /**
+   * 离屏把一块公式渲染成 PNG（data URL）。失败返回 ""。
+   *
+   * ⚠⚠ **必须用 viewport 的 offset 平移，不能用 render() 的 transform 参数**
+   *   （2026-11-12 实测踩坑）：
+   *     ① `page.render({transform:[1,0,0,1,-x,-y]})` 会把整页画到小画布**外面**
+   *        → 裁出来是空白；
+   *     ② canvas 一旦**小于** viewport，`render().promise` 根本不 resolve
+   *        → 页面表现为「一直转圈」，探针永远等不到结果。
+   *   正解：`page.getViewport({scale, offsetX:-x, offsetY:-y})` —— offset 是
+   *   **画布像素**平移 → 公式那块正好落到 (0,0)，画布只有公式那么大。
+   *   实测（对照电脑端 PyMuPDF 同区域的裁图）：两边**逐像素一致**。
+   */
+  async function renderFormulaShot(page, rect) {
+    if (!page || !rect) return "";
+    if (page.rotate) return "";           // 旋转页：坐标系对不上，不裁
+    const scale = FORMULA_SHOT_SCALE;
+    let vp0;
+    try { vp0 = page.getViewport({ scale }); } catch (e) { return ""; }
+    const t = vp0.transform;              // [s,0,0,-s,0,H*s]
+    const view = page.view || [0, 0, 0, 0];
+    // ⚠ bbox 是**相对 CropBox 左上角**的 PDF 点（PyMuPDF/pdfplumber 的口径），
+    //   而 PDF.js 的用户空间原点在 CropBox 左下角 → 两边差一个 CropBox 原点。
+    //   所以：user_x = view[0] + bbox_x，user_y = view[3] - bbox_y。
+    const ux0 = view[0] + rect[0], uy0 = view[3] - rect[1];
+    const ux1 = view[0] + rect[2], uy1 = view[3] - rect[3];
+    const px0 = t[0] * ux0 + t[2] * uy0 + t[4];
+    const py0 = t[1] * ux0 + t[3] * uy0 + t[5];
+    const px1 = t[0] * ux1 + t[2] * uy1 + t[4];
+    const py1 = t[1] * ux1 + t[3] * uy1 + t[5];
+    const x = Math.floor(Math.min(px0, px1));
+    const y = Math.floor(Math.min(py0, py1));
+    const w = Math.ceil(Math.max(px0, px1) - x);
+    const h = Math.ceil(Math.max(py0, py1) - y);
+    if (w < 2 || h < 2) return "";
+    let vp;
+    try {
+      vp = page.getViewport({ scale, offsetX: -x, offsetY: -y });
+    } catch (e) { return ""; }
+    const cv = document.createElement("canvas");
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext("2d");
+    if (!ctx) return "";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+    try {
+      await page.render({ canvasContext: ctx, viewport: vp, intent: "display" }).promise;
+    } catch (e) {
+      console.warn("公式原图裁取失败", e);
+      return "";
+    }
+    if (isBlankShot(ctx, w, h)) return "";   // 裁到白纸 → 当作失败
+    try { return cv.toDataURL("image/png"); } catch (e) { return ""; }
+  }
+
+  /** 这一页有哪些公式块需要裁图。 */
+  function formulaBlocksOf(n) {
+    const rec = (pdfState.blockTrans || {})[n];
+    if (!rec || !rec.blocks) return [];
+    return rec.blocks.filter((b) => b && b.kind === "formula"
+      && formulaRectsOf(b.translation || "").length);
+  }
+
+  /** 公式图的占位块（裁好之前先占位，裁完再填）。 */
+  function formulaHolder(pageNo, rect) {
+    const key = formulaKeyOf(rect);
+    const h = el("div", "tb-formula-shot");
+    h.setAttribute("data-formula-page", String(pageNo));
+    h.setAttribute("data-formula-key", key);
+    const cache = (pdfState.formulaShots && pdfState.formulaShots[pageNo]) || {};
+    const url = cache[key];
+    if (url) fillFormulaShot(h, url);
+    else if (url === "") h.appendChild(el("div", "tb-formula-fallback", "【公式：见原文】"));
+    else h.appendChild(el("div", "tb-formula-wait", "正在裁取公式原图…"));
+    return h;
+  }
+
+  function fillFormulaShot(holder, dataURL) {
+    holder.innerHTML = "";
+    const img = document.createElement("img");
+    img.className = "tb-formula-img";
+    img.alt = "公式原图（从 PDF 原页裁出，与论文一致）";
+    img.src = dataURL;
+    holder.appendChild(img);
+  }
+
+  /** 把这一页裁好的公式图贴回对照视图。 */
+  function paintFormulaShots(n) {
+    const cache = (pdfState.formulaShots && pdfState.formulaShots[n]) || {};
+    const nodes = document.querySelectorAll('.tb-formula-shot[data-formula-page="' + n + '"]');
+    Array.prototype.forEach.call(nodes, (h) => {
+      const key = h.getAttribute("data-formula-key") || "";
+      const url = cache[key];
+      if (url) fillFormulaShot(h, url);
+      else if (url === "") {
+        h.innerHTML = "";
+        h.appendChild(el("div", "tb-formula-fallback", "【公式：见原文】"));
+      }
+    });
+  }
+
+  /** 裁这一页的公式原图（幂等；裁完贴回视图）。 */
+  async function ensureFormulaShots(n) {
+    const blocks = formulaBlocksOf(n);
+    if (!blocks.length) return;
+    const doc = pdfState.doc;
+    if (!doc) return;
+    if (!pdfState.formulaShots) pdfState.formulaShots = {};
+    const cache = (pdfState.formulaShots[n] = pdfState.formulaShots[n] || {});
+    let page = null;
+    for (const b of blocks) {
+      for (const rect of formulaRectsOf(b.translation || "")) {
+        const key = formulaKeyOf(rect);
+        if (cache[key] !== undefined) continue;   // 已裁过（或已失败）
+        if (!page) {
+          try { page = await doc.getPage(n); } catch (e) { return; }
+        }
+        let url = "";
+        try { url = await renderFormulaShot(page, rect); } catch (e) { url = ""; }
+        cache[key] = url;      // 失败也记成 "" → 不反复重试
+      }
+    }
+    paintFormulaShots(n);
   }
 
   /** 把某页的批注高亮画在原文上。 */
@@ -2943,10 +3914,15 @@
     function fit() {
       const r = layer.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
-      cv.width = Math.max(1, Math.floor((r.width || 1) * dpr));
-      cv.height = Math.max(1, Math.floor((r.height || 1) * dpr));
+      // ⚠ 尺寸为 0 时**不要**画到 1×1 的画布上（那等于没画）。
+      //   layer 的尺寸取决于原文 canvas，布局没完成时它是 0。
+      //   → 记下「还没量到尺寸」，等 ResizeObserver / rAF 再来一次。
+      if (!r.width || !r.height) return false;
+      cv.width = Math.max(1, Math.floor(r.width * dpr));
+      cv.height = Math.max(1, Math.floor(r.height * dpr));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       drawInkPage(page, cv, ctx);
+      return true;
     }
 
     function pt(e) {
@@ -2961,6 +3937,10 @@
     layer.addEventListener("pointerdown", (e) => {
       if (!inkState.on) return;
       e.preventDefault();
+      // ⚠ 把这一笔锁定到本元素上：手指划出层边界也继续画，
+      //   不会因为 pointerleave 而中断（那会丢掉半笔）。
+      //   捕获失败（老 WebView 不支持）不影响主流程，忽略即可。
+      try { layer.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
       drawing = true;
       cur = [];
       const p = pt(e);
@@ -2977,21 +3957,40 @@
     const end = (e) => {
       if (!drawing) return;
       drawing = false;
-      if (cur && cur.length >= 4) {
+      try { layer.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      // ⚠ 末尾也允许只有一个点（点一下 = 一个点），不算废笔
+      if (cur && cur.length >= 2) {
         inkStrokes(page).push(cur);
         drawInkPage(page, cv, ctx);
         scheduleInkSave();
+        // ⚠ 2026-11-12：圈完一笔 → 浮出「问这块 / 总结这块 / 清除」。
+        //   用户原话："我直接用手写笔圈一部分，然后直接能问 AI" ——
+        //   圈完还要自己去找按钮，太绕。
+        try { showRegionBar(page); } catch (e) { /* ignore */ }
       }
       cur = null;
       if (e && e.preventDefault) e.preventDefault();
     };
     layer.addEventListener("pointerup", end);
     layer.addEventListener("pointercancel", end);
-    layer.addEventListener("pointerleave", end);
+    // ⚠⚠ **不要**监听 pointerleave 来收笔（2026-10-28 用户实测：「手写没有作用」）：
+    //   手指按住稍微一动就可能移出层边界 → pointerleave 提前收笔
+    //   → 这一笔只攒到 1~2 个点 → 被当废笔丢掉 → 用户看到「画了没反应」。
+    //   现在靠 pointer capture 兜住，移出边界也继续画。
 
     // 画布尺寸要等原文画完才知道
     fit();
     if (window.requestAnimationFrame) requestAnimationFrame(fit);
+    // ⚠ 层尺寸会随**缩放 / 布局变化**而变（放大后原文 canvas 变大），
+    //   只在装的时候量一次不够 → 用 ResizeObserver 跟着重测并重画笔迹。
+    if (typeof ResizeObserver !== "undefined") {
+      try {
+        const ro = new ResizeObserver(() => { fit(); });
+        ro.observe(layer);
+        // 页面被移除时断开观察，别泄漏
+        layer._inkRO = ro;
+      } catch (e) { /* ignore */ }
+    }
     pdfState.inkLayers = pdfState.inkLayers || {};
     pdfState.inkLayers[page] = layer;
     layer.classList.toggle("is-on", inkState.on);
@@ -3007,13 +4006,32 @@
     });
     const btn = $("pdf-toggle-ink");
     if (btn) btn.classList.toggle("is-active", on);
-    if (on) toast("手写已开启：在原文上直接画。画完点「保存标注」同步到坚果云。");
+    // ⚠ 关掉手写 → 圈选操作条也没用了（它只在手写模式下有意义）
+    if (!on) hideRegionBar();
+    if (on) toast("手写已开启：在原文上直接画。圈一块就能问 AI 或总结这块。");
   }
 
   let _inkSaveTimer = null;
   function scheduleInkSave() {
     if (_inkSaveTimer) clearTimeout(_inkSaveTimer);
     _inkSaveTimer = setTimeout(() => { saveInk(); }, 1200);
+  }
+
+  /**
+   * 手写批注的 id —— **必须 ≤64 字符，且同一篇论文每次都一样**。
+   *
+   * ⚠⚠ id 长度不能超过 64（2026-10-27 审计 D-5）：
+   *   电脑端 `AnnotationItem.id` 是 `Field(..., max_length=64)`
+   *   （microbench/app.py:5202）→ 平板写过去的 id 超长时，
+   *   电脑端回传全量 items 会 **422**，那篇论文在电脑上**再也存不了批注**。
+   *   原来的 "ink_" + key：key = paper_id 去噪后的名字，
+   *   最长 70 + 1 + 7 = **78** 字符 → 必然超。
+   *   → "ink_" + hash(paper_id)：djb2 稳定哈希，
+   *     同一篇论文每次算出来都一样（批注不会被当成新的一条），
+   *     长度 = 4 + ≤8 = ≤12 字符。
+   */
+  function inkAnnoId(key) {
+    return "ink_" + hash(String(key || ""));
   }
 
   /**
@@ -3035,7 +4053,8 @@
     });
     if (!strokes.length) { toast("还没有笔迹"); return; }
 
-    const id = "ink_" + key;
+    // ⚠⚠ id 长度**不能超过 64**（见 inkAnnoId 的说明）。
+    const id = inkAnnoId(key);
     const now = new Date().toISOString();
     const items = (pdfState.annos || []).filter((a) => a && a.id !== id);
     items.push({
@@ -3156,13 +4175,6 @@
     // ---- 译文侧 ----
     renderTranslationInto(wrap, n);
 
-    canvas.width = Math.floor(viewport.width * dpr);
-    canvas.height = Math.floor(viewport.height * dpr);
-    canvas.style.width = viewport.width + "px";
-    canvas.style.height = viewport.height + "px";
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
     const body = $("pdf-body");
     // 按页码顺序插入,保证连续阅读时顺序正确
     let before = null;
@@ -3172,7 +4184,7 @@
     }
     body.insertBefore(wrap, before);
 
-    await page.render({ canvasContext: ctx, viewport }).promise;
+    await paintCanvas(canvas, page, viewport, dpr);
 
     // 文本层：PDF.js 3.11 的 renderTextLayer 是**全局函数**（不是 page 的方法），
     // 而且要先拿到 getTextContent() 的结果。参数与桌面版 index.html 保持一致。
@@ -3196,6 +4208,94 @@
     // 手写层要等原文画完（尺寸定了）才能装
     setupInkLayer(inkLayer, n);
     pdfState.rendered.add(n);
+    // ⚠ 离屏页的 canvas 及时释放（见 pruneCanvases）
+    //   ⚠ 以「用户当前所在的页」为中心，不是刚画完的那一页 ——
+    //   预渲染下一页时若按 n 算，会把用户正在看的那一页给释放掉（一片空白）。
+    pruneCanvases(pdfState.currentPage || n);
+  }
+
+  /**
+   * 把一页画到 canvas 上（新建页卡、补画离屏页共用这一段）。
+   */
+  async function paintCanvas(canvas, page, viewport, dpr) {
+    if (!canvas) return;
+    canvas.width = Math.floor(viewport.width * dpr);
+    canvas.height = Math.floor(viewport.height * dpr);
+    canvas.style.width = viewport.width + "px";
+    canvas.style.height = viewport.height + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+  }
+
+  /**
+   * ⚠⚠ 只保留当前页 ±2 的 canvas（2026-10-27 审计 D-7）。
+   *
+   *   dpr=2 时一页 canvas 约 7~8 MB；翻几十页就是几百 MB ——
+   *   低端平板会被系统直接杀掉（用户看到的是「应用自己关了」）。
+   *   以前 `pdfState.rendered` 只增不减，canvas 也从不释放。
+   *
+   * ⚠ **只销毁 canvas，不动页卡节点**：
+   *   删掉节点会改变文档高度 → 滚动位置跳 → 用户正在看的那页被顶走。
+   *   页卡本身（译文栏 / 文本层 / 高亮层）留着，内存占用很小。
+   *   滚回来时由 restoreCanvas() 补画。
+   */
+  const PDF_CANVAS_WINDOW = 2;
+
+  function pruneCanvases(current) {
+    const body = $("pdf-body");
+    if (!body) return;
+    const cur = Number(current) || 1;
+    Array.from(body.children).forEach((child) => {
+      const n = parseInt(child.getAttribute("data-pdf-page") || "0", 10);
+      if (!n) return;
+      if (Math.abs(n - cur) <= PDF_CANVAS_WINDOW) return;
+      if (child.getAttribute && child.getAttribute("data-canvas-released") === "1") return;
+      // ⚠ 只动**原文**那张 canvas —— 手写那张是用户画的，丢了就没了。
+      //   （手写的数据在 inkState.strokes 里，恢复时能重画回来。）
+      const canvas = child.querySelector ? child.querySelector(".tb-pdf-orig canvas") : null;
+      if (!canvas || !canvas.width) return;
+      canvas.width = 0;
+      canvas.height = 0;      // ← 这一步才真的把那几 MB 放掉
+      if (child.setAttribute) child.setAttribute("data-canvas-released", "1");
+    });
+  }
+
+  /**
+   * 离屏页的 canvas 被释放后，滚回来时补画回来。
+   * （笔迹也在 inkState.strokes 里，一起补回来。）
+   */
+  async function restoreCanvas(n) {
+    const wrap = document.querySelector(`[data-pdf-page="${n}"]`);
+    if (!wrap) return;
+    if (!wrap.getAttribute || wrap.getAttribute("data-canvas-released") !== "1") return;
+    const doc = pdfState.doc;
+    if (!doc) return;
+    try {
+      const pdfjsLib = await loadPdfJs();
+      const page = await doc.getPage(n);
+      const viewport = page.getViewport({ scale: pdfFitScale(page) });
+      const dpr = window.devicePixelRatio || 1;
+      const canvas = wrap.querySelector ? wrap.querySelector(".tb-pdf-orig canvas") : null;
+      if (!canvas) return;
+      wrap.removeAttribute("data-canvas-released");
+      await paintCanvas(canvas, page, viewport, dpr);
+      // 手写层也补回来（笔迹数据在 inkState.strokes）
+      const inkCv = wrap.querySelector ? wrap.querySelector(".tb-pdf-ink canvas") : null;
+      if (inkCv) {
+        const layer = inkCv.parentElement;
+        const r = layer && layer.getBoundingClientRect ? layer.getBoundingClientRect() : null;
+        const w = (r && r.width) || inkCv.width || 1;
+        const h = (r && r.height) || inkCv.height || 1;
+        inkCv.width = Math.max(1, Math.floor(w * dpr));
+        inkCv.height = Math.max(1, Math.floor(h * dpr));
+        const ictx = inkCv.getContext("2d");
+        ictx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        drawInkPage(n, inkCv, ictx);
+      }
+    } catch (e) {
+      console.warn("补画离屏页失败", e);
+    }
   }
 
   /** pdf.js 的 renderTextLayer 不可用时的手工兜底（照抄桌面版实现）。 */
@@ -3261,6 +4361,9 @@
       const ar = anchor1.getBoundingClientRect();
       body.scrollTop = (ar.top - br.top) + ratio * br.height - 8;
     }
+    // ⚠ 2026-11-12：缩放重画会把页卡整个换掉 → 圈选操作条要重新挂出来
+    //   （否则用户缩放一次，按钮就没了，还得重新画一遍）。
+    try { showRegionBar(cur); } catch (e) { /* ignore */ }
     pdfStatus("");
   }
 
@@ -3285,6 +4388,14 @@
           pdfState.currentPage = current;
           $("pdf-pageinfo").textContent = `${current} / ${pdfState.numPages}`;
         }
+        // ⚠ 离屏页的 canvas 被释放过 → 滚回来时补画（否则是一片空白）
+        if (pdfState.doc) {
+          restoreCanvas(current);
+          restoreCanvas(current + 1);
+          restoreCanvas(current - 1);
+          // 当前位置变了 → 离当前位置更远的 canvas 可以释放了
+          pruneCanvases(current);
+        }
         // 滚到接近底部 -> 预渲染下一页, 连续读不用等
         if (body.scrollTop + body.clientHeight > body.scrollHeight - body.clientHeight * 0.8) {
           const next = pdfState.currentPage + 1;
@@ -3302,6 +4413,8 @@
     pdfState.doc = null;
     pdfState.rendered.clear();
     $("pdf-body").innerHTML = "";
+    // ⚠ 圈选操作条挂在页卡里 → 关掉阅读器要一起收掉
+    hideRegionBar();
   }
 
   /** 划词气泡：PDF 里选中文字 -> 解读 / 翻译 / 提问 */
@@ -3401,7 +4514,31 @@
     if (!todo.length) { toast("全部原文已经在本地了（可离线阅读）"); return; }
 
     const total = todo.reduce((a, id) => a + ((state.pdfs[id].size || 0)), 0);
+    // ⚠⚠ 缓存前先**看配额**（2026-10-27 审计 D-7）。
+    //   76MB 原文塞进 IndexedDB，撞上 QuotaExceededError 会被吞成
+    //   一句「失败 24」—— 用户只知道「没成功」，不知道为什么。
+    //   → 先用 navigator.storage.estimate() 估一下，不够就**明说**差多少。
+    if (typeof navigator !== "undefined" && navigator.storage
+        && typeof navigator.storage.estimate === "function") {
+      try {
+        const est = await navigator.storage.estimate();
+        const quota = Number(est && est.quota) || 0;
+        const usage = Number(est && est.usage) || 0;
+        // 留 20% 余量（浏览器自己也要占地方）
+        const need = Math.ceil(total * 1.2);
+        if (quota && usage + need > quota) {
+          const lack = Math.ceil((usage + need - quota) / 1048576);
+          toast("平板可用空间不够：这一批原文约 " + Math.round(total / 1048576)
+            + " MB，但只剩 " + Math.max(0, Math.round((quota - usage) / 1048576))
+            + " MB（还差约 " + lack + " MB）。先在系统设置里清点空间再试。", true);
+          return;
+        }
+      } catch (e) {
+        console.warn("读不到存储配额，继续缓存", e);
+      }
+    }
     let got = 0, ok = 0, fail = 0;
+    let quotaFull = false;
     const t0 = Date.now();
     toast(`开始缓存 ${todo.length} 篇原文（约 ${Math.round(total / 1048576)} MB）…`);
     for (let i = 0; i < todo.length; i++) {
@@ -3418,6 +4555,15 @@
         ok++;
         got += blob.size || 0;
       } catch (e) {
+        // ⚠ 配额用满是**明确的一种失败**，不能跟「下载失败」混为一谈：
+        //   再试多少次都一样，得告诉用户「空间不够」。
+        if (e && (e.name === "QuotaExceededError"
+            || /quota/i.test(String((e && e.message) || "")))) {
+          quotaFull = true;
+          fail++;
+          pdfStatus("存储空间已满，停止缓存");
+          break;
+        }
         fail++;
       }
       if (i % 2 === 0 || i === todo.length - 1) {
@@ -3426,6 +4572,13 @@
     }
     pdfStatus("");
     const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
+    if (quotaFull) {
+      toast("缓存中断：平板存储空间已满（已缓存 " + ok + " 篇 / "
+        + Math.round(got / 1048576) + " MB）。先在系统设置里清点空间，"
+        + "剩下的下次再缓存。", true);
+      await openPdfLib();
+      return;
+    }
     toast(`缓存完成：${ok} 篇 ${Math.round(got / 1048576)} MB，用了 ${secs} 秒` +
           (fail ? `，失败 ${fail}` : "") + "。现在没网也能翻论文了。", fail > 0);
     await openPdfLib();
@@ -3517,11 +4670,41 @@
       `MicroBench 平板工作台 · 本地 ${state.notes.size} 篇 · 待同步 ${state.dirtyCount} 篇`;
   }
 
+  /**
+   * 把 AI 网关地址登记到**原生侧的主机白名单**。
+   *
+   * ⚠ 为什么要登记（2026-10-27 审计 C-1 的接线）：
+   *   原生的 `httpPost` 有目标主机白名单 —— 只放行
+   *   dav.jianguoyun.com / api.minimaxi.com / api.minimax.io /
+   *   apihub.agnes-ai.com / api.deepseek.com / api.openai.com
+   *   （否则平板就是个开放代理：页面里任何脚本都能让它代发请求，
+   *    甚至拿它当跳板去打用户内网的 https）。
+   *   而 **AI 网关地址存在网页的 IndexedDB 里（state.ai.base），原生读不到**
+   *   → 用户配的**自定义网关**必须在这里登记一次，
+   *     否则请求会被原生拒掉（报错：网关域名不在白名单）。
+   *
+   * ⚠ 只传 host 相关的**地址**，**绝不能**把 API key 一起传过去。
+   * ⚠ 原生侧没有这个方法时（老 APK / 浏览器路径）**不能抛异常** ——
+   *   保存设置照常成功。
+   */
+  function allowAiHost(base) {
+    if (!nativeBridge || typeof nativeBridge.allowAiHost !== "function") return false;
+    try {
+      nativeBridge.allowAiHost(String(base || ""));
+      return true;
+    } catch (e) {
+      console.warn("登记 AI 网关白名单失败", e);
+      return false;
+    }
+  }
+
   async function saveSettings() {
     state.ai.base = $("cfg-base").value.trim();
     state.ai.key = $("cfg-key").value.trim();
     state.ai.model = $("cfg-model").value.trim() || "MiniMax-M3.1-Flash";
     state.ai.modelT = $("cfg-model-t").value.trim() || "MiniMax-M3";
+    // ⚠ 登记给原生白名单（自定义网关必须登记，内置网关在默认名单里）
+    allowAiHost(state.ai.base);
     await DB.setMeta("ai", state.ai);
     toast("设置已保存");
   }
@@ -3600,6 +4783,9 @@
     // AI 配置
     const ai = await DB.getMeta("ai", null);
     if (ai) state.ai = Object.assign(state.ai, ai);
+    // ⚠ 恢复设置后**也要登记一次**网关白名单 ——
+    //   这样升级 APK 之后不用重新保存设置就能直接用自定义网关。
+    allowAiHost(state.ai.base);
 
     // 目录句柄（安卓 Chrome 可持久化）/ 坚果云 WebDAV（APK）
     if (nativeBridge) {
@@ -3648,7 +4834,7 @@
     // ⚠ 平板屏幕小，双栏并排看很挤 —— 必须能切成单栏。
     const layBtn = $("pdf-layout");
     if (layBtn) {
-      const LAYOUTS = [["both", "原文+译文"], ["orig", "仅原文"], ["trans", "仅译文"]];
+      const LAYOUTS = [["both", "原文+译文"], ["bilingual", "对照"], ["orig", "仅原文"], ["trans", "仅译文"]];
       const syncLabel = () => {
         const cur = LAYOUTS.find((x) => x[0] === (pdfState.layout || "both")) || LAYOUTS[0];
         layBtn.textContent = cur[1];
@@ -3667,6 +4853,9 @@
     // 保存手写
     $("pdf-save-ink").onclick = () => { saveInk(); };
     // 带上手写问 AI（多模态：把手写标注转成图片发给模型）
+    // ⚠ 2026-11-12：这个按钮现在**优先发圈选区域**（只发圈的那一块），
+    //   没有圈选才退回整页图 —— 工具栏上因此不必再加按钮，
+    //   圈选浮条（问这块/总结这块/清除）是快捷路，这个按钮是兜底路。
     $("btn-ai-ink").onclick = () => { askAiWithInk(); };
     document.querySelectorAll("[data-close-lib]").forEach((b) => {
       b.onclick = () => { $("pdf-lib").hidden = true; };
@@ -3700,8 +4889,11 @@
     };
     $("btn-reset").onclick = async () => {
       if (!confirm("清空平板上的全部本地数据？云盘里的文件不受影响。")) return;
-      await DB.clearNotes();
-      await DB.setMeta("current_note", null);
+      // ⚠ 三个 store 一起清（2026-10-27 审计 D-4）：
+      //   notes（笔记）+ meta（**API Key**、批注、译文缓存）+ pdfcache（**76MB 原文**）。
+      //   以前只清 notes → Key 和 PDF 全留在机器上。
+      await DB.resetAll();
+      try { localStorage.clear(); } catch (e) { /* 没有 localStorage 也不该白屏 */ }
       location.reload();
     };
     $("btn-import-pack").onclick = () => $("file-pack").click();
@@ -3810,7 +5002,15 @@
     });
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
+  // ⚠ 不能只挂 DOMContentLoaded（AGENTS.md §4.1 的同型坑）：
+  //   平板端是**离线单页**，脚本在 </body> 前同步加载 → 正常路径下
+  //   DOMContentLoaded 还没触发，监听器是有效的。
+  //   但**不要**改成裸监听就完事 —— 一旦有人把脚本挪到 <head>、
+  //   或改成 defer/async 动态注入，readyState 就会已经是 "interactive"，
+  //   监听器再注册就是**死的** → boot() 一次都没跑 → 平板停在
+  //   「壳子渲染出来了但空空如也」，且没有任何报错（正是用户看到的白屏）。
+  //   → 判 readyState，已就绪就直接跑。
+  function _bootSafely() {
     // boot() 是 async，任何一个 await 抛错都会变成一个没人看的 rejected
     // promise —— 页面就停在"壳子渲染出来了但空空如也"的状态，完全看不出
     // 出了什么事。这里把错误直接摊到页面上。
@@ -3834,7 +5034,13 @@
         stage.textContent = "启动阶段: " + (stage.textContent || "(空)");
       }
     });
-  });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _bootSafely);
+  } else {
+    _bootSafely();
+  }
 
   // 暴露给测试：渲染器和 hash 是这个应用最容易出错的两块，必须能脱离
   // 浏览器单测。挂在 window 上，页面里没人用它。
@@ -3861,6 +5067,12 @@
       currentBackend: currentBackend,
       refreshSyncUi: refreshSyncUi,
       davVaultRootLabel: davVaultRootLabel,
+      // 原生桥 —— 「回包丢了 status 导致 429 换模型不生效」只能靠单测钉住
+      nativeCall: nativeCall,
+      fetchWithTimeout: fetchWithTimeout,
+      // 设置 —— 「自定义网关没登记到原生白名单」只能靠单测钉住
+      saveSettings: saveSettings,
+      allowAiHost: allowAiHost,
       // AI 面板（输入栏清空、多轮上下文这些行为必须有护栏）
       runAI: runAI,
       aiOnKeyDown: aiOnKeyDown,
@@ -3891,6 +5103,10 @@
       saveAnnotations: saveAnnotations,
       loadAnnotations: loadAnnotations,
       mergeAnnos: mergeAnnos,
+      annoTombstones: annoTombstones,
+      inkAnnoId: inkAnnoId,
+      // 目录树的增量重建（性能护栏）
+      buildNav: buildNav,
       // 译文快照的版本闸门（两端必须一致，否则用户看到旧算法翻的坏译文）
       loadTranslation: loadTranslation,
       transCacheKey: transCacheKey,

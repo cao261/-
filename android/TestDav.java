@@ -7,6 +7,9 @@ import microbench.tablet.DavClient;
  *
  * 跑法: python android/_test_dav.py
  * 单独跑: java -cp <classes> TestDav http://127.0.0.1:8765/dav/
+ *
+ * ⚠ 第二个参数（可选）是「坏服务器」地址 —— 用来测畸形响应的防护
+ *   （超大文件 / 超长的行）。不传就跳过那几条。
  */
 public class TestDav {
 
@@ -25,6 +28,7 @@ public class TestDav {
 
     public static void main(String[] args) throws Exception {
         String root = args.length > 0 ? args[0] : "http://127.0.0.1:8765/dav/";
+        String badRoot = args.length > 1 ? args[1] : null;
         DavClient c = new DavClient("me@example.com", "app-pass-123", root);
 
         System.out.println("[1] URL 构造");
@@ -266,6 +270,90 @@ public class TestDav {
         check(fixedList != null && !fixedList.isEmpty()
                         && !fixedList.get(0).path.contains("我的坚果云"),
                 "返回的仍是 vault 相对路径（网页传的就是相对路径）");
+
+        System.out.println("[15] vault 前缀里的 .. 被过滤（越权防护）");
+        // ⚠ 2026-10-27 审计 L-2：前缀是用户手填的，
+        //   原来不过滤 ".." → 「我的坚果云/../../别的目录」能越出 vault 根
+        //   → 删得掉别人的文件。
+        DavClient evil = new DavClient("me@example.com", "app-pass-123", root,
+                "我的坚果云/../../别的目录");
+        String evilUrl = evil.urlFor("01_Literature/x.pdf");
+        check(!evilUrl.contains(".."), "vault 前缀里的 .. 被剔除: " + evilUrl);
+        check(!evilUrl.contains("%2E%2E") && !evilUrl.contains("%2e%2e"),
+                "vault 前缀里的 .. 没被编码绕过: " + evilUrl);
+        check("我的坚果云/别的目录".equals(evil.vaultRoot()),
+                "归一化后前缀里没有 .. 段: " + evil.vaultRoot());
+        DavClient normalRoot = new DavClient("me@example.com", "app-pass-123", root,
+                "我的坚果云/MicroBench工作台");
+        check("我的坚果云/MicroBench工作台".equals(normalRoot.vaultRoot()),
+                "正常前缀不受影响: " + normalRoot.vaultRoot());
+        check(normalRoot.urlFor("01_Literature/x.pdf")
+                        .contains("MicroBench%E5%B7%A5%E4%BD%9C%E5%8F%B0"),
+                "正常前缀仍然照常拼进 URL: " + normalRoot.urlFor("01_Literature/x.pdf"));
+
+        System.out.println("[16] 流式下载（大文件不进内存）");
+        // ⚠ 2026-10-27 审计 M-1：原来整份文件读进 byte[]（上限 128 MB）
+        //   → 平板 OOM。现在走流式：Java 侧一个字节都不攒。
+        DavClient.DavStream st = c.openFile(
+                "我的坚果云/MicroBench工作台/01_Literature/01_论文原文_PDF/a paper.pdf");
+        check(st != null, "openFile 打开了文件");
+        if (st != null) {
+            byte[] buf = new byte[64];
+            int n = st.read(buf, 0, buf.length);
+            check(n > 0 && new String(buf, 0, n, "UTF-8").contains("PDF-BYTES"),
+                    "流式读到的内容正确");
+            check(st.length() > 0, "流式响应带长度（Content-Length）: " + st.length());
+            st.close();
+        }
+        check(c.openFile("不存在/没有这个.pdf") == null, "不存在的文件返回 null");
+        check(DavClient.MAX_BUFFERED_BYTES < DavClient.MAX_STREAM_BYTES,
+                "分档成立：进内存的上限 < 流式的上限（"
+                        + (DavClient.MAX_BUFFERED_BYTES / 1048576) + " MB < "
+                        + (DavClient.MAX_STREAM_BYTES / 1048576) + " MB）");
+
+        if (badRoot != null) {
+            System.out.println("[17] 畸形服务器：超大文件 / 超长的行");
+            DavClient evilServer = new DavClient("me@example.com", "app-pass-123", badRoot);
+            // ⑤ 超大文件 → 明确错误，不是 OOM
+            //   64 MB：进内存那一档的上限是 32 MB → 必须被拒
+            boolean bigThrew = false;
+            String bigMsg = "";
+            try {
+                evilServer.get("__toolarge__/big.pdf");
+            } catch (Exception e) {
+                bigThrew = true;
+                bigMsg = e.getMessage() == null ? e.toString() : e.getMessage();
+            }
+            check(bigThrew && bigMsg.contains("太大"),
+                    "超大文件给出明确错误（不是 OOM）: " + bigMsg);
+            //   384 MB：流式那一档的上限是 256 MB → 也必须被拒
+            boolean bigStreamThrew = false;
+            String bigStreamMsg = "";
+            try {
+                DavClient.DavStream s2 = evilServer.openFile("__toolarge_stream__/big.pdf");
+                if (s2 != null) {
+                    s2.close();
+                }
+            } catch (Exception e) {
+                bigStreamThrew = true;
+                bigStreamMsg = e.getMessage() == null ? e.toString() : e.getMessage();
+            }
+            check(bigStreamThrew && bigStreamMsg.contains("太大"),
+                    "流式下载同样有上限（明确错误）: " + bigStreamMsg);
+            // ⑦ 超长的行 → 报错，不许把内存吃光
+            boolean longThrew = false;
+            String longMsg = "";
+            try {
+                evilServer.list("__longline__");
+            } catch (Exception e) {
+                longThrew = true;
+                longMsg = e.getMessage() == null ? e.toString() : e.getMessage();
+            }
+            check(longThrew && longMsg.contains("过长"),
+                    "超长的响应行被拒（报错，不是内存爆掉）: " + longMsg);
+        } else {
+            System.out.println("[17] 跳过（没传坏服务器地址）");
+        }
 
         System.out.println();
         System.out.println("PASS " + pass + "  FAIL " + fail);

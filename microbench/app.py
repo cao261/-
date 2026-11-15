@@ -104,6 +104,17 @@ async def _lifespan(app: "FastAPI"):
             print(f"[MicroBench] 已补齐 vault 模板: {', '.join(written)}", file=sys.stderr)
     except Exception:
         pass
+    # 快照目录 / 批注目录在这里**建一次**（M-3：原来是在**读**路径上建，
+    # 于是 GET 端点也会建目录 → 跨站一个 <img> 就能让服务端往磁盘 /
+    # 坚果云云端目录里建目录）。读路径现在只算路径不建，写路径显式建。
+    try:
+        _ensure_snapshot_dir()
+    except OSError:
+        pass
+    try:
+        _ensure_annotations_dir()
+    except OSError:
+        pass
     yield
     try:
         from .llm import close_async_clients
@@ -330,9 +341,18 @@ def _token_valid(request: Request) -> bool:
 
 
 def _client_is_local(request: Request) -> bool:
-    """True when the caller is this machine (loopback) or an in-process client."""
+    """True when the caller is this machine (loopback) or an in-process client.
+
+    ⚠ 拿不到对端地址时**不能**当成"本机"（2026-10-27 审计 U-1，fail-open）：
+      判成本机 = 跳过口令校验 = 鉴权整个失效。
+      uvicorn 总会填 scope["client"]，Starlette 的 TestClient 填的是
+      "testclient"（不是 IP → 走回环分支，测试不受影响）；
+      所以这里只有"对端信息完全缺失"这一种异常路径 —— 保守判远端。
+    """
     client = request.client
-    return not _is_remote_peer(client.host if client else "")
+    if client is None or not (client.host or "").strip():
+        return False
+    return not _is_remote_peer(client.host)
 
 
 def _set_token_cookie(response, token: str) -> None:
@@ -445,6 +465,27 @@ async def csrf_origin_guard(request: Request, call_next):
 # outermost and therefore runs first. We want the token check to run before any
 # origin reasoning, so every authentication failure surfaces as the same 401
 # JSON body instead of a mix of 401 and 403 HTML pages.
+def _path_needs_token(path: str) -> bool:
+    """这条路径是否必须带局域网口令。
+
+    规则：
+      * `/api/**` 要 —— 里面全是 vault 读写、LLM 调用（烧用户额度）、同步写盘。
+      * `/api/auth/**` 豁免 —— 平板要先问"要不要口令"再把口令交上来。
+      * `/docs` `/redoc` `/openapi.json` **也要**（2026-10-27 审计新增）：
+        交互式 API 文档等于把「60 条路由 + 全部请求/响应模型」的地图
+        **免费送给局域网上的任何人**。上一轮把它列为 L-5「LAN 模式对
+        /docs /openapi.json 无口令」但一直没修 —— 本轮实测确认：
+        从 192.168.1.100 无口令访问 /openapi.json 拿到 71386 字节的
+        完整 API 目录（200），而同一时刻所有 /api/* 都正确返回 401。
+        文档是「攻击面说明书」，它的价值恰恰在于目标系统的详细程度。
+    """
+    if path.startswith("/api/auth/"):
+        return False
+    if path.startswith("/api/"):
+        return True
+    return path in ("/docs", "/redoc", "/openapi.json")
+
+
 @app.middleware("http")
 async def lan_token_guard(request: Request, call_next):
     """Require the shared token for every non-loopback client.
@@ -458,7 +499,7 @@ async def lan_token_guard(request: Request, call_next):
     then hand one in.
     """
     path = request.url.path
-    if path.startswith("/api/") and not path.startswith("/api/auth/"):
+    if _path_needs_token(path):
         if not _client_is_local(request):
             if not _token_valid(request):
                 return JSONResponse(
@@ -676,6 +717,26 @@ class TranslateRequest(BaseModel):
                        description="临时换模型翻译：空=跟随当前设置, 'agnes'=备用模型, "
                                    "否则是 MiniMax 系模型名")
 
+def _known_model_ids() -> set:
+    """本服务**认识**的全部模型 id（前端下拉框的来源 + 自定义 + DeepSeek + 当前默认）。"""
+    ids = {c["id"] for c in translation_model_choices() if c.get("id")}
+    ids |= {c["id"] for c in qa_model_choices() if c.get("id")}
+    try:
+        active = llm.translation_active_model()
+        if active:
+            ids.add(active)
+    except Exception:
+        pass
+    try:
+        fb = llm.model_manager.get_fallback_config().get("model")
+        if fb:
+            ids.add(fb)
+    except Exception:
+        pass
+    ids.discard("")
+    return ids
+
+
 def _resolve_translation_model(requested: str):
     """解析前端传来的 model 参数。
 
@@ -705,7 +766,15 @@ def _resolve_translation_model(requested: str):
     # DeepSeek 内置 provider：有自己的 base_url/key
     if llm.resolve_model_config(req) is not None:
         return req, False, req
-    return req, False, req
+    # ⚠ M-15（2026-10-27 审计）：原来最后一行是 `return req, False, req`
+    #   —— 客户端传**任意字符串**都被当成模型名一路传下去，
+    #   而且这个名字会被**回显**给浏览器（章节视图的「模型名」，
+    #   前端 reader-section-meta 那行 `${modelName}`）。
+    #   服务端必须有白名单：不在清单里的模型名 → 退回默认，
+    #   而不是把任意字符串透传出去。
+    if req in _known_model_ids():
+        return req, False, req
+    return "", False, llm.translation_active_model()
 
 
 # 可供界面选择的**翻译**模型（与答疑清单分开，见 qa_model_choices）。
@@ -1133,6 +1202,25 @@ class TranslatePageRequest(BaseModel):
                                    "否则是 MiniMax 系模型名")
 
 
+class TranslateBlocksRequest(BaseModel):
+    """段落级翻译（双语同位对照模式用）。
+
+    服务端自己抽这一页的**段落块**（bbox + 原文 + 栏归属），
+    一次 LLM 调用把它们全部翻掉，译文按段号回填 → 前端拿得到
+    「第 i 段的译文 + 它在页面上的位置」。
+    """
+    paper_id: str = Field(..., min_length=3, max_length=300)
+    page: int = Field(..., ge=1, le=200, description="1-based page number")
+    relative_path: Optional[str] = Field(
+        default=None, max_length=500,
+        description="PDF 在 vault 中的相对路径（必填：段落块要服务端抽）",
+    )
+    force: bool = Field(default=False, description="忽略缓存强制重译")
+    model: str = Field(default="", max_length=60,
+                       description="临时换模型翻译：空=跟随当前设置, 'agnes'=备用模型, "
+                                   "否则是 MiniMax 系模型名")
+
+
 class TranslationCacheBatchItem(BaseModel):
     section_key: str = Field(default="", max_length=80)
     text: str = Field(default="", max_length=60000)
@@ -1320,17 +1408,26 @@ async def serve_pwa_asset(filename: str):
 #
 # 译文/批注住在同步目录（坚果云），所以两台设备看到的是同一份数字。
 
+import threading
+
 _REAL_STATS_CACHE: dict = {}
 _REAL_STATS_TS: float = 0.0
 _REAL_STATS_TTL = 15.0   # 秒
+# ⚠ M-G（2026-10-27 审计）：2026-10-27 把 /api/stats 等端点改成同步 `def` 后，
+#   FastAPI 把它们丢进 **anyio 线程池（40 线程）** → 这个模块级缓存变成
+#   **多线程并发读写**。原来的「缓存值」和「时间戳」是两条独立赋值语句，
+#   线程 A 换缓存、线程 B 读到旧时间戳 → 缓存击穿（重复全量扫盘）。
+#   加锁把「读-判断-写」变成一个临界区。
+_REAL_STATS_LOCK = threading.Lock()
 
 
 def _real_output_stats() -> dict:
     """论文原文数 / 笔记数 / 已译页数 / 批注条数。"""
     global _REAL_STATS_CACHE, _REAL_STATS_TS
     now = time.monotonic()
-    if _REAL_STATS_CACHE and (now - _REAL_STATS_TS) < _REAL_STATS_TTL:
-        return dict(_REAL_STATS_CACHE)
+    with _REAL_STATS_LOCK:
+        if _REAL_STATS_CACHE and (now - _REAL_STATS_TS) < _REAL_STATS_TTL:
+            return dict(_REAL_STATS_CACHE)
 
     pdf_total = note_total = 0
     lit = BASE_DIR / "01_Literature"
@@ -1392,8 +1489,9 @@ def _real_output_stats() -> dict:
         "translated_pages": translated_pages,
         "annotation_count": annotation_count,
     }
-    _REAL_STATS_CACHE = out
-    _REAL_STATS_TS = now
+    with _REAL_STATS_LOCK:
+        _REAL_STATS_CACHE = out
+        _REAL_STATS_TS = now
     return dict(out)
 
 
@@ -1873,6 +1971,44 @@ async def api_read_table(req: ReadTableRequest):
     return {"table": table}
 
 
+@app.get("/api/paper/page_blocks")
+async def api_page_blocks(relative_path: str, page: int = 1):
+    """返回某一页的**段落块**（bbox + 栏归属）—— 「译文按原文排版」的地基。
+
+    每块：{i, kind, col, bbox, text}
+      - col：L 左栏 / R 右栏 / S 整宽或单栏
+      - bbox：[x0, top, x1, bottom]，**页面绝对坐标**（pt，左上角原点）
+        —— 与 ⟦FORMULA:…⟧ / ⟦TABLE:…⟧ 标记**同一套坐标系**，
+           前端拿它就能把译文放回原文的位置（沉浸式翻译那种排版）
+      - kind：body 正文 / formula 公式 / table 表格
+
+    ⚠ 这是**独立抽取**（自己开一次 pdfplumber，单页 64~332ms），
+      还没并进抽取缓存 —— 见 docs/HANDOFF_2026-11-12-REGION-ASK-AND-BILINGUAL-LAYOUT.md §3.6。
+    """
+    from .paper_text import extract_page_blocks
+    try:
+        pdf_path = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
+    if page < 1 or page > 2000:
+        raise HTTPException(status_code=400, detail="页码超出范围")
+    # 抽取是**同步重活**（pdfplumber 解析一页 64~332ms）→ 丢线程池，
+    # 别占着事件循环（AGENTS.md §4.58）
+    blocks = await asyncio.to_thread(extract_page_blocks, pdf_path, page)
+    # 段落译文的版本闸门 —— 前端拿它跟快照里的 blocks_version 比对，
+    # 对不上就说明段落切分算法变了 → 旧段落译文作废（整页译文不受影响）。
+    from .bilingual import BLOCK_TRANSLATION_VERSION
+    from .paper_text import EXTRACTOR_VERSION
+    return {
+        "page": page,
+        "blocks": blocks,
+        "blocks_version": BLOCK_TRANSLATION_VERSION,
+        "extractor_version": EXTRACTOR_VERSION,
+    }
+
+
 async def _prepare_tables(page_text: str, pdf_path, page: int, model: str = "") -> tuple[str, dict]:
     """把页面文本里的 ⟦TABLE:...⟧ 标记换成中性的 ⟦TABLE_n⟧，
     并把多模态抄出来的表格存起来（翻译完再按位置拼回去）。
@@ -1964,8 +2100,13 @@ async def api_formula_image(
                             detail="公式裁图需要 PyMuPDF (fitz), 请先 pip install pymupdf") from exc
 
     try:
-        # 与 api_read_table 一致：PyMuPDF 渲染一张 4x 的图是几十~几百毫秒的
-        # 同步调用，在 async def 里直接跑会把其它请求（含 SSE 流）一起卡住。
+        # ⚠ 必须在线程里跑（M-2）：_pdf_clip_png 会 fitz.open(pdf) + 渲染，
+        #   是**同步的 CPU/IO 工作**（几十~几百毫秒）。直接在这里调会把
+        #   事件循环整个卡住 —— 期间看板计数、3 个 SSE 答疑面板、LAN 平板
+        #   全部冻结。
+        #   to_thread 丢进 asyncio 默认执行器（上限 = min(32, cpu+4)），
+        #   顺带也给了并发上限，不会被开几十个 fitz 实例把内存吃光。
+        #   （与 api_read_table 同一处理。）
         png = await asyncio.to_thread(
             _pdf_clip_png, pdf_path, page, (x0, y0, x1, y1), scale)
     except ValueError as e:
@@ -2173,7 +2314,14 @@ async def api_vault_reveal(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"打开失败: {_safe_err(e)}")
 
-    return {"status": "success", "command": cmd, "abs_path": abs_path}
+    # 只回**相对 vault 根**的路径：绝对路径里带本机用户名 + vault 根
+    # （内部信息外泄，2026-10-27 审计 M-J）。前端只用它显示"打开了哪个文件"，
+    # 相对路径足够。
+    try:
+        shown_path = str(Path(abs_path).relative_to(BASE_DIR))
+    except ValueError:
+        shown_path = Path(abs_path).name
+    return {"status": "success", "command": cmd, "abs_path": shown_path}
 
 
 @app.get("/api/paper/find_pdf")
@@ -2191,11 +2339,14 @@ def api_find_pdf(
       - keyword token overlap (splits on non-alphanumeric chars)
     Returns the relative path of the best match, or null.
 
-    ⚠ **同步 def，不是 async def**（2026-10-27）。函数体全是同步磁盘
-      IO（`iterdir` + `rglob` 遍历整个文献库），写成 async def 会直接在
-      事件循环里跑，把同时进行的翻译流/状态查询一起卡住。
-      改成同步 def → FastAPI 丢进 anyio 线程池。与 api_stats /
-      api_list_vault_pdfs 同一处理（那两处 2026-10-27 已改）。
+    ⚠ 这里**必须**是同步 `def`（2026-10-27 审计 M-A）：
+      函数体是 `base.iterdir()` + `cat_dir.rglob("*.pdf")` 的**全量扫盘**，
+      而 `01_Literature` 是**坚果云 junction** → 扫描打的是云端 I/O。
+      写成 `async def` 就会在事件循环上同步阻塞：实测 8 并发时探针
+      mean 11.6ms / MAX 78.3ms，同批的同步端点只有 mean 5.2ms / MAX 23.5ms。
+      改成同步 `def` 后 FastAPI 把它丢进 anyio 线程池 → 不冻结事件循环。
+      （与 2026-10-27 已修的 /api/stats、/api/vault/literature、/api/paper/folders
+      同理 —— 那一轮漏掉了这个端点。）
     """
     base = BASE_DIR / "01_Literature"
     if not base.exists():
@@ -2673,12 +2824,16 @@ def api_ask_question(req: AskRequest):
             "llm_error": llm.friendly_error_text(e),
         }
     except Exception as e:
+        # ⚠ 这里**不能**直接 str(e)：异常可能来自 search_vault 的文件系统错误，
+        #   消息里带本机绝对路径（含 Windows 用户名 + 坚果云目录）→ 内部路径泄露。
+        #   同一个函数上面那个 LLMError 分支走 llm.friendly_error_text（已脱敏），
+        #   这里必须用同一口径的 _safe_err（= mask_paths + redact_secrets + 截断）。
         return {
             "status": "partial",
-            "answer": f"⚠️ 问答过程出错: {str(e)[:200]}。以下是 vault 检索结果。",
+            "answer": f"⚠️ 问答过程出错: {_safe_err(e)}。以下是 vault 检索结果。",
             "chunks": chunks,
             "llm_used": False,
-            "llm_error": str(e),
+            "llm_error": _safe_err(e),
         }
 
 
@@ -3689,6 +3844,33 @@ async def api_translation_cache_clear():
     return {"status": "success", "message": "翻译缓存已清空"}
 
 
+def _extract_page_cached(pdf_path, page_no: int) -> tuple[str, list]:
+    """取一页的抽取结果（text, glyphs）：**先查磁盘缓存，没命中才真抽**。
+
+    ⚠ 这个函数是**同步的**（pdfplumber 解析是纯 CPU），
+      调用方**必须** `await asyncio.to_thread(_extract_page_cached, ...)`，
+      否则会卡住事件循环（2026-10-27 审计 H-2）。
+
+    为什么能复用缓存：`extract_text_from_pdf` 每页调的就是
+    `_extract_page_text(page, glyphs)`，与 `extract_page_text_with_glyphs`
+    调的是**同一个函数** → 输出的 text / glyphs 逐字一致，
+    缓存里的 `⟦G:n⟧` 标记下标也仍然对得上。
+    """
+    try:
+        # ⚠ 单参数调用（与 api_open_vault_pdf 的写侧**同一个签名**）：
+        #   缓存键不含符号词典（抽取层不读词典，见 pdf_cache 模块文档），
+        #   若这里多传一个参数 → 两边算出**不同的键** → 一份写一份读
+        #   → 缓存**永远命中不了** → 用户每次都等 2.7~9.7 秒重抽。
+        cached = pdf_cache.read_cache(pdf_path)
+    except Exception:
+        cached = None
+    if cached:
+        for p in cached:
+            if p.get("page") == page_no:
+                return (p.get("text") or ""), (p.get("glyphs") or [])
+    return extract_page_text_with_glyphs(pdf_path, page_no)
+
+
 @app.post("/api/paper/translate_page")
 async def api_translate_page(req: TranslatePageRequest):
     """
@@ -3720,13 +3902,19 @@ async def api_translate_page(req: TranslatePageRequest):
         try:
             from .generator import BASE_DIR, _safe_path
             pdf_path = _safe_path(BASE_DIR, req.relative_path)
-            # ⚠ 必须丢线程池：pdfplumber 解析单页是**百毫秒级**的同步阻塞调用，
-            #   在 async def 里直接调会冻住整个事件循环 —— 而这一步发生在
-            #   「翻下一页」的必经路径上，用户在翻页时会感觉整个页面卡一下。
-            #   本项目其它抽取调用点（upload / open_vault_pdf）都已走 to_thread，
-            #   这里是漏改的一处。
+            # ⚠ H-2（2026-10-27 审计，实测）：原来这里直接调
+            #   extract_page_text_with_glyphs(pdf_path, req.page)
+            #   —— 那是**同步的 pdfplumber 解析**（实测 64~332 ms/页，
+            #   中位数 264 ms），而且**没有 await** → 每翻一页就把事件循环
+            #   整个卡住 0.1~0.35 秒，期间看板计数、3 个 SSE 答疑面板、
+            #   LAN 平板**全冻结**；36 页论文连翻 = 累计约 9 秒卡顿。
+            # 两步修：
+            #   ① 先查磁盘缓存（pdf_cache）→ 命中就是 ~0ms；
+            #   ② 没命中就丢进线程 → 事件循环不再被卡（代价不变，只是不再冻结全站）。
+            # ⚠ 缓存的读写两侧必须用**同一个签名**（pdf_cache.cache_key 单一真相），
+            #   否则一份写一份读 → 缓存永远命中不了。
             extracted, page_glyphs = await asyncio.to_thread(
-                extract_page_text_with_glyphs, pdf_path, req.page)
+                _extract_page_cached, pdf_path, req.page)
             if extracted and len(extracted.strip()) >= 100:
                 page_text = extracted
                 # 解不出的数学符号（× ≈ ≥ …）→ 裁图让多模态认字
@@ -3878,6 +4066,175 @@ async def api_translate_page(req: TranslatePageRequest):
     return result
 
 
+@app.post("/api/paper/translate_blocks")
+async def api_translate_blocks(req: TranslateBlocksRequest):
+    """段落级翻译 —— 「译文按原文排版」的翻译侧。
+
+    返回该页的**段落块**，每块多一个 ``translation`` 字段（它自己的中文译文），
+    外加一份拼接好的整页译文（给原来的整页面板继续用）。
+
+    与 `/api/paper/translate_page` 的关系：
+      - 两条**独立**链路，缓存键不同 → 互不污染，各翻各的；
+      - 段落译文有**独立版本闸门**（`bilingual.BLOCK_TRANSLATION_VERSION`）：
+        段落切分算法改了 → 只作废段落译文，整页译文无恙；
+      - ⚠⚠ **绝对不要动 `paper_text.EXTRACTOR_VERSION`** ——
+        它一动，用户**全部**整页译文作废重翻，而且跨设备同步会波及另一台。
+
+    三类块分别怎么办：
+      - body（正文）：一次 LLM 调用翻整页，模型按 `⟦B7⟧` 编号回 `⟦T7⟧`；
+      - formula（公式）：**不进模型**（碎片会被模型"补全"成不存在的公式），
+        译文填 `⟦FORMULA:x0,y0,x1,y1⟧` → 前端裁原图贴上去；
+      - table（表格）：**不进模型**（文本层数值整行错位），裁图让多模态逐格抄。
+    """
+    if not llm.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="段落翻译需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
+        )
+    if not (req.relative_path or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="段落翻译必须提供 relative_path（段落块要由服务端抽取）。",
+        )
+    try:
+        pdf_path = _safe_path(BASE_DIR, req.relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
+
+    from .bilingual import (BLOCK_TRANSLATION_VERSION, blocks_signature,
+                            concatenate_blocks, translate_blocks)
+    from .paper_text import extract_page_blocks
+    from .translation import get_cache
+
+    # 抽取是**同步重活**（pdfplumber 解析一页 64~332ms）→ 丢线程池，
+    # 别占着事件循环（AGENTS.md §4.58）
+    blocks = await asyncio.to_thread(extract_page_blocks, pdf_path, req.page)
+    if not blocks:
+        raise HTTPException(
+            status_code=422,
+            detail=f"第 {req.page} 页没有抽到段落块（可能是纯图片页或扫描件）。",
+        )
+
+    _m_name, _m_fallback, model = _resolve_translation_model(req.model)
+    cache = get_cache()
+    cache_section_key = f"blocks:{req.paper_id}:{req.page}"
+    # 缓存键的文本部分 = **段落内容签名**（含 blocks_version 与每段原文，
+    # 不含坐标 —— 坐标变了不影响译文内容）。
+    signature = blocks_signature(blocks)
+    if not req.force:
+        cached = cache.get(cache_section_key, signature, model)
+        if cached and cached.get("blocks"):
+            cached["from_cache"] = True
+            return cached
+
+    # ---- 表格块：裁图让多模态逐格抄（与整页翻译同一套机制）----
+    async def _read_table_blocks() -> dict:
+        async def _one(b: dict):
+            idx = int(b.get("i", 0))
+            bbox = [float(v) for v in (b.get("bbox") or [])]
+            if len(bbox) != 4:
+                return idx, "【表格未能读出，请对照原文】"
+            try:
+                md = await _read_table_vision(pdf_path, req.page, tuple(bbox), req.model)
+                return idx, (md or "").strip() or "【表格未能读出，请对照原文】"
+            except Exception as e:
+                print(f"[MicroBench] 第 {req.page} 页表格块 {idx} 读取失败: {e}",
+                      file=sys.stderr)
+                return idx, "【表格未能读出，请对照原文】"
+
+        pairs = await asyncio.gather(
+            *[_one(b) for b in blocks if b.get("kind") == "table"])
+        return {idx: md for idx, md in pairs}
+
+    # ---- 正文段落：一次 LLM 调用翻整页 ----
+    async def _chat(**kwargs):
+        # llm.chat 是**同步**的 requests 调用 → 必须丢线程池（AGENTS.md §4.58）
+        return await asyncio.to_thread(llm.chat, **kwargs)
+
+    call_info: dict = {}
+    deadline = time.monotonic() + _translation_deadline_seconds(req.model)
+    src_len = sum(len(b.get("text") or "") for b in blocks)
+
+    # 表格读图跟正文翻译**并行**（各要 10~30s，串行就翻倍）
+    table_task = asyncio.create_task(_read_table_blocks())
+    try:
+        out_blocks, reason = await translate_blocks(
+            blocks, _chat,
+            model=model,
+            m_name=_m_name or llm.translation_model_name(),
+            m_fallback=_m_fallback,
+            max_tokens=_translation_max_tokens(src_len, model),
+            deadline=deadline,
+            call_info=call_info,
+            disable_thinking=llm.translation_disable_thinking(),
+        )
+    except llm.LLMError as e:
+        table_task.cancel()
+        raise HTTPException(status_code=502,
+                            detail=f"段落翻译失败: {llm.friendly_error_text(e)}")
+    except Exception as e:
+        table_task.cancel()
+        raise HTTPException(status_code=500, detail=f"段落翻译失败: {_safe_err(e)}")
+    try:
+        table_map = await table_task
+    except Exception:
+        table_map = {}
+
+    # ⚠ 模型完全无视编号标记、段数也对不上 → **放弃同位模式**。
+    #   宁可这一页没有译文，也不能把译文贴到错的段落上 —— 那比没有更糟。
+    if reason == "parse":
+        raise HTTPException(
+            status_code=502,
+            detail=("模型没有按段落编号返回译文，无法保证译文与原文一一对应。"
+                    "请重试，或换用更听话的翻译模型（DeepSeek Flash / MiniMax-M3）。"),
+        )
+
+    # 公式块 → 公式原图标记（前端 renderFormulaImages 换成从 PDF 裁下来的原图）
+    for b in out_blocks:
+        kind = b.get("kind")
+        if kind == "formula":
+            bbox = [float(v) for v in (b.get("bbox") or [])]
+            if len(bbox) == 4:
+                b["translation"] = "⟦FORMULA:%.1f,%.1f,%.1f,%.1f⟧" % tuple(bbox)
+            else:
+                b["translation"] = "【公式未能完整提取，请对照左侧 PDF 原文】"
+        elif kind == "table":
+            b["translation"] = (table_map.get(int(b.get("i", 0)))
+                                or "【表格未能读出，请对照原文】")
+
+    translation = concatenate_blocks(out_blocks)
+    if not translation.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="段落翻译结果为空。模型可能把 token 预算耗在推理上没产出正文。",
+        )
+
+    curr_st = llm.get_llm_status()
+    result = {
+        "status": "success",
+        "paper_id": req.paper_id,
+        "page": req.page,
+        "blocks": out_blocks,
+        # 拼接好的整页译文 —— 老的面板继续用它，形态不变
+        "translation": translation,
+        "blocks_version": BLOCK_TRANSLATION_VERSION,
+        "from_cache": False,
+        "model": call_info.get("model") or model,
+        "model_fell_back": bool(call_info.get("fallback_used")),
+        "is_degraded": curr_st["is_degraded"],
+        # 部分完成：有段落没译出来（逐段提示里会标出来）
+        "partial": bool(reason),
+        "stopped_reason": reason,
+        "block_count": len(out_blocks),
+        "translated_blocks": sum(
+            1 for b in out_blocks if (b.get("translation") or "").strip()),
+    }
+    cache.put(cache_section_key, signature, model, result)
+    return result
+
+
 @app.post("/api/paper/translation_cache_batch_lookup")
 async def api_translation_cache_batch_lookup(req: TranslationCacheBatchRequest):
     """
@@ -4025,6 +4382,27 @@ SNAPSHOT_MAX_BYTES = 5 * 1024 * 1024
 SNAPSHOT_SCHEMA_VERSION = 1
 
 
+class _SnapshotBlockItem(BaseModel):
+    """一页里的**一个段落块**（对照模式用）。
+
+    为什么快照里要存它：平板端**访问不到电脑端的后端**（没有 baseURL、
+    CSP 与原生桥白名单都拦着），它只能读同步过来的快照文件。
+    → 段落译文 + 段落坐标必须**跟着快照走**，平板才能把译文贴回原位。
+
+    ⚠ 这里**不存**原文（text）—— 平板自己渲染 PDF 页就有原文，
+      存了只是让快照白白变大（5MB 上限）。
+    """
+    i: int = Field(..., ge=0, le=2000, description="块序号（阅读顺序）")
+    kind: str = Field(default="body", max_length=16,
+                      description="body 正文 / formula 公式 / table 表格")
+    col: str = Field(default="S", max_length=4,
+                     description="栏归属：L 左栏 / R 右栏 / S 整宽或单栏")
+    bbox: list[float] = Field(default_factory=list, max_length=4,
+                               description="页面绝对坐标 [x0,top,x1,bottom]（pt，左上角原点）")
+    translation: str = Field(default="", max_length=8000,
+                             description="该段的中文译文")
+
+
 class _SnapshotPageItem(BaseModel):
     page_num: int = Field(..., ge=1, le=2000)
     text_hash: str = Field(..., min_length=4, max_length=64,
@@ -4034,6 +4412,16 @@ class _SnapshotPageItem(BaseModel):
     translation: str = Field(..., min_length=1, max_length=30000)
     model: Optional[str] = Field(default="", max_length=64)
     translated_at: Optional[str] = Field(default="", max_length=40)
+    # ---- 段落级译文（对照模式）----
+    #
+    # ⚠ **独立版本闸门**：段落切分算法一改（bilingual.BLOCK_TRANSLATION_VERSION
+    #   +1），这些块的编号/坐标就全变了 → 旧译文贴到新段落上就是**错位**。
+    #   → 前端加载时比对版本，对不上就**只丢掉 blocks**，
+    #     整页译文（translation）继续用 —— 两者的生命周期必须分开。
+    blocks: Optional[list[_SnapshotBlockItem]] = Field(default=None, max_length=500,
+                                                       description="段落级译文（对照模式）")
+    blocks_version: Optional[int] = Field(default=None, ge=0, le=9999,
+                                          description="段落译文版本闸门")
 
 
 class SnapshotSaveRequest(BaseModel):
@@ -4055,7 +4443,21 @@ class SnapshotSaveRequest(BaseModel):
 
 
 def _snapshot_dir() -> Path:
-    p = BASE_DIR / "logs" / SNAPSHOT_DIR_NAME
+    """快照目录（**读路径上不建目录**）。
+
+    ⚠ M-3（2026-10-27 审计）：原来这里直接 mkdir →
+      `GET /api/pdf/snapshot/list` 与 `GET /api/pdf/snapshot/load`
+      也会建目录。而 GET 属安全方法，**不受 csrf_origin_guard 约束** →
+      跨站一个 <img> 就能让服务端往磁盘上建目录。
+      现在改成：读路径只算路径不建；目录在 lifespan 启动时建一次，
+      写路径显式调 _ensure_snapshot_dir()。
+    """
+    return BASE_DIR / "logs" / SNAPSHOT_DIR_NAME
+
+
+def _ensure_snapshot_dir() -> Path:
+    """快照目录（写路径用）：确保目录存在。"""
+    p = _snapshot_dir()
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -4319,6 +4721,12 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
     #   锁按 paper_id 分桶，不同论文互不阻塞。
     #   ⚠ 临界区里绝不能有 await —— 事件循环线程持锁等待会把整条循环卡死。
     from .paper_text import EXTRACTOR_VERSION
+    # ⚠ 合并冲突的解法（2026-11-15 合并云端升级）：
+    #   云端（origin/main）在写路径上加了 `_ensure_snapshot_dir()`
+    #   （M-3：写路径才建目录，读路径不建）；
+    #   本机（HEAD）把这一段重构成了「读旧值 → 合并 → 写回」全程持锁。
+    #   两者不冲突：**都要**——保留锁结构，把 _ensure_snapshot_dir()
+    #   挪进临界区、写盘之前调用（读之前不建目录，保持云端 M-3 的原意）。
     target = _snapshot_path(safe_id)
     with _snapshot_lock(safe_id):
         try:
@@ -4347,6 +4755,9 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
             )
 
         try:
+            # 写路径才建目录（云端 M-3 修的，合并时保留）：
+            #   放在临界区内、真正写盘之前 —— 读路径仍然不建目录。
+            _ensure_snapshot_dir()
             _atomic_write_text(target, serialized)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"写盘失败: {_safe_err(e)}")
@@ -5040,8 +5451,27 @@ class SyncRequest(BaseModel):
                                 description="是否连同 PDF 本体一起同步（增量）")
 
 
+def _sync_root_display(root: Path, request: Request | None = None) -> str:
+    """同步根的展示形式：本地给全路径，远端只给云端末段。
+
+    完整路径长这样：`C:\\Users\\30461\\Nutstore\\1\\我的坚果云\\MicroBench同步`
+    —— 里面有 **Windows 用户名** 和**坚果云镜像 id**，属于内部信息外泄
+    （2026-10-27 审计 M-J）。
+
+    但用户**要靠它确认两台设备的云端路径一致**（docs/SYNC_CONTRACT.md 红线 4：
+    `.env` 的 `ANNOTATIONS_DIR` 云端末段必须都是 `我的坚果云\\MicroBench同步`），
+    所以远端也要给到能对上的那一段 —— 只砍掉用户名前面的部分。
+    """
+    if request is not None and _client_is_local(request):
+        return str(root)
+    parts = root.parts
+    if len(parts) >= 2:
+        return str(Path(*parts[-2:]))
+    return root.name
+
+
 @app.post("/api/sync")
-def api_sync(req: SyncRequest):
+def api_sync(req: SyncRequest, request: Request):
     """一键同步：推送本机状态 + 拉取共享目录里的状态（两边都做，幂等）。
 
     两台设备点同一个按钮即可：推的是自己，拉的是对方，最后合并。
@@ -5135,6 +5565,11 @@ def api_sync(req: SyncRequest):
 
     # ---------- 推送：论文 PDF 本体（增量，只传变化过的） ----------
     if req.include_files and not req.pull_only:
+        # ⚠ M-B（2026-10-27 审计）：files 通道是**重活**（逐文件 sha256 +
+        #   79 MB 拷贝），原来在 async 端点里**同步**执行 →
+        #   事件循环被整个占住 → 期间看板计数、3 个 SSE 答疑面板、LAN 平板全卡。
+        #   → 整个端点改成**同步 def**（FastAPI 自动丢进 anyio 线程池），
+        #     这里就直接同步调用，不用再 to_thread。
         rep = _sync_push_files()
         files_report["push"] = rep
         pushed["files"] = list(rep.get("published", [])) + list(rep.get("updated", []))
@@ -5219,6 +5654,7 @@ def api_sync(req: SyncRequest):
 
         # ---------- 拉取：论文 PDF 本体（还原到 vault 原来的相对路径） ----------
         if req.include_files and not req.push_only:
+            # 同上（M-B）：拉取也是重活（还原 = 拷贝 79 MB）。
             rep = _sync_pull_files()
             files_report["pull"] = rep
             pulled["files"] = list(rep.get("restored", []))
@@ -5227,9 +5663,12 @@ def api_sync(req: SyncRequest):
         # status 保持 "success"（前端与脚本依赖）；单项失败通过 errors 暴露，
         # 不再用「全绿」掩盖某几篇没同步上去。
         "status": "success",
+        # errors / error_count：本机的改动（单项失败不再被吞掉）；
+        # root 用脱敏显示：云端 2026-11 升级加的（不把坚果云真实路径回给前端）。
+        # 两边都要，合并时保留。
         "errors": errors,
         "error_count": len(errors),
-        "root": str(root),
+        "root": _sync_root_display(root, request),
         "pushed": pushed,
         "pulled": pulled,
         "pushed_total": sum(len(v) for v in pushed.values()),
@@ -5352,10 +5791,10 @@ def _sync_files_status() -> dict:
 
 
 @app.get("/api/sync/status")
-async def api_sync_status():
+async def api_sync_status(request: Request):
     """同步目录里有什么、什么时候更新的。"""
     root = _sync_root()
-    out = {"root": str(root), "exists": root.is_dir(), "kinds": {}}
+    out = {"root": _sync_root_display(root, request), "exists": root.is_dir(), "kinds": {}}
     for kind in SYNC_KINDS:
         d = root / kind
         files = []
@@ -5402,8 +5841,20 @@ class AnnotationSaveRequest(BaseModel):
 
 
 def _annotations_dir() -> Path:
-    """批注存放目录 = 同步根目录下的 annotations/（和其他同步内容在一起）。"""
-    d = _sync_root() / "annotations"
+    """批注存放目录 = 同步根目录下的 annotations/（和其他同步内容在一起）。
+
+    ⚠ M-3（2026-10-27 审计）：**读**路径上不建目录。
+      原来这里 mkdir → `GET /api/pdf/annotations/load` 会往**坚果云同步根**
+      里建目录。GET 不受 csrf_origin_guard 约束 → 跨站一个 <img> 就能
+      让服务端在用户的云端共享目录里建目录（还会被坚果云上传）。
+      现在：读路径只算路径；写路径显式调 _ensure_annotations_dir()。
+    """
+    return _sync_root() / "annotations"
+
+
+def _ensure_annotations_dir() -> Path:
+    """批注目录（写路径用）：确保目录存在。"""
+    d = _annotations_dir()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -5420,6 +5871,19 @@ def _legacy_annotation_paths(paper_id: str) -> list:
 def _annotation_path(paper_id: str) -> Path:
     safe = _safe_paper_key(paper_id, "annotations")
     return _annotations_dir() / f"{safe}.json"
+
+
+def _file_fingerprint(path: Path):
+    """文件版本指纹：(mtime_ns, size)。
+
+    用于乐观 CAS：读完之后再取一次，比对变了没有 ——
+    变了说明**另一台设备**（共享坚果云目录）在我们读与写之间改了这个文件。
+    """
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 def _anno_is_newer(a: str, b: str) -> bool:
@@ -5464,16 +5928,8 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
     safe_id = _safe_paper_key(req.paper_id, "annotations")
     now = _dt.datetime.now().isoformat(timespec="seconds")
 
+    _ensure_annotations_dir()   # 写路径才建目录（M-3：GET 不再往坚果云根里建目录）
     target = _annotation_path(safe_id)
-    try:
-        existing = _read_json_or_quarantine(target)
-    except ValueError as e:
-        raise HTTPException(status_code=500, detail=_safe_err(e))
-    if not existing:
-        for legacy in _legacy_annotation_paths(safe_id):
-            existing = _safe_read_json(legacy)
-            if existing:
-                break
     incoming = []
     for a in req.annotations:
         item = a.model_dump()
@@ -5481,25 +5937,59 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
             item["color"] = "yellow"
         incoming.append(item)
 
-    # 合并规则（删除墓碑最后应用，优先级高于 upsert）
-    items = _merge_annotation_lists(
-        (existing or {}).get("annotations") or [], incoming, req.deleted or [])
+    # ⚠ M-H（2026-10-27 审计）：这是**跨设备共享**文件（坚果云同步根）。
+    #   原来的「读 → 合并 → 写」有窗口：另一台设备若在窗口内写了同一个 JSON，
+    #   本机的写回会**整文件覆盖**对方的批注。
+    #   `_merge_annotation_lists` 只在**内容**层面合并，救不了整文件覆盖。
+    # 修法 = 乐观 CAS：写之前再取一次磁盘指纹（mtime_ns + size），
+    #   和读完时取的那份比对；变了说明**另一台设备刚写过** →
+    #   重新读 + 重新合并再来一轮（最多 3 轮）。
+    #   窗口从「整个同步往返」缩到「一次文件读」。
+    #
+    # ⚠⚠ 读旧值**必须**用 `_read_json_or_quarantine` 而不是 `_safe_read_json`：
+    #   损坏的文件（坚果云同步中断/断电留下的半截 JSON）若被当成「没有」，
+    #   合并基数就变成空列表 → 写回时把磁盘上**其它所有批注**永久抹掉，
+    #   而用户看到的是「✅ 保存成功」—— 一条数据都不报错地消失，最难查。
+    #   → 损坏时宁可让这次保存失败并告诉用户，也绝不静默清空。
+    payload: dict = {}
+    serialized = ""
+    for _attempt in range(3):
+        try:
+            existing = _read_json_or_quarantine(target)
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=_safe_err(e))
+        if not existing:
+            for legacy in _legacy_annotation_paths(safe_id):
+                existing = _safe_read_json(legacy)
+                if existing:
+                    break
+        fingerprint = _file_fingerprint(target)
 
-    payload = {
-        "paper_id": safe_id,
-        "saved_at": now,
-        "updated_at": now,
-        "schema_version": 2,
-        "annotations": items,
-    }
-    serialized = json.dumps(payload, ensure_ascii=False, indent=1)
-    if len(serialized.encode("utf-8")) > ANNOTATION_MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"批注过多(>{ANNOTATION_MAX_BYTES // 1024 // 1024}MB),请先删掉一些",
-        )
+        # 合并规则（删除墓碑最后应用，优先级高于 upsert）
+        items = _merge_annotation_lists(
+            (existing or {}).get("annotations") or [], incoming, req.deleted or [])
+
+        payload = {
+            "paper_id": safe_id,
+            "saved_at": now,
+            "updated_at": now,
+            "schema_version": 2,
+            "annotations": items,
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, indent=1)
+        if len(serialized.encode("utf-8")) > ANNOTATION_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"批注过多(>{ANNOTATION_MAX_BYTES // 1024 // 1024}MB),请先删掉一些",
+            )
+        if _file_fingerprint(target) == fingerprint:
+            break   # 磁盘没被别人改 → 可以写
+        # 期间被另一台设备改了 → 下一轮重新读 + 重新合并（不丢对方的批注）
 
     try:
+        # ⚠ 原子写（坚果云同步目录）：先写同目录 .tmp 再 os.replace ——
+        #   同步客户端只会看到旧文件或新文件，不会看到半截 JSON。
+        #   （统一用 `_atomic_write_text`，别再各写一份。）
         _atomic_write_text(target, serialized)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"批注写盘失败: {_safe_err(e)}")
@@ -5509,7 +5999,10 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
         "paper_id": safe_id,
         "saved": len(items),
         "updated_at": now,
-        "dir": str(target.parent),
+        # 同 M-J：不给完整绝对路径（含 Windows 用户名 + 坚果云目录）。
+        # 只给最后两段，用户照样能看出"批注写到哪个共享目录了"。
+        "dir": str(Path(*target.parent.parts[-2:])) if len(target.parent.parts) >= 2
+                else target.parent.name,
     }
 
 

@@ -193,27 +193,33 @@ public class DavPathHandler {
                             (syncRoot ? "还没配置同步目录" : "坚果云账号还没配置")
                                     .getBytes(StandardCharsets.UTF_8)));
         }
-        byte[] data = c.get(path);
-        if (data == null) {
+        // ⚠ 2026-10-27 审计 M-1：原来 `byte[] data = c.get(path)` ——
+        //   整份文件先进内存（上限 128 MB）→ 平板 OOM。
+        //   WebResourceResponse 本来就吃 InputStream → 直接把连接流给它，
+        //   Java 侧一个字节都不攒。
+        DavClient.DavStream stream = c.openFile(path);
+        if (stream == null) {
             // ⚠ 404 有两种可能：文件真的没了 / 前缀配错了。
             //   后者正是用户看到的「24 篇原文全 404」——
             //   重探一次位置，位置对上了就能真下到文件。
             DavClient fixed = tryRedetect(syncRoot);
             if (fixed != null) {
-                data = fixed.get(path);
+                stream = fixed.openFile(path);
             }
         }
-        if (data == null) {
+        if (stream == null) {
             return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
                     new HashMap<String, String>(),
                     new ByteArrayInputStream("not found".getBytes(StandardCharsets.UTF_8)));
         }
         Map<String, String> headers = new HashMap<>();
         headers.put("Cache-Control", "no-store");
-        headers.put("Content-Length", String.valueOf(data.length));
+        long len = stream.length();
+        if (len > 0) {
+            headers.put("Content-Length", String.valueOf(len));
+        }
         // 二进制内容 -> encoding 传 null
-        return new WebResourceResponse(mimeOf(path), null, 200, "OK", headers,
-                new ByteArrayInputStream(data));
+        return new WebResourceResponse(mimeOf(path), null, 200, "OK", headers, stream);
     }
 
     private static WebResourceResponse json(int code, String body) {

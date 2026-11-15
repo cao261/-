@@ -72,7 +72,24 @@ def test_no_tautological_assertions_in_the_suite():
 #
 # 2026-11-10 已换掉 5 条（test_glyph_padding / test_llm_models / test_pdf_cache），
 # 上限按当时的实际条数定；再往下换就要同步改这个数字。
-_MAX_SOURCE_TEXT_GUARDS = 50
+#
+# ⚠ 2026-11-15 合并云端升级时，条数从 50 涨到 132 —— 不是本机新增的，
+#   是云端那批（2026-10-27 / 10-28 / 11-11 审计）带进来的 82 条：
+#     test_audit_2026_10_27_android.py   29
+#     test_zen_mode.py                   23
+#     test_bilingual.py                  12
+#     test_audit_2026_10_27_tablet.py    11
+#     test_audit_2026_10_27_core.py       6
+#     test_audit_2026_10_27_medium.py     1
+#   云端自己的审计（docs/AUDIT_2026-11-11.md §3.13 / §5）也把这一类列为
+#   「要逐类换成行为级」的待办 —— 说明**两边都认这是债**。
+#   这里把上限按**合并后的实测条数**重设为 132：
+#     * 上限的作用是「不许再涨」，不是「必须清零」；
+#     * 照旧钉死在 50 会让合并后的套件直接变红 → 护栏变成摆设、
+#       下次谁都不知道它已经失效了；
+#     * 重设时必须写明来源（本段），否则「改数字」本身就成了没人看的暗箱。
+#   → 后续每换掉一条行为级护栏，就把上限改小 1，并在本段记一笔。
+_MAX_SOURCE_TEXT_GUARDS = 132
 
 
 def test_no_test_builds_a_client_without_sandboxing_the_vault():

@@ -3,6 +3,9 @@ package microbench.tablet;
 import android.content.Context;
 import android.content.SharedPreferences;
 
+import java.util.LinkedHashSet;
+import java.util.Set;
+
 /** 凭证存储。坚果云应用密码与 AI Key 都只留在本机。 */
 public class Prefs {
 
@@ -13,6 +16,28 @@ public class Prefs {
     private static final String K_DAV_ROOT = "dav_root";
     private static final String K_DAV_VAULT = "dav_vault_root";
     private static final String K_DAV_SYNC = "dav_sync_root";
+    /** 用户自己登记的「AI 网关」主机（逗号分隔）。 */
+    private static final String K_AI_HOSTS = "ai_hosts";
+
+    /**
+     * 内置的**目标主机白名单**。
+     *
+     * ⚠ 2026-10-27 审计 C-1：原生桥的 httpPost 原来只校验「https://」前缀
+     *   → 页面里任何脚本都能让平板**代自己发请求**（开放代理），
+     *   尤其能拿平板当跳板去打用户内网的 https 服务。
+     *   → 目标主机必须落在白名单里：
+     *     - 坚果云 WebDAV
+     *     - 桌面端在用的模型网关（见 microbench/llm.py 的 base_url 默认值）
+     *   用户自己填的网关由页面调用 {@link #allowAiHost(String)} 登记。
+     */
+    public static final String[] DEFAULT_ALLOWED_HOSTS = {
+        "dav.jianguoyun.com",     // 坚果云 WebDAV
+        "api.minimaxi.com",       // MiniMax（主）
+        "api.minimax.io",         // MiniMax（国际站）
+        "apihub.agnes-ai.com",    // Agnes 3.0 Flash（备用）
+        "api.deepseek.com",       // DeepSeek
+        "api.openai.com",         // OpenAI 兼容默认
+    };
 
     private final SharedPreferences sp;
 
@@ -49,26 +74,33 @@ public class Prefs {
     }
 
     /**
-     * 统一路径写法：去首尾空白、去首尾斜杠、反斜杠转正斜杠。
+     * 统一路径写法：去首尾空白、去首尾斜杠、反斜杠转正斜杠、丢掉 . 与 .. 段。
      *
      * ⚠ 为什么必须归一化（不是洁癖）：
      *   手填路径可能带尾斜杠「我的坚果云/MicroBench工作台/」，
      *   而探测出来的「我的坚果云/MicroBench工作台」不带。
      *   两者字符串不等 → {@link #redetectVaultRoot()} 每次都认为
      *   「位置变了」→ 每 5 分钟就全盘重探一次 → 白白消耗坚果云配额。
+     *
+     * ⚠ 2026-10-27 审计 L-2：". / .." 段也一起丢掉 ——
+     *   否则手填「../别的目录」就能让请求越出 vault 根。
      */
     private static String normalizeRoot(String p) {
         if (p == null) {
             return "";
         }
         String s = p.trim().replace('\\', '/');
-        while (s.startsWith("/")) {
-            s = s.substring(1);
+        StringBuilder sb = new StringBuilder();
+        for (String seg : s.split("/")) {
+            if (seg.isEmpty() || ".".equals(seg) || "..".equals(seg)) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append('/');
+            }
+            sb.append(seg);
         }
-        while (s.endsWith("/")) {
-            s = s.substring(0, s.length() - 1);
-        }
-        return s;
+        return sb.toString();
     }
 
     /**
@@ -108,6 +140,181 @@ public class Prefs {
             return null;
         }
         return new DavClient(davUser(), davPass(), davRoot(), davVaultRoot());
+    }
+
+    // ------------------------------------------------------------------
+    // AI 网关主机白名单（审计 C-1）
+    // ------------------------------------------------------------------
+
+    /**
+     * 当前允许的**目标主机**集合（内置 + 用户登记的）。
+     */
+    public Set<String> aiHosts() {
+        Set<String> out = new LinkedHashSet<String>();
+        for (String h : DEFAULT_ALLOWED_HOSTS) {
+            out.add(h);
+        }
+        String extra = sp.getString(K_AI_HOSTS, "");
+        if (extra != null) {
+            for (String h : extra.split(",")) {
+                String t = h.trim().toLowerCase();
+                if (!t.isEmpty()) {
+                    out.add(t);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 这个主机能不能作为原生代理的目标。
+     *
+     * ⚠ 除了「在不在白名单」，还额外要求它是**公网 DNS 名**：
+     *   IP 字面量 / localhost / *.local / 单段内网名 一律不收 ——
+     *   否则「把平板当跳板打用户内网」照样成立。
+     */
+    public boolean isAiHostAllowed(String host) {
+        if (host == null) {
+            return false;
+        }
+        String h = host.trim().toLowerCase();
+        if (h.isEmpty()) {
+            return false;
+        }
+        if (!isPublicHostName(h)) {
+            return false;
+        }
+        return aiHosts().contains(h);
+    }
+
+    /**
+     * 登记一个「用户自己配置的 AI 网关」主机。
+     *
+     * ⚠ 页面在用户保存 AI 设置时调用（原生侧不读得到网页的 IndexedDB）。
+     *   只收**公网 DNS 名** —— 内网 / IP 字面量一律拒绝。
+     *
+     * @return 登记成功返回 true
+     */
+    public boolean allowAiHost(String base) {
+        String h = hostOf(base);
+        if (h == null || !isPublicHostName(h)) {
+            return false;
+        }
+        Set<String> cur = new LinkedHashSet<String>();
+        String extra = sp.getString(K_AI_HOSTS, "");
+        if (extra != null) {
+            for (String s : extra.split(",")) {
+                String t = s.trim().toLowerCase();
+                if (!t.isEmpty()) {
+                    cur.add(t);
+                }
+            }
+        }
+        if (!cur.add(h)) {
+            return true;                 // 已经在里面了
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String s : cur) {
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            sb.append(s);
+        }
+        sp.edit().putString(K_AI_HOSTS, sb.toString()).apply();
+        return true;
+    }
+
+    /**
+     * 从一个 URL 里取出主机名（只认 https）。
+     *
+     * ⚠ userinfo（https://user:key@host）必须剥掉 ——
+     *   否则主机名会变成 "user:key@host"，白名单永远匹配不上，
+     *   而凭据还会跟着一起进日志。
+     *
+     * @return 主机名；不是 https / 解析不了返回 null
+     */
+    public static String hostOf(String url) {
+        if (url == null) {
+            return null;
+        }
+        String u = url.trim();
+        if (!u.toLowerCase().startsWith("https://")) {
+            return null;
+        }
+        String rest = u.substring("https://".length());
+        int cut = rest.length();
+        for (int i = 0; i < rest.length(); i++) {
+            char c = rest.charAt(i);
+            if (c == '/' || c == '?' || c == '#') {
+                cut = i;
+                break;
+            }
+        }
+        String host = rest.substring(0, cut);
+        int at = host.lastIndexOf('@');
+        if (at >= 0) {
+            host = host.substring(at + 1);
+        }
+        // 去掉端口
+        int colon = host.lastIndexOf(':');
+        if (colon > 0 && host.indexOf(']') < colon) {
+            host = host.substring(0, colon);
+        }
+        host = host.trim().toLowerCase();
+        return host.isEmpty() ? null : host;
+    }
+
+    /**
+     * 这个主机名是不是**公网 DNS 名**（可以登记为 AI 网关）。
+     *
+     * ⚠ 判据：
+     *   - IP 字面量（IPv4 / IPv6）一律不收 —— 那是「把平板当跳板」的路子；
+     *   - localhost / *.local / *.internal / *.lan / *.home.arpa 不收；
+     *   - 单段主机名（intranet 这种）不收 —— 它只能在内网解析。
+     */
+    public static boolean isPublicHostName(String host) {
+        if (host == null) {
+            return false;
+        }
+        String h = host.trim().toLowerCase();
+        if (h.isEmpty()) {
+            return false;
+        }
+        if (h.startsWith("[") || h.indexOf(':') >= 0) {
+            return false;                   // IPv6 字面量
+        }
+        if (isIpv4Literal(h)) {
+            return false;
+        }
+        if ("localhost".equals(h) || h.endsWith(".localhost")
+                || h.endsWith(".local") || h.endsWith(".internal")
+                || h.endsWith(".lan") || h.endsWith(".home.arpa")
+                || h.endsWith(".intranet")) {
+            return false;
+        }
+        return h.indexOf('.') > 0;         // 至少要有「域名 + 后缀」
+    }
+
+    /** 是不是 IPv4 字面量（四个十进制段）。 */
+    private static boolean isIpv4Literal(String h) {
+        String[] parts = h.split("\\.");
+        if (parts.length != 4) {
+            return false;
+        }
+        for (String p : parts) {
+            if (p.isEmpty() || p.length() > 3) {
+                return false;
+            }
+            for (int i = 0; i < p.length(); i++) {
+                if (p.charAt(i) < '0' || p.charAt(i) > '9') {
+                    return false;
+                }
+            }
+            if (Integer.parseInt(p) > 255) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

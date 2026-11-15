@@ -1239,6 +1239,62 @@
     .pdf-translation-block .page-text p:last-child { margin-bottom: 0; }
     .pdf-translation-loading { padding: var(--s-4); color: var(--fg-subtle); font-size: var(--t-sm); font-style: italic; }
 
+    /* ---------- 对照模式：译文按原文排版 ----------
+       用户诉求（2026-11-12）："像沉浸式翻译那样，译文和原文的排版一模一样，
+       原文是双栏，译文也是双栏"。
+
+       为什么是**重排**而不是把译文贴回 canvas 上：
+       PDF 页在阅读器里是「按栏宽自适应」渲染的（612pt 的页塞进 ~420px 宽的栏，
+       缩放倍率约 0.69）→ 原文正文只有 ~6px 高。译文贴回原位也是 6px，
+       **根本读不了**。所以对照模式改成「按原文的分栏重排」：
+       左栏段落进左栏、右栏段落进右栏，字号恢复正常。
+       代价：图片/图表不在文本层里 → 重排后看不到（切回「原文」视图即可）。
+    */
+    .bilingual-page {
+      box-sizing: border-box;
+      max-width: 1200px;
+      margin: 0 auto var(--s-4) auto;
+      padding: var(--s-5) var(--s-5) var(--s-4) var(--s-5);
+      background: var(--surface-raised);
+      border: 1px solid var(--line-hairline);
+      border-left: 2px solid var(--accent-2);
+      border-radius: var(--r-md);
+    }
+    .bilingual-span { margin: 0 0 var(--s-4) 0; }
+    .bilingual-cols { display: flex; align-items: flex-start; gap: var(--s-5); }
+    .bilingual-col { flex: 1 1 0; min-width: 0; }
+    .bilingual-col + .bilingual-col {
+      border-left: 1px solid var(--line-hairline);
+      padding-left: var(--s-5);
+    }
+    .bilingual-block { margin: 0 0 var(--s-4) 0; }
+    .bilingual-block:last-child { margin-bottom: 0; }
+    .bb-orig {
+      font-family: var(--font-sans);
+      font-size: 0.76rem;
+      line-height: 1.55;
+      color: var(--fg-subtle);
+      margin: 0 0 3px 0;
+    }
+    .bb-trans {
+      font-family: var(--font-cn);
+      font-size: 0.9375rem;
+      line-height: 1.78;
+      color: var(--fg-strong);
+    }
+    .bb-trans p { margin: 0 0 4px 0; text-indent: 0; }
+    .bilingual-block.kind-heading .bb-orig { font-weight: 600; color: var(--fg-muted); }
+    .bilingual-block.kind-heading .bb-trans { font-weight: 600; }
+    .bilingual-block.kind-formula { text-align: center; }
+    .bilingual-block.kind-formula .bb-orig { display: none; }
+    .bilingual-block.kind-table .bb-orig { display: none; }
+    .bilingual-note {
+      padding: var(--s-3) var(--s-4);
+      color: var(--fg-subtle);
+      font-size: var(--t-sm);
+      text-align: center;
+    }
+
     /* PDF.js text layer — must stay transparent so the canvas shows through. */
     .textLayer {
       position: absolute;
@@ -1628,6 +1684,12 @@
        文字挤成两行、破坏版面。所以改成在画布上叠一层矩形（荧光笔效果），
        矩形坐标按页面归一化存储，缩放时按比例还原。 */
     .anno-overlay-layer { position: absolute; inset: 0; pointer-events: none; z-index: 5; }
+        /* 手写笔迹（平板端画过来的）——SVG 叠加层，不干扰原文 canvas */
+        .anno-ink-svg {
+          position: absolute; inset: 0; width: 100%; height: 100%;
+          overflow: visible; pointer-events: none;
+        }
+        .anno-ink-stroke { pointer-events: none; }
     .anno-overlay {
       position: absolute;
       border-radius: 2px;
@@ -1879,7 +1941,14 @@
       z-index: 1000;
       background: var(--surface-canvas);
     }
-    .reader-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+    /* ⚠️ width:100% 不能省 —— #reader-modal 打开时是 display:flex（行向 flex），
+       .reader-shell 是它的 flex item，width:auto 会走 **fit-content 收缩**：
+       壳的宽度 = 内容的 max-content，而不是视口宽度。
+       平时顶栏在文档流里、内容很宽，壳被撑满，看不出问题；
+       一旦顶栏脱离文档流（专注模式 position:fixed），壳里只剩 .pdf-split，
+       壳立刻缩成 616px（1280 屏上只占一半），右半屏全空。
+       min-width:0 同理：否则 min-content 撑大时 flex item 不肯缩。 */
+    .reader-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; width: 100%; min-width: 0; }
 
     .seg-value {
       min-width: 48px;
@@ -1931,7 +2000,11 @@
     /* PDF split view */
     #reader-pdf-view { flex: 1; min-height: 0; }
     .pdf-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); height: 100%; min-height: 0; }
-    .pdf-split-pane { overflow-y: auto; padding: var(--s-5) var(--s-6) var(--s-12); background: var(--surface-sunken); }
+    /* scrollbar-gutter: stable —— 滚动条位置**提前占好**。
+       不占的话：PDF 画布渲染时容器还没出现滚动条（宽度按"无滚动条"量），
+       画布一加进去、竖向滚动条冒出来 → 容器宽度少 15px → 画布比容器宽 →
+       底部多一条横向滚动条。占位之后宽度从一开始就稳定。 */
+    .pdf-split-pane { overflow-y: auto; scrollbar-gutter: stable; padding: var(--s-5) var(--s-6) var(--s-12); background: var(--surface-sunken); }
     .pdf-split-pane + .pdf-split-pane { border-left: 1px solid var(--line-soft); }
     .pdf-split-pane-alt { background: var(--surface-canvas); }
     @media (max-width: 900px) { .pdf-split { grid-template-columns: 1fr; } }
@@ -2133,6 +2206,135 @@
     @media (pointer: coarse) and (min-width: 1180px) {
       .container { padding-top: var(--s-8); }
     }
+
+    /* =====================================================================
+       专注模式（Zen / Focus）——小屏极简阅读
+       目标：屏幕上只剩「论文页 + 译文页」。顶栏工具条 / 章节导航 /
+       AI 提问区 / 划词答疑悬浮钮 默认全部收起，需要时从顶部滑出。
+
+       设计约束（改之前先读）：
+       1) 工具条**复用 .reader-topbar**，不另做一套按钮
+          → 既有功能一行不多地全部保留，也不会和顶栏分叉。
+       2) 顶栏在专注模式下改成 position:fixed + translateY(-101%)，
+          脱离文档流 → .reader-body 自然撑满，不需要额外的 padding 补偿。
+       3) **不给 .reader-shell 加 position:relative** ——
+          那会把里面 position:absolute 的浮层（批注编辑器 / 笔记抽屉）
+          的包含块从 .reader-modal 换成 .reader-shell，位置全乱。
+       4) 窄屏（<860px）本来就会塌成单列；专注模式保持一致，
+          且此时章节导航不参与（单列放不下第三栏）。
+       5) 选择器一律用 #reader-modal 前缀 —— 基础样式里的
+          @media (max-width:1200px) .reader-body 是「两列」，靠 id 权重压住它，
+          专注模式才不会被基础规则反覆盖。
+       ===================================================================== */
+    #reader-modal.zen .reader-topbar {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 1200;
+      transform: translateY(-101%);
+      /* ⚠ HIGH-4（2026-10-27 审计，实测复现）：transform **不会**把元素
+         移出焦点序。只靠 translateY 藏起来的话，工具条里 23 个可聚焦控件
+         仍然能用 Tab 走到 —— 而且它们的 boundingClientRect.top 是 -90
+         （在视口上方，屏幕上看不见）→ 键盘/读屏用户掉进一个看不见的
+         工具条里。visibility:hidden 才是真正的「藏」：同时移出焦点序
+         和可访问性树，而且不影响滑出/滑回的过渡动画。
+         收起时延迟 0.2s 再隐藏（等 transform 动画走完），展开时立即可见。 */
+      visibility: hidden;
+      transition: transform .2s var(--ease), visibility 0s linear .2s;
+      max-height: 56vh;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, .22);
+    }
+    #reader-modal.zen.zen-bar-open .reader-topbar {
+      transform: translateY(0);
+      visibility: visible;
+      transition: transform .2s var(--ease), visibility 0s;
+    }
+
+    /* 章节导航：默认收起，只留论文页 + 译文页 */
+    #reader-modal.zen .reader-nav { display: none; }
+    #reader-modal.zen.zen-nav-open .reader-nav { display: block; }
+    #reader-modal.zen .reader-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    #reader-modal.zen.zen-nav-open .reader-body { grid-template-columns: 200px minmax(0, 1fr) minmax(0, 1fr); }
+
+    /* AI 提问区 / 划词答疑悬浮钮：默认收起（划词气泡不受影响，它是临时出现的）
+       ⚠️ 用 **id** 选（#reader-qa-floating-btn），别用类名 ——
+       这个按钮身上的类叫 .reader-floating-copilot-btn，
+       .reader-qa-floating-btn 是它的 id。写成类选择器会**静默失效**
+       （规则匹配不到任何元素，看着像生效了其实没生效）。 */
+    #reader-modal.zen .reader-aux { display: none; }
+    #reader-modal.zen.zen-aux-open .reader-aux { display: block; }
+    #reader-modal.zen #reader-qa-floating-btn { display: none !important; }
+
+    /* 专注模式要的是「整屏可用」—— 把基础样式里给平板准备的
+       `max-width: 860px + margin: auto` 取消掉。
+       ⚠️ 不取消的后果（浏览器实测抓到的）：
+       基础样式 `@media (700-1100px) .reader-shell > * { max-width:860px;
+       margin-left:auto; margin-right:auto; }` 在**交叉轴上用 auto 外边距
+       取消了 flex 的 stretch** → 变成 fit-content 收缩 →
+       单栏时 PDF 栏被收缩成「内容宽度」，右半屏全空。
+       专注模式本来就是为了「小屏多看字」，必须占满整屏。 */
+    #reader-modal.zen .reader-shell > * {
+      max-width: none;
+      margin-left: 0;
+      margin-right: 0;
+    }
+
+    /* 单栏模式：只显示一栏，论文页 / 译文页 二选一 */
+    #reader-modal.zen.zen-single .reader-body { grid-template-columns: minmax(0, 1fr); }
+    /* ⚠️ 章节视图里的两栏（原文 pane / 译文 pane-alt）必须**互斥**地二选一：
+       单栏默认显示译文栏；zen-show-orig 时显示原文栏。
+       浏览器实测抓到的 bug：原来的写法
+         .reader-pane:not(.reader-pane-alt){display:none}   ← 永远藏原文
+         .zen-show-orig .reader-pane-alt{display:none}     ← show-orig 时藏译文
+       两条同时生效 → 切到「论文页」时**两栏都没了**（一片空白）。
+       所以要显式地把 show-orig 下的原文 pane 放回来。 */
+    #reader-modal.zen.zen-single .reader-pane { display: none; }
+    #reader-modal.zen.zen-single .reader-pane-alt { display: block; }
+    #reader-modal.zen.zen-single.zen-show-orig .reader-pane { display: none; }
+    #reader-modal.zen.zen-single.zen-show-orig .reader-pane-alt { display: none; }
+    #reader-modal.zen.zen-single.zen-show-orig .reader-pane:not(.reader-pane-alt) { display: block; }
+    #reader-modal.zen.zen-single .pdf-split { grid-template-columns: minmax(0, 1fr); }
+    /* ⚠️ 必须带 :not(.zen-show-orig) —— 否则「切到论文页」时这条规则
+       仍然把 PDF 容器藏起来 → 切过去是一片空白（浏览器实测抓到的）。
+       同理，下面那条在 zen-show-orig 时才藏译文栏。 */
+    #reader-modal.zen.zen-single:not(.zen-show-orig) #pdf-viewer-container { display: none; }
+    #reader-modal.zen.zen-single.zen-show-orig #pdf-translations-container { display: none; }
+
+    @media (max-width: 860px) {
+      #reader-modal.zen .reader-body,
+      #reader-modal.zen.zen-nav-open .reader-body { grid-template-columns: 1fr; }
+      #reader-modal.zen.zen-nav-open .reader-nav { display: none; }
+    }
+
+    /* 顶部细把手：专注模式下唯一常驻的元素 */
+    .zen-handle {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: 7px;
+      z-index: 1199;
+      background: linear-gradient(180deg, rgba(130, 130, 150, .40), rgba(130, 130, 150, 0));
+      cursor: pointer;
+      display: none;
+      overflow: hidden;
+      transition: height .18s var(--ease);
+    }
+    #reader-modal.zen .zen-handle { display: block; }
+    #reader-modal.zen.zen-bar-open .zen-handle { opacity: 0; pointer-events: none; }
+    #reader-modal.zen .zen-handle:hover { height: 26px; }
+    .zen-handle-title {
+      display: block;
+      padding: 4px 10px 0;
+      font-size: var(--t-xs);
+      color: var(--fg-subtle);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* 专注模式专属按钮：非专注时藏起来（进入专注的按钮除外，它要一直可见） */
+    #reader-modal:not(.zen) .zen-only { display: none !important; }
+    #reader-modal:not(.zen-single) #zen-pane-btn { display: none !important; }
 </style>
 </head>
 <body>
@@ -2551,9 +2753,12 @@
   <div id="toast" role="status" aria-live="polite"></div>
 <script>
     let _toastTimer = null;
-    // ms：提示停留时长。带排查建议的长文案要传长一点，否则用户还没看完就没了
-    // （历史上 15 处调用都传了第三个参数，但签名只有两个 → 全部被无声忽略）。
-    function showToast(msg, isError = false, ms = 3800) {
+    // ⚠️ duration 以前是**死的** —— 函数只有两个形参，但代码库里好几处
+    //    （含本分支新增的 3 处）都按 showToast(msg, isError, ms) 调，
+    //    第三个参数被静默忽略 → 一律 3800ms。这里把形参补上。
+    //    ms：提示停留时长。带排查建议的长文案要传长一点，否则用户还没看完就没了
+    //    （历史上 15 处调用都传了第三个参数，但签名只有两个 → 全部被无声忽略）。
+    function showToast(msg, isError = false, duration = 3800) {
       const t = document.getElementById("toast");
       if (!t) return;
       t.innerText = msg;
@@ -2561,7 +2766,7 @@
       t.setAttribute("data-error", isError ? "true" : "false");
       t.style.display = "block";
       clearTimeout(_toastTimer);
-      _toastTimer = setTimeout(() => { t.style.display = "none"; }, ms);
+      _toastTimer = setTimeout(() => { t.style.display = "none"; }, duration);
     }
 
     // ------------------------------------------------------------------
@@ -3404,6 +3609,37 @@
       }
 
       // ---------------------------------------------------------------
+      // Modal Esc dismissal (no click-outside).
+      //
+      // ⚠ 旧写法 `document.addEventListener("keydown", onEsc, { once: true })`
+      //   有三个坑（2026-10-27 审计 HIGH-2，全部实测复现）：
+      //   ① { once: true } 的语义是「**任意**键按一次就摘掉监听器」，
+      //      不是「Esc 才摘」→ 弹窗开着时先按了字母键，Esc 就再也关不掉它；
+      //   ② 诊断弹窗的监听器只在 `if (!modal)` 里挂一次 →
+      //      关掉再打开后 Esc **永久失效**；
+      //   ③ 快照弹窗每打开一次就多挂一个 keydown 监听器（实测 3 次 → 3 个）。
+      //
+      // 这里统一：只认 Esc、关掉时摘干净、并且 stopPropagation
+      // —— 否则专注模式的 Esc 会和弹窗的 Esc 一起响应 → 两边都不响应
+      // （zen 的让路逻辑 `if (_zenOverlayOpen()) return;` 会把 Esc 让给弹窗，
+      //   而弹窗自己的 Esc 已经被别的键吃掉了 → 键盘陷阱）。
+      // ---------------------------------------------------------------
+      function _wireModalEsc(overlay, closeFn) {
+        if (!overlay) return;
+        if (overlay._escDismiss) overlay._escDismiss();
+        const onKey = (e) => {
+          if (e.key !== "Escape") return;
+          e.stopPropagation();
+          if (overlay._escDismiss) overlay._escDismiss();
+          closeFn();
+        };
+        document.addEventListener("keydown", onKey);
+        overlay._escDismiss = () => {
+          document.removeEventListener("keydown", onKey);
+        };
+      }
+
+      // ---------------------------------------------------------------
       // Vault save modal: pick subfolder + filename before exporting
       // bilingual notes or QA cards. Returns Promise<{subfolder, filename}|
       // null (user cancelled).
@@ -3993,6 +4229,9 @@
           lastAnswerText: _lastAnswerText || "",
           readerMode: _readerMode || "section",
           pdfZoom: _pdfZoom || 1.0,
+          zenPref: !!_zenPref,
+          // 对照模式（译文按原文排版）—— 记住偏好，下次打开 PDF 直接是对照视图
+          bilingual: !!_bilingualPref,
         };
         localStorage.setItem(LS_STATE_KEY, JSON.stringify(state));
       } catch (e) {}
@@ -4008,6 +4247,8 @@
         if (typeof s.lastAnswerText === "string") _lastAnswerText = s.lastAnswerText;
         if (s.readerMode === "section" || s.readerMode === "pdf") _readerMode = s.readerMode;
         if (typeof s.pdfZoom === "number") _pdfZoom = s.pdfZoom;
+        if (s.zenPref === true) _zenPref = true;
+        if (s.bilingual === true) _bilingualPref = true;
       } catch (e) {
         console.error("[restoreLocalState]", e);
       }
@@ -4062,6 +4303,8 @@
       loadStats();
       fetchModelStatus();
       initReaderSelectionListener();
+      _initZenMode();
+      _initPdfWidthObserver();
       _restoreLocalState();
       _restoreFromHash();
       loadVaultPdfOptions();
@@ -4155,6 +4398,10 @@
         document.addEventListener("keydown", _readerEscHandler);
       }
       fetchModelStatus();
+      // 专注模式偏好：上次开着 → 这次直接进专注（不用再点一次「专注」按钮）
+      if (_zenPref && !_zenMode) {
+        setTimeout(() => { if (!_zenMode) enterZenMode({ silent: true }); }, 0);
+      }
     }
     function closeReaderModal() {
       document.getElementById("reader-modal").style.display = "none";
@@ -4186,6 +4433,8 @@
     // ---------------------------------------------------------------------------
     let _readerMode = "section"; // "section" | "pdf"
     let _pdfZoom = 1.0; // user-controlled PDF zoom multiplier (PDF dual-column view)
+    // 对照模式（译文按原文排版）的偏好开关 —— 跨会话记住
+    let _bilingualPref = false;
     let _pdfState = null; // { paperId, paperTitle, relativePath, pdfDoc, pages: [{num, canvas, text, translated}], rendering }
 
     function switchReaderMode(mode, opts = {}) {
@@ -4265,16 +4514,336 @@
       if (el) el.textContent = Math.round((_pdfZoom || 1.0) * 100) + "%";
     }
 
-    // 窗口尺寸变化 -> 按新的栏宽重新渲染 PDF。
-    // PDF 宽度是按左栏可用宽度自适应的（100% = 占满整栏），所以窗口一变
+    // =====================================================================
+    // 专注模式（Zen / Focus）
+    //
+    // 目标：小屏上只留「论文页 + 译文页」，其余界面默认收起。
+    //
+    // 唤出工具条的方式（哪种都行，总有一个能用）：
+    //   - 顶部那条 7px 细把手 —— 点一下（再点一下收起）
+    //   - 鼠标移到屏幕最上方 40px
+    //   - 内容区往回上滑（scroll up）/ 滑到最底部
+    //   - 快捷键 Z（切换专注）
+    //   - Esc（先收起工具条，再按退出专注）
+    //
+    // 工具条 = 原有 .reader-topbar（不另做一套按钮）→ 既有功能一行不少，
+    // 也不会和顶栏分叉出两套行为。
+    //
+    // 两个状态别混：
+    //   _zenMode = 当前这个阅读器是不是专注布局（运行时）
+    //   _zenPref = 用户偏好（持久化）—— 下次打开论文直接进专注
+    // =====================================================================
+    let _zenMode = false;
+    let _zenPref = false;
+    let _zenBarTimer = null;
+    let _zenScrollT = 0;
+    let _zenScrollEl = null;      // 上一次滚动的容器（滚动位置按容器分别记）
+    const ZEN_SCROLL_TOL = 4;   // 滚动方向判定容差（px）
+
+    // 上层弹窗（论文快照 / 诊断）开着没有？
+    // 它们的 keydown 处理器没有 stopPropagation → 一次 Esc 会两边都响应
+    //（弹窗关了 + 专注也退出了）。所以专注的 Esc 要先给它们让路。
+    function _zenOverlayOpen() {
+      const ids = ["snapshot-modal", "diag-modal"];
+      for (const id of ids) {
+        const el = document.getElementById(id);
+        if (el && el.style.display !== "none" && el.style.display !== "") return true;
+      }
+      return false;
+    }
+
+    function _zenModal() { return document.getElementById("reader-modal"); }
+    function isZenMode() { return !!_zenMode; }
+    // 只有「阅读器开着 + 处于专注」才算激活 —— 关闭阅读器后不该还有交互
+    function _zenActive() {
+      const modal = _zenModal();
+      return !!(modal && _zenMode && modal.style.display !== "none");
+    }
+
+    // 布局变了 → PDF 画布可能要按新栏宽重绘。
+    //
+    // ⚠️ force 必须**按调用点**给，不能一律 true：
+    //    - 进出专注（顶栏在文档流 ↔ fixed 浮层）：`.reader-shell` 宽度恒为 100%
+    //      （§4.48），顶栏进出**不改变 PDF 栏宽** → 不需要重绘。
+    //      一律 force=true 会让 391 页的论文每点一次「专注」就全量重绘一遍
+    //      （每页一次 await renderPdfPage）→ 明显卡顿。
+    //    - 切单栏 / 切论文页：`.pdf-split` 的列数变了 → 栏宽大变 → 必须重绘。
+    //
+    // 不用 `window.dispatchEvent(new Event("resize"))` 当内部调用 ——
+    // 那是全局广播，将来任何新增的 resize 监听器都会被误触发。
+    function _zenRelayoutPdf(force) {
+      try {
+        _pdfRelayoutIfNeeded(!!force);
+      } catch (e) { /* 忽略 */ }
+    }
+
+    function _zenSyncLabels() {
+      const modal = _zenModal();
+      const single = !!(modal && modal.classList.contains("zen-single"));
+      const btn = document.getElementById("zen-single-btn");
+      if (btn) btn.textContent = single ? "双栏" : "单栏";
+      const titleEl = document.getElementById("zen-handle-title");
+      const readerTitle = document.getElementById("reader-title");
+      if (titleEl) titleEl.textContent = readerTitle ? (readerTitle.textContent || "") : "";
+    }
+
+    function _zenOpenBar(sticky) {
+      const modal = _zenModal();
+      if (!modal || !_zenMode) return;
+      modal.classList.add("zen-bar-open");
+      clearTimeout(_zenBarTimer);
+      _zenBarTimer = null;
+      _zenSyncLabels();
+      if (!sticky) _zenBarTimer = setTimeout(_zenCloseBar, 2600);
+    }
+
+    function _zenCloseBar() {
+      const modal = _zenModal();
+      if (!modal || !_zenMode) return;
+      modal.classList.remove("zen-bar-open");
+      clearTimeout(_zenBarTimer);
+      _zenBarTimer = null;
+    }
+
+    function enterZenMode(opts = {}) {
+      const modal = _zenModal();
+      if (!modal) return;
+      const firstTime = !_zenMode;
+      _zenMode = true;
+      _zenPref = true;
+      modal.classList.add("zen");
+      if (opts.single) modal.classList.add("zen-single");
+      if (opts.showOrig) modal.classList.add("zen-show-orig");
+      _persistLocalState();
+      _zenSyncLabels();
+      if (firstTime && !opts.silent) {
+        showToast("专注模式：顶部细条点一下展开工具条 · Z 切换 · Esc 退出", false, 3600);
+      }
+      // 顶栏脱离文档流 → 论文页变宽 → PDF 必须重绘（否则画布和栏宽对不上）
+      // ⚠️ force=false：进出专注**不改变 PDF 栏宽**（壳恒为 100% 宽），
+      //    真正的重绘交给 ResizeObserver 按实际宽度差决定 —— 见 _zenRelayoutPdf。
+      setTimeout(function () { _zenRelayoutPdf(false); }, 260);
+    }
+
+    function exitZenMode() {
+      const modal = _zenModal();
+      if (!modal) return;
+      _zenMode = false;
+      _zenPref = false;
+      modal.classList.remove("zen", "zen-bar-open", "zen-single",
+                            "zen-show-orig", "zen-nav-open", "zen-aux-open");
+      clearTimeout(_zenBarTimer);
+      _zenBarTimer = null;
+      _persistLocalState();
+      _zenSyncLabels();
+      // 退出专注：顶栏回到文档流，PDF 栏宽不变 → force=false（见 _zenRelayoutPdf）
+      setTimeout(function () { _zenRelayoutPdf(false); }, 260);
+    }
+
+    function toggleZenMode() {
+      if (_zenMode) exitZenMode(); else enterZenMode();
+    }
+
+    // ⚠️ 章节导航（.reader-nav）和 AI 提问区（.reader-aux）都住在
+    //    「章节视图」容器 #reader-body 里，而 PDF 双栏模式下那个容器
+    //    整体是 display:none —— 这时候点「章节」「提问」**什么也不会发生**，
+    //    点了像按钮坏了。所以先切到章节视图再展开对应面板。
+    //
+    //    但章节视图的**内容**来自「全文拆分章节」（_readerState.sections），
+    //    只有走过 openVaultPdf / 拉取全文 的论文才有；
+    //    仅靠地址栏恢复的本地 PDF 没有章节数据 → 切过去是一片空白，
+    //    用户会以为坏了 → 这种情况直接说清楚，不切。
+    function _zenHasSections() {
+      return !!(typeof _readerState !== "undefined" && _readerState &&
+                Array.isArray(_readerState.sections) && _readerState.sections.length);
+    }
+
+    // 返回 true = 已切到章节视图（调用方接着展开面板）
+    // 返回 false = 切不过去（已弹提示说明原因，或本来就在章节视图）
+    function _zenEnsureSectionView() {
+      if (_readerMode === "section") return false;
+      if (!_zenHasSections()) {
+        showToast("这篇还没有章节数据 —— 需要先「拉取全文」拆分章节", true, 3600);
+        return false;
+      }
+      switchReaderMode("section");
+      return true;
+    }
+
+    function toggleZenNav() {
+      const modal = _zenModal();
+      if (!modal) return;
+      // ⚠ HIGH-3（2026-10-27 审计，实测复现）：窄屏（<860px）下 CSS 里
+      //   `#reader-modal.zen.zen-nav-open .reader-nav { display: none; }`
+      //   会把刚打开的导航又关掉 → 按钮点了**什么都没发生**：
+      //   实测 display=none、元素 0×0、也没有任何提示 → 用户以为按钮坏了。
+      //   专注模式本来就是给小屏用的，所以这里必须**如实说明**而不是白点。
+      if (window.matchMedia && window.matchMedia("(max-width: 860px)").matches) {
+        showToast("小屏放不下章节导航 —— 专注模式请用「提问」，或退出专注看目录", true, 3600);
+        return;
+      }
+      if (_zenEnsureSectionView()) {
+        modal.classList.add("zen-nav-open");
+        showToast("已切到章节视图（章节导航只在章节视图里有）", false, 2600);
+        return;
+      }
+      if (_readerMode !== "section") return;  // 切不过去就别动开关
+      // ⚠️ 已经在章节视图了，但**这篇没有章节数据** → 导航是空的，
+      //    打开只会多出一条 200px 的空列（用户看着像坏了）→ 如实提示。
+      if (!_zenHasSections()) {
+        showToast("这篇还没有章节数据 —— 章节导航需要先「拉取全文」拆分章节", true, 3600);
+        return;
+      }
+      modal.classList.toggle("zen-nav-open");
+    }
+
+    function toggleZenAux() {
+      const modal = _zenModal();
+      if (!modal) return;
+      if (_zenEnsureSectionView()) {
+        modal.classList.add("zen-aux-open");
+        showToast("已切到章节视图（提问区只在章节视图里有）", false, 2600);
+        return;
+      }
+      if (_readerMode !== "section") return;  // 切不过去就别动开关
+      modal.classList.toggle("zen-aux-open");
+    }
+
+    function toggleZenSingle() {
+      const modal = _zenModal();
+      if (!modal) return;
+      modal.classList.toggle("zen-single");
+      _zenSyncLabels();
+      // 列数变了 → PDF 栏宽大变 → 必须重绘（force=true）
+      setTimeout(function () { _zenRelayoutPdf(true); }, 300);
+    }
+
+    function zenTogglePane() {
+      const modal = _zenModal();
+      if (!modal) return;
+      modal.classList.toggle("zen-show-orig");
+      // 论文页 / 译文页互斥切换 → PDF 栏宽大变 → 必须重绘（force=true）
+      setTimeout(function () { _zenRelayoutPdf(true); }, 300);
+    }
+
+    /**
+     * 专注模式的交互接线（只跑一次，在 _bootDashboard 里调）。
+     * 所有监听器都用 document 级 + 运行时判活跃 —— 阅读器本身是常驻 DOM，
+     * 但它在关闭时 display:none，不能让这些监听器在首页上乱触发。
+     */
+    function _initZenMode() {
+      const handle = document.getElementById("zen-handle");
+      if (handle) {
+        // ⚠️ 把手只负责**展开**工具条，不能"再点一下收起"：
+        //    工具条打开时把手是 `pointer-events:none` 且被顶栏盖住
+        //    （z-index 1199 < 1200）→ 点不到 → 「再点一下收起」是死分支。
+        //    收起靠：Esc / 鼠标移出顶栏（1.2s 后自动收起）/ 顶栏的「✕ 退出专注」。
+        handle.addEventListener("click", () => {
+          if (!_zenActive()) return;
+          _zenOpenBar(true);   // 显式点开 → 常驻，不自动收起
+        });
+      }
+      // 鼠标移到屏幕最上方 → 滑出工具条（停手 2.6s 自动收起）
+      document.addEventListener("mousemove", (e) => {
+        if (!_zenActive()) return;
+        if (e.clientY > 40) return;
+        // ⚠️ 指针**已经在工具条上**时不要重置定时器 ——
+        //    否则光标停在条上抖 1px 就会重挂 2.6s 定时器，
+        //    2.6s 后工具条在光标底下自己关掉（mouseover 只在"进入"时触发，补不回来）。
+        const onBar = e.target && e.target.closest && e.target.closest(".reader-topbar");
+        if (onBar) return;
+        _zenOpenBar(false);
+      });
+      // 指针停在工具条上时不自动收起；离开后再开始计时
+      document.addEventListener("mouseover", (e) => {
+        if (!_zenActive()) return;
+        const bar = e.target && e.target.closest && e.target.closest(".reader-topbar");
+        if (bar) { clearTimeout(_zenBarTimer); _zenBarTimer = null; }
+      });
+      document.addEventListener("mouseout", (e) => {
+        if (!_zenActive()) return;
+        const bar = e.target && e.target.closest && e.target.closest(".reader-topbar");
+        if (bar && !(e.relatedTarget && bar.contains(e.relatedTarget))) {
+          clearTimeout(_zenBarTimer);
+          _zenBarTimer = setTimeout(_zenCloseBar, 1200);
+        }
+      });
+      // 滚动：往回上滑 / 滑到最底部 → 滑出工具条
+      // scroll 不冒泡，用 capture:true 才能在 document 上收到
+      document.addEventListener("scroll", (e) => {
+        if (!_zenActive()) return;
+        const el = e.target;
+        if (!el || !el.closest || !el.closest("#reader-body, #reader-pdf-view")) return;
+        const top = el.scrollTop || 0;
+        // ⚠️ 滚动位置必须**按容器**分别记 —— 阅读器里有 4 个滚动容器
+        //    （章节视图 2 个 + PDF 视图 2 个），共用一个全局量的话，
+        //    在译文栏滚 300px 再到 PDF 栏往上滚 5px 会被误判成
+        //    「大幅往回上滑」→ 工具条凭空滑出。
+        if (el !== _zenScrollEl) {
+          _zenScrollEl = el;
+          _zenScrollT = top;
+          return;                      // 第一次在这个容器上滚动 → 不判方向
+        }
+        const dy = top - _zenScrollT;
+        _zenScrollT = top;
+        // ⚠️ 「滑到最底部」只对**真的能滚**的容器成立 ——
+        //    scrollHeight === clientHeight 的短容器恒为真 → 一滚就弹工具条。
+        const scrollable = (el.scrollHeight || 0) > (el.clientHeight || 0) + 4;
+        const nearBottom = scrollable &&
+          (el.scrollHeight || 0) - top - (el.clientHeight || 0) < 24;
+        if (dy < -ZEN_SCROLL_TOL || nearBottom) _zenOpenBar(false);
+      }, true);
+      // 快捷键：Z 切换专注，Esc 先收工具条、再按退出专注
+      document.addEventListener("keydown", (e) => {
+        if (!_zenActive()) return;
+        const t = e.target;
+        const tag = ((t && t.tagName) || "").toLowerCase();
+        if (tag === "input" || tag === "textarea" || tag === "select" ||
+            (t && t.isContentEditable)) return;
+        if (e.key === "Escape") {
+          // ⚠️ 上层弹窗（论文快照 / 诊断）开着时，Esc **归它** ——
+          //    一次按键不能干两件事（退出专注 + 关弹窗）。
+          //    那些弹窗自己的 keydown 处理器没有 stopPropagation，
+          //    两边都会响应 → 弹窗关了，专注也退出了。
+          if (_zenOverlayOpen()) return;
+          const modal = _zenModal();
+          if (modal && modal.classList.contains("zen-bar-open")) _zenCloseBar();
+          else exitZenMode();
+          e.preventDefault();
+          return;
+        }
+        if ((e.key === "z" || e.key === "Z") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          toggleZenMode();
+          e.preventDefault();
+        }
+      });
+    }
+
+    // PDF 栏宽变了 -> 按新的栏宽重新渲染 PDF。
+    // PDF 宽度是按左栏可用宽度自适应的（100% = 占满整栏），所以栏宽一变
     // 就得重绘，否则页面宽度和栏宽对不上，两侧又会空出来。
+    //
+    // ⚠️ 只听 window resize 是不够的（浏览器实测抓到的）：
+    //    阅读器打开前是 display:none，#pdf-pages-list 的宽度是 0；
+    //    第一次渲染时量到 0 → 走兜底 520px；等阅读器真的显示出来，
+    //    **窗口尺寸一点没变** → window resize 根本不触发 →
+    //    画布永远停在 520px，右半屏全空。
+    //    所以要直接观察 PDF 列表容器本身（ResizeObserver），
+    //    它在「隐藏 → 显示」「单栏 → 双栏」这些变化上都会报。
     let _pdfResizeTimer = null;
-    window.addEventListener("resize", () => {
+    // ⚠️ 必须是**计数**，不能是布尔 —— loadPdfDualColumn 可以并发（重绘定时器 +
+    //    缩放）。用布尔时，先结束的那次渲染会在 finally 里把标记清成 false，
+    //    另一场还在跑 → 忙标记提前失效 → 渲染中途的尺寸回调不再被挡。
+    let _pdfRelayoutBusyCount = 0;
+    function _pdfIsRelayoutBusy() { return _pdfRelayoutBusyCount > 0; }
+
+    function _pdfRelayoutIfNeeded(force) {
       if (_readerMode !== "pdf" || !_pdfState || !_pdfState.pdfDoc) return;
+      if (_pdfIsRelayoutBusy()) return;
       const w = document.getElementById("pdf-pages-list")?.clientWidth || 0;
-      if (!w) return;
+      if (!w) return;               // 阅读器还没显示 / 容器不可见 → 宽度不可信
       const last = _pdfState.lastRenderWidth || 0;
-      if (last && Math.abs(w - last) < 40) return; // 变化太小不值得重绘
+      if (!force && last && Math.abs(w - last) < 40) return; // 变化太小不值得重绘
       clearTimeout(_pdfResizeTimer);
       _pdfResizeTimer = setTimeout(() => {
         if (!_pdfState || !_pdfState.rendering) return;
@@ -4284,7 +4853,37 @@
         document.getElementById("pdf-pages-list").innerHTML = "";
         loadPdfDualColumn({ keepTranslations: true, generation: gen });
       }, 250);
-    });
+    }
+
+    window.addEventListener("resize", () => _pdfRelayoutIfNeeded(false));
+
+    /**
+     * 渲染完成后复核栏宽。
+     *
+     * 阅读器可能是在**渲染过程中**才从隐藏变可见的 ——
+     * 那一瞬间的 ResizeObserver 回调会被「忙」标记挡掉，
+     * 不复核的话画布就停在「看不见时量到的兜底宽度 520px」上。
+     *
+     * 用**渲染起始时**的宽度比，不是最后一页的：
+     * 渲染中途变可见时，前几页是旧宽度、后几页是新宽度，
+     * 最后一页的宽度会掩盖掉这个事实。
+     */
+    function _pdfVerifyRenderedWidth(renderW0, listEl) {
+      const el = listEl || document.getElementById("pdf-pages-list");
+      if (!el) return;
+      if (Math.abs(renderW0 - el.clientWidth) > 40) _pdfRelayoutIfNeeded(true);
+    }
+
+    /** 观察 PDF 列表容器尺寸 —— 覆盖「阅读器从隐藏变可见」「专注模式切单双栏」
+     *  这些 window resize 抓不到的宽度变化。 */
+    function _initPdfWidthObserver() {
+      const listEl = document.getElementById("pdf-pages-list");
+      if (!listEl || typeof ResizeObserver === "undefined") return;
+      try {
+        const ro = new ResizeObserver(() => _pdfRelayoutIfNeeded(false));
+        ro.observe(listEl);
+      } catch (e) { /* 观察器不可用就退回 window resize */ }
+    }
 
     /**
      * 载入 PDF 文档，worker 源按「本地 vendor -> CDN」顺序尝试。
@@ -4408,6 +5007,14 @@
                 translation: prev.translation,
                 translation_model: prev.translation_model || "",
                 translated_at: prev.translated_at || "",
+                // 对照模式的段落数据也要带着走 —— 否则缩放一次，
+                // 整篇的段落译文就得重翻一遍（钱和命都是）。
+                blocks: prev.blocks || null,
+                blocksVersion: prev.blocksVersion || 0,
+                blockTranslations: prev.blockTranslations || null,
+                blockTranslated: !!prev.blockTranslated,
+                snapshotBlocks: prev.snapshotBlocks || null,
+                snapshotBlocksVersion: prev.snapshotBlocksVersion,
               });
             }
           }
@@ -4418,6 +5025,8 @@
           relativePath: found.relative_path,
           pdfDoc,
           pages: [],
+          // 对照模式（译文按原文排版）—— 默认关，用户点工具栏的「对照」才开
+          bilingual: !!_bilingualPref,
           rendering: { cancelled: false, generation: myGen },
         };
         // 打开这篇论文的历史批注（高亮 + 我的笔记），下次进来直接可见
@@ -4429,20 +5038,35 @@
 
         // Render all pages
         listEl.innerHTML = "";
-        for (let p = 1; p <= pdfDoc.numPages; p++) {
-          if (_pdfState.rendering.cancelled) break;
-          // Generation guard: bail if a newer zoom toggle superseded us
-          if (_pdfState.rendering.generation !== myGen) break;
-          const pageData = await renderPdfPage(p);
-          // Re-attach the translation we already paid for (zoom only).
-          const prev = prevPageState.get(p);
-          if (prev) {
-            pageData.translated = true;
-            pageData.translation = prev.translation;
-            pageData.translation_model = prev.translation_model;
-            pageData.translated_at = prev.translated_at;
+        // 渲染开始时的栏宽（渲染结束后用它复核栏宽有没有中途变过）
+        const renderW0 = listEl.clientWidth;
+        // 重绘进行中 → 忽略容器尺寸变化（否则清空列表触发的 ResizeObserver
+        // 回调会再排一次重绘 → 自激循环）
+        _pdfRelayoutBusyCount++;
+        try {
+          for (let p = 1; p <= pdfDoc.numPages; p++) {
+            if (_pdfState.rendering.cancelled) break;
+            // Generation guard: bail if a newer zoom toggle superseded us
+            if (_pdfState.rendering.generation !== myGen) break;
+            const pageData = await renderPdfPage(p);
+            // Re-attach the translation we already paid for (zoom only).
+            const prev = prevPageState.get(p);
+            if (prev) {
+              pageData.translated = true;
+              pageData.translation = prev.translation;
+              pageData.translation_model = prev.translation_model;
+              pageData.translated_at = prev.translated_at;
+              pageData.blocks = prev.blocks;
+              pageData.blocksVersion = prev.blocksVersion;
+              pageData.blockTranslations = prev.blockTranslations;
+              pageData.blockTranslated = prev.blockTranslated;
+              pageData.snapshotBlocks = prev.snapshotBlocks;
+              pageData.snapshotBlocksVersion = prev.snapshotBlocksVersion;
+            }
+            _pdfState.pages.push(pageData);
           }
-          _pdfState.pages.push(pageData);
+        } finally {
+          _pdfRelayoutBusyCount--;
         }
         // 批注徽标一次性刷新（原来在 renderPdfPage 里逐页刷 → O(页数²)）
         refreshPdfPageAnnoBadges();
@@ -4502,6 +5126,11 @@
           }
           startPdfTranslationQueue();
         }
+        // 渲染完成后再核一次栏宽 —— 用「渲染开始时的宽度」比，不是最后一页的：
+        // 阅读器可能是在渲染过程中才从隐藏变可见的（那一瞬间的
+        // ResizeObserver 回调会被「忙」标记挡掉），
+        // 不核对的话画布就停在「看不见时量到的兜底宽度 520px」上。
+        _pdfVerifyRenderedWidth(renderW0, listEl);
       } catch (err) {
         listEl.innerHTML = `<div style="padding:18px; color:#B25336;">❌ PDF 加载失败: ${escapeHtml(String(err))}</div>`;
         if (!keepTranslations) transList.innerHTML = "";
@@ -4603,6 +5232,13 @@
       for (const pg of pdfState.pages) {
         const snapPage = (snapshot.pages || []).find(s => s.page_num === pg.num);
         if (!snapPage) continue;
+        // 段落译文（对照模式）：先存着，等段落块抽出来再比对版本闸门
+        // （_applySnapshotBlocks）。版本对不上 = 段落切分算法变了 →
+        // 块编号已错位 → 旧译文一律丢弃，绝不贴到错的段落上。
+        if (snapPage.blocks && snapPage.blocks.length) {
+          pg.snapshotBlocks = snapPage.blocks;
+          pg.snapshotBlocksVersion = snapPage.blocks_version;
+        }
         const curHash = await _sha256Hex16(pg.text || "");
         const hashOk = (curHash === snapPage.text_hash);
         // Two-phase resolve for DOM elements: if getElementById misses (e.g.
@@ -4692,6 +5328,16 @@
         }
       }
       console.log(`[snapshot] ${matched} hydrated, ${stale} stale/fallback out of ${(snapshot.pages || []).length}`);
+      // 对照模式：快照里的段落译文现在才拿得到（上面刚存进 pg.snapshotBlocks），
+      // 而对照视图在 renderPdfPage 阶段就已经画过了（那时快照还没到）→
+      // 这里补一次：比对版本闸门 → 贴回译文 → 重画对照视图。
+      if (_pdfState && _pdfState.bilingual) {
+        for (const pg of pdfState.pages) {
+          if (!pg.snapshotBlocks) continue;
+          _applySnapshotBlocks(pg);
+          renderBilingualPage(pg.num);
+        }
+      }
       // Safety net: kick the queue once more 200ms after hydrate. If hydrate
       // marked translated=true on all pages, this is a no-op (find returns
       // undefined). If any page is still translated=false, it gets picked up.
@@ -4743,6 +5389,8 @@
         return null;
       }
       const translatable = _pdfState.pages.filter(p => p.translated && p.translation);
+      // 每页的段落译文**只算一次**（下面拼 payload 时要用两次：判空 + 取值）
+      translatable.forEach((pg) => { pg.__bilingualBlocks = _bilingualBlocksPayload(pg); });
       if (translatable.length === 0) {
         if (!silent) showToast("当前论文还没有翻译完成的页面,先翻几页再保存", true, 3800);
         return null;
@@ -4758,6 +5406,13 @@
         translation: pg.translation,
         model: pg.translation_model || "",
         translated_at: pg.translated_at || new Date().toISOString(),
+        // 段落级译文（对照模式）。
+        // ⚠ 它有**独立版本闸门**（blocks_version）—— 段落切分算法一改，
+        //   块编号就变了，旧译文贴上去就是错位 → 前端会比对版本，对不上就丢弃。
+        //   整页译文（translation）不受影响，两者的生命周期必须分开。
+        ...(pg.__bilingualBlocks
+            ? { blocks: pg.__bilingualBlocks, blocks_version: pg.blocksVersion || 0 }
+            : {}),
       })));
       // Pull current mtime so load-time check has something to compare
       let paperMtime = 0;
@@ -4791,6 +5446,32 @@
       } finally {
         if (btn && !silent) { btn.disabled = false; btn.innerText = origText; }
       }
+    }
+
+    /**
+     * 这一页的段落译文（存进快照用）。
+     * 没有就返回 null（调用方决定要不要带这个字段）。
+     *
+     * 只存 **i / kind / col / bbox / translation**：
+     * 原文（text）平板自己渲染 PDF 就有，存了只是让快照白白变大
+     * （快照有 5MB 上限）。
+     */
+    function _bilingualBlocksPayload(pg) {
+      if (!pg || !pg.blocks || !pg.blocks.length) return null;
+      const trans = pg.blockTranslations || {};
+      const out = [];
+      pg.blocks.forEach(b => {
+        const t = trans[b.i];
+        if (!t) return;
+        out.push({
+          i: b.i,
+          kind: b.kind || "body",
+          col: b.col || "S",
+          bbox: (b.bbox || []).slice(0, 4),
+          translation: t,
+        });
+      });
+      return out.length ? out : null;
     }
 
     async function listSnapshots() {
@@ -4871,15 +5552,8 @@
       } else {
         modal.style.display = "flex";
       }
-      // ESC to close
-      //
-      // ⚠ 不能只用 `{ once: true }`：它只在**下一次按键**时移除。
-      //   用户多半是点「×」关窗 → 监听器永远留在 document 上，
-      //   每次打开弹窗再加一个 → 越用越多，而且下次按 Esc 会去关
-      //   早已关闭的弹窗。改成显式句柄 + close 里移除（见 closeSnapshotModal）。
-      if (_snapshotEscHandler) document.removeEventListener("keydown", _snapshotEscHandler);
-      _snapshotEscHandler = (e) => { if (e.key === "Escape") closeSnapshotModal(); };
-      document.addEventListener("keydown", _snapshotEscHandler);
+      // ESC to close —— 走 _wireModalEsc（旧写法 {once:true} 有坑，见其注释）
+      _wireModalEsc(modal, closeSnapshotModal);
       await refreshSnapshotModal();
     }
 
@@ -4954,11 +5628,7 @@
     function closeSnapshotModal() {
       const m = document.getElementById("snapshot-modal");
       if (m) m.style.display = "none";
-      // 与 showSnapshotModal 里注册的 Esc 句柄配对，避免监听器越积越多
-      if (_snapshotEscHandler) {
-        document.removeEventListener("keydown", _snapshotEscHandler);
-        _snapshotEscHandler = null;
-      }
+      if (m && m._escDismiss) { m._escDismiss(); m._escDismiss = null; }
     }
 
     // Expose to window for inline onclick attribute on the TopNav button
@@ -5043,10 +5713,9 @@
       } else {
         modal.style.display = "flex";
       }
-      // Esc 关闭（显式句柄 + close 里移除，同 snapshot 弹窗的理由）
-      if (_diagEscHandler) document.removeEventListener("keydown", _diagEscHandler);
-      _diagEscHandler = (e) => { if (e.key === "Escape") closeDiagnoseModal(); };
-      document.addEventListener("keydown", _diagEscHandler);
+      // ESC to close —— 必须放在 if/else **外面**：旧写法挂在 `if (!modal)` 里，
+      // 弹窗第一次创建时才挂一次 → 关掉再打开 Esc 永久失效（实测复现）。
+      _wireModalEsc(modal, closeDiagnoseModal);
       _renderDiagnoseTable();
     }
     function _renderDiagnoseTable() {
@@ -5104,10 +5773,7 @@
     function closeDiagnoseModal() {
       const m = document.getElementById("diag-modal");
       if (m) m.style.display = "none";
-      if (_diagEscHandler) {
-        document.removeEventListener("keydown", _diagEscHandler);
-        _diagEscHandler = null;
-      }
+      if (m && m._escDismiss) { m._escDismiss(); m._escDismiss = null; }
     }
     window.showDiagnoseModal = showDiagnoseModal;
     window.closeDiagnoseModal = closeDiagnoseModal;
@@ -5150,7 +5816,12 @@
       // Bail if a newer paper started its own chain while we were waiting
       if (_pdfChainOwnerPaperId !== _pdfState.paperId) return;
 
-      const nextPage = _pdfState.pages.find(p => !p.translated && !p.translating);
+      // 对照模式 → 找「还没做**段落**翻译」的页；否则找「还没做整页翻译」的页。
+      // ⚠ 两个标志不能混用：段落翻译成功后也会把 translated 置 true
+      //   （快照要收它），所以对照模式下必须按 blockTranslated 找。
+      const nextPage = _pdfState.bilingual
+        ? _pdfState.pages.find(p => !p.blockTranslated && !p.translating)
+        : _pdfState.pages.find(p => !p.translated && !p.translating);
       if (!nextPage) return;
 
       // Ownership of `translating` flag lives in translatePdfPage (it sets
@@ -5158,7 +5829,11 @@
       // would race the dedupe check inside translatePdfPage and cause the
       // inner call to return immediately, freezing page 1 forever with
       // its initial "⏳ 正在翻译本页…" HTML never replaced.
-      await translatePdfPage(nextPage.num, nextPage.text, false);
+      if (_pdfState.bilingual) {
+        await translateBlocksForPage(nextPage.num, false);
+      } else {
+        await translatePdfPage(nextPage.num, nextPage.text, false);
+      }
 
       if (!_pdfState || _pdfState.rendering.cancelled || _pdfQueuePaused) return;
       // After awaiting, the user may have switched papers. Verify ownership
@@ -5181,7 +5856,6 @@
       const scale = fitScale * (_pdfZoom || 1.0);
       const viewport = page.getViewport({ scale });
       if (_pdfState) _pdfState.lastRenderWidth = availWidth;
-
       const wrapper = document.createElement("div");
       wrapper.className = "pdf-page-block";
       wrapper.id = `pdf-page-block-${pageNum}`;
@@ -5217,6 +5891,15 @@
       canvasWrapper.appendChild(textLayerDiv);
 
       wrapper.appendChild(canvasWrapper);
+
+      // 对照模式（译文按原文排版）的容器。
+      // 默认藏起来；开了对照模式才显示（此时 canvasWrapper 也藏起来）。
+      const biHost = document.createElement("div");
+      biHost.className = "bilingual-page";
+      biHost.id = `bilingual-page-${pageNum}`;
+      biHost.style.display = "none";
+      wrapper.appendChild(biHost);
+
       listEl.appendChild(wrapper);
 
       const ctx = canvas.getContext("2d");
@@ -5248,6 +5931,13 @@
       // querySelectorAll 全部页块 × 每条批注，在 20 页的循环里被调 20 次
       // 就是 O(N²)。徽标统一在循环结束后刷一次。
       drawAnnoOverlays(pageNum, canvasWrapper);
+
+      // 对照模式开着 → 这一页也要画对照视图（段落块是异步抽的，不挡渲染）
+      if (_pdfState && _pdfState.bilingual) {
+        canvasWrapper.style.display = "none";
+        biHost.style.display = "";
+        ensurePageBlocks(pageNum).then(() => renderBilingualPage(pageNum));
+      }
 
       // Add placeholder translation block. A zoom re-render walks every
       // page again, so this append has to be idempotent: if a block for
@@ -5587,6 +6277,307 @@
     }
     window.resetAndRetryPdfPage = resetAndRetryPdfPage;
 
+    // =====================================================================
+    // 对照模式：译文按原文排版（2026-11-12）
+    // =====================================================================
+    //
+    // 用户诉求原话：「就像那种翻译插件一样，他们和原文的排版是一模一样的，
+    // 就是没什么区别。原文是双栏，他们也是双栏。」
+    //
+    // 实现要点（改这块之前先读）：
+    //  1. **重排**而不是把译文贴回 canvas。
+    //     PDF 页是按栏宽自适应渲染的（612pt 的页塞进 ~420px 的栏 → 倍率 0.69）
+    //     → 原文正文只有 ~6px 高，贴回原位也读不了。
+    //     所以对照视图改成「按原文分栏重排」：左栏进左栏、右栏进右栏，
+    //     字号恢复正常（可读）。图片/图表不在文本层 → 重排后看不到，
+    //     切回「原文」视图即可。
+    //  2. 段落译文有**独立版本闸门**（服务端返回的 blocks_version）。
+    //     段落切分算法一改 → 块编号变了 → 旧译文贴上去就是错位 → 整份丢弃。
+    //     ⚠ **绝对不要动 paper_text.EXTRACTOR_VERSION** —— 动了用户全部整页
+    //     译文作废重翻，还会波及另一台设备。
+    //  3. 段落译文存进**快照**（pages[].blocks）→ 平板端能同步过去。
+    //     平板访问不到本地后端（没有 baseURL、CSP 与原生桥白名单都拦着），
+    //     快照是它唯一的通道。
+    // =====================================================================
+
+    /** 这一页的对照视图容器。 */
+    function _bilingualHost(pageNum) {
+      return document.getElementById(`bilingual-page-${pageNum}`);
+    }
+
+    /**
+     * 取这一页的段落块（几何：i/kind/col/bbox/text）。
+     * 没有就现抽 —— 服务端抽一页 64~332ms，丢在异步里不挡界面。
+     */
+    async function ensurePageBlocks(pageNum) {
+      if (!_pdfState || !_pdfState.pages) return null;
+      const pg = _pdfState.pages.find(p => p.num === pageNum);
+      if (!pg) return null;
+      if (pg.blocks) { _applySnapshotBlocks(pg); return pg.blocks; }
+      if (pg.blocksPromise) { await pg.blocksPromise; return pg.blocks || null; }
+      pg.blocksPromise = (async () => {
+        try {
+          const url = `/api/paper/page_blocks?relative_path=${encodeURIComponent(_pdfState.relativePath || "")}&page=${pageNum}`;
+          const data = await getJson(url);
+          pg.blocks = data.blocks || [];
+          pg.blocksVersion = data.blocks_version || 0;
+          // 快照里存着的段落译文，版本对得上才复用（对不上 = 段落切分变了）
+          _applySnapshotBlocks(pg);
+        } catch (e) {
+          console.warn(`[bilingual p${pageNum}] 段落块抽取失败`, e);
+          pg.blocks = [];
+        }
+      })();
+      await pg.blocksPromise;
+      pg.blocksPromise = null;
+      return pg.blocks;
+    }
+
+    /** 把快照里的段落译文贴回这一页（版本闸门在这里把关）。 */
+    function _applySnapshotBlocks(pg) {
+      if (!pg || !pg.snapshotBlocks) return;
+      if (pg.snapshotBlocksVersion !== pg.blocksVersion) return;   // 版本对不上 → 丢弃
+      // 块编号必须一致（段数变了说明切分算法变了，编号已经错位）
+      const snapIds = (pg.snapshotBlocks || []).map(b => b.i).join(",");
+      const curIds = (pg.blocks || []).map(b => b.i).join(",");
+      if (snapIds !== curIds) return;
+      const map = {};
+      (pg.snapshotBlocks || []).forEach(b => {
+        if (b.translation) map[b.i] = b.translation;
+      });
+      if (Object.keys(map).length) {
+        pg.blockTranslations = map;
+        pg.blockTranslated = true;
+      }
+    }
+
+    /** 把一段 Markdown 渲染进对照块（公式原图 / 表格 / KaTeX 都走现成那套）。 */
+    function _bilingualRenderInto(el, text, relativePath, pageNum) {
+      el.innerHTML = formatMarkdownLite(text || "");
+      renderFormulaImages(el, relativePath || "", pageNum);
+      if (typeof renderMathIn === "function") renderMathIn(el);
+    }
+
+    /**
+     * 画一页的对照视图。
+     * 结构：整宽块（标题/跨栏表） → [左栏 | 右栏] 两列 → 尾部整宽块。
+     */
+    function renderBilingualPage(pageNum) {
+      const host = _bilingualHost(pageNum);
+      if (!host || !_pdfState || !_pdfState.pages) return;
+      const pg = _pdfState.pages.find(p => p.num === pageNum);
+      const blocks = (pg && pg.blocks) || [];
+      const trans = (pg && pg.blockTranslations) || {};
+      const rel = (_pdfState && _pdfState.relativePath) || "";
+
+      if (!blocks.length) {
+        host.innerHTML = `<div class="bilingual-note">第 ${pageNum} 页没有可对照的段落（纯图片页？）</div>`;
+        host.style.display = _pdfState.bilingual ? "" : "none";
+        return;
+      }
+
+      // 按栏分桶。阅读顺序是「整宽顶部 → 左栏 → 右栏 → 跨栏」，
+      // 所以整宽块按它在序列里的位置拆成「顶部」和「尾部」两段。
+      const firstColIdx = blocks.findIndex(b => b.col === "L" || b.col === "R");
+      const top = [], left = [], right = [], tail = [];
+      blocks.forEach((b, idx) => {
+        if (b.col === "L") { left.push(b); return; }
+        if (b.col === "R") { right.push(b); return; }
+        if (firstColIdx >= 0 && idx < firstColIdx) top.push(b);
+        else tail.push(b);
+      });
+
+      const mkBlock = (b) => {
+        const d = document.createElement("div");
+        d.className = "bilingual-block kind-" + (b.kind || "body");
+        // 原文：公式块是乱序碎片、表格块没有原文 → 不显示
+        if (b.kind === "body" || b.kind === "heading") {
+          const orig = document.createElement("div");
+          orig.className = "bb-orig";
+          orig.textContent = (b.text || "").replace(/\s*\n\s*/g, " ");
+          d.appendChild(orig);
+        }
+        const tr = document.createElement("div");
+        tr.className = "bb-trans";
+        const t = trans[b.i];
+        if (t) {
+          _bilingualRenderInto(tr, t, rel, pageNum);
+        } else {
+          tr.innerHTML = `<span style="color:var(--fg-subtle);">（这一段还没翻）</span>`;
+        }
+        d.appendChild(tr);
+        return d;
+      };
+
+      host.innerHTML = "";
+      if (top.length) {
+        const span = document.createElement("div");
+        span.className = "bilingual-span";
+        top.forEach(b => span.appendChild(mkBlock(b)));
+        host.appendChild(span);
+      }
+      if (left.length || right.length) {
+        const cols = document.createElement("div");
+        cols.className = "bilingual-cols";
+        [["L", left], ["R", right]].forEach(([key, arr]) => {
+          if (!arr.length) return;
+          const col = document.createElement("div");
+          col.className = "bilingual-col";
+          col.dataset.col = key;
+          arr.forEach(b => col.appendChild(mkBlock(b)));
+          cols.appendChild(col);
+        });
+        host.appendChild(cols);
+      }
+      if (tail.length) {
+        const span = document.createElement("div");
+        span.className = "bilingual-span";
+        span.style.marginTop = "var(--s-4)";
+        tail.forEach(b => span.appendChild(mkBlock(b)));
+        host.appendChild(span);
+      }
+      host.style.display = _pdfState.bilingual ? "" : "none";
+    }
+
+    /** 对照模式的段落级翻译（一次 LLM 调用翻整页，按段号回填）。 */
+    async function translateBlocksForPage(pageNum, isPriority = false, force = false, model = null) {
+      if (!_pdfState || !_pdfState.pages) return;
+      const pg = _pdfState.pages.find(p => p.num === pageNum);
+      if (!pg) return;
+      if (pg.translating) return;
+      pg.translating = true;
+
+      const tagEl = document.getElementById(`pdf-page-tag-${pageNum}`);
+      const textEl = document.getElementById(`pdf-page-text-${pageNum}`);
+      if (tagEl) tagEl.textContent = isPriority ? "⚡ 对照翻译中..." : "⏳ 对照翻译中...";
+      if (textEl) textEl.innerHTML = `<span class="pdf-translation-loading">⏳ 正在按段落翻译第 ${pageNum} 页...</span>`;
+
+      const ac = new AbortController();
+      const acTimer = setTimeout(() => ac.abort(), 240000);
+      const t0 = performance.now();
+      try {
+        const r = await fetch("/api/paper/translate_blocks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            paper_id: _pdfState.paperId,
+            page: pageNum,
+            relative_path: (_pdfState && _pdfState.relativePath) || null,
+            force: !!force,
+            model: (model != null ? model : (_pdfTransModel || "")),
+          }),
+          signal: ac.signal,
+        });
+        clearTimeout(acTimer);
+        const data = await r.json();
+        _recordDiag({
+          ts: new Date().toISOString(),
+          page: pageNum,
+          url: "/api/paper/translate_blocks",
+          status: r.status,
+          ok: r.ok,
+          duration_ms: Math.round(performance.now() - t0),
+          model: data?.model || "",
+          chars_in: 0,
+          chars_out: (data?.translation || "").length,
+          error: null,
+        });
+        if (!r.ok) {
+          let detail = data.detail;
+          if (Array.isArray(detail)) {
+            detail = detail.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
+          } else if (typeof detail !== 'string') {
+            detail = JSON.stringify(detail);
+          }
+          throw new Error(detail || `HTTP ${r.status}`);
+        }
+
+        // 回填：几何 + 每段译文
+        const map = {};
+        (data.blocks || []).forEach(b => {
+          if (b.translation) map[b.i] = b.translation;
+        });
+        pg.blocks = data.blocks || pg.blocks;
+        pg.blocksVersion = data.blocks_version || 0;
+        pg.blockTranslations = map;
+        pg.blockTranslated = true;
+        pg.translated = true;
+        pg.translating = false;
+        pg.failed = false;
+        pg.translation = data.translation || "";
+        pg.translation_model = data.model || "";
+        pg.translated_at = new Date().toISOString();
+
+        // 右栏面板照旧显示整页译文（服务端把段落译文拼好了一起给）
+        if (textEl && pg.translation) {
+          textEl.className = "page-text";
+          textEl.innerHTML = formatMarkdownLite(pg.translation);
+          renderFormulaImages(textEl, (_pdfState && _pdfState.relativePath) || "", pageNum);
+          applyAnnotationsToPage(pageNum, textEl);
+          if (typeof renderMathIn === "function") renderMathIn(textEl);
+        }
+        const modelTag = data.model ? ` · ${data.model}` : "";
+        if (tagEl) {
+          tagEl.textContent = data.partial
+            ? `⚠️ 对照翻译不完整${modelTag}`
+            : `✅ 已对照翻译${modelTag}`;
+        }
+        renderBilingualPage(pageNum);
+        _scheduleAutoSnapshot();
+        fetchModelStatus();
+      } catch (err) {
+        clearTimeout(acTimer);
+        const isAbort = err && (err.name === "AbortError" || /aborted/i.test(err.message || ""));
+        const detail = isAbort ? "请求超时 (>240s)" : (err?.message || "未知错误");
+        console.error(`[translateBlocksForPage#${pageNum}]`, err);
+        if (tagEl) tagEl.textContent = isAbort ? "⏳ 超时" : "❌ 对照翻译失败";
+        if (textEl) {
+          textEl.innerHTML = `<span style="color:#B25336;">❌ 对照翻译失败: ${escapeHtml(detail)}</span>`;
+        }
+        pg.translating = false;
+        pg.failed = true;
+        // 标记成"已处理"，免得队列每 3.2 秒又来翻一次
+        pg.blockTranslated = true;
+      }
+    }
+
+    /** 开关对照模式。 */
+    async function toggleBilingualMode() {
+      if (!_pdfState) return;
+      _pdfState.bilingual = !_pdfState.bilingual;
+      _bilingualPref = !!_pdfState.bilingual;
+      const btn = document.getElementById("pdf-bilingual-toggle");
+      if (btn) {
+        btn.classList.toggle("active", !!_pdfState.bilingual);
+        btn.textContent = _pdfState.bilingual ? "🔀 对照中" : "🔀 对照";
+      }
+      _persistLocalState();
+      const pages = _pdfState.pages || [];
+      if (_pdfState.bilingual) {
+        for (const pg of pages) {
+          await ensurePageBlocks(pg.num);
+          renderBilingualPage(pg.num);
+        }
+        _showBilingualVisibility(true);
+        // 没做段落翻译的页 → 交给队列按段落翻
+        processNextInPdfQueue();
+        showToast("🔀 对照模式：译文按原文分栏排版（左栏回左栏、右栏回右栏）", false, 4200);
+      } else {
+        _showBilingualVisibility(false);
+      }
+    }
+    window.toggleBilingualMode = toggleBilingualMode;
+
+    /** 切换「原文画布 / 对照重排」两者的显隐。 */
+    function _showBilingualVisibility(on) {
+      document.querySelectorAll(".pdf-page-canvas-wrapper").forEach(w => {
+        w.style.display = on ? "none" : "";
+      });
+      document.querySelectorAll(".bilingual-page").forEach(el => {
+        el.style.display = on ? "" : "none";
+      });
+    }
+
 
     let _readerState = {
       title: "",
@@ -5852,7 +6843,7 @@
           <div class="reader-section-header">
             <div class="reader-section-title">📝 中文翻译</div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <span class="reader-section-meta">${modelName ? `[${modelName}] · ` : ""}${translated.length} 字</span>
+              <span class="reader-section-meta">${modelName ? `[${escapeHtml(modelName)}] · ` : ""}${translated.length} 字</span>
               <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="copySectionTranslation(${idx})">📋 复制译文</button>
               <button class="btn-pill-outline" style="font-size:11px; padding:3px 10px;" onclick="translateSection(${idx}, true)">🔄 重新翻译</button>
             </div>
@@ -6223,6 +7214,15 @@
       }
       // Display math
       container.querySelectorAll(".math-display-block").forEach(el => {
+        // ⚠️ 幂等守卫：**已经渲染过就别再渲染一次**。
+        // katex.render(tex, el) 把结果写回 el 之后，el.textContent 变成
+        // 「MathML 的 <annotation> 原文 + 可视文本」= "H" + "H" = "HH"。
+        // 再渲染一次 → "HH" → 再一次 → "HHH"……
+        // 用户看到的就是 (H) 变成 (HHH)、α_ME 变成 αMEαME。
+        // 触发条件：同一个元素被 renderMathIn 处理两次
+        // （KaTeX 是懒加载的，首屏会并发调多次 + 150ms 重试，
+        //   第一次渲染完成、第二次重试随后才拿到 katex，就会渲染两遍）。
+        if (el.querySelector(".katex")) return;
         const tex = el.textContent || "";
         try {
           katex.render(tex, el, {
@@ -6238,6 +7238,7 @@
       });
       // Inline math
       container.querySelectorAll(".math-placeholder.math-inline").forEach(el => {
+        if (el.querySelector(".katex")) return;   // 同上：幂等
         const tex = el.textContent || "";
         try {
           katex.render(tex, el, {
@@ -7154,6 +8155,54 @@
         badge.title = a.note ? a.note.slice(0, 120) : "点击查看批注";
         layer.appendChild(badge);
       });
+
+      // ⚠⚠ 手写笔迹（2026-10-28 用户实测：「手写没有任何作用」）。
+      //   平板端手写存进批注的 `strokes` 字段（归一化坐标），每条笔迹自带页码：
+      //     { page: 0, source:"ink", strokes:[ {page: 3, pts:[x,y,x,y,...]}, ... ] }
+      //   ⚠⚠ **批注本身的 `page` 是 0**（一条手写批注可以跨多页），
+      //     所以**不能**按 `a.page === pageNum` 过滤 —— 那会永远匹配不到
+      //     → 要按 `strokes[].page` 判断笔迹属于哪一页。
+      //   桌面端原来**只画 rects**（划词高亮）→ 完全忽略 strokes
+      //   → 平板上画的东西同步到电脑后**一个字都看不到**。
+      //   → 这里用 SVG polyline 画笔迹（不干扰原文 canvas，
+      //     也不需要 dpr 处理 —— SVG 用 viewBox 缩放）。
+      const NS = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("class", "anno-ink-svg");
+      svg.setAttribute("preserveAspectRatio", "none");
+      svg.setAttribute("viewBox", "0 0 1000 1000");
+      let inkCount = 0;
+      (_annoState.items || []).forEach(a => {
+        (a.strokes || []).forEach(s => {
+          const sgPage = (s && s.page != null) ? parseInt(s.page, 10) : NaN;
+          // 页码归属：笔迹自带页码优先；没有就用批注的页码
+          const target = isNaN(sgPage) ? parseInt(a.page, 10) : sgPage;
+          if (target !== pageNum) return;
+          const pts = (s && s.pts) ? s.pts : (Array.isArray(s) ? s : null);
+          if (!pts || pts.length < 4) return;
+          // ⚠ 数据形态有两种（平板历史版本）：
+          //   ① [{page, pts:[x,y,x,y,...]}]  ← 现在这种
+          //   ② [x,y,x,y,...]                  ← 早期直接是点序列
+          const seq = [];
+          for (let i = 0; i + 1 < pts.length; i += 2) {
+            seq.push((Number(pts[i]) || 0) * 1000, (Number(pts[i + 1]) || 0) * 1000);
+          }
+          if (seq.length < 4) return;
+          const poly = document.createElementNS(NS, "polyline");
+          poly.setAttribute("points", seq.join(","));
+          poly.setAttribute("class", "anno-ink-stroke");
+          poly.setAttribute("data-anno-id", a.id || "");
+          poly.setAttribute("fill", "none");
+          poly.setAttribute("stroke", "#D8342A");
+          poly.setAttribute("stroke-width", "4");
+          poly.setAttribute("stroke-linecap", "round");
+          poly.setAttribute("stroke-linejoin", "round");
+          poly.setAttribute("vector-effect", "non-scaling-stroke");
+          svg.appendChild(poly);
+          inkCount++;
+        });
+      });
+      if (inkCount) layer.appendChild(svg);
     }
 
     function drawAllAnnoOverlays() {
@@ -7531,6 +8580,13 @@
       const textEl = document.getElementById(`pdf-page-text-${pageNum}`);
       if (tagEl) tagEl.textContent = "🔄 重译中…";
       if (textEl) textEl.className = "page-text pdf-translation-loading";
+      // 对照模式开着 → 重译走**段落**那条路（否则对照视图和右栏会各说各话）
+      if (_pdfState && _pdfState.bilingual) {
+        const pg = _pdfState.pages.find(p => p.num === pageNum);
+        if (pg) { pg.blockTranslated = false; pg.translating = false; }
+        await translateBlocksForPage(pageNum, true, true, _pdfTransModel);
+        return;
+      }
       await translatePdfPage(pageNum, null, true, true, _pdfTransModel);
     }
 
@@ -8120,6 +9176,11 @@
     }
 
     function initAnnotationFeatures() {
+      // ⚠ 监听器只能挂一次：这个函数在**每次打开论文**时都会被调用，
+      //   而 document 级的 click 监听器挂一次就常驻 → 开 N 篇论文就有 N 个
+      //   监听器，每次点批注都会触发 N 次 openAnnotationEditor。
+      if (window.__mbAnnoFeaturesInited) return;
+      window.__mbAnnoFeaturesInited = true;
       // 点高亮 → 编辑对应批注
       document.addEventListener("click", (e) => {
         const mark = e.target.closest(".anno-mark");
@@ -8133,9 +9194,27 @@
       const list = document.getElementById("pdf-translations-list");
       if (list && list.dataset.annoObs !== "1") {
         list.dataset.annoObs = "1";
+        // ⚠ 这里**必须防抖**，否则就是自激循环（2026-10-27 审计 CRITICAL-1，已实测复现）：
+        //   reapplyAnnotations 自己会改 DOM（_clearAnnoMarks 清标记 + _wrapTextWithMark
+        //   重新包 <mark>），而这个 DOM 正在被观察 →
+        //   改 DOM → 触发 observer → 再排一次 setTimeout → 再改 DOM → …
+        //   实测：只要有一条能匹配上的批注，就会以 ~10.7 次/秒 无限重放，永不停止。
+        // 后果不是"有点卡"，而是**每 80ms 洗一次译文栏的文本选区** →
+        //   用户的划词选区被清空 → 划词答疑读不到 getSelection() → 核心工作流断掉。
+        //
+        // 两条防线：
+        //   ① clearTimeout 真防抖（旧的写法是"每次变更都排队"，不是防抖）；
+        //   ② 用户正在划词时**不动 DOM**（选区非折叠就跳过这一轮）。
+        let _annoReplayTimer = null;
         const obs = new MutationObserver(() => {
           if (!_annoState.items.length) return;
-          setTimeout(reapplyAnnotations, 80);
+          clearTimeout(_annoReplayTimer);
+          _annoReplayTimer = setTimeout(() => {
+            _annoReplayTimer = null;
+            const sel = window.getSelection();
+            if (sel && !sel.isCollapsed && sel.rangeCount) return;  // 用户正在划词 → 跳过
+            reapplyAnnotations();
+          }, 200);
         });
         obs.observe(list, { childList: true, subtree: true, characterData: true });
       }
@@ -9124,6 +10203,10 @@
             <button class="btn-zoom-toggle" onclick="setReaderZoom(1)" title="放大 10%">+</button>
             <button class="btn-zoom-toggle" onclick="setReaderZoom('fit')" title="恢复 100%">适配</button>
             <span class="seg-divider"></span>
+            <button class="btn-zoom-toggle" id="pdf-bilingual-toggle"
+                    onclick="toggleBilingualMode()"
+                    title="对照模式：译文按原文排版（左栏回左栏、右栏回右栏，段落对段落）">🔀 对照</button>
+            <span class="seg-divider"></span>
             <button class="btn-zoom-toggle" id="pdf-queue-pause-btn"
                     onclick="togglePdfQueuePause()" title="暂停 / 继续自动排队翻译">⏸ 暂停排队</button>
             <button class="btn-zoom-toggle" id="pdf-snapshot-save-btn"
@@ -9154,6 +10237,22 @@
           <button class="btn-pill-outline" id="sync-btn" onclick="syncNow()"
                   title="把当前阅读进度 / 已翻好的译文 / 批注推到共享目录，同时拉回另一台设备的内容">☁ 同步</button>
           <button class="btn-pill-outline" id="translate-all-btn" onclick="translateAllSections()">批量翻译</button>
+
+          <!-- 专注模式（Zen）：默认收起，需要时从顶部滑出原工具条 -->
+          <button class="btn-zoom-toggle" id="zen-toggle-btn"
+                  onclick="toggleZenMode()"
+                  title="专注模式：屏幕上只留论文页 + 译文页（快捷键 Z 切换）">◱ 专注</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-exit-btn"
+                  onclick="exitZenMode()" title="退出专注模式（Esc）">✕ 退出专注</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-nav-btn"
+                  onclick="toggleZenNav()" title="显示 / 隐藏章节导航">章节</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-single-btn"
+                  onclick="toggleZenSingle()" title="单栏 / 双栏（小屏用单栏更宽）">单栏</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-pane-btn"
+                  onclick="zenTogglePane()" title="单栏时在论文页 / 译文页之间切换">论文 ⇄ 译文</button>
+          <button class="btn-zoom-toggle zen-only" id="zen-aux-btn"
+                  onclick="toggleZenAux()" title="显示 / 隐藏 AI 提问区">提问</button>
+
           <button class="btn-pill" onclick="closeReaderModal()"><span>关闭</span></button>
         </div>
       </div>
@@ -9381,6 +10480,16 @@
             </div>
           </div>
         </div>
+      </div>
+
+      <!-- ---------- 专注模式：顶部细把手 ----------
+           ⚠️ 必须放在 .reader-shell 的**最后**（浮动区块之后）：
+           .reader-shell 是 flex column，第 1 个孩子是 .reader-topbar、
+           第 2 个是章节视图区、第 3 个是 PDF 视图 —— 插在前面会把
+           这些位置型契约全部挤偏。放在最后则一个都不动。
+           位置：fixed，不占 flex 位；只在专注模式下显示（见 CSS）。 -->
+      <div id="zen-handle" class="zen-handle" title="专注模式：点一下展开工具条（Esc 退出）">
+        <span class="zen-handle-title" id="zen-handle-title"></span>
       </div>
 
     </div>

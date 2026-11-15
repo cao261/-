@@ -109,6 +109,20 @@ REQUIREMENTS = [
      ["本地已有的记录必须**以本地为准**"], None),
     ("⑨ 数据安全：渲染崩溃有兜底（不白屏）",
      ["Markdown 渲染失败，回退纯文本"], None),
+
+    # ---- ⑩ 对照模式（译文按原文排版）+ 富内容正常显示 ----
+    ("⑩ 对照：两栏对照渲染（左右栏对应原文栏）",
+     ["renderBilingualInto", "tb-bilingual-cols"], None),
+    ("⑩ 对照：整块公式贴 **PDF 原图**（平板本地裁）",
+     ["ensureFormulaShots", "paintFormulaShots", "tb-formula-shot"], None),
+    ("⑩ 对照：公式图占位带坐标键（回填用）",
+     ["data-formula-key", "data-formula-page"], None),
+    ("⑩ 对照：译文栏里的表格出真表（不是一堆竖线）",
+     [".tb-pdf-trans-body table"], None),
+    ("⑩ 对照：行内公式走 KaTeX（不是 $...$ 源码）",
+     ["renderMath", "katex"], None),
+    ("⑩ 对照：段落译文有版本闸门（旧译文不乱贴）",
+     ["blocks_v"], None),
 ]
 
 # 曾经有过、现在必须不在的坏代码
