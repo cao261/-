@@ -87,13 +87,23 @@ def _css_block(selector: str, src: str = None) -> str:
     return m.group(1)
 
 
-def test_zen_node_guardrail_passes():
-    """行为级护栏必须通过（node 跑前端真实函数，含变异自检）。"""
+@pytest.fixture(scope="module")
+def zen_js_result():
+    """跑一次 node 行为级护栏，把结果给本模块所有用例复用。
+
+    ⚠ 这套护栏自带 16 个变异体要重跑一遍，实测要 ~1 分钟 ——
+      用例多了就会把全量 pytest 拖垮，所以只跑一次。
+    """
     node = shutil.which("node")
     if not node:
         pytest.skip("没装 node —— 专注模式行为护栏跳过")
-    proc = subprocess.run([node, str(JS_TEST)], capture_output=True,
-                          text=True, encoding="utf-8", timeout=180)
+    return subprocess.run([node, str(JS_TEST)], capture_output=True,
+                          text=True, encoding="utf-8", timeout=600)
+
+
+def test_zen_node_guardrail_passes(zen_js_result):
+    """行为级护栏必须通过（node 跑前端真实函数，含变异自检）。"""
+    proc = zen_js_result
     assert proc.returncode == 0, f"专注模式护栏失败:\n{proc.stdout}\n{proc.stderr}"
     assert "FAIL 0" in proc.stdout, proc.stdout
     # 变异自检必须真的抓到东西 —— 否则这套断言是恒真的
@@ -103,6 +113,27 @@ def test_zen_node_guardrail_passes():
     assert total > 0, "变异自检一个都没配 —— 等于没写：\n" + proc.stdout
     assert caught == total, \
         f"变异只抓到 {caught}/{total} —— 有一套断言是恒真的：\n" + proc.stdout
+
+
+def test_zen_toolbar_wake_rules_are_covered_by_the_behavioural_suite(zen_js_result):
+    """「工具条怎么唤出」这两条规则必须**行为级**被守住。
+
+    用户 2026-11-14 原话：「不要就是我一往上滑就出来」——
+    工具条只认鼠标动作：指针到屏幕最上面才唤出，滚轮一律不唤出。
+
+    ⚠️ 这两条规则以前是用「读 index.html 源码文本」守的
+       （assert 'ZEN_TOP_HOTZONE' in src 之类）——
+       那类断言改坏行为也照样绿（把 `_zenPointerAtTop` 改成永远 false，
+       源码里那个函数名还在 → 全绿）。
+    → 现在由 node 护栏真跑前端函数守住，这里只钉「那两条规则**确实在套件里**」，
+       免得以后有人把 node 套件里的用例删了却没人发现。
+    """
+    proc = zen_js_result
+    assert proc.returncode == 0, f"专注模式护栏失败:\n{proc.stdout}\n{proc.stderr}"
+    passed_lines = [l for l in proc.stdout.splitlines() if "  PASS  " in l]
+    for rule in ("滚轮上滑 / 滚到底", "鼠标移到屏幕最上面", "鼠标停在屏幕中间"):
+        assert any(rule in l for l in passed_lines), (
+            "node 套件里没有守住「" + rule + "」这条规则（用例被删了？）:\n" + proc.stdout)
 
 
 def test_zen_handle_is_the_last_child_of_reader_shell():
@@ -401,40 +432,6 @@ def test_showtoast_accepts_a_duration():
     assert m, "找不到 showToast 的定义"
     assert "duration" in m.group(1), \
         "showToast 没有 duration 形参 —— 传进去的时长被静默忽略"
-
-
-def test_scroll_never_opens_the_zen_toolbar():
-    """滚轮滚动**不得**唤出工具条（用户 2026-11-14 明确要求）。
-
-    用户原话：「不要就是我一往上滑就出来」。
-    原来「内容区往回上滑 / 滑到最底部 → 工具条滑出」——
-    读书往回看一行，工具条就跳出来打断阅读。
-    现在工具条只认**鼠标动作**：指针到屏幕最上面 / 点顶部细把手。
-
-    ⚠️ 保留一个**空的** scroll 监听是刻意的 —— 它是这条规则的代码锚点，
-    真机自检与变异自检都盯着它（往里塞 _zenOpenBar 就会被抓到）。
-    """
-    src = _src()
-    assert 'document.addEventListener("scroll"' in src, \
-        "专注模式里没有 scroll 监听 —— 「滚轮不唤出」这条规则没有代码锚点，回归抓不住"
-    scroll_fn = src[src.index('document.addEventListener("scroll"'):]
-    scroll_fn = scroll_fn[:scroll_fn.index("}, true);")]
-    assert "_zenOpenBar" not in scroll_fn, \
-        "滚轮滚动又去开工具条了 —— 用户明确要求：滚轮一律不唤出工具条"
-
-
-def test_zen_toolbar_opens_only_when_the_pointer_is_at_the_top():
-    """工具条只能被「鼠标到了屏幕最上面」唤出（滚轮不算）。"""
-    src = _src()
-    assert "ZEN_TOP_HOTZONE" in src, "没有「屏幕顶部判定带」这个常量"
-    assert "function _zenPointerAtTop(" in src, "没有「鼠标是不是在最上面」的判断函数"
-    move_fn = src[src.index('document.addEventListener("mousemove"'):]
-    move_fn = move_fn[:move_fn.index("});")]
-    assert "_zenPointerAtTop(e)" in move_fn, \
-        "mousemove 没有走 _zenPointerAtTop —— 顶部判定带的语义被绕过了"
-    # 旧的「按容器记滚动位置」那套必须彻底走干净（滚轮已经不参与唤出了）
-    assert "_zenScrollEl" not in src and "ZEN_SCROLL_TOL" not in src, \
-        "还留着「按容器记滚动位置」的旧实现 —— 滚轮已经不该参与唤出工具条了"
 
 
 def test_narrow_screen_overrides_zen_two_columns():

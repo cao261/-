@@ -112,7 +112,8 @@ def test_concurrent_snapshot_save_and_sync_keep_all_pages(client, sandbox, monke
 
     这是 F4 的正题：两个写者写的是同一个文件
     （logs/_pdf_snapshots/<paper_id>.json）：
-      * 保存端点是 async → 跑在事件循环线程；
+      * 保存端点是 def  → 被 FastAPI 丢到线程池线程
+        （2026-11-15 审计 P0 修正：它原来是 async，等锁会把**整条事件循环**冻住）；
       * /api/sync 是 def  → 被 FastAPI 丢到线程池线程。
     没有锁时，两者会读到同一个旧基线，后写的把先写的页整份盖掉，
     而两个接口都返回 success —— 用户只看到「保存成功」，翻过的页没了。

@@ -89,7 +89,56 @@ def test_no_tautological_assertions_in_the_suite():
 #       下次谁都不知道它已经失效了；
 #     * 重设时必须写明来源（本段），否则「改数字」本身就成了没人看的暗箱。
 #   → 后续每换掉一条行为级护栏，就把上限改小 1，并在本段记一笔。
-_MAX_SOURCE_TEXT_GUARDS = 132
+#
+# ⚠ 2026-11-15（本机分支合并云端 origin/main 时）：上限 132 → **131**
+#   本机分支自己新增过 22 条这类假护栏（test_replaced_pdf.py 19 + test_zen_mode.py 3），
+#   合并后总数涨到 154 → 顶红了上限。**没有靠调大上限绕过**，
+#   而是把这 22 条**全部**换成了行为级断言：
+#
+#   ① test_replaced_pdf.py 的 19 条 →
+#      * 「模块里有 build_replaced_pdf / Block / BuildStats」
+#        → test_module_exposes_the_builder_api（真 import + 真调用 + 真断言字段）
+#      * 「涂改时 images=NONE / graphics=NONE」
+#        → test_redaction_only_removes_text_keeps_figures
+#          （真造一篇带**位图 + 矢量图 + 正文**的 PDF → 真构建 →
+#            比对替换页与原文页的图片数 / 矢量图数 / 文字）
+#      * 「端点存在 + 版本闸门」
+#        → test_api_builds_the_replaced_pdf_end_to_end
+#          / test_api_refuses_a_snapshot_from_an_old_block_version
+#          / test_api_refuses_a_snapshot_without_blocks
+#          （TestClient **真打端点**，判据是响应码 200/409/404）
+#      * 「不许覆盖源 PDF」
+#        → test_api_never_overwrites_the_source_pdf（真打端点 → 400，
+#          且源文件**逐字节**比对没被改）
+#      * 「前端按钮接线 + 替换版视图（不重翻 / 单列 / 判定跟文件走）」
+#        → 新增 microbench/_test_replaced_pdf_frontend.js
+#          （node 从 index.html 里**切出真实函数**跑：9 条行为断言 +
+#            12 个变异自检，改坏 onclick / 端点 / replaced 标志 / 单列类名 /
+#            翻译刹车 / 标题去重 全部被抓）
+#          + tests/test_replaced_pdf.py::test_replaced_pdf_frontend_node_guardrail_passes
+#      * 另把两条 `re.search(..., src)` 的换行断言也换成
+#        test_newlines_become_spaces_before_layout（clean_translation 真调用）
+#
+#   ② test_zen_mode.py 的 4 条（其中 1 条来自云端基线）→
+#      「滚轮不唤出工具条」「指针到屏幕最上面才唤出」这两条规则，
+#      原来是用「读 index.html 源码文本」守的 ——
+#      把 `_zenPointerAtTop` 改成永远 false，源码里那个函数名还在 → 全绿。
+#      → 现在由 node 套件 microbench/_test_zen_mode.js 里**已有的 3 条行为断言**
+#        （滚轮上滑/滚到底不唤出、鼠标到顶才唤出、鼠标停在中间不唤出）
+#        + 16 个变异自检守住；
+#      → pytest 里新增 test_zen_toolbar_wake_rules_are_covered_by_the_behavioural_suite，
+#        钉住「那 3 条用例**确实在套件里**」，免得以后被人删了没人发现。
+#      ⚠ 被删掉的那 1 条来自云端基线（`let _zenScrollEl = null;`）：
+#        它守的是「按容器记滚动位置」这套机制，而用户 2026-11-14 明确要求
+#        「滚轮一律不唤出工具条」→ 那套机制已被**整体删除**，
+#        留着这条就是守一个**不存在的行为** → 随用例一起删，上限 -1。
+#
+#   → 现状：131 条（云端基线 132 - 1）。
+#   ⚠ 仍存在的债（2026-11-15 独立审计点名）：本条的正则只认
+#     `in src|source|app_src|source_code|js_src` 这几个**变量名**，
+#     把新假护栏的变量改叫 `in text` / `in body` 就能绕过。
+#     要真堵住得把剩下那批逐条换成行为级（工程量不小），先记着。
+_MAX_SOURCE_TEXT_GUARDS = 131
 
 
 def test_no_test_builds_a_client_without_sandboxing_the_vault():

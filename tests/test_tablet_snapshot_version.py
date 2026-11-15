@@ -27,7 +27,36 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
+
+
+def _katex_assets_present() -> bool:
+    """平板导出需要的 KaTeX 运行时资源在不在。
+
+    ⚠ `microbench/_vendor/node_modules/` **被 .gitignore 忽略**
+      （仓库里只有 package.json / package-lock.json）→
+      全新 clone、或另一台从没跑过 `npm install` 的设备上**没有**这些文件。
+      而导出器会**主动拒绝**导出残废版（2026-11-09 审计 P1-4：
+      缺资源还照常写盘 → 平板端公式全废，却打印「完成」）。
+
+      → 导出类用例在这种机器上必然红，那不是代码坏了，是**环境没装依赖**。
+      → 这里的处置是**显式跳过并写明原因**，不拿「跳过」冒充「通过」。
+    """
+    try:
+        from microbench.export_offline import missing_katex_assets
+    except Exception:
+        return False
+    return not missing_katex_assets(need_js=True)
+
+
+requires_katex = pytest.mark.skipif(
+    not _katex_assets_present(),
+    reason="缺 KaTeX 资源（microbench/_vendor/node_modules 被 .gitignore 忽略）"
+           "—— 需要在 microbench/_vendor/ 跑一次 npm install；"
+           "导出器会主动拒绝导出残废版（2026-11-09 审计 P1-4）",
+)
 
 
 def _cur_ver() -> int:
@@ -124,8 +153,14 @@ def test_exporter_as_script_can_resolve_extractor_version():
         f"脚本模式取到的版本不对: {proc.stdout.strip()!r}"
 
 
+@requires_katex
 def test_exporter_as_script_bakes_only_current_translations(tmp_path):
-    """端到端：脚本模式跑出来的单文件，trans_ver 要有值，且不含旧译文。"""
+    """端到端：脚本模式跑出来的单文件，trans_ver 要有值，且不含旧译文。
+
+    ⚠ 需要 KaTeX 运行时资源（`microbench/_vendor/` 跑一次 npm install）——
+      缺资源时导出器会**拒绝导出**（2026-11-09 审计 P1-4），
+      那条闸门本身由 tests/test_audit_2026_11_09.py 单独守着。
+    """
     out = tmp_path / "tablet.html"
     proc = _export_as_script(out)
     assert proc.returncode == 0, f"导出失败:\n{proc.stdout[-800:]}\n{proc.stderr[-800:]}"

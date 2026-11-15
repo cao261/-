@@ -4869,7 +4869,7 @@ async def api_pdf_snapshot_load(
 
 
 @app.post("/api/pdf/snapshot/save")
-async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
+def api_pdf_snapshot_save(req: SnapshotSaveRequest):
     """
     Save (or overwrite) a snapshot. Body must fit within 5MB serialized.
 
@@ -4880,6 +4880,22 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
 
     Writes atomically via a .tmp + os.replace to avoid leaving half-files
     if MicroBench is killed mid-write.
+
+    ⚠⚠ **这个端点必须是 `def`（同步端点），不许改回 `async def`** ——
+      2026-11-15 合并云端 origin/main 时审计实测的 P0：
+
+        下面的临界区要拿 `threading.Lock`（跟 /api/sync 串行化同一篇快照）。
+        `threading.Lock.acquire()` 是**阻塞**的，而 FastAPI 只把 **`def` 端点**
+        丢进线程池 —— `async def` 端点跑在**事件循环线程**上。
+
+        于是：用户点「保存译文」撞上正在跑的同步（临界区里还要写
+        **坚果云共享目录**，耗时不可控）→ 事件循环被冻住 →
+        一个**完全无关**的 GET /api/pdf/snapshot/list 从 15ms 变成 **1547ms**
+        （SSE 翻译流、看板轮询全停）。
+
+        改成 `def` 之后，等锁只占住一个线程池线程，事件循环毫发无损。
+        ⚠ 纪律：① 别改回 async；② 临界区里仍然**绝不能出现 await**
+           （那会把事件循环卡在持锁状态，连线程池都救不了）。
     """
     safe_id = _safe_paper_key(req.paper_id, "snapshot")
     if len(safe_id) < 3:

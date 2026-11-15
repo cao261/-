@@ -4975,6 +4975,20 @@
       throw firstErr;
     }
 
+    /**
+     * 这个 PDF 是不是「中译替换版」？
+     *
+     * ⚠ 判定**跟着文件走**（文件名以 _中译替换版.pdf 结尾），不靠调用方传参：
+     *   缩放 / 窗口变化会再次调用 loadPdfDualColumn（重排），
+     *   若只靠传参，重排后这个标志会丢 → 右栏又冒出来、又开始翻译（白花钱）。
+     *
+     * 抽成独立函数是为了**能被护栏直接跑**（node 切片跑真实源码），
+     * 免得这条判定只能靠「读源码文本」来守。
+     */
+    function _isReplacedPdfPath(p) {
+      return /_中译替换版\.pdf$/i.test(p || "");
+    }
+
     async function loadPdfDualColumn(opts = {}) {
       const { keepTranslations = false, generation = null, restoreSnapshot = null } = opts;
       // 「中译替换版」：译文已经打进 PDF 里了 → 不翻第二遍、右栏收起。
@@ -4983,7 +4997,7 @@
       //   若只靠调用方传参，重排后这个标志会丢 → 右栏又冒出来、又开始翻译。
       const replaced = (opts.replaced !== undefined)
         ? !!opts.replaced
-        : /_中译替换版\.pdf$/i.test(_readerState.pdfPath || "");
+        : _isReplacedPdfPath(_readerState.pdfPath);
       _pdfReplacedView = replaced;
       _applyReplacedPdfView(replaced);
       const title = _readerState.title || "";
