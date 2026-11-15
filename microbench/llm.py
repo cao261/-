@@ -3144,6 +3144,7 @@ __all__ = [
     "_stream_model",
     "summarize_paper",
     "answer_with_context",
+    "friendly_error_text",
     "agnes_limiter",
     "model_manager",
 ]

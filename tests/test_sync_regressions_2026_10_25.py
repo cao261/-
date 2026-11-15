@@ -63,7 +63,12 @@ def test_translate_endpoints_reference_module_sys():
         assert "\n        import sys" not in body and "\n    import sys" not in body, (
             f"{marker} 里又出现了局部 import sys"
         )
-    assert app_mod is not None
+    # 2026-11-09 第 2 批：原来这里只是 `assert app_mod is not None`（import
+    # 之后恒真）。换成运行时事实：两个翻译端点**真的挂了路由** ——
+    # 2026-10-27 §6.6 真踩过「装饰器挂错函数，端点没了但源码还在」的坑。
+    routes = {getattr(r, "path", "") for r in app_mod.app.routes}
+    assert "/api/paper/translate_section" in routes, "翻译章节端点没有路由"
+    assert "/api/paper/translate_page" in routes, "按页翻译端点没有路由"
 
 
 # ---------------------------------------------------------------------------

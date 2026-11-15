@@ -23,6 +23,7 @@ V1.2 features:
 import io
 import math
 import re
+import sys
 from collections import Counter, defaultdict
 from typing import Optional
 
@@ -304,6 +305,8 @@ def _parse_csv_points(text: str) -> list:
     Returns list of [x, y] (floats). Pairs with non-numeric cells are skipped.
     """
     out = []
+    skipped_nonfinite = 0
+    skipped_extra_cols = 0
     for line in text.splitlines():
         s = line.strip()
         if not s or s.startswith("#") or s.startswith("//"):
@@ -317,13 +320,29 @@ def _parse_csv_points(text: str) -> list:
             parts = s.split(",")
         if len(parts) < 2:
             continue
+        # 2026-11-09 审计：千位分隔的 "1,234.5,6.7" 会被静默截成
+        # [1.0, 234.5] —— 一个不声不响的错坐标。有多余非空列就整行跳过，
+        # 而不是猜用户想表达什么。
+        if len(parts) > 2 and any(p.strip() for p in parts[2:]):
+            skipped_extra_cols += 1
+            continue
         try:
             x = float(parts[0].strip())
             y = float(parts[1].strip())
-            out.append([x, y])
         except ValueError:
             # Likely a header row (e.g. "V_G, I_D"); skip silently
             continue
+        # float("nan") / float("inf") 是合法 float，但会把下游所有指标
+        # 污染成 nan：实测一个 nan 就把复现判成 fail，还绕过 inconclusive
+        # 保护。非有限值一律不进结果。
+        if not (math.isfinite(x) and math.isfinite(y)):
+            skipped_nonfinite += 1
+            continue
+        out.append([x, y])
+    if skipped_nonfinite or skipped_extra_cols:
+        print(f"[plot_compare] 已跳过 {skipped_nonfinite} 行非有限坐标(nan/inf)、"
+              f"{skipped_extra_cols} 行列数过多（如果是千位分隔，请去掉逗号）",
+              file=sys.stderr)
     return out
 
 
@@ -348,7 +367,21 @@ def compute_metrics(
     if not paper_xy or not repro_xy:
         raise ValueError("paper_xy 与 repro_xy 均不能为空")
 
-    tol = tolerance or DEFAULT_TOLERANCE
+    # 2026-11-09 审计：调用方可能绕过 _parse_csv_points 直接传 nan/inf，
+    # 那样所有指标都会变成 nan 而 verdict 仍会给结论。在这里兜住。
+    for seq, name in ((paper_xy, "paper_xy"), (repro_xy, "repro_xy")):
+        for p in seq:
+            try:
+                finite = math.isfinite(float(p[0])) and math.isfinite(float(p[1]))
+            except (TypeError, ValueError, IndexError):
+                finite = False
+            if not finite:
+                raise ValueError(
+                    f"{name} 含非有限或非法坐标 {p!r}；请先清洗 nan/inf 再比较"
+                )
+
+    # 半残 tolerance（只给 pass_pct）原来会在 tol["warn_pct"] 抛 KeyError。
+    tol = {**DEFAULT_TOLERANCE, **(tolerance or {})}
 
     # Sort both by x
     paper_sorted = sorted(paper_xy, key=lambda p: p[0])

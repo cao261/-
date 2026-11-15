@@ -29,10 +29,18 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo [2/6] 清理残留的 5000 端口进程...
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":5000.*LISTENING"') do (
-    echo   杀掉占用 5000 的进程 PID %%p
-    taskkill /PID %%p /F >nul 2>&1
+echo [2/6] 精确清理 5000 端口进程（不误杀 50000 等相邻端口）...
+REM 端口必须按数字精确匹配：findstr ":5000" 会把 127.0.0.1:50000 也选进来，
+REM 本机 Zotero 插件常占 50000（AGENTS 4.19），旧写法会 /F 强杀无关进程。
+REM 用 Get-NetTCPConnection -LocalPort 5000 按端口取 PID，绝不会串到相邻端口。
+set "MB_PIDS=%TEMP%\mb_port5000_pids.txt"
+powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue).OwningProcess" > "%MB_PIDS%" 2>nul
+if exist "%MB_PIDS%" (
+    for /f "usebackq delims=" %%p in ("%MB_PIDS%") do (
+        echo   结束占用 5000 端口的进程 PID %%p
+        taskkill /PID %%p /F >nul 2>&1
+    )
+    del "%MB_PIDS%" >nul 2>&1
 )
 
 echo.

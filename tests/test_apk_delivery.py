@@ -200,16 +200,26 @@ def test_translations_are_baked_in(parts):
     assert len(data.get("notes") or []) >= 20, "笔记不全"
 
 
+@pytest.mark.apk_toolchain
 def test_apk_is_signed_and_coverable():
     """签名必须和已装版本一致 —— 否则装不上（只能卸载，数据会丢）。"""
     if not APK.exists():
         pytest.skip("还没构建 APK")
+    import os
     import shutil
     import subprocess
-    bt = Path(r"D:\Android\Sdk\build-tools\35.0.1")
-    jdk = Path(r"D:\Desktop\杂物\z\Zotero\jdk")
+    # 2026-11-09 第 2 批：原来硬编码对方设备(30461)的 D 盘路径，本机永远
+    # 命中 skip —— 「APK 签名一致」这条护栏在 25353 上从未真正生效。
+    # 现在可用 MB_APKSIGNER_DIR / MB_JDK_DIR 指定工具链；缺失时仍 skip，
+    # 但原因写清楚（这是「没验」，不是「验过了」），并打上可筛选的标记。
+    bt = Path(os.environ.get("MB_APKSIGNER_DIR",
+                             r"D:\Android\Sdk\build-tools\35.0.1"))
+    jdk = Path(os.environ.get("MB_JDK_DIR",
+                              r"D:\Desktop\杂物\z\Zotero\jdk"))
     if not (bt / "lib" / "apksigner.jar").exists() or not jdk.exists():
-        pytest.skip("这台机器没有 apksigner / JDK")
+        pytest.skip("未验证 APK 签名：缺 apksigner/JDK。"
+                    "请用 MB_APKSIGNER_DIR=<build-tools 目录> 与 "
+                    "MB_JDK_DIR=<JDK 目录> 指定后重跑（这是跳过，不是通过）")
     r = subprocess.run(
         [str(jdk / "bin" / "java.exe"), "-cp", str(bt / "lib" / "apksigner.jar"),
          "com.android.apksigner.ApkSignerTool", "verify", "--verbose",

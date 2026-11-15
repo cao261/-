@@ -31,7 +31,9 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -92,11 +94,50 @@ def safe_target(vault: Path, rel: str) -> Path | None:
     return target
 
 
-def read_text(p: Path) -> str:
+def read_text(p: Path) -> str | None:
+    """读原笔记；失败返回 None（**不要**退化成 ""）。
+
+    2026-11-09 审计：原来读失败（GBK、被占用、权限）静默返回空串，
+    冲突稿里的「## 电脑版本」就变成空白，用户手动清理冲突时会以为
+    原笔记本来就是空的 —— 「读不到」和「空文件」必须分开。
+    """
     try:
         return p.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return ""
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"  [拒绝] 原文件读不出来，已跳过以免造出空版本: {p.name} ({e})",
+              file=sys.stderr)
+        return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """同目录唯一临时文件 + os.replace —— 绝不把用户笔记写成半截。
+
+    原来三处都是 `target.write_text(...)`：写入中断 / 磁盘满 / 进程被杀
+    会直接截断原笔记，与文件头 "never lose data" 矛盾（2026-11-09 审计）。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    fd_taken = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd_taken = True
+            fh.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        if not fd_taken:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +149,18 @@ def merge_pack(pack: dict, vault: Path, dry_run: bool = False) -> dict:
     summary = {"written": [], "created": [], "skipped": [], "conflicts": [],
                "rejected": [], "total": 0}
     notes = pack.get("notes") or []
+    if not isinstance(notes, list):
+        raise ValueError("变更包 notes 必须是数组")
     summary["total"] = len(notes)
 
     for rec in notes:
+        # 2026-11-09 审计：畸形元素（字符串 / null）会让 rec.get 抛
+        # AttributeError，而此时前面的笔记**已经落盘** → vault 处于
+        # 「合并了一半」的中间态。load_pack 已做整包校验，这里再兜一层，
+        # 保证直接调用 merge_pack 也不会半途崩。
+        if not isinstance(rec, dict):
+            summary["rejected"].append("(变更包元素不是对象)")
+            continue
         rel = rec.get("id") or rec.get("rel") or ""
         body = rec.get("body")
         base_hash = rec.get("baseHash") or ""
@@ -125,11 +175,13 @@ def merge_pack(pack: dict, vault: Path, dry_run: bool = False) -> dict:
 
         exists = target.exists()
         current = read_text(target) if exists else ""
+        if current is None:
+            summary["rejected"].append(rel)
+            continue
 
         if not exists:
             if not dry_run:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(body, encoding="utf-8")
+                _atomic_write_text(target, body)
             summary["created"].append(rel)
             continue
 
@@ -137,7 +189,7 @@ def merge_pack(pack: dict, vault: Path, dry_run: bool = False) -> dict:
             # 平板改的期间没人动过这份文件 —— 平板的版本直接生效
             if current != body:
                 if not dry_run:
-                    target.write_text(body, encoding="utf-8")
+                    _atomic_write_text(target, body)
                 summary["written"].append(rel)
             else:
                 summary["skipped"].append(rel)
@@ -148,9 +200,12 @@ def merge_pack(pack: dict, vault: Path, dry_run: bool = False) -> dict:
             continue
 
         # 两边都改了 —— 绝不覆盖，另存一份合并稿
+        # 秒级时间戳 + 短随机后缀（2026-11-09）：同秒重跑同一个包，
+        # 或 watch 同时合并两个包且冲突到同一篇，原来会同名 write_text
+        # 互相覆盖 → 悄悄丢掉一份平板版本。
         stamp = time.strftime("%Y%m%d_%H%M%S")
         name = target.name[:-3] if target.name.lower().endswith(".md") else target.name
-        merged_name = f"{name}_冲突合并_{stamp}.md"
+        merged_name = f"{name}_冲突合并_{stamp}_{uuid.uuid4().hex[:6]}.md"
         merged_rel = str(target.parent.relative_to(vault)).replace("\\", "/").strip("/")
         merged_rel = f"{merged_rel}/{merged_name}" if merged_rel else merged_name
         merged_target = safe_target(vault, merged_rel)
@@ -165,7 +220,7 @@ def merge_pack(pack: dict, vault: Path, dry_run: bool = False) -> dict:
             f"{current.rstrip()}\n"
         )
         if not dry_run:
-            merged_target.write_text(merged_body, encoding="utf-8")
+            _atomic_write_text(merged_target, merged_body)
         summary["conflicts"].append(rel)
 
     return summary
@@ -179,6 +234,18 @@ def load_pack(path: Path) -> dict | None:
         return None
     if not isinstance(pack, dict) or pack.get("format") != "microbench-tablet-pack":
         print(f"  [跳过] {path.name}: 不是变更包")
+        return None
+    # 2026-11-09 审计：原来只校验顶层 format，`notes` 里混进一个字符串/null
+    # 就会在合并到一半时抛 AttributeError —— 前面的笔记已写盘、后面的没写。
+    # 整包先验完再开写，坏包一条都不落盘。
+    notes = pack.get("notes") or []
+    if not isinstance(notes, list):
+        print(f"  [跳过] {path.name}: notes 不是数组，整包拒绝")
+        return None
+    bad = [i for i, rec in enumerate(notes) if not isinstance(rec, dict)]
+    if bad:
+        print(f"  [跳过] {path.name}: notes 第 {bad[:5]} 项不是对象，"
+              f"整包拒绝（避免在写了一半时崩溃）")
         return None
     return pack
 
@@ -238,13 +305,23 @@ def main() -> int:
     try:
         while True:
             if src.is_dir():
+                # 2026-11-09 审计：p.stat() 在包被删/移动时会抛 OSError
+                # 让整个 watch 崩；秒级 mtime + 只增不减的 seen 还会漏掉
+                # 同秒覆盖写、并让集合长期膨胀。
+                current_keys = set()
                 for p in sorted(src.glob("*.json")):
-                    key = (str(p), p.stat().st_mtime)
+                    try:
+                        st = p.stat()
+                    except OSError:
+                        continue
+                    key = (str(p), st.st_mtime_ns, st.st_size)
+                    current_keys.add(key)
                     if key in seen:
                         continue
                     seen.add(key)
                     print(f"[watch] 合并 {p.name}")
                     merge_path(p, vault, args.dry_run)
+                seen.intersection_update(current_keys)
             time.sleep(args.watch)
     except KeyboardInterrupt:
         print("\n[watch] 已退出")

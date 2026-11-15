@@ -151,6 +151,12 @@ git ls-files --eol <改过的文件>        # 确认 i/lf w/lf
 python -m pytest tests -q -m "not slow"   # 全绿（⚠ 漏了 -m 会卡在网络测试上）
 ```
 
+📌 **2026-11-09 第 2 批**：根目录新增 `pytest.ini`（`addopts = -m "not slow"`），
+现在**直接 `pytest` 也默认排除 slow**，不会再卡在 arxiv 下载上；命令行显式
+给 `-m` 仍可覆盖。另新增 `constraints.txt` 锁定 16 个直接依赖的实测版本，
+新设备/重建环境用 `pip install -r requirements.txt -c constraints.txt`，
+避免两台装出不同依赖树（`requirements.txt` 本身保持 `>=` 不动）。
+
 ---
 
 ## 3. 架构速览：改哪里

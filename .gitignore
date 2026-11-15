@@ -36,8 +36,14 @@ _/_liu_*.py
 /_clean_*.py
 
 # Vendored KaTeX dist (rebuild with:
-#   npm install katex --prefix microbench/_vendor --registry=https://registry.npmmirror.com)
-microbench/_vendor/
+#   cd microbench/_vendor && npm install --registry=https://registry.npmmirror.com)
+#
+# ⚠ 只忽略 node_modules —— package.json / package-lock.json **要入库**：
+#   导出器的离线公式渲染依赖 npm 装的 katex，而 package.json 里有版本号、
+#   package-lock.json 里有精确锁定。两者不入库的话，干净 clone 根本不知道
+#   该装哪个版本，导出器只能报「缺 KaTeX 资源」而没有可执行的修复步骤
+#   （2026-11-10 审计 F6）。
+microbench/_vendor/node_modules/
 
 # Generated offline bundle — a build artifact, not source
 MicroBench_离线阅读版.html

@@ -385,7 +385,16 @@ def test_real_document_resolution_never_leaks_markers(tmp_path):
 # 5) 端点级护栏：上传/打开接口必须走**整篇一次**（不是逐页）
 # ---------------------------------------------------------------------------
 
-def test_upload_endpoint_uses_document_level_glyph_resolution(monkeypatch):
+def test_upload_endpoint_uses_document_level_glyph_resolution(monkeypatch, sandbox):
+    """⚠ 必须带 `sandbox` fixture —— 否则这条测试会往**用户真实 vault** 里写 PDF。
+
+    2026-11-10 审计 P0（实测）：这条测试原来自己 new 了 TestClient(app_mod.app)，
+    **绕过 sandbox fixture** → app.BASE_DIR / generator.BASE_DIR 还是真实仓库根
+    → `/api/paper/upload_pdf` 把 PDF 写进
+    `01_Literature/01_Device_TCAD_器件仿真/01_论文原文_PDF/2026_Revert_Check.pdf`。
+    跑一次测试就在用户地盘上留一个 406 字节的垃圾 PDF。
+    （这正是 2026-10-26 审计 P0「测试不再碰真数据」的同型复发。）
+    """
     """上传接口 → 整篇解析只调 1 次（改成逐页必须变红）。
 
     这条是本次问题的**端点级**护栏：单元测试只测 resolve_document_glyphs 本身，
@@ -443,12 +452,21 @@ def test_upload_endpoint_uses_document_level_glyph_resolution(monkeypatch):
     assert not page_calls, \
         f"接口又改回逐页解析了：{len(page_calls)} 次逐页调用（每页一次多模态请求 → 打开 8 分钟）"
 
+    # 产物必须落在沙箱里 —— BASE_DIR 确实被钉住了
+    landed = list(Path(sandbox).rglob("*Revert*Check*.pdf"))
+    assert landed, (
+        "上传的 PDF 没落在沙箱里 —— BASE_DIR 没被钉住，"
+        "这条测试正在往用户真实 vault 里写垃圾")
 
-def test_open_endpoint_does_not_call_model(monkeypatch):
+
+def test_open_endpoint_does_not_call_model(monkeypatch, sandbox):
     """打开论文**不许调模型** —— 这是"半天没反应"的直接保证。
 
     打开必须亚秒级返回：符号认不出来显示 [?] 完全可以接受，
     而认字失败还会触发全局降格，连累用户后续的翻译。
+
+    ⚠ 必须带 `sandbox` fixture：原来自己 new TestClient → 绕过沙箱
+    → PDF 写进用户真实 vault（2026-11-10 审计 P0 实测）。
     """
     from microbench import app as app_mod
 
@@ -472,6 +490,12 @@ def test_open_endpoint_does_not_call_model(monkeypatch):
     )
     assert r.status_code == 200, r.text
     assert calls == [], f"打开论文不该调模型，实际调了 {len(calls)} 次"
+
+    # 产物必须落在沙箱里（见本文件顶部的说明）
+    landed = list(Path(sandbox).rglob("*NoModel*.pdf"))
+    assert landed, (
+        "上传的 PDF 没落在沙箱里 —— BASE_DIR 没被钉住，"
+        "这条测试正在往用户真实 vault 里写垃圾")
 
 
 def _pdf_bytes() -> bytes:
