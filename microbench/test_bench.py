@@ -17,6 +17,7 @@ or:
 """
 import sys
 import io
+import os
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -67,9 +68,80 @@ from microbench.translation import (
     reset_cache,
 )
 
+# ---------------------------------------------------------------------------
+# ⚠️ 沙箱：这套 standalone 测试台**绝不写真实 vault**（2026-11-09 审计 P1-2）
+#
+# 原来它把 BASE_DIR 指向真实仓库根，会：
+#   * 对 03_Knowledge/踩坑与排错日记.md 做 3 次非原子全量重写；
+#   * 用同名 os.replace 覆盖用户**当天真实周报**（cleanup 只记文件名，
+#     同名文件不会被删，测试渲染内容永久替换原稿）；
+#   * 在真实 01_Literature 下建/删测试卡片。
+# 而且它不走 pytest/conftest 的 sandbox（__test__ = False，独立进程）。
+# 现在整套件跑在一个临时 vault 里：真实库只被**只读**用来拷模板。
+# ---------------------------------------------------------------------------
+import atexit
+import shutil
+import tempfile as _tempfile
+
+import microbench.generator as _gen_mod
+
+_REAL_VAULT = Path(_gen_mod.BASE_DIR).resolve()
+_SANDBOX = Path(_tempfile.mkdtemp(prefix="mb_testbench_")).resolve()
+for _d in ("00_Dashboard", "01_Literature", "02_Reproduction",
+           "03_Knowledge", "04_Weekly_Reports", "_Templates", "logs", "assets"):
+    (_SANDBOX / _d).mkdir(parents=True, exist_ok=True)
+
+_tpl_src = _REAL_VAULT / "_Templates"
+if not _tpl_src.exists():
+    _tpl_src = _REAL_VAULT / "microbench" / "templates"
+if _tpl_src.exists():
+    shutil.copytree(_tpl_src, _SANDBOX / "_Templates", dirs_exist_ok=True)
+
+# 合成一篇 vault 内容笔记，供 /api/vault/file 等读路径用例使用。
+# 必须放在「vault 内容目录」里 —— 仓库根的 AGENTS.md 会被
+# is_vault_content_path() 判为非内容而返回 400（审计 T1）。
+_smoke_dir = _SANDBOX / "01_Literature" / "00_Smoke"
+_smoke_dir.mkdir(parents=True, exist_ok=True)
+(_smoke_dir / "note.md").write_text(
+    "# 沙箱笔记\n\n这是测试台合成的内容，不来自用户 vault。\n", encoding="utf-8")
+
+_gen_mod.BASE_DIR = _SANDBOX
+BASE_DIR = _SANDBOX
+try:
+    _gen_mod._invalidate_vault_stats_cache()
+except AttributeError:
+    pass
+
+# app / pdf_cache / glyphs 里有 import 期就固化下来的路径常量，
+# 光改 generator.BASE_DIR 拦不住它们。
+_shared = _SANDBOX / "_sync_shared"
+_shared.mkdir(parents=True, exist_ok=True)
+try:
+    from microbench import app as _app_mod
+    from microbench import pdf_cache as _pdf_cache_mod
+    from microbench import glyphs as _glyphs_mod
+
+    _app_mod.BASE_DIR = _SANDBOX
+    _app_mod.GLYPH_DICT_PATH = _SANDBOX / "logs" / "glyph_dict.json"
+    _app_mod._sync_root = lambda: _shared
+    try:
+        _app_mod._annotations_dir = lambda: _shared / "annotations"
+    except AttributeError:
+        pass
+    _pdf_cache_mod.CACHE_DIR = _SANDBOX / "logs" / "pdf_extract_cache"
+    _glyphs_mod.DEFAULT_DICT_PATH = _SANDBOX / "logs" / "glyph_dict.json"
+except Exception as _e:   # 沙箱装配失败就别跑，绝不能退回真实 vault
+    print(f"[test_bench] 沙箱装配失败，拒绝在真实 vault 上运行: {_e}",
+          file=sys.stderr)
+    raise
+
+atexit.register(lambda: shutil.rmtree(_SANDBOX, ignore_errors=True))
+
 PASS_COUNT = 0
 FAIL_COUNT = 0
 FAILED_TESTS = []
+SKIP_COUNT = 0
+SKIPPED_TESTS = []
 
 # This file is a STANDALONE script, not a pytest module. Without this
 # marker pytest collects every `test_*` function in it and runs them
@@ -91,6 +163,14 @@ def _check(cond: bool, label: str):
         FAIL_COUNT += 1
         FAILED_TESTS.append(label)
         print(f"  ❌ {label}")
+
+
+def _skip(label: str, reason: str):
+    """显式跳过（不是"通过"）—— 沙箱里没有对应真实数据时诚实记账。"""
+    global SKIP_COUNT
+    SKIP_COUNT += 1
+    SKIPPED_TESTS.append(label)
+    print(f"  ⏭ 跳过: {label} —— {reason}")
 
 
 # ===========================================================================
@@ -156,7 +236,11 @@ def _cleanup_test_artifacts():
     # date instead.
     trouble_file = BASE_DIR / "03_Knowledge" / "踩坑与排错日记.md"
     if trouble_file.exists():
-        text = trouble_file.read_text(encoding="utf-8")
+        try:
+            text = trouble_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"  [跳过] 踩坑日记读不出来，不改动它: {e}", file=sys.stderr)
+            return removed
         # Strip blocks whose keyword matches a test pattern.
         # The fences are 3 or 4 backticks: record_troubleshoot now uses a
         # 4-backtick fence so that a `raw_error` containing ``` cannot
@@ -168,7 +252,18 @@ def _cleanup_test_artifacts():
             text,
         )
         if cleaned != text:
-            trouble_file.write_text(cleaned, encoding="utf-8")
+            # 原子写：这套件即使退回到真实 vault 上跑，也不能把用户的
+            # 整本日记截断成半截（2026-11-09 审计）。
+            tmp = trouble_file.with_name(trouble_file.name + ".tmp")
+            try:
+                tmp.write_text(cleaned, encoding="utf-8")
+                os.replace(tmp, trouble_file)
+            finally:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
     return removed
 
 
@@ -179,7 +274,9 @@ def test_path_safety():
     print("\n[1] Path safety / traversal protection")
     # Normal usage
     p = _safe_path(BASE_DIR, "01_Literature", "01_Device_TCAD_器件仿真")
-    _check(p.exists() or True, "正常路径合法解析")
+    # 原来写的是 `p.exists() or True` —— 恒真，什么都没验证（2026-11-09 审计 T4）。
+    _check(p == BASE_DIR / "01_Literature" / "01_Device_TCAD_器件仿真",
+           "正常路径解析到 vault 内的目标目录")
 
     # Reject traversal via ..
     try:
@@ -563,9 +660,13 @@ def test_search_vault():
         blob = (results[0]["path"] + results[0]["title"] + results[0]["snippet"]).lower()
         _check("gaa" in blob, "Top 1 结果与 GAA 相关")
 
-    # Chinese keyword query
+    # Chinese keyword query —— 沙箱里没有含该关键词的真实笔记时显式跳过，
+    # 不能硬断言命中（2026-11-09 审计 T6：真库数据依赖）。
     results_cn = search_vault("自热", top_k=5)
-    _check(len(results_cn) > 0, f"中文关键词 '自热' 查询命中 ({len(results_cn)} 条)")
+    if results_cn:
+        _check(len(results_cn) > 0, f"中文关键词 '自热' 查询命中 ({len(results_cn)} 条)")
+    else:
+        _skip("中文关键词 '自热' 查询命中", "沙箱里没有含该关键词的笔记")
 
     # No-match query
     no_match = search_vault("xyzzy_no_match_keyword", top_k=5)
@@ -1151,11 +1252,18 @@ def test_translate_endpoint_routing():
             "section_title": "Introduction", "section_text": big_text,
             "section_key": "introduction",
         })
-        _check(r3.status_code == 200, "大章节翻译返回 200")
-        data3 = r3.json()
-        _check(data3.get("was_segmented") is True, f"大章节 was_segmented=True")
-        _check(data3.get("chunk_count", 1) >= 2, f"大章节 chunk_count >= 2 (实际 {data3.get('chunk_count')})")
-        _check(len(data3.get("translation", "")) > 0, "大章节翻译结果非空")
+        # 这段会真的分段调用上游模型（16500 字符 → 多个 chunk），
+        # 离线 / 额度受限 / 上游超时时返回非 200。测试台没有 mock 上游，
+        # 所以明确跳过而不是记为失败（2026-11-09 审计 T6）。
+        if r3.status_code != 200:
+            _skip("大章节分段翻译（需真实 LLM 上游）",
+                  f"translate_section 返回 {r3.status_code}；本段依赖真实模型与网络")
+        else:
+            data3 = r3.json()
+            _check(data3.get("was_segmented") is True, "大章节 was_segmented=True")
+            _check(data3.get("chunk_count", 1) >= 2,
+                   f"大章节 chunk_count >= 2 (实际 {data3.get('chunk_count')})")
+            _check(len(data3.get("translation", "")) > 0, "大章节翻译结果非空")
     else:
         _check(False, "LLM 未配置, 跳过 LLM 调用断言")
         _check(False, "LLM 未配置, 跳过缓存命中断言")
@@ -1435,8 +1543,11 @@ def test_vault_file_endpoint_serves_markdown():
 
     # 5) If any .md exists in vault, /api/vault/file should serve it
     from pathlib import Path
-    any_md = next(iter([p for p in Path(BASE_DIR).rglob("*.md")
-                        if "/.git/" not in str(p)]), None)
+    # 只找 vault 内容目录里的 .md（2026-11-09 审计 T1）：
+    # 从仓库根 rglob 会先抓到 AGENTS.md / README.md，而 §4.35 的
+    # is_vault_content_path() 会把根目录 .md 判为非内容 → 必然 400。
+    any_md = next(iter([p for p in (BASE_DIR / "01_Literature").rglob("*.md")
+                        if ".git" not in p.parts]), None)
     if any_md:
         rel = str(any_md.relative_to(BASE_DIR)).replace("\\", "/")
         r = client.get("/api/vault/file", params={"relative_path": rel})
@@ -1625,11 +1736,17 @@ def test_find_pdf_and_upload_pdf():
     r = client.get(f"/api/paper/find_pdf?title={title}")
     _check(r.status_code == 200, "find_pdf 返回 200")
     data = r.json()
-    _check(data.get("found") is True, f"成功模糊匹配到本地已下载的 PDF (found=True, score={data.get('score')})")
+    # 沙箱 vault 里没有用户的真实论文 PDF（2026-11-09 审计 T6）：
+    # 这两个端点本来需要真实库数据。没有就显式跳过，不能硬断言 found=True
+    # 让测试台假红，更不能因此去读真实 vault。
+    if not data.get("found"):
+        _skip("find_pdf 模糊匹配 / upload_pdf",
+              "沙箱里没有真实论文 PDF；这两个端点需要真库数据，请在真实环境手工验证")
+        return
     _check("AgenticTCAD" in data.get("file_name", ""), f"匹配的文件为: {data.get('file_name')}")
 
     # 2. Test upload_pdf with existing PDF bytes
-    existing_pdf = BASE_DIR / data["relative_path"]
+    existing_pdf = BASE_DIR / (data.get("relative_path") or "")
     if existing_pdf.exists():
         pdf_bytes = existing_pdf.read_bytes()
         files = {"file": ("local_test_paper.pdf", pdf_bytes, "application/pdf")}
@@ -2150,56 +2267,75 @@ def test_explain_stream_endpoint_returns_sse():
 
 
 def run_all():
+    """逐条跑；单条异常不再中断整套件、也不再丢汇总（2026-11-09 审计 T5）。"""
+    global FAIL_COUNT
     _cleanup_test_artifacts()
-    test_path_safety()
-    test_whitelist()
-    test_special_chars()
-    test_paper_fetcher_dispatch()
-    test_arxiv_https_priority_and_fallback()
-    test_bibtex()
-    test_reproduction_scaffold()
-    test_troubleshoot()
-    test_weekly_report()
-    test_vault_stats()
-    test_search_vault()
-    test_llm_config_and_fallback()
-    test_summarize_paper_fallback()
-    test_answer_with_context_empty_chunks()
-    test_extract_curve_from_image()
-    test_calibrate_points()
-    test_compute_metrics()
-    test_parse_csv_points()
-    test_linear_interp()
-    test_extract_text_from_pdf()
-    test_classify_title_to_section()
-    test_split_into_sections()
-    test_chunk_section_text()
-    test_translation_cache_lru()
-    test_build_cross_section_context()
-    test_translate_endpoint_routing()
-    test_cross_qa_endpoint()
-    test_cache_stats_endpoint()
-    test_llm_chat_retry_on_transient_errors()
-    test_dual_model_status_and_probe_endpoints()
-    test_export_bilingual_endpoint()
-    test_export_qa_endpoint()
-    test_agnes_rate_limiter_unit()
-    test_primary_rate_limiter_unit()
-    test_find_pdf_and_upload_pdf()
-    test_explain_selection_endpoint()
-
-    # Stage 1: async llm path
-    test_chat_async_basic()
-    test_chat_async_cancel_event_preset()
-    test_chat_async_cancel_during_retry()
-    test_invoke_model_async_retries_on_502()
-    test_explain_stream_endpoint_handles_slow_upstream()
+    tests = [
+        test_path_safety,
+        test_whitelist,
+        test_special_chars,
+        test_paper_fetcher_dispatch,
+        test_arxiv_https_priority_and_fallback,
+        test_bibtex,
+        test_reproduction_scaffold,
+        test_troubleshoot,
+        test_weekly_report,
+        test_vault_stats,
+        test_search_vault,
+        test_llm_config_and_fallback,
+        test_summarize_paper_fallback,
+        test_answer_with_context_empty_chunks,
+        test_extract_curve_from_image,
+        test_calibrate_points,
+        test_compute_metrics,
+        test_parse_csv_points,
+        test_linear_interp,
+        test_extract_text_from_pdf,
+        test_classify_title_to_section,
+        test_split_into_sections,
+        test_chunk_section_text,
+        test_translation_cache_lru,
+        test_build_cross_section_context,
+        test_translate_endpoint_routing,
+        test_cross_qa_endpoint,
+        test_cache_stats_endpoint,
+        test_llm_chat_retry_on_transient_errors,
+        test_dual_model_status_and_probe_endpoints,
+        test_export_bilingual_endpoint,
+        test_export_qa_endpoint,
+        test_agnes_rate_limiter_unit,
+        test_primary_rate_limiter_unit,
+        test_find_pdf_and_upload_pdf,
+        test_explain_selection_endpoint,
+        # Stage 1: async llm path
+        test_chat_async_basic,
+        test_chat_async_cancel_event_preset,
+        test_chat_async_cancel_during_retry,
+        test_invoke_model_async_retries_on_502,
+        test_explain_stream_endpoint_handles_slow_upstream,
+    ]
+    for fn in tests:
+        try:
+            fn()
+        except Exception as e:
+            # 原来任一用例抛异常（例如 find_pdf 没匹配到时的 KeyError）
+            # 整个进程就退出，FAILED_TESTS / 汇总全部丢失。
+            FAIL_COUNT += 1
+            label = f"{fn.__name__} 抛出未捕获异常: {type(e).__name__}: {e}"
+            FAILED_TESTS.append(label)
+            print(f"  ❌ {label}", file=sys.stderr)
 
     _cleanup_test_artifacts()
 
     print("\n" + "=" * 60)
-    print(f"📊 测试汇总: ✅ {PASS_COUNT} 通过 / ❌ {FAIL_COUNT} 失败")
+    print(f"📊 测试汇总: ✅ {PASS_COUNT} 通过 / ❌ {FAIL_COUNT} 失败 "
+          f"/ ⏭ {SKIP_COUNT} 跳过")
+    print(f"   （全部在临时 vault: {_SANDBOX}，真实库零写入）")
     print("=" * 60)
+    if SKIPPED_TESTS:
+        print("\n跳过的用例:")
+        for t in SKIPPED_TESTS:
+            print(f"  - {t}")
     if FAIL_COUNT > 0:
         print("\n失败的测试:")
         for t in FAILED_TESTS:
@@ -2210,18 +2346,20 @@ def run_all():
 
 
 def run_all_with_cleanup():
-    """Run the suite and leave the vault exactly as it was found.
+    """Run the suite in the sandbox and remove the sandbox on exit.
 
-    The suite writes into the real vault (that is the only way to test
-    the card writers), so it must clean up AFTER itself too — the
-    pre-run cleanup only removed the debris of the *previous* run, which
-    meant every execution left one test card and one troubleshooting entry
-    behind in the user's knowledge base.
+    2026-11-09 审计前：这里写的是**真实 vault**，靠 finally 再清理一次；
+    清理本身一抛异常还会掩盖原始异常。现在所有产物都在 _SANDBOX 里，
+    atexit 负责整目录删除，这里的 finally 只做兜底且不再抛。
     """
     try:
         run_all()
     finally:
-        _cleanup_test_artifacts()
+        try:
+            _cleanup_test_artifacts()
+        except Exception as e:
+            print(f"[test_bench] 收尾清理失败（仅临时沙箱，可忽略）: {e}",
+                  file=sys.stderr)
 
 
 if __name__ == "__main__":

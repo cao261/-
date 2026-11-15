@@ -56,12 +56,17 @@ def _as_remote_peer(monkeypatch):
 # A 局域网口令护栏
 # ===========================================================================
 
-def test_lan_openapi_and_docs_require_token(monkeypatch):
+def test_lan_openapi_and_docs_require_token(monkeypatch, sandbox):
     """/docs /redoc /openapi.json 在局域网上**必须**要口令。
 
     实测（2026-10-27）：从 192.168.1.100 无口令访问 /openapi.json 拿到
     71386 字节的**完整 API 目录**（200），而同一时刻所有 /api/* 都正确 401。
     交互式文档等于把「60 条路由 + 全部请求模型」的地图免费送给局域网anyone。
+
+    ⚠ `sandbox` 参数不是为了这个断言，而是**元护栏**的要求：
+      自己 new TestClient 的测试必须把 vault 指向临时目录
+      （tests/test_guard_efficacy.py）。这三个用例目前只读，但规则统一，
+      免得以后有人往里加一条写操作就写进了用户真实 vault。
     """
     from fastapi.testclient import TestClient
     from microbench.app import app
@@ -79,8 +84,11 @@ def test_lan_openapi_and_docs_require_token(monkeypatch):
         assert r.status_code == 200, r.text
 
 
-def test_lan_openapi_still_open_for_local_users(monkeypatch):
-    """本机（回环）用不能被这道护栏挡住 —— 桌面端要能看 API 文档。"""
+def test_lan_openapi_still_open_for_local_users(monkeypatch, sandbox):
+    """本机（回环）用不能被这道护栏挡住 —— 桌面端要能看 API 文档。
+
+    `sandbox` 是元护栏的要求（见上面那条的说明），与本断言无关。
+    """
     from fastapi.testclient import TestClient
     from microbench.app import app
 
@@ -106,8 +114,11 @@ def test_client_is_local_fails_closed_when_peer_is_missing():
 # C 绝对路径 / 凭据回显
 # ===========================================================================
 
-def test_sync_status_root_is_masked_for_remote_clients(monkeypatch):
-    """远端拿到的同步根只能是云端末段，不能带本机用户名和坚果云镜像 id。"""
+def test_sync_status_root_is_masked_for_remote_clients(monkeypatch, sandbox):
+    """远端拿到的同步根只能是云端末段，不能带本机用户名和坚果云镜像 id。
+
+    `sandbox` 是元护栏的要求（自己 new TestClient 必须沙箱化）。
+    """
     from fastapi.testclient import TestClient
     from microbench.app import app
 

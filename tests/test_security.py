@@ -297,10 +297,29 @@ def test_null_origin_is_rejected(client):
     assert r.status_code == 403, "Origin: null 未被拒绝"
 
 
-def test_get_is_not_blocked_by_the_csrf_guard(client):
-    """Read-only endpoints must stay reachable (the dashboard polls them)."""
+def test_same_origin_get_is_not_blocked(client):
+    """看板轮询的读请求必须照常可达。
+
+    2026-11-09 审计改了契约：GET 现在也校验 Origin，但只拦「跨站」。
+    同源请求（浏览器通常压根不带 Origin；带了也是 127.0.0.1:5000）放行。
+    """
+    assert client.get("/api/stats").status_code == 200
+    assert client.get("/api/stats",
+                      headers={"Origin": "http://127.0.0.1:5000",
+                               "Host": "127.0.0.1:5000"}).status_code == 200
+
+
+def test_cross_origin_get_is_rejected(client):
+    """本机浏览器上的恶意页面不能跨站读走笔记 / 批注 / 译文。
+
+    以前 GET 完全不看 Origin，而 CORS 会回显部分外部 Origin，
+    于是 `<img>`/fetch 之外的读端点也成了数据外泄口（2026-11-09 审计 P1-10）。
+    """
     r = client.get("/api/stats", headers={"Origin": "https://evil.example"})
-    assert r.status_code == 200
+    assert r.status_code == 403, "跨站 GET 未被拒绝"
+    r2 = client.get("/api/vault/literature",
+                    headers={"Origin": "https://evil.example"})
+    assert r2.status_code == 403, "跨站读文献列表未被拒绝"
 
 
 # ---------------------------------------------------------------------------

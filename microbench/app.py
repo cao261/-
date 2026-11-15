@@ -19,7 +19,9 @@ import ipaddress
 import uuid
 import asyncio
 import shutil
+import threading
 import time
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -134,16 +136,21 @@ app = FastAPI(
 # whenever the page is loaded from a slightly different origin (e.g. the
 # desktop webview on a custom --port).
 #
-# allow_origin_regex additionally admits private-LAN origins (192.168.x.x /
-# 10.x / 172.16-31.x). That is only reachable when the server is actually
-# bound to 0.0.0.0, and every non-loopback caller still has to pass the
-# token guard below — CORS alone never grants access.
+# allow_origin_regex admits private-LAN origins so the tablet's WebView can
+# reach the API when its page is served from a LAN IP. Keep this list narrow:
+#   * IPv4 只放行 RFC1918 私网段；
+#   * IPv6 只放行 [::1]（2026-11-09 审计：原来是 `\[[0-9a-fA-F:]+\]`，
+#     等于放行**任意 IPv6 字面量，包括公网地址**。而 CORS 判的是请求头
+#     Origin，与「服务是否绑 0.0.0.0」无关 —— 旧注释那句论证是错的）。
+# 另见 csrf_origin_guard：读请求（GET/HEAD/OPTIONS）现在同样校验 Origin，
+# 堵住「本机上的恶意页面跨站读走笔记/批注/译文」；非 loopback 客户端仍由
+# lan_token_guard 统一把关，平板 file:// 页面的 Origin: null 不受影响。
 _LAN_ORIGIN_RE = (
     r"^https?://("
     r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
     r"|192\.168\.\d{1,3}\.\d{1,3}"
     r"|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
-    r"|\[[0-9a-fA-F:]+\]"
+    r"|\[::1\]"
     r")(:\d{1,5})?$"
 )
 
@@ -378,12 +385,25 @@ async def csrf_origin_guard(request: Request, call_next):
     Both paths are additionally covered by the token guard above, so even a
     same-origin-looking request from a LAN device needs the secret.
     """
-    if request.method.upper() not in _SAFE_METHODS:
-        origin = request.headers.get("origin")
-        referer = request.headers.get("referer")
-        client_host = request.client.host if request.client else ""
-        host_header = request.headers.get("host") or ""
+    path = request.url.path
+    method = request.method.upper()
+    client_host = request.client.host if request.client else ""
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+    host_header = request.headers.get("host") or ""
 
+    # 读请求同样要校验，但只覆盖「本机浏览器 + /api/*」这一条路径。
+    # 2026-11-09 审计：原来 GET 完全不看 Origin，配合 CORS 回显，
+    # 用户浏览器里的恶意页面可以跨站读走笔记 / 批注 / 译文快照。
+    #   * 同源 GET 通常不带 Origin，或带同源 Referer → 正常放行；
+    #   * 非 loopback 客户端（平板）跳过 —— lan_token_guard 已验 token，
+    #     且 file:// 页面发的是 Origin: null，在这里收紧会打断平板同步；
+    #   * 静态资源 / 非 /api 的 GET 不校验，避免误伤页面本身。
+    read_request = method in _SAFE_METHODS
+    needs_check = (not read_request) or (
+        path.startswith("/api/") and not _is_remote_peer(client_host)
+    )
+    if needs_check:
         if _is_remote_peer(client_host):
             # LAN client: same-origin only. The Origin/Referer host:port has
             # to equal the Host header the browser actually connected to.
@@ -4599,6 +4619,43 @@ def _snapshot_path(paper_id: str) -> Path:
     return _snapshot_dir() / f"{safe}.json"
 
 
+# ---------------------------------------------------------------------------
+# 快照写锁：按 paper_id 分桶（2026-11-10 审计 F4）
+#
+# 为什么必须有：快照是「读旧值 → 按 page_num 合并 → 整份写回」三步，
+# 而这三步**不原子**。两个写者同时进来时：
+#   A 读到基线 {} → 合并出 {页1} → 写盘
+#   B 读到基线 {}（A 还没写）→ 合并出 {页2} → 写盘
+#   → A 的页1 被 B 整份盖掉，接口却两次都返回 success。
+# 隔离读（_read_json_or_quarantine）只防「文件损坏」，防不住这个。
+#
+# 谁会同时写同一份快照：
+#   * api_pdf_snapshot_save —— async 端点，跑在事件循环线程；
+#   * api_sync 的拉取分支 —— **def** 端点，跑在线程池线程，
+#     写的是同一个 logs/_pdf_snapshots/<paper_id>.json；
+#   * 两个标签页同时点「保存译文」。
+# 跨设备（另一台机器同时写坚果云里的同一份）不在本锁的射程内 ——
+# 那是 revision/CAS 的活，属第 3 批（要两台设备同时改）。
+#
+# ⚠ 使用纪律：**临界区里绝不能出现 await**。
+#   事件循环线程拿到锁后如果 await，就会把整条事件循环卡住，
+#   而等锁的另一个请求也在同一条事件循环上 → 死锁。
+#   下面三处临界区全是同步代码，满足这条。
+# ---------------------------------------------------------------------------
+_snapshot_locks_guard = threading.Lock()
+_snapshot_locks: dict[str, threading.Lock] = {}
+
+
+def _snapshot_lock(key: str) -> threading.Lock:
+    """取某个 paper_id 的写锁。key 传文件名主干（不含 .json）。"""
+    with _snapshot_locks_guard:
+        lk = _snapshot_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _snapshot_locks[key] = lk
+        return lk
+
+
 def _safe_read_json(path: Path) -> Optional[dict]:
     """宽容读 JSON：文件不存在 / 内容坏掉 → 都返回 None。
 
@@ -4615,20 +4672,49 @@ def _safe_read_json(path: Path) -> Optional[dict]:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """原子写文本：先写同目录 `.tmp`，再 `os.replace` 覆盖目标。
+    """原子写文本：同目录**唯一**临时文件 → `os.replace` 覆盖目标。
 
     为什么必须（不只是"优雅"）：这些 JSON 都住在**坚果云同步目录**里。
     直接 `write_text` 时，文件在「已被截断、还没写完」的那一瞬间会被同步
     客户端抓走并上行，另一台设备拿到半截 JSON → 解析失败 → 用户的批注/
     进度看起来"没了"。`os.replace` 在同一分区上是原子的，同步端只会看到
     旧文件或新文件，不会看到中间态。
+
+    ⚠ 临时文件名必须唯一（2026-11-09 审计）：原来是固定的
+      `path.name + ".tmp"`，两个并发写同一目标会共用它 —— A 写完被 B 覆盖，
+      A 的 `os.replace` 把 B 的半成品推成成品，B 再 replace 就抛
+      FileNotFoundError。快照保存（事件循环）与 /api/sync（线程池）同时写
+      同一份 JSON 就会踩到。与 pdf_cache.py 的 `mkstemp` 做法保持一致。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    fd_taken = False
     try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd_taken = True          # fd 已交给 fh，with 退出时负责关闭
+            fh.write(text)
+        # Windows 上多个线程同时 rename 到同一目标时，目标可能被刚完成的
+        # 另一次 replace 短暂占用 → PermissionError（12 线程并发实测复现）。
+        # 这是瞬时冲突，重试即可；每次 replace 本身仍是原子的。
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
     except Exception:
+        # 只有 fdopen 本身失败时 fd 还归我们管；已交给 fh 的绝不重复 close，
+        # 否则可能关掉被别的线程复用的同一个 fd 编号。
+        if not fd_taken:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             if tmp.exists():
                 tmp.unlink()
@@ -4642,6 +4728,26 @@ def _atomic_write_json(path: Path, obj, indent: int = 1) -> None:
     _atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent))
 
 
+class _TransientReadError(ValueError):
+    """读文件时的**瞬时 I/O 故障**（文件被占用等）—— **不是**内容损坏。
+
+    继承 ValueError 是为了兼容既有调用点（它们都是 `except ValueError`
+    → HTTP 500），但它与「内容损坏」必须能区分：
+    损坏 → 改名隔离；瞬时故障 → **一个字节都不动**，只报错让用户重试。
+    """
+
+
+def _quarantine_corrupt(path: Path, reason: str) -> str:
+    """把**确认损坏**的文件改名隔离，返回给用户看的一句话。"""
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        os.replace(path, quarantine)
+        return f"文件内容损坏，已隔离为 {quarantine.name}: {path.name} ({reason})"
+    except OSError:
+        return f"文件内容损坏，且隔离失败（原文件仍在原处）: {path.name} ({reason})"
+
+
 def _read_json_or_quarantine(path: Path) -> Optional[dict]:
     """读 JSON；**损坏的文件改名隔离并报错**，不当成"没有"。
 
@@ -4653,23 +4759,53 @@ def _read_json_or_quarantine(path: Path) -> Optional[dict]:
     而用户看到的是"✅ 保存成功"。一条数据都不报错地消失，最难查。
 
     宁可让这次保存失败并告诉用户"文件损坏，已备份到 X"，也不能静默清空。
+
+    ⚠ 2026-11-15 修正（独立审查 P1-1）：**瞬时 I/O 故障 ≠ 内容损坏**。
+      原来 except 里混着 `OSError` —— Windows 上文件被坚果云客户端 / 杀软 /
+      别的进程短暂占用（`PermissionError`）时，会把**内容完全健康**的快照
+      改名成 `.corrupt-XXXX` → 译文从界面上消失，用户以为得重翻（烧 token）。
+      现在分三类处理：
+        * **内容坏**（解码失败 / JSON 坏 / 顶层不是对象）→ 改名隔离 + 报错；
+        * **瞬时 I/O 故障**（PermissionError 等）→ **一个字节都不动**，
+          只报错让调用方/用户重试；
+        * **文件刚好不存在**（exists 与 read 之间被删）→ 当成「没有旧值」，
+          不是损坏。
     """
-    if not path.exists():
-        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as e:
-        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
-        kept = ""
-        try:
-            os.replace(path, quarantine)
-            kept = f"，已隔离为 {quarantine.name}"
-        except OSError:
-            kept = "，且隔离失败（原文件仍在原处）"
-        msg = f"文件内容损坏{kept}: {path.name} ({e})"
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # 竞态：上一次 exists() 为真、这次读的时候已经被删了
+        # （同步端点正在重写同一个文件）→ 当成「没有旧值」，不是损坏。
+        return None
+    except UnicodeDecodeError as e:
+        # 字节层面就不是合法 UTF-8 —— 这才是真·内容损坏
+        msg = _quarantine_corrupt(path, f"不是合法的 UTF-8: {e}")
+        print(f"[microbench] {msg}", file=sys.stderr)
+        raise ValueError(msg) from e
+    except OSError as e:
+        # ⚠ 读不到 ≠ 坏了。文件可能只是被占用 / 权限不足 / 磁盘瞬时不可用。
+        #    **绝不碰这个文件** —— 改名的后果是用户的译文「凭空消失」。
+        msg = (f"文件读不出来（可能正被其它进程占用，不是内容损坏），"
+               f"请稍后重试: {path.name} ({e})")
+        print(f"[microbench] {msg}", file=sys.stderr)
+        raise _TransientReadError(msg) from e
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        msg = _quarantine_corrupt(path, f"JSON 解析失败: {e}")
+        print(f"[microbench] {msg}", file=sys.stderr)
+        raise ValueError(msg) from e
+
+    # 合法 JSON 但顶层不是对象（[] / "x" / null）同样危险：调用方一律
+    # 按 dict 合并，`.get()` 会抛 AttributeError；更糟的是 `or {}` 会把
+    # 空数组悄悄当成"没有旧值" → 下一次写回清空数据。一并按损坏隔离。
+    if not isinstance(data, dict):
+        msg = _quarantine_corrupt(path, f"顶层必须是对象，实际是 {type(data).__name__}")
         print(f"[microbench] {msg}", file=sys.stderr)
         raise ValueError(msg)
+
+    return data
 
 
 @app.get("/api/pdf/snapshot/list")
@@ -4767,35 +4903,58 @@ async def api_pdf_snapshot_save(req: SnapshotSaveRequest):
     #   **重新烧 token**。
     #   （docs/SYNC_CONTRACT.md 声称快照是「整份替换」且「不会互相踩坏」，
     #    实测不成立 —— 快照是整个同步层里唯一会互相踩坏的一路。）
-    existing = _safe_read_json(_snapshot_path(safe_id)) or {}
-    pages_out = _merge_snapshot_pages(existing, req, pages_out)
-
+    # ⚠ 写路径上的「读旧值再合并」必须用 _read_json_or_quarantine，不能用
+    #   _safe_read_json（2026-11-09 审计）：后者把「半截 JSON」和「文件不存在」
+    #   都返回 None → 合并基数变空 → 本次只上传几页就把磁盘上其它已翻页
+    #   永久抹掉，而接口还返回 success。批注保存早已修过，这里补上。
+    # ⚠ 整段「读旧值 → 合并 → 写回」必须持锁（2026-11-10 审计 F4）：
+    #   隔离读只防「文件损坏」，防不住「两个写者读到同一个旧基线」——
+    #   api_sync 跑在线程池线程、这个端点跑在事件循环线程，两者写的是
+    #   同一个 logs/_pdf_snapshots/<paper_id>.json；两个标签页同时保存也一样。
+    #   后写的会把先写的页整份盖掉，而两个接口都返回 success。
+    #   锁按 paper_id 分桶，不同论文互不阻塞。
+    #   ⚠ 临界区里绝不能有 await —— 事件循环线程持锁等待会把整条循环卡死。
     from .paper_text import EXTRACTOR_VERSION
-    payload = {
-        "schema_version": SNAPSHOT_SCHEMA_VERSION,
-        # 抽取算法版本：加载时对不上就整份作废（见 api_pdf_snapshot_load）
-        "extractor_version": EXTRACTOR_VERSION,
-        "paper_id": safe_id,
-        "paper_title": req.paper_title,
-        "relative_path": req.relative_path,
-        "paper_mtime": req.paper_mtime,
-        "paper_text_signature": req.paper_text_signature,
-        "pages": pages_out,
-        "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
-    }
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
-    if len(serialized.encode("utf-8")) > SNAPSHOT_MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"快照过大(>{SNAPSHOT_MAX_BYTES // 1024 // 1024}MB),请减少保存页数",
-        )
-
-    _ensure_snapshot_dir()   # 写路径才建目录（M-3：读路径不建）
+    # ⚠ 合并冲突的解法（2026-11-15 合并云端升级）：
+    #   云端（origin/main）在写路径上加了 `_ensure_snapshot_dir()`
+    #   （M-3：写路径才建目录，读路径不建）；
+    #   本机（HEAD）把这一段重构成了「读旧值 → 合并 → 写回」全程持锁。
+    #   两者不冲突：**都要**——保留锁结构，把 _ensure_snapshot_dir()
+    #   挪进临界区、写盘之前调用（读之前不建目录，保持云端 M-3 的原意）。
     target = _snapshot_path(safe_id)
-    try:
-        _atomic_write_text(target, serialized)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"写盘失败: {_safe_err(e)}")
+    with _snapshot_lock(safe_id):
+        try:
+            existing = _read_json_or_quarantine(target) or {}
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=_safe_err(e))
+        pages_out = _merge_snapshot_pages(existing, req, pages_out)
+
+        payload = {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            # 抽取算法版本：加载时对不上就整份作废（见 api_pdf_snapshot_load）
+            "extractor_version": EXTRACTOR_VERSION,
+            "paper_id": safe_id,
+            "paper_title": req.paper_title,
+            "relative_path": req.relative_path,
+            "paper_mtime": req.paper_mtime,
+            "paper_text_signature": req.paper_text_signature,
+            "pages": pages_out,
+            "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        if len(serialized.encode("utf-8")) > SNAPSHOT_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"快照过大(>{SNAPSHOT_MAX_BYTES // 1024 // 1024}MB),请减少保存页数",
+            )
+
+        try:
+            # 写路径才建目录（云端 M-3 修的，合并时保留）：
+            #   放在临界区内、真正写盘之前 —— 读路径仍然不建目录。
+            _ensure_snapshot_dir()
+            _atomic_write_text(target, serialized)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"写盘失败: {_safe_err(e)}")
 
     return {
         "status": "success",
@@ -5093,6 +5252,12 @@ def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
     return text
 
 
+def _current_extractor_version():
+    """单独一层，方便在回归测试里模拟「模块导入失败」这条 fail-closed 路径。"""
+    from .paper_text import EXTRACTOR_VERSION
+    return EXTRACTOR_VERSION
+
+
 def _snapshot_extractor_ok(data: dict) -> bool:
     """快照的抽取算法版本必须与当前一致。
 
@@ -5104,10 +5269,15 @@ def _snapshot_extractor_ok(data: dict) -> bool:
     所以合并之前必须先看版本：对不上就**不合**。
     """
     try:
-        from .paper_text import EXTRACTOR_VERSION
-    except Exception:
-        return True
-    return (data or {}).get("extractor_version") == EXTRACTOR_VERSION
+        cur = _current_extractor_version()
+    except Exception as e:
+        # fail closed（2026-11-09 审计）：取不到当前版本号时，宁可不合，
+        # 也绝不能放行旧快照里的坏译文。AGENTS §4.18 与 export_offline 的
+        # 译文收集都是这个口径；原来 `return True` 会让整道闸门失效。
+        print(f"[microbench] 取不到 EXTRACTOR_VERSION，拒绝合并快照: {e}",
+              file=sys.stderr)
+        return False
+    return (data or {}).get("extractor_version") == cur
 
 
 def _merge_snapshot_pages(existing: dict, req, incoming: list) -> list:
@@ -5517,6 +5687,15 @@ def api_sync(req: SyncRequest, request: Request):
     pulled["files"] = []
     files_report: dict = {"push": {}, "pull": {}}
     snapshot_updated = False
+    # 2026-11-09 审计：原来单个文件读写失败被 `except OSError: continue`
+    # 静默吞掉，最后仍返回 status: success —— 用户以为全传上去了，
+    # 实际某几篇译文/批注根本没上云，且没有任何日志可查。
+    errors: list[dict] = []
+
+    def _record_error(kind: str, name: str, exc: Exception) -> None:
+        detail = _safe_err(exc)
+        errors.append({"kind": kind, "name": name, "error": detail})
+        print(f"[sync] {kind} 失败: {name}: {detail}", file=sys.stderr)
 
     # ---------- 推送：翻译快照 ----------
     local_snap_dir = BASE_DIR / "logs" / "_pdf_snapshots"
@@ -5529,12 +5708,17 @@ def api_sync(req: SyncRequest, request: Request):
                 dst = dst_dir / fp.name
                 # ⚠ 按 page_num 合并，不整份覆盖 ——
                 #   否则「页数更少的那一份」会赢，另一台已翻的页被清空。
-                merged = _merge_snapshot_files(dst, fp)
-                if merged is None:
-                    continue
-                _atomic_write_text(dst, merged)
+                # ⚠ 「读 dst → 合并 → 写 dst」同样要持锁（2026-11-10 审计 F4）：
+                #   两个 /api/sync 并发、或同步与快照保存端点并发，
+                #   都会读到同一个旧基线，后写的把先写的页盖掉。
+                with _snapshot_lock(fp.stem):
+                    merged = _merge_snapshot_files(dst, fp)
+                    if merged is None:
+                        continue
+                    _atomic_write_text(dst, merged)
                 pushed["snapshots"].append(fp.name)
-            except OSError:
+            except (OSError, ValueError) as e:
+                _record_error("snapshot_push", fp.name, e)
                 continue
 
     # ---------- 推送：批注 ----------
@@ -5567,8 +5751,11 @@ def api_sync(req: SyncRequest, request: Request):
             # 而它是从浏览器直接传来的。裁掉未知字段并限长，防止一次调用
             # 把同步目录塞进几十 MB 垃圾。
             rec = _trim_progress_record(rec)
-            _atomic_write_json(_sync_dir("progress") / f"{safe}.json", rec)
-            pushed["progress"].append(safe + ".json")
+            try:
+                _atomic_write_json(_sync_dir("progress") / f"{safe}.json", rec)
+                pushed["progress"].append(safe + ".json")
+            except OSError as e:
+                _record_error("progress_push", safe + ".json", e)
 
     # ---------- 推送：论文 PDF 本体（增量，只传变化过的） ----------
     if req.include_files and not req.pull_only:
@@ -5592,13 +5779,18 @@ def api_sync(req: SyncRequest, request: Request):
                 dst = local_snap_dir / fp.name
                 # ⚠ 同样按 page_num 合并 —— 共享目录那份不该把本机
                 #   已翻的页整块清掉。
-                merged = _merge_snapshot_files(dst, fp)
-                if merged is None:
-                    continue
-                _atomic_write_text(dst, merged)
+                # ⚠ 这个 dst 就是 api_pdf_snapshot_save 写的那个文件
+                #   （logs/_pdf_snapshots/<paper_id>.json），两处必须共用
+                #   同一把锁，否则同步线程与保存端点会互相踩（2026-11-10 审计 F4）。
+                with _snapshot_lock(fp.stem):
+                    merged = _merge_snapshot_files(dst, fp)
+                    if merged is None:
+                        continue
+                    _atomic_write_text(dst, merged)
                 pulled["snapshots"].append(fp.name)
                 snapshot_updated = True
-            except OSError:
+            except (OSError, ValueError) as e:
+                _record_error("snapshot_pull", fp.name, e)
                 continue
 
         # ---------- 拉取：批注（共享 → 本机，本机只是**镜像**） ----------
@@ -5616,7 +5808,14 @@ def api_sync(req: SyncRequest, request: Request):
                 if fp.stat().st_size > SYNC_MAX_FILE_BYTES:
                     continue
                 dst = ann_local_dir / fp.name
-                new = _safe_read_json(fp) or {}
+                # 共享目录里的文件**不能**用 _read_json_or_quarantine 改名隔离
+                # （会动到另一台设备的数据）。但损坏时也不能当空值往下写 ——
+                # 那会把本机镜像清空。跳过并明确报错。
+                new = _safe_read_json(fp)
+                if not isinstance(new, dict):
+                    _record_error("annotation_pull", fp.name,
+                                  ValueError("批注文件内容损坏，已跳过（未覆盖本机镜像）"))
+                    continue
                 cur = _safe_read_json(dst) or {}
                 new_items = new.get("annotations") or []
                 if (cur.get("annotations") or []) == new_items:
@@ -5625,10 +5824,10 @@ def api_sync(req: SyncRequest, request: Request):
                            "updated_at": (new.get("updated_at")
                                           or _dt.datetime.now().isoformat(timespec="seconds")),
                            "schema_version": 2, "annotations": new_items}
-                dst.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
-                               encoding="utf-8")
+                _atomic_write_json(dst, payload)
                 pulled["annotations"].append(fp.name)
-            except OSError:
+            except (OSError, ValueError) as e:
+                _record_error("annotation_pull", fp.name, e)
                 continue
 
         # ---------- 拉取：阅读进度 ----------
@@ -5644,8 +5843,8 @@ def api_sync(req: SyncRequest, request: Request):
                 pulled["progress"].append(safe + ".json")
         try:
             _write_local_progress(prog)
-        except OSError:
-            pass
+        except OSError as e:
+            _record_error("progress_local", "reading_progress.json", e)
 
         # ---------- 拉取：论文 PDF 本体（还原到 vault 原来的相对路径） ----------
         if req.include_files and not req.push_only:
@@ -5655,7 +5854,14 @@ def api_sync(req: SyncRequest, request: Request):
             pulled["files"] = list(rep.get("restored", []))
 
     return {
+        # status 保持 "success"（前端与脚本依赖）；单项失败通过 errors 暴露，
+        # 不再用「全绿」掩盖某几篇没同步上去。
         "status": "success",
+        # errors / error_count：本机的改动（单项失败不再被吞掉）；
+        # root 用脱敏显示：云端 2026-11 升级加的（不把坚果云真实路径回给前端）。
+        # 两边都要，合并时保留。
+        "errors": errors,
+        "error_count": len(errors),
         "root": _sync_root_display(root, request),
         "pushed": pushed,
         "pulled": pulled,

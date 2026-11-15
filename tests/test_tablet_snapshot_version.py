@@ -317,6 +317,27 @@ def test_merge_files_keeps_content_when_both_sides_are_stale(tmp_path):
 # ④ 平板端：同样的判据（行为级测试在 JS 套件里，见下）
 # ---------------------------------------------------------------------------
 
+def _tablet_uses_strict_version_check(src: str) -> bool:
+    """源码层面的快速护栏（行为级护栏在 _test_tablet_hardening.js）。
+
+    2026-11-09 第 2 批：原来只查一行字符串，把
+    `const cur = state.transVer` 改成 `const cur = data.extractor_version`
+    （比较恒 false、旧快照永不作废）照样能过 —— 等于没护栏。
+    现在同时检查「比较符」和「cur 的来源」，并在下面配反向用例。
+    """
+    marker = "data.extractor_version !== cur"
+    pos = src.find(marker)
+    if pos < 0:
+        return False
+    prefix = src[:pos]
+    defs = list(re.finditer(r"\bconst\s+cur\s*=\s*([^;\n]+)", prefix))
+    if not defs:
+        return False                       # 找不到 cur 的定义，无法证明严格
+    if "data." in defs[-1].group(1):
+        return False                       # cur 取自待校验数据本身 → 闸门恒真
+    return "data.extractor_version\n" not in src
+
+
 def test_tablet_uses_strict_version_check():
     """平板端必须是**严格**比较：`!==` 当前版本就作废。
 
@@ -325,10 +346,21 @@ def test_tablet_uses_strict_version_check():
       桌面端 `api_pdf_snapshot_load` 用的是严格判据，两端必须一致。
     """
     src = (REPO / "microbench" / "static" / "tablet" / "app.js").read_text(encoding="utf-8")
-    assert "data.extractor_version !== cur" in src, \
-        "平板端没有用严格版本比较"
-    assert "data.extractor_version\n" not in src, \
-        "平板端还在用宽松写法（没有版本号的旧快照会被放行）"
+    assert _tablet_uses_strict_version_check(src), \
+        "平板端没有用严格版本比较（或 cur 取自待校验数据本身）"
+
+
+def test_tablet_version_guard_has_a_negative_case():
+    """反向验证：把闸门改坏，上面的护栏必须能抓到（不是恒真检查）。"""
+    good = ("const cur = state.transVer;\n"
+            "if (cur == null || data.extractor_version !== cur) { return null; }")
+    assert _tablet_uses_strict_version_check(good), "正常代码被误判"
+    assert not _tablet_uses_strict_version_check(good.replace("!==", "==")), \
+        "比较符被改宽松了，护栏却没发现"
+    assert not _tablet_uses_strict_version_check(
+        "const cur = data.extractor_version;\n"
+        "if (cur == null || data.extractor_version !== cur) { return null; }"), \
+        "cur 取自 data 自身（闸门恒真）却没被发现"
 
 
 def test_tablet_cache_is_version_scoped():

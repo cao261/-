@@ -66,26 +66,55 @@ def test_cache_key_ignores_the_glyph_dictionary(tmp_path):
     )
 
 
-def test_extractor_does_not_need_the_glyph_dictionary():
-    """上面那条等价断言的**前提**：抽取层不依赖词典。
+def test_extractor_does_not_need_the_glyph_dictionary(tmp_path, monkeypatch):
+    """抽取层**不能**依赖符号词典（行为级：词典变了，抽取结果必须一模一样）。
 
-    一旦将来有人把词典读进 `extract_text_from_pdf`（比如想在里面直接把
-    ⟦G:n⟧ 换成真实字符），缓存就必须重新带上词典签名 —— 这条会先红，
-    提醒他回去改 `pdf_cache` 的键和上面那条断言，而不是留着一个脏缓存。
+    ⚠ 原写法是 `assert "glyph_dict" not in inspect.getsource(paper_text)` ——
+    源码里那两个词不在就绿，但词典可以从别的路进来（换个变量名、
+    从模块 import 一个路径、甚至 lazy import），护栏全看不见
+    （2026-11-10 审计 F5：源码文本护栏换行为级）。
+
+    现在反过来测**行为**：把词典指向两份内容完全不同的文件，
+    抽取结果必须逐字相同。哪天抽取层真的开始读词典，这里立刻红。
     """
     import inspect
 
+    from microbench import glyphs as gl
     from microbench import paper_text
 
+    # 1) 函数签名不能多出「词典」参数（这条原来就有，保留）
     params = list(inspect.signature(paper_text.extract_text_from_pdf).parameters)
     assert params == ["pdf_bytes"], (
         f"extract_text_from_pdf 多了参数 {params} —— 如果它开始依赖词典，"
         "pdf_cache 的缓存键必须重新计入词典签名"
     )
-    src = inspect.getsource(paper_text)
-    assert "glyph_dict" not in src and "GlyphDict" not in src, (
-        "抽取层开始读符号词典了 → 缓存键必须重新计入词典签名"
-    )
+
+    # 2) 行为级：词典内容变了，抽取结果必须一模一样
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    try:
+        doc.new_page()
+        doc[0].insert_text((72, 100), "Hello alpha 123", fontsize=11)
+        pdf_bytes = doc.tobytes()
+    finally:
+        doc.close()
+
+    def extract_with_dict(path):
+        monkeypatch.setattr(gl, "DEFAULT_DICT_PATH", path, raising=False)
+        # 抽取层若自己 import 了词典路径，这里一并换掉
+        for name in ("GLYPH_DICT_PATH", "DEFAULT_DICT_PATH", "GLYPH_DICT"):
+            if hasattr(paper_text, name):
+                monkeypatch.setattr(paper_text, name, path, raising=False)
+        return paper_text.extract_text_from_pdf(pdf_bytes)
+
+    d1 = tmp_path / "d1.json"
+    d1.write_text("{}", encoding="utf-8")
+    d2 = tmp_path / "d2.json"
+    d2.write_text(json.dumps({"s:F|1": "Ω"}), encoding="utf-8")
+
+    a = extract_with_dict(d1)
+    b = extract_with_dict(d2)
+    assert a == b, "符号词典变了，抽取结果跟着变了 → 抽取层在读词典"
 
 
 def test_cache_key_includes_the_extractor_version(tmp_path):

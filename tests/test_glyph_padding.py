@@ -35,12 +35,35 @@ def test_glyph_pad_is_small():
 
 
 def test_render_glyph_uses_the_calibrated_pad():
-    """_render_glyph 必须真的用这个 padding（别出现"常量改了但没用"）。"""
-    import inspect
-    src = inspect.getsource(gl._render_glyph)
-    assert "pad: float = _GLYPH_PAD_PT" in src, "签名没用 _GLYPH_PAD_PT"
-    assert "x0 - pad" in src and "x1 + pad" in src, "裁剪框没用 pad"
-    assert "x0 - 1.0" not in src, "还残留着写死的 ±1.0"
+    """_render_glyph 的**默认**外扩量必须就是标定出来的那个常量（行为级）。
+
+    ⚠ 原写法是读源码找 "pad: float = _GLYPH_PAD_PT" 这行字 ——
+    常量改了但函数里没用（或者写死成 ±1.0），那行字都还在，护栏照样绿
+    （2026-11-10 审计 F5：源码文本护栏换行为级）。
+
+    现在真裁三张图比对产物：
+      不传 pad  == 传标定值   → 常量真的生效
+      不传 pad  != 传旧的 1.0 → 没有残留写死的 ±1.0
+    """
+    fitz = pytest.importorskip("fitz")
+
+    doc = fitz.open()
+    try:
+        doc.new_page()
+        # 窄字形（3pt 宽）+ 高倍缩放：让 0.25 与 1.0 的差别落到像素尺寸上
+        bbox = {"x0": 100.0, "x1": 103.0, "top": 90.0, "bottom": 103.0}
+        default = gl._render_glyph(doc, 1, bbox, zoom=72)
+        calibrated = gl._render_glyph(doc, 1, bbox, zoom=72, pad=gl._GLYPH_PAD_PT)
+        old_hardcoded = gl._render_glyph(doc, 1, bbox, zoom=72, pad=1.0)
+    finally:
+        doc.close()
+
+    assert default, "裁图没出东西（_render_glyph 返回空）"
+    assert default == calibrated, (
+        "默认外扩量不是标定值 —— 常量改了但没生效")
+    assert default != old_hardcoded, (
+        "产物与旧的 ±1.0 完全一致 —— 还残留着写死的值；"
+        "窄字形会把邻居裁进来（实测 14/46 混入）")
 
 
 # ---------------------------------------------------------------------------

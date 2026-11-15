@@ -8751,7 +8751,16 @@
         });
 
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
+        // 2026-11-09 审计：后端单项失败不再被吞掉，errors 里有明细。
+        // 只要有失败项就不能再显示「✅ 同步成功」—— 否则用户以为全上云了。
+        const syncErrors = Array.isArray(d.errors) ? d.errors : [];
+        const errCount = Number(d.error_count) || syncErrors.length;
         const bits = [];
+        if (errCount) {
+          const detail = syncErrors.slice(0, 2)
+            .map(x => `${x.kind || "同步"}: ${x.name || ""}`).join("、");
+          bits.push(`⚠ ${errCount} 项失败${detail ? "（" + detail + "）" : ""}`);
+        }
         const pulledAnno = ((d.pulled || {}).annotations || []).length;
         if (pulledAnno) bits.push(`更新了 ${pulledAnno} 条批注`);
         if (d.progress && d.progress.page) bits.push(`阅读进度：第 ${d.progress.page} 页`);
@@ -8765,7 +8774,7 @@
         if (d.snapshot_updated) {
           // 拉到了新译文：结果留在面板上（别一闪而过），给用户看清再刷新
           if (noteEl) {
-            noteEl.textContent = `✅ 同步成功 · 推送 ${d.pushed_total || 0} 项 / 拉取 ${d.pulled_total || 0} 项`
+            noteEl.textContent = `${errCount ? "⚠ 同步完成但有失败项" : "✅ 同步成功"} · 推送 ${d.pushed_total || 0} 项 / 拉取 ${d.pulled_total || 0} 项`
               + ` · 耗时 ${secs}s · 拉到了新的译文，10 秒后自动刷新页面重建`
               + (bits.length ? " · " + bits.join(" · ") : "");
           }
@@ -8783,7 +8792,7 @@
         }
 
         if (noteEl) {
-          noteEl.textContent = `✅ 同步成功 · 推送 ${d.pushed_total || 0} 项 / 拉取 ${d.pulled_total || 0} 项`
+          noteEl.textContent = `${errCount ? "⚠ 同步完成但有失败项" : "✅ 同步成功"} · 推送 ${d.pushed_total || 0} 项 / 拉取 ${d.pulled_total || 0} 项`
             + ` · 耗时 ${secs}s` + (bits.length ? " · " + bits.join(" · ") : "");
         }
         if (pulledAnno) {

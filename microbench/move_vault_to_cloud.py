@@ -72,21 +72,26 @@ def is_junction(p: Path) -> bool:
 
 
 def make_junction(link: Path, target: Path) -> bool:
-    """Create a directory junction (no admin rights needed)."""
-    if hasattr(os, "symlink"):
+    """Create a directory junction (no admin rights needed).
+
+    2026-11-09 审计：原来先试 `os.symlink`。在开了开发者模式/以管理员
+    运行的 Windows 上它会**成功**，建出来的是符号链接而不是 junction ——
+    与另一台设备 `mklink /J` 建的类型不一致，且部分工具对符号链接的
+    跟随策略不同。Windows 一律直接走 mklink /J；其它平台才用 symlink。
+    """
+    if os.name == "nt":
         try:
-            os.symlink(target, link, target_is_directory=True)
-            return True
-        except OSError:
-            pass
-    # fallback: mklink /J
+            r = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True, text=True, timeout=60,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
     try:
-        r = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-            capture_output=True, text=True, timeout=60,
-        )
-        return r.returncode == 0
-    except Exception:
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except OSError:
         return False
 
 
@@ -126,6 +131,29 @@ def move_item(src: Path, dst: Path) -> bool:
         return False
 
 
+def rollback_moved(moved: list, target: Path) -> bool:
+    """把已经搬走的目录原样搬回 vault（2026-11-09 审计）。
+
+    搬迁中途失败时，原路径的目录已经消失、junction 又还没建 ——
+    vault 处于半残状态。原来只打印 `[失败]` 就 return 1，用户得自己
+    猜怎么恢复。这里在**建 junction 之前**自动回滚，代价最小。
+    """
+    ok = True
+    for name in moved:
+        src, dst = target / name, REPO / name
+        if not src.exists():
+            continue
+        if move_item(src, dst):
+            print(f"  [回滚] {name} 已搬回原路径")
+        else:
+            ok = False
+            print(f"  [回滚失败] {name}: 请手动把 {src} 搬回 {dst}", file=sys.stderr)
+    if not ok:
+        print("\n  ⚠ 自动回滚未完成。也可稍后执行："
+              "python microbench/move_vault_to_cloud.py --undo", file=sys.stderr)
+    return ok
+
+
 def do_move(apply: bool) -> int:
     cloud = detect_cloud_dir()
     if not cloud:
@@ -139,10 +167,20 @@ def do_move(apply: bool) -> int:
     print(f"原路径     : {REPO}")
     print()
 
-    if is_junction(REPO):
-        print("原路径已经是 junction 了 —— 已经搬过了。")
-        print(f"  -> {os.readlink(REPO) if os.path.islink(REPO) else '(reparse point)'}")
-        return 0
+    # 2026-11-09 审计：这里原来查的是 REPO **本身**是不是 junction，
+    # 而仓库根永远不是（junction 是它下面的每个内容目录），所以「已经搬过」
+    # 从来检测不出来 —— 另一台设备先搬过时，所有 dst.exists() 命中跳过，
+    # moved 为空却打印「搬迁完成」，两台各传各的、永不合并。
+    already = [n for n in VAULT_ITEMS if is_junction(REPO / n)]
+    if already:
+        if len(already) == len(VAULT_ITEMS):
+            print("vault 内容目录已经全部是 junction —— 已经搬过了，不要重复执行。")
+            return 0
+        print(f"⚠ 检测到部分目录已是 junction：{', '.join(already)}")
+        print("  这可能是另一台设备先搬过，或上次执行中断留下的半成品。")
+        print("  继续搬会造成两台数据分叉。请先按 AGENTS.md §4.4 的三步顺序核对")
+        print("  云端目录，或执行 --undo 回滚后重来。")
+        return 1
 
     items = [REPO / n for n in VAULT_ITEMS if (REPO / n).exists()]
     if not items:
@@ -176,7 +214,18 @@ def do_move(apply: bool) -> int:
             moved.append(it.name)
         else:
             print(f"  [失败] {it.name}")
+            print("\n搬迁未完成，正在把已搬走的目录回滚到原路径 ...",
+                  file=sys.stderr)
+            rollback_moved(moved, target)
             return 1
+
+    if not moved:
+        print("\n⚠ 一个目录都没有搬成（云端多半已有同名目录）。"
+              "\n  这可能意味着另一台设备已经搬过 vault —— 直接在这里再建一次"
+              "\n  junction 会让两台各写各的、永不合并。请按 AGENTS.md §4.4 的"
+              "\n  三步顺序核对云端目录后再操作；必要时用 --undo 回滚。",
+              file=sys.stderr)
+        return 1
 
     print()
     print("建立 junction (原路径指向新位置) ...")
@@ -194,6 +243,7 @@ def do_move(apply: bool) -> int:
     if not ok:
         print("\n有 junction 没建成功 —— 原路径现在是空的，文件都在云盘目录里。")
         print(f"手动补:  mklink /J \"{REPO / moved[0]}\" \"{target / moved[0]}\"")
+        print("或整体回滚:  python microbench/move_vault_to_cloud.py --undo")
         return 1
 
     print()

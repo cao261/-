@@ -127,6 +127,33 @@ def _pin_sync_root(tmp_path, monkeypatch):
     monkeypatch.setenv("ANNOTATIONS_DIR", str(shared))
 
 
+@pytest.fixture(autouse=True)
+def _pin_logs_write_paths(request, monkeypatch, tmp_path):
+    """把 import 期就固化到真实 `logs/` 的三个写路径也钉进临时目录。
+
+    AUDIT_2026-11-09 B2：`_pin_sync_root` 只钉了同步根，而
+      - `pdf_cache.CACHE_DIR`       = `_REPO_ROOT/logs/pdf_extract_cache`
+      - `app.GLYPH_DICT_PATH`      = `Path(BASE_DIR)/logs/glyph_dict.json`
+      - `glyphs.DEFAULT_DICT_PATH` = 相对 cwd 的 `logs/glyph_dict.json`
+    都是模块导入时算好的，patch `BASE_DIR` 完全管不到。而 `logs/` 就在
+    vault 根、会被坚果云同步（H-1 已实测过测试写进共享目录）。
+
+    只对**显式使用 sandbox** 的测试生效：`vault_client` 那类读真库的
+    只读用例不该被改路径。
+    """
+    if "sandbox" not in request.fixturenames:
+        return
+    from microbench import app as app_mod
+    from microbench import glyphs as glyphs_mod
+    from microbench import pdf_cache as pdf_cache_mod
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(app_mod, "GLYPH_DICT_PATH", logs / "glyph_dict.json")
+    monkeypatch.setattr(pdf_cache_mod, "CACHE_DIR", logs / "pdf_extract_cache")
+    monkeypatch.setattr(glyphs_mod, "DEFAULT_DICT_PATH", logs / "glyph_dict.json")
+
+
 @pytest.fixture()
 def sandbox(tmp_path, monkeypatch) -> Path:
     """Redirect BASE_DIR at both `generator` and `app` to a temp vault.

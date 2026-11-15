@@ -18,6 +18,28 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "BASE_DIR", vault)
     monkeypatch.setattr(app, "_sync_root", lambda: sync)
     monkeypatch.setenv("ANNOTATIONS_DIR", str(sync))
+
+    # ⚠ env 必须是**完整的**沙箱，不能只钉一半（2026-11-15 独立审查发现）：
+    #   元护栏 tests/test_guard_efficacy.py 把 `env` 和 `sandbox` 同等看待
+    #   （「自己 new TestClient 的测试必须先把 vault 指向临时目录」），
+    #   但 env 原来只钉了 app.BASE_DIR + 同步根，**没钉**：
+    #     * generator.BASE_DIR —— 写卡片/笔记走它 → 会落进**用户真实 vault**
+    #       （01_Literature 是坚果云 junction → 直接同步到另一台设备）；
+    #     * pdf_cache.CACHE_DIR / glyphs.DEFAULT_DICT_PATH /
+    #       app.GLYPH_DICT_PATH —— import 期就固化的 logs 路径 → 写真实 logs/。
+    #   今天这 13 个用例还没触发这些写路径（属潜伏隐患），但「元护栏说它
+    #   是沙箱」和「它其实只沙箱了一半」之间不能留这种缝。
+    from microbench import generator as gen_mod
+    from microbench import glyphs as glyphs_mod
+    from microbench import pdf_cache as pdf_cache_mod
+
+    monkeypatch.setattr(gen_mod, "BASE_DIR", vault)
+    logs = vault / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(app, "GLYPH_DICT_PATH", logs / "glyph_dict.json")
+    monkeypatch.setattr(pdf_cache_mod, "CACHE_DIR", logs / "pdf_extract_cache")
+    monkeypatch.setattr(glyphs_mod, "DEFAULT_DICT_PATH", logs / "glyph_dict.json")
+    gen_mod._invalidate_vault_stats_cache()
     return app, vault, sync
 
 

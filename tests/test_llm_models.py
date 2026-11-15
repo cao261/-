@@ -7,6 +7,7 @@
   - 付费模型不吃速率限制，只有免费版 Agnes 有限制
   - 表格靠多模态读图 → 抄表失败不能把"这里没有表格"当表格拼进译文
 """
+import asyncio
 import os
 
 import pytest
@@ -177,19 +178,53 @@ def test_markdown_table_detection():
     assert app_mod._looks_like_markdown_table("   ") is False
 
 
-def test_table_read_failure_has_fallback_text():
-    """抄表失败 → 译文里放兜底提示，不是空白。"""
-    src = (app_mod.__file__ and open(app_mod.__file__, encoding="utf-8").read())
-    assert "【表格未能读出，请对照左侧 PDF 原文】" in src
+def test_table_read_failure_has_fallback_text(monkeypatch):
+    """抄表失败 → 译文里放兜底提示，不是空白（行为级）。
+
+    ⚠ 原写法是 `assert "【表格未能读出，请对照左侧 PDF 原文】" in src` ——
+    那句字只要还在源码里就绿，哪怕它被挪到了没人调用的分支、
+    或者拼错了半个字也照样绿（2026-11-10 审计 F5）。
+    现在真让抄表失败一次，看**产物**里是不是那句兜底提示。
+    """
+    from microbench import app as app_mod
+
+    async def boom(pdf_path, page, rect, model=""):
+        raise RuntimeError("模拟多模态抄表失败")
+
+    monkeypatch.setattr(app_mod, "_read_table_vision", boom)
+    page_text = "前文 ⟦TABLE:10,20,100,50⟧ 后文"
+    _out, tables = asyncio.run(
+        app_mod._prepare_tables(page_text, None, 1, "Agnes-3.0-Flash"))
+    assert tables.get("⟦TABLE_0⟧") == "【表格未能读出，请对照左侧 PDF 原文】", (
+        f"抄表失败时没有兜底提示（译文里会是一片空白）: {tables}")
 
 
-def test_prepare_tables_passes_model_through():
-    """整页翻译这条主路径必须把用户选的模型传给表格读图。"""
-    src = open(app_mod.__file__, encoding="utf-8").read()
-    assert "await _prepare_tables(page_text, pdf_path, req.page, req.model)" in src, \
-        "翻译路径的表格读图没有跟随所选模型"
-    assert "await _read_table_vision(pdf_path, page, rect, model)" in src, \
-        "_prepare_tables 没有把 model 传给 _read_table_vision"
+def test_prepare_tables_passes_model_through(monkeypatch):
+    """整页翻译这条主路径必须把用户选的模型传给表格读图（行为级）。
+
+    ⚠ 原写法是
+    `assert "await _prepare_tables(page_text, pdf_path, req.page, req.model)" in src`
+    —— 源码里那行字还在就绿，但中间**任何一层**把 model 丢了，
+    护栏毫无察觉（这正是 2026-10-25 那次「表格偷跑 M3」的同类问题）。
+    现在把 _read_table_vision 换成探针，直接看它收到的 model。
+    """
+    from microbench import app as app_mod
+
+    seen: list = []
+
+    async def probe(pdf_path, page, rect, model=""):
+        seen.append(model)
+        return "| a | b |"
+
+    monkeypatch.setattr(app_mod, "_read_table_vision", probe)
+    page_text = "前文 ⟦TABLE:10,20,100,50⟧ 后文"
+    out, tables = asyncio.run(
+        app_mod._prepare_tables(page_text, None, 1, "Agnes-3.0-Flash"))
+
+    assert seen == ["Agnes-3.0-Flash"], (
+        f"表格读图没用用户选的模型: {seen}")
+    assert "⟦TABLE_0⟧" in out, "表格标记没换成中性标记"
+    assert tables.get("⟦TABLE_0⟧") == "| a | b |", "抄出来的表格没进表字典"
 
 
 # ---------------------------------------------------------------------------

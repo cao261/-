@@ -270,7 +270,10 @@ def test_stderr_log_redacts_secrets():
 def test_friendly_error_text_is_exported():
     """llm.friendly_error_text 要能从模块外面调到（app.py 用它）。"""
     assert callable(llm.friendly_error_text)
-    assert "friendly_error_text" in llm.__all__ or True  # __all__ 不强制
+    # 2026-11-09 第 2 批：原来是 `... or True` 恒真断言，改坏导出也照样绿。
+    # app.py 按名字调用这个函数，__all__ 里必须真的有它。
+    assert "friendly_error_text" in llm.__all__, \
+        "app.py 直接按名字调用 friendly_error_text，必须显式导出"
 
 
 if __name__ == "__main__":

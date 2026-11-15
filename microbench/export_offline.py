@@ -39,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,6 +71,69 @@ VAULT_DIRS = [
 ]
 
 KATEX_DIST = HERE / "_vendor" / "node_modules" / "katex" / "dist"
+
+
+def missing_katex_assets(*, need_js: bool = False) -> list[str]:
+    """缺哪些 KaTeX 运行时文件（2026-11-09 审计）。
+
+    `.gitignore` 忽略 `microbench/_vendor/node_modules/`，全新 clone 没跑
+    npm install 时 `build_katex_css()` 返回空串、`katex_js=""` —— 原来
+    **一声不吭**照样导出并打印「完成」，平板端公式全部不可用。宁可让导出
+    失败，也不能用残废版覆盖上一版好的交付物。
+    """
+    wanted = [("样式", KATEX_DIST / "katex.min.css")]
+    if need_js:
+        wanted.append(("运行时", KATEX_DIST / "katex.min.js"))
+    return [f"{label} {p}" for label, p in wanted if not p.exists()]
+
+
+# 缺 KaTeX 时给用户的**可执行**修复步骤（2026-11-10 审计 F6）。
+#
+# 原来写的是「见根目录 _vendor_assets.py」—— 那个脚本被 .gitignore 的
+# `/_*.py` 忽略，**根本不在仓库里**；而且它管的是 `static/vendor/`
+# （那份是入库的），跟这里要的 `microbench/_vendor/node_modules/katex`
+# 完全是两回事。照着原提示走，对方设备只会更困惑。
+#
+# 现在指向仓库里真实存在、且真能复现的东西：
+# `microbench/_vendor/package.json` + `package-lock.json`（已入库，锁 katex 0.19.0）。
+KATEX_MISSING_HINT = (
+    "请先安装 KaTeX（需要 Node.js）：\n"
+    "    cd microbench/_vendor\n"
+    "    npm install --registry=https://registry.npmmirror.com\n"
+    "  版本由 microbench/_vendor/package.json + package-lock.json 锁定（katex 0.19.0）。"
+)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """同目录唯一临时文件 + os.replace，绝不留下半截 HTML。
+
+    交付物是用户直接拷到平板上打开的**单文件**；写盘中断/磁盘满时
+    原来的 `write_text` 会把上一版好文件截断成半截 HTML。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    fd_taken = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd_taken = True
+            fh.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        if not fd_taken:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
 
 # Placeholders for extracted math. These have to survive Python-Markdown
 # untouched, so they use only word characters and @.
@@ -1083,6 +1147,18 @@ def export_once(out_path: Path, quiet: bool = False) -> bool:
         if not quiet:
             print(*a)
 
+    # ⚠ 资源检查必须在**最前面**（2026-11-10 审计 F3）：
+    #   原来这个检查排在 render_formulas() 之后 —— 而 render_formulas
+    #   正是「用 KaTeX 渲染公式」那一步，缺资源时它已经跑过了（要么直接
+    #   失败，要么留下未渲染的残骸），再拒绝导出已经是马后枪。
+    #   而且 export_tablet 的同名检查本来就在最前面 —— 两个入口口径必须一致。
+    missing = missing_katex_assets()
+    if missing:
+        print("[导出器] 缺少 KaTeX 资源，拒绝导出（已有产物不会被覆盖）:\n  "
+              + "\n  ".join(missing) + "\n  " + KATEX_MISSING_HINT,
+              file=sys.stderr)
+        return False
+
     say(f"[1/4] 扫描 vault ...")
     notes = collect_notes()
     if not notes:
@@ -1116,9 +1192,11 @@ def export_once(out_path: Path, quiet: bool = False) -> bool:
         offset += len(per_note[i])
         n.search_text = re.sub(r"[#*`$|>\[\]()]", " ", n.body)
 
+    # 资源检查已在函数最前面做过（缺 KaTeX 早就返回 False 了）。
+    # 这里再取一次样式即可 —— 走到这行说明资源齐全。
     katex_css = build_katex_css()
     doc = build_html(notes, katex_css)
-    out_path.write_text(doc, encoding="utf-8")
+    _atomic_write_text(out_path, doc)
 
     size_kb = out_path.stat().st_size / 1024
     say(f"\n  完成: {out_path}")
@@ -1230,10 +1308,16 @@ def collect_translations() -> dict:
     snap_dir = REPO / "logs" / "_pdf_snapshots"
     if not snap_dir.is_dir():
         return out
+    skipped = 0
     for fp in sorted(snap_dir.glob("*.json")):
         try:
             data = json.loads(fp.read_text(encoding="utf-8"))
+            # 合法 JSON 但顶层是 [] / 字符串时，下面的 data.get 会抛
+            # AttributeError 让整个导出崩（2026-11-09 审计）。
+            if not isinstance(data, dict):
+                raise ValueError("顶层不是对象")
         except (OSError, ValueError):
+            skipped += 1
             continue
         if data.get("extractor_version") != EXTRACTOR_VERSION:
             continue    # 旧算法翻的 —— 不给平板看
@@ -1248,6 +1332,10 @@ def collect_translations() -> dict:
                 pages[str(pn)] = t
         if pages:
             out[fp.stem] = pages
+    if skipped:
+        print(f"[导出器] ⚠ 跳过 {skipped} 份损坏 / 格式非法的译文快照"
+              f"（已烤入 {len(out)} 篇；损坏文件请检查 logs/_pdf_snapshots/）",
+              file=sys.stderr)
     return out
 
 
@@ -1335,6 +1423,19 @@ def export_tablet(out_path: Path, quiet: bool = False) -> bool:
         if not quiet:
             print(*a)
 
+    # 2026-11-09 审计：这两个「静默降级」原来都会照常写盘并返回 True，
+    # 把上一版好的单文件换成无译文 / 无公式的残废版。前置拒绝，绝不覆盖。
+    missing = missing_katex_assets(need_js=True)
+    if missing:
+        print("[导出器] 缺少 KaTeX 资源，拒绝导出（已有产物不会被覆盖）:\n  "
+              + "\n  ".join(missing) + "\n  " + KATEX_MISSING_HINT,
+              file=sys.stderr)
+        return False
+    if current_extractor_version() is None:
+        print("[导出器] 取不到抽取算法版本，译文按 fail-closed 全部跳过；"
+              "拒绝导出，以免用「无译文版」覆盖已有产物。", file=sys.stderr)
+        return False
+
     say("[tablet] 扫描 vault ...")
     notes = collect_notes()
     if not notes:
@@ -1370,7 +1471,7 @@ def export_tablet(out_path: Path, quiet: bool = False) -> bool:
 
     say("[tablet] 组装单文件 ...")
     doc = build_tablet_html(notes, katex_css, pdfjs)
-    out_path.write_text(doc, encoding="utf-8")
+    _atomic_write_text(out_path, doc)
     say(f"[tablet] 完成: {out_path}  ({out_path.stat().st_size/1024:.0f} KB)")
     return True
 
@@ -1481,9 +1582,25 @@ def main() -> int:
                 last = fp
                 ts = __import__("datetime").datetime.now().strftime("%H:%M:%S")
                 print(f"[watch {ts}] 检测到变化,重新导出 ...")
-                export(out_path, quiet=True)
-                print(f"[watch {ts}] 完成 "
-                      f"({out_path.stat().st_size/1024:.0f} KB)")
+                # 2026-11-09 审计：原来忽略返回值（失败仍打印「完成」），
+                # 且 out_path.stat() 在产物不存在时抛 FileNotFoundError；
+                # 单轮异常没有兜底 → 整个 watch 进程退出。
+                try:
+                    ok = export(out_path, quiet=True)
+                except Exception as e:
+                    ok = False
+                    print(f"[watch {ts}] 导出异常，保留上一版产物: {e}",
+                          file=sys.stderr)
+                if ok:
+                    try:
+                        size = out_path.stat().st_size / 1024
+                    except OSError:
+                        size = 0
+                    print(f"[watch {ts}] 完成 ({size:.0f} KB)")
+                else:
+                    print(f"[watch {ts}] 本轮失败，已保留上一版产物，下一轮重试",
+                          file=sys.stderr)
+                    last = None   # 强制下轮重试，别等文件内容再次变化
             time.sleep(args.watch)
     except KeyboardInterrupt:
         print("\n[watch] 已退出")

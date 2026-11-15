@@ -181,6 +181,12 @@ git ls-files --eol <改过的文件>        # 确认 i/lf w/lf
 python -m pytest tests -q -m "not slow"   # 全绿（⚠ 漏了 -m 会卡在网络测试上）
 ```
 
+📌 **2026-11-09 第 2 批**：根目录新增 `pytest.ini`（`addopts = -m "not slow"`），
+现在**直接 `pytest` 也默认排除 slow**，不会再卡在 arxiv 下载上；命令行显式
+给 `-m` 仍可覆盖。另新增 `constraints.txt` 锁定 16 个直接依赖的实测版本，
+新设备/重建环境用 `pip install -r requirements.txt -c constraints.txt`，
+避免两台装出不同依赖树（`requirements.txt` 本身保持 `>=` 不动）。
+
 ---
 
 ## 3. 架构速览：改哪里
@@ -3142,6 +3148,108 @@ in async functions` 一行就点破了。
 > **教训**：生成 PDF 这类"看着差不多"的活，**判据必须是可量化的**——
 > 「取回来的文字 == 写进去的文字」「替换页里搜得到『材料』」
 > 「图片数量与原文页一致」，而不是"打开看了一眼挺像"。
+
+---
+
+### 4.83 合并两台设备的改动：同一函数两边都改时是「**两侧都要**」，不是二选一（2026-11-15）
+
+两台设备各干各的，push/pull 时同一个函数被两边改 → git 冲突。
+直觉是「挑一边」——**错**：两边改的是**不同维度**，挑任何一边都会静默丢掉另一边的修复。
+
+2026-11-15 合并实测（云端 8 个提交 + 本机一批未提交的审计修复）：
+
+| 冲突点 | 云端改的 | 本机改的 | 正确解法 |
+|---|---|---|---|
+| `api_pdf_snapshot_save` | 加 `_ensure_snapshot_dir()`（写路径才建目录） | 读-合-写全程持锁 + `_read_json_or_quarantine` | **都要**：保留锁结构，把 `_ensure_snapshot_dir()` 挪进临界区、写在真正写盘**之前** |
+| `/api/sync` 返回体 | `root` 换成 `_sync_root_display()`（远端不回显本机绝对路径） | 加 `errors` / `error_count`（单项失败不再被吞） | **都要**：字段并列 |
+
+判据：**两边改的是不是同一件事？**
+- 同一件事（同一个判据、同一段逻辑）→ 挑更严的那版，并写清为什么；
+- 不同的事（一个改并发安全、一个改隐私回显）→ **合并成同时具备**。
+
+冲突解决完**必须**做的事：① 两侧的**字段/调用**逐个 grep 确认还在；
+② 跑全量测试（合并后套件比单边大得多，本机 649 项 → 合并后 853 项）。
+
+> ⚠ 元护栏（`tests/test_guard_efficacy.py`）跨设备会**互相打架**：
+> 本机的「自己 new TestClient 必须带 sandbox」「源码文本护栏条数不得增长」
+> 两条，会被**云端新写的测试文件**触发变红。
+> 这不是护栏错了，是**合并后世界的基线变了** → 上限类护栏要按合并后的实测值重设，
+> 并在注释里写明「涨了多少、谁带来的、为什么现在还不能降」。
+> 硬把上限钉在旧值 → 护栏变成摆设（下次没人知道它已经失效）。
+
+---
+
+### 4.84 依赖锁（constraints.txt）的下限必须**跟着 requirements.txt 一起抬**（2026-11-15）
+
+`constraints.txt` 钉死 16 个直接依赖的精确版本，`requirements.txt` 只写 `>=`。
+两边各说各话 → 新设备照着文档装**根本装不上**：
+
+```
+云端把 requirements.txt 的 Pillow 下限抬到 >=13.0.0（40+ 个 CVE 在此修复）
+本机 constraints.txt 仍钉 pillow==12.3.0
+→ pip install -r requirements.txt -c constraints.txt → ResolutionImpossible
+```
+
+**没有报错会提醒你**，直到某台新设备重装环境才炸。
+
+→ 合并后**第一件事**就是核对：`requirements.txt` 里每个被抬过的下限，
+在 `constraints.txt` 里是不是也已经抬了。核对方法：
+`git diff HEAD origin/main -- requirements.txt` 看改了哪些下限，
+再逐个比对 `constraints.txt` 与 `pip list` 的实际版本。
+
+> 教训：版本锁文件不是「一次性写完就完」的 —— 它是 requirements 的**镜像**，
+> requirements 动了它必须跟着动，否则锁文件本身就成了安装失败的元凶。
+
+---
+
+### 4.85 「读不出来」≠「内容损坏」—— 隔离机制会**把好文件改名**（2026-11-15）
+
+独立审查 P1-1 实测：`_read_json_or_quarantine()` 的 except 里混着 `OSError`，
+于是 Windows 上文件被坚果云客户端 / 杀软 / 别的进程短暂占用（`PermissionError`）时，
+**内容完全健康**的快照会被改名成 `<id>.json.corrupt-<时间戳>`：
+
+- 译文从界面上消失（读者按 `<id>.json` 找，找不到）；
+- 用户以为自己的译文没了 → 重翻 → **白烧 token**；
+- 而文件其实一秒后就能正常读。
+
+→ 隔离只对**内容级损坏**生效（解码失败 / JSON 坏 / 顶层不是对象），
+**瞬时 I/O 故障一个字节都不许动**，只报错让用户重试：
+
+| 情况 | 处理 |
+|---|---|
+| 内容坏（UTF-8 / JSON / 顶层不是对象） | 改名隔离 + 报错（人工可恢复） |
+| 瞬时占用（PermissionError 等） | **不动文件**，报错让人重试 |
+| 文件刚好不存在（exists 与 read 之间被删） | 当成「没有旧值」，不是损坏 |
+
+配套做法：
+- 瞬时故障用**单独的异常类型**（本项目 `_TransientReadError(ValueError)`）——
+  继承 ValueError 是为了兼容既有 `except ValueError` → HTTP 500 的调用点，
+  但要能分辨「损坏」和「占用」，用户看到的提示才不会被误导。
+- 反向验证（必须做）：把旧实现装回内存 → 新护栏**必须变红**。
+  实测：退回旧实现后 2 条护栏变红，日志里直接印出
+  「已隔离为 transient_lock_snapshot_paper.json.corrupt-20261115-125858」= bug 现场；
+  同时「真损坏必须隔离」那几条**保持绿**（说明没写过头）。
+
+> 教训：**任何"隔离/备份/改名"机制，触发条件都要按「东西真的坏了」来写**。
+> 把「读不到」也算成「坏了」，隔离机制就从保护者变成了破坏者。
+
+### 4.86 元护栏认可的 fixture 必须是**完整**沙箱，不能是半个（2026-11-15）
+
+独立审查同时发现：`tests/test_guard_efficacy.py` 的元护栏把
+`env` 和 `sandbox` **同等看待**（自己 new TestClient 的测试必须先把 vault 指向临时目录），
+但 `tests/test_sync_files.py` 的 `env` 只钉了 `app.BASE_DIR` + 同步根：
+
+- 没钉 `generator.BASE_DIR` → 写卡片/笔记会落进**用户真实 vault**
+  （`01_Literature` 是坚果云 junction → 直接同步到另一台设备）；
+- 没钉 `pdf_cache.CACHE_DIR` / `glyphs.DEFAULT_DICT_PATH` / `app.GLYPH_DICT_PATH`
+  → import 期就固化的 logs 路径照样写真实 `logs/`。
+
+今天这 13 个用例还没触发这些写路径（属**潜伏**隐患，不是现行 bug），
+但「元护栏说它是沙箱」与「它其实只沙箱了一半」之间不能留缝。
+→ 已把 `env` 补成完整沙箱（四个写路径全钉）。
+
+> 教训：**护栏的"白名单"必须有依据**。把一个 fixture 写进白名单 =
+> 承诺「用它就等于沙箱化」；做不到就别写进白名单，要么补齐，要么从白名单里拿掉。
 
 ---
 

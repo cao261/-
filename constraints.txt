@@ -1,0 +1,37 @@
+# MicroBench 依赖版本锁（2026-11-09 审计第 2 批）
+#
+# 为什么需要：requirements.txt 全部是 `>=` 且无上限，两台设备同步同一个
+# commit 也可能装出不同的依赖树（pydantic 2→3、numpy 2.x、pywebview 6.x
+# 都是潜在 break 点），出现「一台全绿、另一台莫名其妙报错」。
+#
+# 用法（新设备 / 重建环境）：
+#     pip install -r requirements.txt -c constraints.txt
+# 更新（确认新版可用后再提交本文件）：
+#     pip freeze | findstr /I "fastapi uvicorn requests ..."   （或手工核对）
+#
+# 约束文件只限制版本、不负责安装；requirements.txt 仍是依赖清单。
+# 下面是本机 25353 实测可用的精确版本。
+#
+# ⚠ 2026-11-15 合并云端升级时改过一条：
+#   pillow 12.3.0 → 13.0.0。
+#   云端把 requirements.txt 的 Pillow 下限抬到 13.0.0（40+ 个 CVE 在
+#   13.0.0 修复），而本机还钉在 12.3.0 → `pip install -r requirements.txt
+#   -c constraints.txt` 会直接 ResolutionImpossible，新设备根本装不上。
+#   → 约束文件必须与 requirements.txt 的下限**同时抬**，两边不能各说各话。
+
+defusedxml==0.7.1
+fastapi==0.143.0
+httpx==0.28.1
+Jinja2==3.1.6
+Markdown==3.11.2
+numpy==2.5.3
+pdfplumber==0.11.10
+pillow==13.0.0
+pydantic==2.14.0
+pytest==9.1.1
+python-dotenv==1.2.4
+python-multipart==0.0.32
+pywebview==6.2.1
+requests==2.34.2
+Send2Trash==2.1.0
+uvicorn==0.54.0
