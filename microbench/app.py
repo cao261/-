@@ -1989,6 +1989,156 @@ async def api_page_blocks(relative_path: str, page: int = 1):
     }
 
 
+# ---------------------------------------------------------------------------
+# 译文替换版 PDF：「原文页 + 替换页」交替
+# ---------------------------------------------------------------------------
+#
+# 用户诉求（2026-11-15 原话）：
+#   「直接就是原文上直接把翻译打上去……这篇论文一共十页，
+#     然后我翻译完之后就变成二十页。第一页就是原来的那个文章，
+#     第二页就是原来的那个字儿直接削去……然后第三页又是原来的第二页……
+#     然后原本的图表还都保持不变。」
+#
+# 译文从**快照**里拿（对照模式翻好的段落译文 + 段落坐标），
+# 不重新调模型 → 生成一份 PDF 只要一两秒。
+
+_REPLACED_DIR_NAME = "05_译文替换版_PDF"
+_REPLACED_SUFFIX = "_中译替换版"
+
+
+class ReplacedPdfRequest(BaseModel):
+    paper_id: str = Field(..., min_length=3, max_length=128,
+                          description="快照用的 paper_id（与阅读器一致）")
+    relative_path: str = Field(..., min_length=3, max_length=500,
+                               description="源 PDF 在 vault 里的相对路径")
+    out_relative_path: Optional[str] = Field(default=None, max_length=500,
+                                              description="输出路径（默认自动放在主题目录里）")
+
+
+def _default_replaced_out(src_rel: str) -> str:
+    """默认输出位置：主题目录下的 `05_译文替换版_PDF/`（与 `01_论文原文_PDF/` 平级）。
+
+    ⚠ 不能放进 `01_论文原文_PDF/` —— 那个目录名说的是「论文原文」，
+    混进中译替换版会让「从仓库论文库打开」的列表出现同名同源的两份 PDF。
+    """
+    rel = (src_rel or "").replace("\\", "/")
+    parent, _, name = rel.rpartition("/")
+    stem = name[:-4] if name.lower().endswith(".pdf") else name
+    parts = parent.split("/") if parent else []
+    if parts and parts[-1] == "01_论文原文_PDF":
+        parts = parts[:-1]
+    parts.append(_REPLACED_DIR_NAME)
+    return "/".join([p for p in parts if p] + [stem + _REPLACED_SUFFIX + ".pdf"])
+
+
+@app.post("/api/paper/build_replaced_pdf")
+async def api_build_replaced_pdf(req: ReplacedPdfRequest):
+    """生成「原文页 + 替换页」交替的译文替换版 PDF。
+
+    - 原文页**原样保留**；替换页 = 同一页，正文英文被抹掉、中文原地填回，
+      **图表 / 公式 / 矢量图一个不动**（PyMuPDF redaction 只删文字）。
+    - 译文来自**快照**（对照模式翻好的段落译文）→ 不额外调模型。
+    - 段落切分算法变了（blocks_version 对不上）→ **直接报错**，
+      因为旧段落译文的坐标可能已经错位，贴上去会串行。
+    """
+    from .replaced_pdf import Block, build_replaced_pdf
+
+    try:
+        src_path = _safe_path(BASE_DIR, req.relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    if not src_path.exists() or src_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
+
+    # ---- 译文来源：快照 ----
+    snap = _safe_read_json(_snapshot_path(req.paper_id))
+    if not snap:
+        raise HTTPException(
+            status_code=404,
+            detail="还没有这篇论文的翻译快照 —— 先在阅读器里用「🔀 对照」翻几页并「保存快照」")
+    pages_raw = snap.get("pages") or []
+    if not pages_raw:
+        raise HTTPException(status_code=404, detail="快照里没有已翻译的页面")
+
+    # ---- 版本闸门：段落坐标变了就不能贴旧译文 ----
+    from .bilingual import BLOCK_TRANSLATION_VERSION
+    saved_ver = None
+    for pg in pages_raw:
+        if isinstance(pg, dict) and pg.get("blocks_version") is not None:
+            saved_ver = int(pg.get("blocks_version"))
+            break
+    if saved_ver is None:
+        raise HTTPException(
+            status_code=409,
+            detail="快照里没有段落级译文（blocks）—— 请用「🔀 对照」模式翻几页并保存快照")
+    if saved_ver != BLOCK_TRANSLATION_VERSION:
+        raise HTTPException(
+            status_code=409,
+            detail="段落切分算法已升级（v%d → v%d），旧的段落译文坐标可能错位，"
+                   "请重新用「🔀 对照」翻一次" % (saved_ver, BLOCK_TRANSLATION_VERSION))
+
+    page_blocks: dict = {}
+    for pg in pages_raw:
+        if not isinstance(pg, dict):
+            continue
+        try:
+            pno = int(pg.get("page_num") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pno < 1:
+            continue
+        blocks = []
+        for b in (pg.get("blocks") or []):
+            if not isinstance(b, dict):
+                continue
+            bbox = b.get("bbox") or []
+            if len(bbox) < 4:
+                continue
+            blocks.append(Block(
+                index=int(b.get("i") or 0),
+                bbox=(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+                translation=b.get("translation") or "",
+                kind=b.get("kind") or "body",
+                col=b.get("col") or "S",
+            ))
+        if blocks:
+            page_blocks[pno] = blocks
+    if not page_blocks:
+        raise HTTPException(status_code=409, detail="快照里没有可用的段落译文")
+
+    # ---- 输出路径 ----
+    out_rel = (req.out_relative_path or "").strip() or _default_replaced_out(req.relative_path)
+    try:
+        out_path = _safe_path(BASE_DIR, out_rel)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法输出路径: {_safe_err(e)}")
+    if out_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="输出必须是 .pdf")
+    # ⚠ 不允许覆盖源文件（会把原文搞没）
+    try:
+        if out_path.resolve() == src_path.resolve():
+            raise HTTPException(status_code=400, detail="输出路径不能和源 PDF 相同")
+    except OSError:
+        pass
+
+    # ---- 构建（CPU/IO 重活 → 丢线程池，别占事件循环）----
+    t0 = time.time()
+    try:
+        stats = await asyncio.to_thread(
+            build_replaced_pdf, src_path, out_path, page_blocks)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"生成译文替换版失败: {_safe_err(e)}")
+    elapsed = round((time.time() - t0) * 1000)
+    d = stats.as_dict()
+    d.update({
+        "ok": True,
+        "out_relative_path": out_rel.replace("\\", "/"),
+        "out_size_bytes": out_path.stat().st_size if out_path.exists() else 0,
+        "elapsed_ms": elapsed,
+    })
+    return d
+
+
 async def _prepare_tables(page_text: str, pdf_path, page: int, model: str = "") -> tuple[str, dict]:
     """把页面文本里的 ⟦TABLE:...⟧ 标记换成中性的 ⟦TABLE_n⟧，
     并把多模态抄出来的表格存起来（翻译完再按位置拼回去）。

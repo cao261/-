@@ -321,6 +321,92 @@ async function runSuite(focusSrc, label) {
       "应有 2600ms 自动收起定时器，实际 " + JSON.stringify(calls));
   });
 
+  await check("滚轮上滑 / 滚到底：都**不**唤出工具条（用户：滚轮不唤出）", () => {
+    const env2 = makeEnv();
+    const api2 = buildApi(focusSrc, env2);
+    api2.enterZenMode();
+    api2._initZenMode();
+    const modal2 = env2.elements["reader-modal"];
+    // 模拟「在译文栏往上滚」—— 事件带齐旧实现会看的那几个字段
+    const scroller = {
+      scrollTop: 300, scrollHeight: 4000, clientHeight: 800,
+      closest() { return null; },
+    };
+    env2.document._fire("scroll", { target: scroller });
+    assert(!modal2.classList.contains("zen-bar-open"),
+      "滚轮上滑不该唤出工具条（用户原话：不要我一往上滑就出来）");
+    // 再滚到底
+    scroller.scrollTop = 3900;
+    env2.document._fire("scroll", { target: scroller });
+    assert(!modal2.classList.contains("zen-bar-open"),
+      "滚到底也不该唤出工具条");
+  });
+
+  await check("鼠标移到屏幕最上面 → 工具条滑出", () => {
+    const env2 = makeEnv();
+    const api2 = buildApi(focusSrc, env2);
+    api2.enterZenMode();
+    api2._initZenMode();
+    const modal2 = env2.elements["reader-modal"];
+    env2.document._fire("mousemove", { clientY: 20, target: modal2 });
+    assert(modal2.classList.contains("zen-bar-open"),
+      "鼠标到屏幕最上面应滑出工具条");
+  });
+
+  await check("鼠标停在屏幕中间 → 不唤出工具条", () => {
+    const env2 = makeEnv();
+    const api2 = buildApi(focusSrc, env2);
+    api2.enterZenMode();
+    api2._initZenMode();
+    const modal2 = env2.elements["reader-modal"];
+    env2.document._fire("mousemove", { clientY: 300, target: modal2 });
+    assert(!modal2.classList.contains("zen-bar-open"),
+      "鼠标不在顶部就不该弹工具条");
+  });
+
+  await check("指针停在最上面 → 自动收起定时器到点也不收（还扶着它）", () => {
+    const env2 = makeEnv();
+    const api2 = buildApi(focusSrc, env2);
+    api2.enterZenMode();
+    api2._initZenMode();
+    const modal2 = env2.elements["reader-modal"];
+    const realSetTimeout = global.setTimeout;
+    let cb = null;
+    global.setTimeout = (fn, ms) => { if (ms === 2600 && !cb) cb = fn; return 0; };
+    try {
+      env2.document._fire("mousemove", { clientY: 20, target: modal2 });
+    } finally {
+      global.setTimeout = realSetTimeout;
+    }
+    assert(modal2.classList.contains("zen-bar-open"), "鼠标在最上面应滑出工具条");
+    assert(cb, "没挂上 2600ms 的自动收起定时器");
+    cb();   // 定时器到点
+    assert(modal2.classList.contains("zen-bar-open"),
+      "指针还停在最上面时不该自动收起 —— 收了用户还得再扫一次鼠标");
+  });
+
+  await check("指针离开最上面 → 自动收起定时器到点会收起", () => {
+    const env2 = makeEnv();
+    const api2 = buildApi(focusSrc, env2);
+    api2.enterZenMode();
+    api2._initZenMode();
+    const modal2 = env2.elements["reader-modal"];
+    const realSetTimeout = global.setTimeout;
+    let cb = null;
+    global.setTimeout = (fn, ms) => { if (ms === 2600 && !cb) cb = fn; return 0; };
+    try {
+      env2.document._fire("mousemove", { clientY: 20, target: modal2 });
+      env2.document._fire("mousemove", { clientY: 400, target: modal2 });
+    } finally {
+      global.setTimeout = realSetTimeout;
+    }
+    assert(modal2.classList.contains("zen-bar-open"), "工具条应已滑出");
+    assert(cb, "没挂上自动收起定时器");
+    cb();
+    assert(!modal2.classList.contains("zen-bar-open"),
+      "指针已经离开最上面 → 定时器到点应收起工具条");
+  });
+
   await check("章节导航 / AI 提问区：各自独立开关", () => {
     api.enterZenMode();
     api.toggleZenNav();
@@ -622,6 +708,12 @@ const MUTATIONS = [
   { name: "把渲染后的宽度复核去掉（画布停在兜底宽度）", from: 'if (Math.abs(renderW0 - el.clientWidth) > 40) _pdfRelayoutIfNeeded(true);', to: 'if (false) _pdfRelayoutIfNeeded(true);' },
   { name: "把 40px 阈值改成 0（该跳过的也重绘）", from: 'Math.abs(w - last) < 40', to: 'Math.abs(w - last) < 0' },
   { name: "把切单栏的 force 去掉（栏宽变了不重绘）", from: '_zenRelayoutPdf(true); }, 300);', to: '_zenRelayoutPdf(false); }, 300);' },
+  // ↓↓↓ 专注模式「工具条怎么唤出」这一轮的护栏（用户 2026-11-14 要求）
+  { name: "把滚轮触发加回来（滚轮又弹工具条）", from: 'document.addEventListener("scroll", () => {', to: 'document.addEventListener("scroll", () => { _zenOpenBar(false);' },
+  { name: "把鼠标顶部热区判断去掉（任何位置都唤出）", from: "if (!_zenPointerAtTop(e)) return;", to: "/* no hot zone check */" },
+  { name: "把顶部判定带从 40px 改成 0（几乎唤不出来）", from: "const ZEN_TOP_HOTZONE = 40;", to: "const ZEN_TOP_HOTZONE = 0;" },
+  { name: "把「在最上面」的判断函数改坏（永远 false）", from: 'return !!e && typeof e.clientY === "number" && e.clientY <= ZEN_TOP_HOTZONE;', to: "return false;" },
+  { name: "把「指针还在最上面就不收」这条去掉", from: "if (_zenPointerY >= 0 && _zenPointerY <= ZEN_TOP_HOTZONE) return;", to: "/* 总是收 */" },
 ];
 
 async function main() {

@@ -403,20 +403,38 @@ def test_showtoast_accepts_a_duration():
         "showToast 没有 duration 形参 —— 传进去的时长被静默忽略"
 
 
-def test_scroll_position_is_tracked_per_container():
-    """滚动位置必须**按容器**分别记。
+def test_scroll_never_opens_the_zen_toolbar():
+    """滚轮滚动**不得**唤出工具条（用户 2026-11-14 明确要求）。
 
-    独立审查（2026-10-27）抓到的低危缺陷：
-    阅读器里有 4 个滚动容器（章节视图 2 个 + PDF 视图 2 个），
-    共用一个全局 `_zenScrollT` → 在译文栏滚 300px 再到 PDF 栏往上滚 5px
-    会被误判成「大幅往回上滑」→ 工具条凭空滑出。
+    用户原话：「不要就是我一往上滑就出来」。
+    原来「内容区往回上滑 / 滑到最底部 → 工具条滑出」——
+    读书往回看一行，工具条就跳出来打断阅读。
+    现在工具条只认**鼠标动作**：指针到屏幕最上面 / 点顶部细把手。
+
+    ⚠️ 保留一个**空的** scroll 监听是刻意的 —— 它是这条规则的代码锚点，
+    真机自检与变异自检都盯着它（往里塞 _zenOpenBar 就会被抓到）。
     """
     src = _src()
-    assert "let _zenScrollEl = null;" in src, \
-        "没有记录「上次滚动的是哪个容器」—— 多个滚动容器共用一个滚动位置会串台"
+    assert 'document.addEventListener("scroll"' in src, \
+        "专注模式里没有 scroll 监听 —— 「滚轮不唤出」这条规则没有代码锚点，回归抓不住"
     scroll_fn = src[src.index('document.addEventListener("scroll"'):]
     scroll_fn = scroll_fn[:scroll_fn.index("}, true);")]
-    assert "_zenScrollEl" in scroll_fn, "滚动处理里没按容器区分滚动位置"
+    assert "_zenOpenBar" not in scroll_fn, \
+        "滚轮滚动又去开工具条了 —— 用户明确要求：滚轮一律不唤出工具条"
+
+
+def test_zen_toolbar_opens_only_when_the_pointer_is_at_the_top():
+    """工具条只能被「鼠标到了屏幕最上面」唤出（滚轮不算）。"""
+    src = _src()
+    assert "ZEN_TOP_HOTZONE" in src, "没有「屏幕顶部判定带」这个常量"
+    assert "function _zenPointerAtTop(" in src, "没有「鼠标是不是在最上面」的判断函数"
+    move_fn = src[src.index('document.addEventListener("mousemove"'):]
+    move_fn = move_fn[:move_fn.index("});")]
+    assert "_zenPointerAtTop(e)" in move_fn, \
+        "mousemove 没有走 _zenPointerAtTop —— 顶部判定带的语义被绕过了"
+    # 旧的「按容器记滚动位置」那套必须彻底走干净（滚轮已经不参与唤出了）
+    assert "_zenScrollEl" not in src and "ZEN_SCROLL_TOL" not in src, \
+        "还留着「按容器记滚动位置」的旧实现 —— 滚轮已经不该参与唤出工具条了"
 
 
 def test_narrow_screen_overrides_zen_two_columns():

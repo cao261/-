@@ -2031,6 +2031,11 @@
     /* PDF split view */
     #reader-pdf-view { flex: 1; min-height: 0; }
     .pdf-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); height: 100%; min-height: 0; }
+    /* 「中译替换版」：右栏收起 → PDF 独占整栏。
+       ⚠ 只把右栏 display:none **不够** —— .pdf-split 是 grid（两列各 1fr），
+       藏掉第二列后第一列**仍然只占一半宽**（实测 1600px 视口里只有 785px，
+       白白浪费一半屏幕）。→ 必须把列数改成 1。 */
+    .pdf-split.pdf-split-single { grid-template-columns: minmax(0, 1fr); }
     /* scrollbar-gutter: stable —— 滚动条位置**提前占好**。
        不占的话：PDF 画布渲染时容器还没出现滚动条（宽度按"无滚动条"量），
        画布一加进去、竖向滚动条冒出来 → 容器宽度少 15px → 画布比容器宽 →
@@ -4476,6 +4481,13 @@
     // 开着这个开关 → 原页 canvas 不再被藏起来（宽屏左右并排、窄屏上下堆叠）。
     let _bilingualOrigPref = false;
     let _pdfState = null; // { paperId, paperTitle, relativePath, pdfDoc, pages: [{num, canvas, text, translated}], rendering }
+    // 当前打开的是不是「中译替换版」—— 那份 PDF 里已经有中文了，
+    // 不能让翻译队列再翻一遍（§ 见 openPdfDirect 的 opts.replaced）。
+    let _pdfReplacedView = false;
+    // 生成替换版时用的**源**（paper_id + 路径）。
+    // 为什么单独记：生成后阅读器打开的是**替换版**，`_pdfState` 也就变成了它；
+    //   再点一次按钮若还用 `_pdfState` → 会去找「替换版的快照」→ 必然 409。
+    let _pdfReplacedSource = null;
 
     function switchReaderMode(mode, opts = {}) {
       _readerMode = mode;
@@ -4560,11 +4572,14 @@
     // 目标：小屏上只留「论文页 + 译文页」，其余界面默认收起。
     //
     // 唤出工具条的方式（哪种都行，总有一个能用）：
-    //   - 顶部那条 7px 细把手 —— 点一下（再点一下收起）
-    //   - 鼠标移到屏幕最上方 40px
-    //   - 内容区往回上滑（scroll up）/ 滑到最底部
+    //   - 顶部那条 7px 细把手 —— 点一下（展开后常驻）
+    //   - 鼠标移到屏幕最上方 40px（停手 2.6s 自动收起；指针还停在上方就不收）
     //   - 快捷键 Z（切换专注）
     //   - Esc（先收起工具条，再按退出专注）
+    //
+    // ⚠️ **滚轮滚动一律不唤出**（用户 2026-11-14 明确要求）：
+    //    原来「内容区往回上滑 / 滑到最底部」会弹工具条 —— 读书往回看一行，
+    //    工具条就跳出来打断阅读。现在工具条**只认鼠标动作**。
     //
     // 工具条 = 原有 .reader-topbar（不另做一套按钮）→ 既有功能一行不少，
     // 也不会和顶栏分叉出两套行为。
@@ -4576,9 +4591,9 @@
     let _zenMode = false;
     let _zenPref = false;
     let _zenBarTimer = null;
-    let _zenScrollT = 0;
-    let _zenScrollEl = null;      // 上一次滚动的容器（滚动位置按容器分别记）
-    const ZEN_SCROLL_TOL = 4;   // 滚动方向判定容差（px）
+    let _zenPointerY = -1;              // 最近一次鼠标 Y（判断指针是不是还停在最上面）
+    const ZEN_TOP_HOTZONE = 40;         // 鼠标「到了最上面」的判定带（px）
+    const ZEN_BAR_AUTO_CLOSE_MS = 2600; // 指针离开顶部后，多久自动收起工具条
 
     // 上层弹窗（论文快照 / 诊断）开着没有？
     // 它们的 keydown 处理器没有 stopPropagation → 一次 Esc 会两边都响应
@@ -4634,7 +4649,7 @@
       clearTimeout(_zenBarTimer);
       _zenBarTimer = null;
       _zenSyncLabels();
-      if (!sticky) _zenBarTimer = setTimeout(_zenCloseBar, 2600);
+      if (!sticky) _zenBarTimer = setTimeout(_zenAutoClose, ZEN_BAR_AUTO_CLOSE_MS);
     }
 
     function _zenCloseBar() {
@@ -4643,6 +4658,20 @@
       modal.classList.remove("zen-bar-open");
       clearTimeout(_zenBarTimer);
       _zenBarTimer = null;
+    }
+
+    // 自动收起的守门：指针**还停在屏幕最上面**（= 用户还扶着工具条）就别收 ——
+    // 收了用户还得再扫一次鼠标，纯添堵。
+    function _zenAutoClose() {
+      _zenBarTimer = null;
+      if (_zenPointerY >= 0 && _zenPointerY <= ZEN_TOP_HOTZONE) return;
+      _zenCloseBar();
+    }
+
+    // 鼠标是不是「到了最上面」（屏幕顶部判定带内）。
+    // 这是**唯一**能自动唤出工具条的鼠标手势。
+    function _zenPointerAtTop(e) {
+      return !!e && typeof e.clientY === "number" && e.clientY <= ZEN_TOP_HOTZONE;
     }
 
     function enterZenMode(opts = {}) {
@@ -4657,7 +4686,7 @@
       _persistLocalState();
       _zenSyncLabels();
       if (firstTime && !opts.silent) {
-        showToast("专注模式：顶部细条点一下展开工具条 · Z 切换 · Esc 退出", false, 3600);
+        showToast("专注模式：鼠标移到屏幕最上面展开工具条 · Z 切换 · Esc 退出", false, 3600);
       }
       // 顶栏脱离文档流 → 论文页变宽 → PDF 必须重绘（否则画布和栏宽对不上）
       // ⚠️ force=false：进出专注**不改变 PDF 栏宽**（壳恒为 100% 宽），
@@ -4784,9 +4813,11 @@
         });
       }
       // 鼠标移到屏幕最上方 → 滑出工具条（停手 2.6s 自动收起）
+      // ⚠️ 这是**唯一**能自动唤出工具条的鼠标手势（滚轮一律不唤出，见下）
       document.addEventListener("mousemove", (e) => {
         if (!_zenActive()) return;
-        if (e.clientY > 40) return;
+        if (typeof e.clientY === "number") _zenPointerY = e.clientY;
+        if (!_zenPointerAtTop(e)) return;
         // ⚠️ 指针**已经在工具条上**时不要重置定时器 ——
         //    否则光标停在条上抖 1px 就会重挂 2.6s 定时器，
         //    2.6s 后工具条在光标底下自己关掉（mouseover 只在"进入"时触发，补不回来）。
@@ -4808,30 +4839,15 @@
           _zenBarTimer = setTimeout(_zenCloseBar, 1200);
         }
       });
-      // 滚动：往回上滑 / 滑到最底部 → 滑出工具条
-      // scroll 不冒泡，用 capture:true 才能在 document 上收到
-      document.addEventListener("scroll", (e) => {
-        if (!_zenActive()) return;
-        const el = e.target;
-        if (!el || !el.closest || !el.closest("#reader-body, #reader-pdf-view")) return;
-        const top = el.scrollTop || 0;
-        // ⚠️ 滚动位置必须**按容器**分别记 —— 阅读器里有 4 个滚动容器
-        //    （章节视图 2 个 + PDF 视图 2 个），共用一个全局量的话，
-        //    在译文栏滚 300px 再到 PDF 栏往上滚 5px 会被误判成
-        //    「大幅往回上滑」→ 工具条凭空滑出。
-        if (el !== _zenScrollEl) {
-          _zenScrollEl = el;
-          _zenScrollT = top;
-          return;                      // 第一次在这个容器上滚动 → 不判方向
-        }
-        const dy = top - _zenScrollT;
-        _zenScrollT = top;
-        // ⚠️ 「滑到最底部」只对**真的能滚**的容器成立 ——
-        //    scrollHeight === clientHeight 的短容器恒为真 → 一滚就弹工具条。
-        const scrollable = (el.scrollHeight || 0) > (el.clientHeight || 0) + 4;
-        const nearBottom = scrollable &&
-          (el.scrollHeight || 0) - top - (el.clientHeight || 0) < 24;
-        if (dy < -ZEN_SCROLL_TOL || nearBottom) _zenOpenBar(false);
+      // ⚠️ 滚轮**不**唤出工具条（用户 2026-11-14 明确要求）。
+      //    原来这里是「内容区往回上滑 / 滑到最底部 → 滑出工具条」：
+      //    读书往回看一行，工具条就跳出来打断阅读。
+      //    现在工具条只认鼠标动作：指针到屏幕最上方（_zenPointerAtTop）
+      //    或点顶部那条细把手。
+      //    这里**保留一个空监听**是刻意的 —— 让「滚轮不唤出」这条规则
+      //    有代码锚点：真机自检 / 变异自检都盯着它，往里塞 _zenOpenBar 就会被抓到。
+      document.addEventListener("scroll", () => {
+        /* 刻意留空：滚轮滚动不唤出工具条 */
       }, true);
       // 快捷键：Z 切换专注，Esc 先收工具条、再按退出专注
       document.addEventListener("keydown", (e) => {
@@ -4961,6 +4977,15 @@
 
     async function loadPdfDualColumn(opts = {}) {
       const { keepTranslations = false, generation = null, restoreSnapshot = null } = opts;
+      // 「中译替换版」：译文已经打进 PDF 里了 → 不翻第二遍、右栏收起。
+      // ⚠ 判定**跟着文件走**（文件名以 _中译替换版.pdf 结尾）：
+      //   缩放/窗口变化会再次调用本函数（重排），
+      //   若只靠调用方传参，重排后这个标志会丢 → 右栏又冒出来、又开始翻译。
+      const replaced = (opts.replaced !== undefined)
+        ? !!opts.replaced
+        : /_中译替换版\.pdf$/i.test(_readerState.pdfPath || "");
+      _pdfReplacedView = replaced;
+      _applyReplacedPdfView(replaced);
       const title = _readerState.title || "";
       const placeholder = document.getElementById("pdf-viewer-placeholder");
       const listEl = document.getElementById("pdf-pages-list");
@@ -5177,9 +5202,10 @@
               console.error("snapshot auto-load failed", e);
             }
           }
-          startPdfTranslationQueue();
+          // ⚠ 「中译替换版」：**不能**再翻一遍
+          //   译文已经打进 PDF 的替换页里了，再翻 12 页 = 白花钱。
+          if (!_pdfReplacedView) startPdfTranslationQueue();
         }
-        // 渲染完成后再核一次栏宽 —— 用「渲染开始时的宽度」比，不是最后一页的：
         // 阅读器可能是在渲染过程中才从隐藏变可见的（那一瞬间的
         // ResizeObserver 回调会被「忙」标记挡掉），
         // 不核对的话画布就停在「看不见时量到的兜底宽度 520px」上。
@@ -5439,6 +5465,12 @@
       const silent = !!(opts && opts.silent);
       if (!_pdfState || !_pdfState.paperId) {
         if (!silent) showToast("请先打开一篇 PDF 再保存快照", true);
+        return null;
+      }
+      // 「中译替换版」不存快照：译文**已经在 PDF 里**了，
+      //   再存一份只会给快照目录添垃圾（还会把 APK 烘焙护栏顶红）。
+      if (_pdfReplacedView) {
+        if (!silent) showToast("中译替换版不用存快照：译文已经打进 PDF 里了", false, 3600);
         return null;
       }
       const translatable = _pdfState.pages.filter(p => p.translated && p.translation);
@@ -5866,6 +5898,8 @@
 
     async function processNextInPdfQueue() {
       if (!_pdfState || !_pdfState.pages || _pdfState.rendering.cancelled || _pdfQueuePaused) return;
+      // 「中译替换版」：译文已在 PDF 里 → 不排队翻译（省钱）
+      if (_pdfReplacedView) return;
       // Bail if a newer paper started its own chain while we were waiting
       if (_pdfChainOwnerPaperId !== _pdfState.paperId) return;
 
@@ -5905,7 +5939,11 @@
       // 按左栏「实际可用宽度」自适应：_pdfZoom = 1.0 表示正好占满栏宽。
       // 原先固定 baseWidth=520px，栏宽一变两侧就空出一大片。
       const availWidth = Math.max(260, (listEl.clientWidth || 520) - 4);
-      const fitScale = availWidth / viewport0.width;
+      // 「中译替换版」独占整栏 → 直接铺满 1500+px 会让整页大到离谱
+      // （一屏只看得到半页版面）。给个阅读上限：整页最多 1100px 宽，
+      // 页块是 align-items:center（CSS）→ 会自动居中，两侧留白。
+      const renderWidth = _pdfReplacedView ? Math.min(availWidth, 1100) : availWidth;
+      const fitScale = renderWidth / viewport0.width;
       const scale = fitScale * (_pdfZoom || 1.0);
       const viewport = page.getViewport({ scale });
       if (_pdfState) _pdfState.lastRenderWidth = availWidth;
@@ -6596,6 +6634,119 @@
         pg.failed = true;
         // 标记成"已处理"，免得队列每 3.2 秒又来翻一次
         pg.blockTranslated = true;
+      }
+    }
+
+    /**
+     * 直接在 PDF 双栏里打开一个 vault 里的 PDF —— **不做全文解析**。
+     *
+     * 为什么要单独一条：生成出来的「中译替换版」没必要再拆章节
+     * （openVaultPdf 会跑一遍全文抽取 + 分章，慢且没用）。
+     *
+     * opts.replaced = true → 这是「中译替换版」：
+     *   译文**已经打进 PDF 的替换页**里了（第 2 页就是第 1 页的中文版），
+     *   所以 ① 右栏（对照译文）整条收起，PDF 占满宽度；
+     *        ② **不能**再让翻译队列去翻一遍（12 页白花钱）。
+     */
+    async function openPdfDirect(relativePath, title, opts = {}) {
+      if (!relativePath) return;
+      _readerState.title = title || "";
+      _readerState.sections = [];
+      _readerState.translations = {};
+      _readerState.translationModels = {};
+      _readerState.activeSection = 0;
+      _readerState.pdfPath = relativePath;
+      renderReader();
+      openReaderModal();
+      switchReaderMode("pdf", { skipLoad: true });
+      await loadPdfDualColumn({ replaced: !!opts.replaced });
+    }
+
+    /**
+     * 「中译替换版」视图的界面状态。
+     *
+     * ⚠ 为什么不直接沿用普通 PDF 视图：
+     *   1. 右栏挂的是**旧论文**的对照译文（页码也对不上这份 PDF）→
+     *      用户会以为那就是替换页的内容；
+     *   2. 翻译队列会把这份 PDF 的 12 页**重新翻一遍** → 白花钱。
+     */
+    function _applyReplacedPdfView(on) {
+      const trans = document.getElementById("pdf-translations-container");
+      if (trans) trans.style.display = on ? "none" : "";
+      // ⚠ 光藏右栏不够：.pdf-split 是两列 grid → 还要把列数改成 1，
+      //   否则 PDF 只占半屏（实测 1600px 视口里容器仍是 785px）。
+      const split = document.querySelector("#reader-pdf-view .pdf-split");
+      if (split) split.classList.toggle("pdf-split-single", !!on);
+      // 回到普通 PDF → 源也没了（否则会拿旧的源去重建）
+      if (!on) _pdfReplacedSource = null;
+      if (!on) return;
+      if (_pdfState) {
+        _pdfState.bilingual = false;
+        _pdfState.bilingualOrig = false;
+      }
+      const b1 = document.getElementById("pdf-bilingual-toggle");
+      if (b1) { b1.classList.remove("active"); b1.textContent = "🔀 对照"; }
+      const b2 = document.getElementById("pdf-bilingual-orig-toggle");
+      if (b2) b2.classList.remove("active");
+      _showBilingualVisibility(false);
+    }
+
+    /**
+     * 生成「中译替换版 PDF」—— 原文页 + 替换页交替（10 页 → 20 页）。
+     *
+     * 用户原话（2026-11-15）：
+     *   「直接就是原文上直接把翻译打上去……这篇论文一共十页，
+     *     然后我翻译完之后就变成二十页……然后原本的图表还都保持不变。」
+     *
+     * 译文来自**快照**（对照模式翻好的段落译文 + 段落坐标），
+     * 不额外调模型 → 一两秒出结果。
+     */
+    async function buildReplacedPdf() {
+      if (!_pdfState || !_pdfState.relativePath) {
+        showToast("先打开一篇 PDF", true, 3000);
+        return;
+      }
+      // ⚠ 源必须是**原论文**：生成完阅读器里打开的是替换版，
+      //   `_pdfState` 也就变成了它 → 再点一次若还用它 = 找「替换版的快照」→ 必然 409。
+      const src = _pdfReplacedSource || {
+        paper_id: _pdfState.paperId,
+        relative_path: _pdfState.relativePath,
+      };
+      const started = Date.now();
+      showToast("正在生成中译替换版 PDF…");
+      const btn = document.getElementById("pdf-replaced-toggle");
+      if (btn) { btn.disabled = true; btn.textContent = "⏳ 生成中"; }
+      try {
+        const res = await fetch("/api/paper/build_replaced_pdf", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            paper_id: src.paper_id,
+            relative_path: src.relative_path,
+          }),
+        });
+        const { data, text } = await _readJsonSafe(res);
+        if (!res.ok) {
+          throw new Error(_httpErrorMessage(data, res, text, "生成失败"));
+        }
+        const d = data || {};
+        const sec = ((Date.now() - started) / 1000).toFixed(1);
+        const total = (d.pages_total || 0) + (d.pages_replaced || 0);
+        const warn = d.blocks_unfit ? ` · ${d.blocks_unfit} 段放不下（保留英文）` : "";
+        showToast(`✅ 已生成 ${total} 页（${d.pages_total} 原文 + ${d.pages_replaced} 替换），`
+          + `${d.blocks_written} 段已替换${warn} · ${sec}s`, false, 6000);
+        // 记住源 → 再点一次还能重建
+        _pdfReplacedSource = { paper_id: src.paper_id, relative_path: src.relative_path };
+        // ⚠ 标题别叠成「（中译替换版）（中译替换版）」—— 再点一次就会叠一次
+        const baseTitle = (_readerState.title || "论文")
+          .replace(/（中译替换版）\s*$/, "");
+        await openPdfDirect(d.out_relative_path,
+          `${baseTitle}（中译替换版）`, { replaced: true });
+      } catch (err) {
+        console.error("[buildReplacedPdf]", err);
+        showToast("生成失败: " + (err && err.message ? err.message : err), true, 6000);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "🧾 中译替换版"; }
       }
     }
 
@@ -10341,6 +10492,9 @@
             <button class="btn-zoom-toggle" id="pdf-bilingual-orig-toggle"
                     onclick="toggleBilingualOrig()"
                     title="对照模式里同时显示原页图（图片/图表不在文本层里，重排后看不到；开着这个就还看得见）">🖼 原页图</button>
+            <button class="btn-zoom-toggle" id="pdf-replaced-toggle"
+                    onclick="buildReplacedPdf()"
+                    title="生成「中译替换版 PDF」：原文页 + 替换页交替（10 页 → 20 页）。替换页 = 同一页，英文被抹掉、中文原地填回，图表保持原样（需要先用「对照」翻几页并保存快照）">🧾 中译替换版</button>
             <span class="seg-divider"></span>
             <button class="btn-zoom-toggle" id="pdf-queue-pause-btn"
                     onclick="togglePdfQueuePause()" title="暂停 / 继续自动排队翻译">⏸ 暂停排队</button>
