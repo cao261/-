@@ -285,6 +285,63 @@ def merge_path(path: Path, vault: Path, dry_run: bool = False) -> bool:
     return True
 
 
+def _watch_once(src: Path, vault: Path, seen: set, dry_run: bool = False) -> None:
+    """扫描一轮：把新出现的变更包合并进 vault。
+
+    ⚠⚠ **单个包合并失败不许让整个 watch 进程退出**（2026-11-15 审计）。
+
+    原来这里是 `merge_path(...)` 裸调 —— 而 `_atomic_write_text` 里的
+    `os.replace` 在 Windows 上遇到 Obsidian / 杀软 / 坚果云同步客户端
+    **占用了那篇笔记** → 抛 `PermissionError`（OSError）
+    → 一路冒到 `while True` 外面 → 只被 `except KeyboardInterrupt` 兜着
+    → **守护进程当场退出**，后面的变更包再也合并不进来（要人工重启才恢复）。
+
+    同型缺陷 `export_offline.py` 在 2026-11-09 那轮已经修了（单轮 try/except
+    + 失败不标记 → 下一轮重试），这里补齐。
+
+    两条规矩：
+      1. **失败不写 seen** → 下一轮自动重试
+         （跟 export_offline 的 `last = None` 一个道理：
+          失败的文件不算「处理过」）；
+      2. **失败不打断本轮** → 后面的包照常合并。
+
+    拆成独立函数是为了**能被护栏直接跑**（node/pytest 都跑真代码，
+    别让这条只能靠「读源码文本」来守）。
+    """
+    if not src.is_dir():
+        return
+    try:
+        packs = sorted(src.glob("*.json"))
+    except OSError as e:
+        # 目录本身读不出来（同步客户端正在换掉它 / 权限变化）→ 本轮跳过，别退出
+        print(f"[watch] 变更包目录读不出来，本轮跳过: {e}", file=sys.stderr)
+        return
+
+    # 2026-11-09 审计：p.stat() 在包被删/移动时会抛 OSError
+    # 让整个 watch 崩；秒级 mtime + 只增不减的 seen 还会漏掉
+    # 同秒覆盖写、并让集合长期膨胀。
+    current_keys = set()
+    for p in packs:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        key = (str(p), st.st_mtime_ns, st.st_size)
+        current_keys.add(key)
+        if key in seen:
+            continue
+        print(f"[watch] 合并 {p.name}")
+        try:
+            merge_path(p, vault, dry_run)
+        except Exception as e:
+            # ⚠ 不写 seen → 下一轮会重试这个包
+            print(f"[watch] 合并 {p.name} 失败（{e}）—— 下一轮自动重试，"
+                  "本轮继续处理后面的包", file=sys.stderr)
+            continue
+        seen.add(key)
+    seen.intersection_update(current_keys)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="把平板的变更包合并回 vault")
     ap.add_argument("source", help="变更包 JSON 文件，或放满变更包的目录")
@@ -324,24 +381,7 @@ def main() -> int:
     seen = set()
     try:
         while True:
-            if src.is_dir():
-                # 2026-11-09 审计：p.stat() 在包被删/移动时会抛 OSError
-                # 让整个 watch 崩；秒级 mtime + 只增不减的 seen 还会漏掉
-                # 同秒覆盖写、并让集合长期膨胀。
-                current_keys = set()
-                for p in sorted(src.glob("*.json")):
-                    try:
-                        st = p.stat()
-                    except OSError:
-                        continue
-                    key = (str(p), st.st_mtime_ns, st.st_size)
-                    current_keys.add(key)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    print(f"[watch] 合并 {p.name}")
-                    merge_path(p, vault, args.dry_run)
-                seen.intersection_update(current_keys)
+            _watch_once(src, vault, seen, args.dry_run)
             time.sleep(args.watch)
     except KeyboardInterrupt:
         print("\n[watch] 已退出")

@@ -3363,6 +3363,39 @@ in async functions` 一行就点破了。
 「读不到 ≠ 读坏了」三分类、元护栏 AST 化），但仍然藏了一个 P0
 （§4.91）—— 只有把对方代码当成「别人的代码」重新审，才会看到这种问题。
 
+### 4.95 「同型缺陷」修一半 = 下一个坑：守护循环里单个任务失败**不许**打死进程（2026-11-15）
+
+**症状**：`merge_changes.py --watch`（平板变更包合并守护进程）**自己退出了**，
+后面的变更包再也合并不进来 —— 表现为「平板改了，电脑端一直没合进来」，
+要人工重启才恢复。
+
+**根因**：watch 循环里 `merge_path(...)` 是**裸调**：
+`_atomic_write_text` 里的 `os.replace(tmp, path)` 在 Windows 上遇到
+Obsidian / 杀软 / 坚果云同步客户端**占用了那篇笔记** → 抛 `PermissionError`（OSError）
+→ 一路冒到 `while True` 外面 → 只被 `except KeyboardInterrupt` 兜着 → **进程当场退出**。
+
+**同型缺陷 `export_offline.py` 在 2026-11-09 那轮已经修过**
+（单轮 try/except + 失败不标记 → 下一轮重试）
+→ **修一半**：同一个「守护循环」模式，两处只修了一处。
+
+**修法**（`microbench/merge_changes.py`）：
+1. 把一轮扫描抽成 `_watch_once(src, vault, seen, dry_run)`（**好测**）；
+2. 单个包合并失败 → `except Exception` → 打印到 stderr → **继续处理后面的包**；
+3. **失败不写 `seen`** → 下一轮自动重试
+   （跟 export_offline 的 `last = None` 一个道理：**失败的文件不算「处理过」**）；
+4. 包目录本身列不出来（`glob` 抛 OSError）→ 本轮跳过，别退出。
+
+**护栏**：`tests/test_merge_changes_watch.py`（4 条，**行为级**：
+真跑 `main()` 和 `_watch_once()`，不靠读源码文本确认「有没有 try/except」）。
+**变异自检已做**：拆掉 try/except / 把「失败不写 seen」改成「失败也记成处理过」/
+去掉目录兜底 → 三个变异体**全部被抓**。
+
+⚠ **通用教训**：审计看到「同型缺陷」时，**要把同类的地方一次找齐**。
+本例的信号很明确：「`export_offline.py` 修了、`merge_changes.py` 没修」
+—— 两处是同一个模式（守护循环 + 单轮失败就该跳过）。
+→ 修完一处，回头搜一遍「还有没有第二处同样的循环」；
+   护栏也要**两边都写**，别只补被投诉的那一个。
+
 ## 5. 通用教训（从上面提炼的原则）
 1. **先定位根因，再改代码。** 拿不准就在可疑位置加 `console.log` 探针 + 用浏览器的
    `query(kind=console)` 看，比盯着代码猜快得多。

@@ -83,15 +83,23 @@ VERDICT: EVENT LOOP BLOCKED
 > 否则那条用例会**跳过**（不是红）。
 > 坑记在 `AGENTS.md` §4.93。
 
-### 2.3 【中】`merge_changes.py` 的 watch 循环没有轮次级 try/except
+### 2.3 【中】`merge_changes.py` 的 watch 循环没有轮次级 try/except —— ✅ **已修**
 
-`microbench/merge_changes.py:343` 的 `merge_path(...)` 裸调：
+`microbench/merge_changes.py` 的 `merge_path(...)` 裸调：
 `_atomic_write_text` 里的 `os.replace` 遇到 Obsidian / 杀软占用会抛 `OSError`
-→ **整个「平板变更包合并」守护进程退出**。
+→ **整个「平板变更包合并」守护进程退出**（后面的变更包再也合并不进来）。
 同型缺陷 `export_offline.py` 那边对方**已经补了** try/except → 修一半。
 
-**本轮没改**（不在这次合并范围内，且不碰用户数据）。
-建议单独一轮修：跟 `export_offline.py` 的写法对齐即可。
+**已修**（2026-11-15 追加一轮）：
+- 把一轮扫描抽成 `_watch_once(src, vault, seen, dry_run)`；
+- 单个包失败 → 记到 stderr → **继续处理后面的包**，进程不退出；
+- **失败不写 `seen`** → 下一轮自动重试；
+- 包目录列不出来（`glob` 抛 OSError）→ 本轮跳过。
+
+**护栏**：`tests/test_merge_changes_watch.py`（4 条行为级），
+**变异自检已做**（拆掉 try/except / 改成「失败也记成处理过」/ 去掉目录兜底
+→ 三个变异体全被抓）。
+坑记在 `AGENTS.md` §4.95。
 
 ### 2.4 【低】`move_vault_to_cloud.py` 的回滚不校验
 
