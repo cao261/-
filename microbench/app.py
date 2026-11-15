@@ -4578,6 +4578,26 @@ def _atomic_write_json(path: Path, obj, indent: int = 1) -> None:
     _atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent))
 
 
+class _TransientReadError(ValueError):
+    """读文件时的**瞬时 I/O 故障**（文件被占用等）—— **不是**内容损坏。
+
+    继承 ValueError 是为了兼容既有调用点（它们都是 `except ValueError`
+    → HTTP 500），但它与「内容损坏」必须能区分：
+    损坏 → 改名隔离；瞬时故障 → **一个字节都不动**，只报错让用户重试。
+    """
+
+
+def _quarantine_corrupt(path: Path, reason: str) -> str:
+    """把**确认损坏**的文件改名隔离，返回给用户看的一句话。"""
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        os.replace(path, quarantine)
+        return f"文件内容损坏，已隔离为 {quarantine.name}: {path.name} ({reason})"
+    except OSError:
+        return f"文件内容损坏，且隔离失败（原文件仍在原处）: {path.name} ({reason})"
+
+
 def _read_json_or_quarantine(path: Path) -> Optional[dict]:
     """读 JSON；**损坏的文件改名隔离并报错**，不当成"没有"。
 
@@ -4589,29 +4609,53 @@ def _read_json_or_quarantine(path: Path) -> Optional[dict]:
     而用户看到的是"✅ 保存成功"。一条数据都不报错地消失，最难查。
 
     宁可让这次保存失败并告诉用户"文件损坏，已备份到 X"，也不能静默清空。
+
+    ⚠ 2026-11-15 修正（独立审查 P1-1）：**瞬时 I/O 故障 ≠ 内容损坏**。
+      原来 except 里混着 `OSError` —— Windows 上文件被坚果云客户端 / 杀软 /
+      别的进程短暂占用（`PermissionError`）时，会把**内容完全健康**的快照
+      改名成 `.corrupt-XXXX` → 译文从界面上消失，用户以为得重翻（烧 token）。
+      现在分三类处理：
+        * **内容坏**（解码失败 / JSON 坏 / 顶层不是对象）→ 改名隔离 + 报错；
+        * **瞬时 I/O 故障**（PermissionError 等）→ **一个字节都不动**，
+          只报错让调用方/用户重试；
+        * **文件刚好不存在**（exists 与 read 之间被删）→ 当成「没有旧值」，
+          不是损坏。
     """
-    if not path.exists():
-        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        # 合法 JSON 但顶层不是对象（[] / "x" / null）同样危险：调用方一律
-        # 按 dict 合并，`.get()` 会抛 AttributeError；更糟的是 `or {}` 会把
-        # 空数组悄悄当成"没有旧值" → 下一次写回清空数据。一并按损坏隔离。
-        if not isinstance(data, dict):
-            raise ValueError(f"顶层必须是对象，实际是 {type(data).__name__}")
-        return data
-    except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError) as e:
-        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
-        kept = ""
-        try:
-            os.replace(path, quarantine)
-            kept = f"，已隔离为 {quarantine.name}"
-        except OSError:
-            kept = "，且隔离失败（原文件仍在原处）"
-        msg = f"文件内容损坏{kept}: {path.name} ({e})"
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # 竞态：上一次 exists() 为真、这次读的时候已经被删了
+        # （同步端点正在重写同一个文件）→ 当成「没有旧值」，不是损坏。
+        return None
+    except UnicodeDecodeError as e:
+        # 字节层面就不是合法 UTF-8 —— 这才是真·内容损坏
+        msg = _quarantine_corrupt(path, f"不是合法的 UTF-8: {e}")
+        print(f"[microbench] {msg}", file=sys.stderr)
+        raise ValueError(msg) from e
+    except OSError as e:
+        # ⚠ 读不到 ≠ 坏了。文件可能只是被占用 / 权限不足 / 磁盘瞬时不可用。
+        #    **绝不碰这个文件** —— 改名的后果是用户的译文「凭空消失」。
+        msg = (f"文件读不出来（可能正被其它进程占用，不是内容损坏），"
+               f"请稍后重试: {path.name} ({e})")
+        print(f"[microbench] {msg}", file=sys.stderr)
+        raise _TransientReadError(msg) from e
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        msg = _quarantine_corrupt(path, f"JSON 解析失败: {e}")
+        print(f"[microbench] {msg}", file=sys.stderr)
+        raise ValueError(msg) from e
+
+    # 合法 JSON 但顶层不是对象（[] / "x" / null）同样危险：调用方一律
+    # 按 dict 合并，`.get()` 会抛 AttributeError；更糟的是 `or {}` 会把
+    # 空数组悄悄当成"没有旧值" → 下一次写回清空数据。一并按损坏隔离。
+    if not isinstance(data, dict):
+        msg = _quarantine_corrupt(path, f"顶层必须是对象，实际是 {type(data).__name__}")
         print(f"[microbench] {msg}", file=sys.stderr)
         raise ValueError(msg)
+
+    return data
 
 
 @app.get("/api/pdf/snapshot/list")
