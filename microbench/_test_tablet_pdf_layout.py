@@ -27,6 +27,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+try:  # 作为脚本跑 / 作为包被导入，两种都要能用
+    from _headless_browser import dump_dom, find_browser as _find_browser
+except ImportError:  # pragma: no cover
+    from microbench._headless_browser import dump_dom, find_browser as _find_browser
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -62,12 +67,17 @@ RULE_PATTERNS = [
 MEDIA_RE = re.compile(r"@media \(min-width: 900px\)\s*\{(?:[^{}]|\{[^{}]*\})*\}")
 
 
+
+
+
 def find_browser() -> str | None:
-    for p in EDGE_CANDIDATES:
-        if Path(p).is_file():
-            return p
-    found = shutil.which("msedge") or shutil.which("chrome")
-    return found
+    """首选系统 Edge/Chrome；没有就退到 Playwright 的 Chromium。
+
+    ⚠ 必须把 Playwright 一起算进来：各探针的 main() 里都有
+      「找不到浏览器 → SKIP 整个护栏」的判断 —— 只找系统浏览器的话，
+      系统浏览器一没，护栏就**静默失效**了（AGENTS §4.16）。
+    """
+    return _find_browser()
 
 
 def extract_rules(css: str) -> str:
@@ -159,17 +169,9 @@ def run_probe(browser: str, rules: str) -> list[dict]:
         html = Path(td) / "probe.html"
         html.write_text(PROBE_HTML.format(rules=rules), encoding="utf-8")
         out = Path(td) / "out.html"
-        cmd = [
-            browser, "--headless", "--disable-gpu", "--no-sandbox",
-            "--virtual-time-budget=3000", "--dump-dom",
-            html.resolve().as_uri(),
-        ]
-        try:
-            p = subprocess.run(cmd, capture_output=True, timeout=120)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("headless 浏览器超时")
-        out.write_bytes(p.stdout)
-        dom = p.stdout.decode("utf-8", errors="replace")
+        dom = dump_dom(html, browser=browser, window_size="1400,1000",
+                       virtual_time_budget=3000)
+        out.write_text(dom, encoding="utf-8")
         m = re.search(r"RESULT:(\[.*?\])</title>", dom)
         if not m:
             raise RuntimeError("没拿到探针结果（DOM 长度 %d）" % len(dom))

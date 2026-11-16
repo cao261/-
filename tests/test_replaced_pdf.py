@@ -473,6 +473,57 @@ def test_api_builds_the_replaced_pdf_end_to_end(client, sandbox):
         doc.close()
 
 
+def test_api_reports_the_pages_that_cannot_be_replaced(client, sandbox):
+    """⚠ 用户 2026-11-17：「我论文最后几页都没替换」。
+
+    根因：那几页是在**普通模式**翻的（只有整页译文，没有段落坐标），
+    而替换版要按段落**原地**贴回原页 → 没坐标就没地方写中文 → 只能保留英文。
+
+    → 端点必须**如实报告**哪些页没替换（`pages_without_blocks`），
+      前端据此提示并按段落重翻。**不许静默降级**（用户会以为全替换了）。
+    """
+    from microbench.bilingual import BLOCK_TRANSLATION_VERSION
+    from microbench.app import _snapshot_path
+    _make_vault_pdf(sandbox)
+    # 第 1 页有段落级译文；第 2 页只有整页译文（普通模式翻的）
+    path = _snapshot_path(PAPER_ID)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "paper_id": PAPER_ID,
+        "relative_path": SRC_REL,
+        "pages": [
+            {
+                "page_num": 1,
+                "blocks_version": BLOCK_TRANSLATION_VERSION,
+                "blocks": [{
+                    "i": 0, "bbox": [70.0, 76.0, 500.0, 96.0],
+                    "translation": "磁致伸缩复合材料在此研究。",
+                    "kind": "body", "col": "S",
+                }],
+            },
+            {"page_num": 2, "translation": "第二页的整页译文（没有段落坐标）"},
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    res = client.post("/api/paper/build_replaced_pdf", json={
+        "paper_id": PAPER_ID,
+        "relative_path": SRC_REL,
+    })
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data.get("pages_without_blocks") == [2], \
+        "没如实报告「哪些页替换不了」：" + json.dumps(data, ensure_ascii=False)
+    assert data.get("pages_replaced") == 1, \
+        "只有第 1 页能替换，实际替换了 %s 页" % data.get("pages_replaced")
+    # 第 2 页在输出里仍然是英文（不能凭空写一段没坐标的中文）
+    out_path = sandbox / data["out_relative_path"]
+    doc = fitz.open(str(out_path))
+    try:
+        assert doc.page_count == 3, "2 页原文 + 1 张替换页 = 3 页，实际 %d" % doc.page_count
+    finally:
+        doc.close()
+
+
 def test_api_refuses_a_snapshot_from_an_old_block_version(client, sandbox):
     """⚠ 版本闸门：段落切分算法变了 → 旧译文的坐标会错位 → 必须拒绝。
 

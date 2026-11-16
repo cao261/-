@@ -6715,11 +6715,77 @@
      * 译文来自**快照**（对照模式翻好的段落译文 + 段落坐标），
      * 不额外调模型 → 一两秒出结果。
      */
+    /**
+     * 哪些页「有整页译文、但没有段落级译文」？
+     *
+     * ⚠ 替换版要把中文**原地**贴回原页 → 必须有每个段落的**坐标**（blocks）。
+     *   而「整页译文」（普通模式翻的）没有坐标 → 那些页只能**原样保留英文**。
+     *   用户 2026-11-17：「我论文最后几页都没替换」—— 就是这个原因：
+     *   那几页是在普通模式翻的（只有整页译文），而替换版只认段落级。
+     *
+     * 判据直接读**快照**（替换版端点读的就是它）→ 一次请求拿到真相，
+     * 不用逐页去抽段落块几何。
+     */
+    async function _pagesMissingParagraphTranslations() {
+      try {
+        const snap = await getJson(
+          `/api/pdf/snapshot/load?paper_id=${encodeURIComponent(_pdfState.paperId)}`);
+        const pages = snap.pages || [];
+        return pages
+          .filter(p => (p.translation || "").trim() && !(p.blocks && p.blocks.length))
+          .map(p => p.page_num)
+          .filter(n => Number.isFinite(n));
+      } catch (e) {
+        return [];
+      }
+    }
+
+    /**
+     * 把缺段落级译文的页按段落重翻一遍（复用对照模式那套机器）。
+     * 翻完的 blocks 会随快照存下来 → 下次构建不用再翻。
+     * @returns {{done: number[], failed: number[]}}
+     */
+    async function _ensureParagraphTranslations() {
+      const out = { done: [], failed: [] };
+      const missing = await _pagesMissingParagraphTranslations();
+      if (!missing.length) return out;
+      const nums = missing.join("、");
+      if (missing.length >= 2) {
+        const ok = confirm(
+          `第 ${nums} 页只有「整页译文」，没有「段落级译文」。\n\n` +
+          `替换版要把中文按段落原地贴回原页，必须有段落坐标 → ` +
+          `这几页现在只能保留英文。\n\n` +
+          `要按段落重翻这 ${missing.length} 页吗？\n` +
+          `（会调用模型 ${missing.length} 次，约 ${missing.length * 15} 秒，消耗 API 额度）`);
+        if (!ok) return out;
+      }
+      showToast(`第 ${nums} 页缺段落级译文，正在按段落重翻（约 ${missing.length * 15} 秒）…`,
+                false, 8000);
+      for (const n of missing) {
+        try {
+          await translateBlocksForPage(n, true);
+          const pg = (_pdfState.pages || []).find(p => p.num === n);
+          if (pg && pg.blockTranslated) out.done.push(n);
+          else out.failed.push(n);
+        } catch (e) {
+          out.failed.push(n);
+        }
+      }
+      if (out.done.length) {
+        // 把新翻的段落译文存进快照（不存的话下次构建又要重翻一遍）
+        await savePdfSnapshot({ silent: true });
+      }
+      return out;
+    }
+
     async function buildReplacedPdf() {
       if (!_pdfState || !_pdfState.relativePath) {
         showToast("先打开一篇 PDF", true, 3000);
         return;
       }
+      // ⚠ 先把缺段落级译文的页补上 —— 否则那些页会**原样保留英文**
+      //   （用户 2026-11-17：「我论文最后几页都没替换」）。
+      const fill = await _ensureParagraphTranslations();
       // ⚠ 源必须是**原论文**：生成完阅读器里打开的是替换版，
       //   `_pdfState` 也就变成了它 → 再点一次若还用它 = 找「替换版的快照」→ 必然 409。
       const src = _pdfReplacedSource || {
@@ -6747,8 +6813,13 @@
         const sec = ((Date.now() - started) / 1000).toFixed(1);
         const total = (d.pages_total || 0) + (d.pages_replaced || 0);
         const warn = d.blocks_unfit ? ` · ${d.blocks_unfit} 段放不下（保留英文）` : "";
+        // ⚠ 如实说明哪些页**没**被替换（用户 2026-11-17 报的「最后几页都没替换」）
+        const skipped = Array.isArray(d.pages_without_blocks) ? d.pages_without_blocks : [];
+        const skipNote = skipped.length
+          ? ` · ⚠ 第 ${skipped.join("、")} 页没有段落级译文，保留英文`
+          : "";
         showToast(`✅ 已生成 ${total} 页（${d.pages_total} 原文 + ${d.pages_replaced} 替换），`
-          + `${d.blocks_written} 段已替换${warn} · ${sec}s`, false, 6000);
+          + `${d.blocks_written} 段已替换${warn}${skipNote} · ${sec}s`, false, 8000);
         // 记住源 → 再点一次还能重建
         _pdfReplacedSource = { paper_id: src.paper_id, relative_path: src.relative_path };
         // ⚠ 标题别叠成「（中译替换版）（中译替换版）」—— 再点一次就会叠一次
@@ -10041,6 +10112,51 @@
       }
     }
 
+    /**
+     * 收集当前页的**公式坐标**（PDF 点，左上角原点）。
+     *
+     * 为什么需要（2026-11-17 用户实测）：
+     *   「划译文的词句问问题，因为公式是直接截图放在译文里的，
+     *     ai 看上下文的时候完全看不到公式推导，只能猜」。
+     *
+     * 公式在译文里是**从 PDF 原页裁下来的图片**，文本上下文里只有乱序碎片；
+     * 而整页截图上的公式又只有几十像素高（整页图会被多模态模型降采样，
+     * 一条 223pt 宽的公式在整页图上只有 ~18px 高）→ 模型照样读不出来。
+     * → 唯一能让模型看清的办法：把公式**按坐标单独裁成高清图**一起给它。
+     *
+     * 坐标从哪来：译文原文里的 ⟦FORMULA:x0,y0,x1,y1⟧ 标记
+     *   （抽取层定位到公式时写进去的，模型照抄不改数字）。
+     *   · 整页译文      → pg.translation
+     *   · 对照模式段落译文 → pg.blockTranslations（公式块由后端直接填标记）
+     */
+    function _collectPageFormulaRects(pageNum) {
+      const out = [];
+      if (!pageNum) return out;
+      const RE = /⟦FORMULA:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧/g;
+      const seen = new Set();
+      const push = (txt) => {
+        if (!txt) return;
+        RE.lastIndex = 0;
+        let m;
+        while ((m = RE.exec(txt)) !== null) {
+          const key = m[1] + "," + m[2] + "," + m[3] + "," + m[4];
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push([parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), parseFloat(m[4])]);
+        }
+      };
+      try {
+        const pg = (_pdfState && _pdfState.pages || []).find(p => p.num === pageNum);
+        if (pg) {
+          push(pg.translation);
+          const bt = pg.blockTranslations || {};
+          Object.keys(bt).forEach(k => push(bt[k]));
+        }
+      } catch (e) { /* 拿不到就只发整页图，不影响答疑 */ }
+      // 上限 16：再多的公式对一次问答也没意义（服务端还会再卡一道）
+      return out.slice(0, 16);
+    }
+
     async function submitReaderQA() {
       const qInput = document.getElementById("qa-question-input");
       const question = (qInput ? qInput.value.trim() : "");
@@ -10108,8 +10224,16 @@
 
       // 多模态兜底：把所选页面截图一起发给模型（表格/曲线图不好文字化时，
       // 光靠抽出来的碎片文本是答不出来的）。截图失败不影响正常答疑。
+      //
+      // ⚠ 2026-11-17 修：门禁从「source === 'pdf'」放宽成「**知道页码就截**」。
+      //   原来只有从 PDF 原文侧划选才带截图；
+      //   用户在**译文栏**划词提问（source='translation'）→ 不带截图 →
+      //   而公式在译文里是**图片**（从原页裁下来的）→ 上下文里一个字都没有 →
+      //   模型只能猜「公式推导」（用户原话：「ai 看上下文的时候完全看不到公式推导，只能猜」）。
+      //   实测（Playwright 拦截请求）：译文栏划选时 has_page_image=false。
+      //   → 现在译文栏划选也带上**那一页的图**（服务端会按 PDF 坐标重渲染一张清晰的）。
       let pageImage = null;
-      if (_readerSelState.source === "pdf") {
+      if (_readerSelState.pageNum) {
         pageImage = _captureSelectionPageImage();
       }
 
@@ -10122,6 +10246,14 @@
         source_type: _readerSelState.source || "general",
         page_image: pageImage,
         pdf_relative_path: (_pdfState && _pdfState.relativePath) || null,
+        // ⚠ 页码：服务端据此按 PDF 原始坐标**重渲染一张清晰整页图**给模型
+        //   （浏览器那张是 PDF.js 画布，按栏宽渲染 → 整页只有 ~785px 宽，
+        //     公式在上面只有几十像素，多模态模型读不出来）。
+        page_num: _readerSelState.pageNum || null,
+        // ⚠ 该页公式的坐标（PDF 点）→ 服务端按坐标裁**高清公式原图**给模型。
+        //   整页图只给布局上下文：一条 223pt 宽的公式在整页图上只有 ~18px 高，
+        //   模型读不出来（用户原话：公式推导完全看不到，只能猜）。
+        formula_rects: _collectPageFormulaRects(_readerSelState.pageNum),
         // Tell the server which scope we used. Without it the backend
         // falls back to the mid cap (8000) and silently truncates the
         // wide (20K) / full (50K) contexts.

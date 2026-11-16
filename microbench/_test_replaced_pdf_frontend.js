@@ -54,6 +54,8 @@ function sliceAll(src) {
     sliceFn(src, "function _applyReplacedPdfView(on) {"),
     sliceFn(src, "async function buildReplacedPdf() {"),
     sliceFn(src, "async function processNextInPdfQueue() {"),
+    sliceFn(src, "async function _pagesMissingParagraphTranslations() {"),
+    sliceFn(src, "async function _ensureParagraphTranslations() {"),
   ].join("\n\n");
 }
 
@@ -120,6 +122,8 @@ function makeEnv() {
   const rendered = [];
   const translated = [];
   const timers = [];
+  const snapshotsSaved = [];
+  const confirms = [];
 
   const env = {
     elements,
@@ -132,6 +136,8 @@ function makeEnv() {
     rendered,
     translated,
     timers,
+    snapshotsSaved,
+    confirms,
     showToast(msg, isErr, dur) {
       toasts.push({ msg: String(msg), isErr: !!isErr, dur: dur });
     },
@@ -144,7 +150,26 @@ function makeEnv() {
     switchReaderMode(mode, opts) { modeSwitches.push({ mode, opts }); },
     loadPdfDualColumn(opts) { loadPdfCalls.push(opts || {}); },
     translatePdfPage(num) { translated.push({ kind: "page", num }); },
-    translateBlocksForPage(num) { translated.push({ kind: "blocks", num }); },
+    // ⚠ 桩要**真的**把该页标成「段落已翻」，否则上游会以为这页翻失败了
+    translateBlocksForPage(num, isPriority) {
+      translated.push({ kind: "blocks", num, isPriority });
+      const pg = ((env.__pdfState || {}).pages || []).find(p => p.num === num);
+      if (pg) pg.blockTranslated = true;
+      return Promise.resolve();
+    },
+    // 快照读取：默认「所有页都有段落级译文」→ 不触发补翻
+    getJson(url) {
+      return Promise.resolve(env.__snapshot || { pages: [] });
+    },
+    // 确认框：默认同意
+    confirm(msg) {
+      confirms.push(String(msg));
+      return env.__confirmAnswer !== false;
+    },
+    savePdfSnapshot(opts) {
+      snapshotsSaved.push(opts || {});
+      return Promise.resolve();
+    },
     _showBilingualVisibility() {},
     _fetchImpl: async () => ({ ok: true, status: 200 }),
   };
@@ -174,6 +199,7 @@ const console = { error: () => {}, warn: () => {}, log: () => {} };
     "document", "showToast", "fetch", "_readJsonSafe", "_httpErrorMessage",
     "renderReader", "openReaderModal", "switchReaderMode", "loadPdfDualColumn",
     "translatePdfPage", "translateBlocksForPage", "_showBilingualVisibility",
+    "getJson", "confirm", "savePdfSnapshot", "__env",
     "__timers",
     prelude + js + `
 return {
@@ -182,7 +208,9 @@ return {
   _applyReplacedPdfView,
   buildReplacedPdf,
   processNextInPdfQueue,
-  setPdfState: (v) => { _pdfState = v; },
+  _pagesMissingParagraphTranslations,
+  _ensureParagraphTranslations,
+  setPdfState: (v) => { _pdfState = v; __env.__pdfState = v; },
   getPdfState: () => _pdfState,
   setReplacedView: (v) => { _pdfReplacedView = !!v; },
   getReplacedView: () => _pdfReplacedView,
@@ -200,7 +228,8 @@ return {
     (data, res, text, fallback) => (data && data.detail) || fallback || "失败",
     env.renderReader, env.openReaderModal, env.switchReaderMode,
     env.loadPdfDualColumn, env.translatePdfPage, env.translateBlocksForPage,
-    env._showBilingualVisibility, env.timers,
+    env._showBilingualVisibility, env.getJson, env.confirm, env.savePdfSnapshot,
+    env, env.timers,
   );
 }
 
@@ -430,6 +459,106 @@ async function runSuite(src, label) {
     assertEq(env9.translated[0].kind, "page", "该走整页翻译");
   });
 
+  // ---- 「缺段落级译文」的页：构建前先补翻（用户 2026-11-17 报的）--------
+  // 用户原话：「我论文最后几页都没替换」。
+  // 根因：那几页在**普通模式**翻的（只有整页译文，没有段落坐标），
+  // 而替换版要按段落**原地**贴回原页 → 没坐标就没地方写中文。
+  await check("缺段落级译文的页 → 构建前先按段落重翻", async () => {
+    const env10 = makeEnv();
+    const api10 = buildApi(src, env10);
+    // 快照：第 1 页有段落级译文，第 5 页只有整页译文
+    env10.__snapshot = {
+      pages: [
+        { page_num: 1, translation: "第一页译文", blocks: [{ i: 0, translation: "段落" }] },
+        { page_num: 5, translation: "第五页的整页译文（没有段落坐标）" },
+      ],
+    };
+    api10.setPdfState({
+      paperId: "paper_abc123", relativePath: SRC_REL,
+      pages: [{ num: 1, text: "x", translated: false },
+              { num: 5, text: "x", translated: false }],
+      rendering: { generation: 0, cancelled: false },
+    });
+    api10.setReaderTitle("某论文");
+    env10._fetchImpl = async () => ({ ok: true, status: 200, __data: OK_DATA });
+    const tag = buttonTag(src);
+    const fn = new Function("buildReplacedPdf", "return (" + onclickBody(tag).trim() + ")");
+    await fn(api10.buildReplacedPdf);
+    const blocks = env10.translated.filter(t => t.kind === "blocks");
+    assertEq(blocks.length, 1, "第 5 页该按段落重翻一次，实际 " + JSON.stringify(env10.translated));
+    assertEq(blocks[0].num, 5, "翻的不是缺段落译文的那一页");
+    assertEq(env10.snapshotsSaved.length, 1,
+      "补翻完没存快照 → 下次构建还要再翻一遍");
+  });
+
+  await check("所有页都有段落级译文 → 不重翻（不白烧额度）", async () => {
+    const env11 = makeEnv();
+    const api11 = buildApi(src, env11);
+    env11.__snapshot = {
+      pages: [{ page_num: 1, translation: "第一页译文", blocks: [{ i: 0, translation: "段落" }] }],
+    };
+    api11.setPdfState({
+      paperId: "paper_abc123", relativePath: SRC_REL,
+      pages: [{ num: 1, text: "x", translated: false }],
+      rendering: { generation: 0, cancelled: false },
+    });
+    api11.setReaderTitle("某论文");
+    env11._fetchImpl = async () => ({ ok: true, status: 200, __data: OK_DATA });
+    const tag = buttonTag(src);
+    const fn = new Function("buildReplacedPdf", "return (" + onclickBody(tag).trim() + ")");
+    await fn(api11.buildReplacedPdf);
+    assertEq(env11.translated.filter(t => t.kind === "blocks").length, 0,
+      "全都翻过了还去翻一遍");
+  });
+
+  await check("缺 ≥2 页 → 先问用户（会调 N 次模型）", async () => {
+    const env12 = makeEnv();
+    const api12 = buildApi(src, env12);
+    env12.__snapshot = {
+      pages: [
+        { page_num: 5, translation: "第五页整页译文" },
+        { page_num: 6, translation: "第六页整页译文" },
+      ],
+    };
+    api12.setPdfState({
+      paperId: "paper_abc123", relativePath: SRC_REL,
+      pages: [{ num: 5, text: "x" }, { num: 6, text: "x" }],
+      rendering: { generation: 0, cancelled: false },
+    });
+    api12.setReaderTitle("某论文");
+    env12._fetchImpl = async () => ({ ok: true, status: 200, __data: OK_DATA });
+    const tag = buttonTag(src);
+    const fn = new Function("buildReplacedPdf", "return (" + onclickBody(tag).trim() + ")");
+    await fn(api12.buildReplacedPdf);
+    assertEq(env12.confirms.length, 1, "缺 2 页还没问用户就开翻（白烧额度）");
+    assert(/2/.test(env12.confirms[0]), "确认框里没写清要翻几页：" + env12.confirms[0]);
+  });
+
+  await check("用户拒绝补翻 → 不翻（尊重用户的选择）", async () => {
+    const env13 = makeEnv();
+    const api13 = buildApi(src, env13);
+    env13.__snapshot = {
+      pages: [
+        { page_num: 5, translation: "第五页整页译文" },
+        { page_num: 6, translation: "第六页整页译文" },
+      ],
+    };
+    env13.__confirmAnswer = false;
+    api13.setPdfState({
+      paperId: "paper_abc123", relativePath: SRC_REL,
+      pages: [{ num: 5, text: "x" }, { num: 6, text: "x" }],
+      rendering: { generation: 0, cancelled: false },
+    });
+    api13.setReaderTitle("某论文");
+    env13._fetchImpl = async () => ({ ok: true, status: 200, __data: OK_DATA });
+    const tag = buttonTag(src);
+    const fn = new Function("buildReplacedPdf", "return (" + onclickBody(tag).trim() + ")");
+    await fn(api13.buildReplacedPdf);
+    assertEq(env13.translated.filter(t => t.kind === "blocks").length, 0,
+      "用户点了「否」还去翻了");
+    assertEq(env13.fetches.length, 1, "拒绝补翻后不该再发构建请求");
+  });
+
   return { passed, failed };
 }
 
@@ -449,6 +578,29 @@ const MUTATIONS = [
   { name: "把标题去重去掉（标题会叠）", from: '.replace(/（中译替换版）\\s*$/, "")', to: '.replace(/__nothing__/, "")' },
   { name: "把「先打开一篇 PDF」的提前返回删掉", from: 'showToast("先打开一篇 PDF", true, 3000);', to: '/* 不提示 */;' },
   { name: "把失败提示删掉", from: 'showToast("生成失败: " + (err && err.message ? err.message : err), true, 6000);', to: '/* 静默 */;' },
+  {
+    name: "把「构建前先补翻缺段落级译文的页」删掉（最后几页又不替换了）",
+    from: "const fill = await _ensureParagraphTranslations();",
+    to: "const fill = { done: [], failed: [] };",
+  },
+  {
+    name: "把「缺段落级译文」的判据改坏（整页译文也算有段落译文）",
+    from: '.filter(p => (p.translation || "").trim() && !(p.blocks && p.blocks.length))',
+    to: '.filter(p => false)',
+  },
+  {
+    name: "把补翻完存快照这一步删掉（下次构建还要再翻一遍）",
+    from: "await savePdfSnapshot({ silent: true });",
+    to: "/* 不存快照 */;",
+  },
+  {
+    // ⚠ 必须带上下文：`const ok = confirm(` 在 index.html 里有 **3 处**
+    //   （删笔记 / 补翻缺段落译文 / 别处），只写这一句会改到第一处（删笔记），
+    //   跟被测代码无关 → 变异"没被抓到"，看起来像断言恒真，其实是变异打偏了。
+    name: "把「先问用户」这一步删掉（不问就白烧额度）",
+    from: "const ok = confirm(\n          `第 ${nums} 页只有「整页译文」",
+    to: "const ok = true || confirm(\n          `第 ${nums} 页只有「整页译文」",
+  },
 ];
 
 async function main() {

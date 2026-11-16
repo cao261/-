@@ -253,6 +253,12 @@ def test_behavioural_guard_files_are_still_there():
         "tests/test_tablet_frontend.py",          # 把 JS 套件挂进 pytest
         "tests/test_route_contracts.py",          # 装饰器挂错函数的反向护栏
         "tests/test_audit_2026_11_09.py",         # 第 1 批的行为级回归
+        # ↓ 2026-11-17（用户报「最后几页没替换」「划译文提问看不到公式」那轮）
+        "microbench/_test_replaced_pdf_frontend.js",  # 替换版：缺段落级译文 → 补翻
+        "microbench/_test_qa_formula_frontend.js",    # 划词答疑：公式坐标随请求发
+        "tests/test_qa_formula_images.py",            # 后端：公式高清图真的发给模型
+        # ↓ 2026-11-17：5 个渲染护栏的浏览器回退链（系统 Edge 坏了不至于集体失效）
+        "microbench/_headless_browser.py",
     ]
     missing = [r for r in required if not (REPO / r).exists()]
     assert not missing, f"行为级护栏文件不见了: {missing}"

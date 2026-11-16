@@ -160,16 +160,35 @@ def main() -> int:
 
         # 直接查生成出来的 PDF（比在渲染出来的画布上找字更可靠）
         import fitz
-        gen = None
-        for cand in (REPO / "01_Literature/04_Survey_综述/05_译文替换版_PDF").glob("*.pdf"):
-            gen = cand
-            break
+        # ⚠ 必须取**最新**的那个：同目录下可能有别的论文的产物
+        #   （glob 取第一个 = 随机命中别人的文件 → 判据全错）。
+        cands = list((REPO / "01_Literature/04_Survey_综述/05_译文替换版_PDF").glob("*.pdf"))
+        gen = max(cands, key=lambda p: p.stat().st_mtime) if cands else None
         if gen is None:
             check("生成的文件在 vault 里", False, "没找到 05_译文替换版_PDF/*.pdf")
         else:
+            # ⚠ 期望值**从 toast 里解析**，不写死：
+            #   写死的话，护栏会把「哪几页没替换」这个 bug 当成正确行为钉住
+            #   （2026-11-17 用户报「最后几页都没替换」时，这条护栏是绿的）。
+            #   现在断言的是**不变量**：页数 = 原文 + 替换、且严格交替。
+            import re as _re
+            m = _re.search(r"已生成\s*(\d+)\s*页（(\d+)\s*原文\s*\+\s*(\d+)\s*替换）", toast or "")
+            if not m:
+                check("能从提示里读出「原文几页 + 替换几页」", False,
+                      "toast=%r" % (toast or "")[:200])
+                n_orig = n_repl = None
+            else:
+                n_orig = int(m.group(2))
+                n_repl = int(m.group(3))
+                check("能从提示里读出「原文几页 + 替换几页」", True,
+                      "原文 %d + 替换 %d" % (n_orig, n_repl))
             doc = fitz.open(str(gen))
-            check("输出页数 = 原文页数 + 替换页数（8 → 12）",
-                  doc.page_count == 12, "实际 %d 页" % doc.page_count)
+            if n_orig is None:
+                doc.close()
+                return 1
+            check("输出页数 = 原文页数 + 替换页数（%d → %d）"
+                  % (n_orig, n_orig + n_repl),
+                  doc.page_count == n_orig + n_repl, "实际 %d 页" % doc.page_count)
             orig_hits = repl_hits = 0
             pattern = []
             for i in range(doc.page_count):
@@ -191,9 +210,9 @@ def main() -> int:
             print("   页面序列: %s" % "".join(pattern))
             check("原文页保留英文", orig_hits >= 4, "识别到 %d 个原文页" % orig_hits)
             check("替换页是中文", repl_hits >= 4, "识别到 %d 个替换页" % repl_hits)
-            # 前 8 页 = 有译文的第 1~4 页，严格「原文/替换」交替；
-            # 后 4 页 = 没翻过的第 5~8 页，只有原文页。
-            expect = ("英中" * 4) + ("英" * 4)
+            # 期望序列 = 严格「原文/替换」交替 × 替换页数
+            # + 剩下的原文页（没翻过的页只有原文页）
+            expect = ("英中" * n_repl) + ("英" * (n_orig - n_repl))
             check("原文页与替换页交替出现",
                   "".join(pattern) == expect,
                   "".join(pattern) + " ≠ " + expect)

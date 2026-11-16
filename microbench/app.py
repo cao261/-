@@ -32,7 +32,7 @@ from fastapi.responses import (HTMLResponse, FileResponse, StreamingResponse,
                                 RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import List, Optional
 
 from .paper_fetcher import (
     smart_fetch_paper,
@@ -1166,6 +1166,19 @@ class ExplainSelectionRequest(BaseModel):
     pdf_relative_path: Optional[str] = Field(default=None, max_length=500,
                                               description="PDF 在 vault 中的相对路径。提供 page_image 时用于"
                                                           "校验图片来源 (只允许 vault 内的 PDF)。")
+    page_num: Optional[int] = Field(default=None, ge=1, le=2000,
+                                    description="所选片段所在页（1 起）。"
+                                                "给了它 + pdf_relative_path，"
+                                                "服务端就会按 PDF 原始坐标重渲染一张清晰整页图给模型"
+                                                "（浏览器端那张是按栏宽渲染的，公式看不清）。")
+    formula_rects: Optional[List[List[float]]] = Field(default=None,
+                                                       description="所选页里公式的坐标列表 "
+                                                                   "[[x0,y0,x1,y1], ...]"
+                                                                   "（PDF 点，左上角原点）。"
+                                                                   "服务端按这些坐标从 PDF 原页裁出"
+                                                                   "**高清公式图**一起给模型 —— "
+                                                                   "整页图会被降采样，公式在上面只有几十像素高，"
+                                                                   "模型读不出来（用户原话：只能猜）。")
 
 
 class ReadTableRequest(BaseModel):
@@ -2098,6 +2111,12 @@ async def api_build_replaced_pdf(req: ReplacedPdfRequest):
                    "请重新用「🔀 对照」翻一次" % (saved_ver, BLOCK_TRANSLATION_VERSION))
 
     page_blocks: dict = {}
+    # ⚠ 有「整页译文」但**没有段落级译文**的页 —— 那些页**没法原地替换**
+    #   （没有坐标就没地方写中文）→ 只能原样保留英文。
+    #   用户 2026-11-17 报「我论文最后几页都没替换」—— 就是这个原因：
+    #   那几页是在**普通模式**翻的（只有整页译文），而替换版只认段落级。
+    #   → 如实报告出去，前端据此提示并按段落重翻。
+    pages_without_blocks: list[int] = []
     for pg in pages_raw:
         if not isinstance(pg, dict):
             continue
@@ -2123,8 +2142,13 @@ async def api_build_replaced_pdf(req: ReplacedPdfRequest):
             ))
         if blocks:
             page_blocks[pno] = blocks
+        elif (pg.get("translation") or "").strip():
+            pages_without_blocks.append(pno)
     if not page_blocks:
-        raise HTTPException(status_code=409, detail="快照里没有可用的段落译文")
+        raise HTTPException(
+            status_code=409,
+            detail=("快照里没有段落级译文（blocks）—— 替换版要按段落原地替换，"
+                    "请用「🔀 对照」模式翻几页并保存快照"))
 
     # ---- 输出路径 ----
     out_rel = (req.out_relative_path or "").strip() or _default_replaced_out(req.relative_path)
@@ -2155,6 +2179,8 @@ async def api_build_replaced_pdf(req: ReplacedPdfRequest):
         "out_relative_path": out_rel.replace("\\", "/"),
         "out_size_bytes": out_path.stat().st_size if out_path.exists() else 0,
         "elapsed_ms": elapsed,
+        # 有整页译文、但没有段落级译文的页 → 这些页**保留英文**（如实报告）
+        "pages_without_blocks": sorted(pages_without_blocks),
     })
     return d
 
@@ -3859,6 +3885,135 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
+def _render_page_png_b64(pdf_path: Path, page: int, zoom: float = 2.0) -> str:
+    """把 PDF 某一页渲染成 PNG（base64，无 data URL 前缀）；失败返回 ""。
+
+    为什么服务端要自己渲染（2026-11-17 用户实测）：
+
+      用户原话：「如果是划译文的词句问问题，因为公式是直接截图放在译文里的，
+      ai 看上下文的时候完全看不到公式推导，只能猜」。
+
+      两层原因：
+        ① 译文栏划选走的是 `source_type="translation"` → 前端**根本没带截图**
+           （原来只有从 PDF 原文侧划选才带）；
+        ② 就算带了，浏览器那张是 **PDF.js 画布** —— 画布按**栏宽**渲染
+           （双栏模式下整页只有 ~785px 宽）→ 公式在上面只有几十像素，
+           多模态模型**读不出来**。
+
+      → 服务端按 PDF 原始坐标重渲染（走 `paper_text.render_page_png`，
+        它自带 max_pixels 护栏）。但**整页图只能给「布局上下文」**：
+        一条 223pt 宽的公式在整页图上只有 ~18px 高 → 照样读不出来。
+        → 公式必须单独裁出来（见 `_render_formula_crops_b64`）。
+    """
+    if not pdf_path or not pdf_path.exists():
+        return ""
+    try:
+        import base64
+    except ImportError:
+        return ""
+    try:
+        from .paper_text import render_page_png
+        png = render_page_png(pdf_path, page, zoom=zoom)
+    except Exception as e:
+        print(f"[microbench] 整页渲染失败 {pdf_path.name} p{page}: {e}",
+              file=sys.stderr)
+        return ""
+    return base64.b64encode(png).decode("ascii")
+
+
+def _sanitize_formula_rects(rects) -> list:
+    """校验前端送来的公式坐标：只保留合法的 [x0,y0,x1,y1]。
+
+    ⚠ 这是**客户端可控**的入参 —— 必须自己把关，不能让一个畸形的矩形
+      打到裁图接口上（超大框 → 几十 MB 的 PNG → 把本机服务打爆）。
+    """
+    out = []
+    for r in list(rects or [])[:16]:
+        try:
+            vals = [float(v) for v in r]
+        except (TypeError, ValueError):
+            continue
+        if len(vals) != 4:
+            continue
+        if any(v != v or v in (float("inf"), float("-inf")) for v in vals):
+            continue
+        x0, y0, x1, y1 = vals
+        if x1 <= x0 or y1 <= y0:
+            continue
+        out.append((x0, y0, x1, y1))
+    return out
+
+
+def _render_formula_crops_b64(pdf_path: Path, page: int, rects: list,
+                              scale: float = 4.0) -> list:
+    """把一页里的若干公式坐标裁成**高清 PNG**（base64 列表）。
+
+    为什么必须单独裁（2026-11-17 实测数据）：
+
+      JACERS 综述真实页面，公式坐标 223×10pt：
+        · 整页图（zoom=2.0，max_pixels=1.6M → 实际 1064px 宽）
+          → 公式只有 ~400×18px → 上下标根本分不清 → 模型只能猜
+        · 按坐标裁（scale=4）→ **894×40px** → 公式原貌清清楚楚
+
+      所以「整页图给上下文 + 公式裁图给细节」必须**两个都给**，
+      少了裁图这一半，这个缺陷就还在。
+    """
+    if not pdf_path or not pdf_path.exists():
+        return []
+    try:
+        import base64
+    except ImportError:
+        return []
+    out = []
+    for r in rects:
+        try:
+            png = _pdf_clip_png(pdf_path, page, r, scale)
+        except Exception:
+            continue
+        if png:
+            out.append(base64.b64encode(png).decode("ascii"))
+    return out
+
+
+async def _qa_page_images(req: "ExplainSelectionRequest"):
+    """给答疑模型准备图片：**整页缩略图** + **该页公式高清原图**。
+
+    返回 (page_b64, [formula_b64, ...])。两者都没有时才退回前端截的那张
+    （PDF.js 画布，偏糊，但总比没有强）。
+    """
+    page_num = req.page_num
+    rel = (req.pdf_relative_path or "").strip()
+    pdf_path = None
+    if rel:
+        try:
+            pdf_path = _safe_path(BASE_DIR, rel)
+        except ValueError:
+            pdf_path = None
+    if pdf_path is None or not pdf_path.exists():
+        return _frontend_page_image(req), []
+
+    page_b64 = ""
+    if page_num:
+        page_b64 = await asyncio.to_thread(_render_page_png_b64, pdf_path, page_num, 2.0)
+    rects = _sanitize_formula_rects(req.formula_rects)
+    formula_b64s = []
+    if rects and page_num:
+        formula_b64s = await asyncio.to_thread(
+            _render_formula_crops_b64, pdf_path, page_num, rects, 4.0)
+    if not page_b64 and not formula_b64s:
+        # 服务端渲染失败 → 退回前端那张
+        page_b64 = _frontend_page_image(req)
+    return page_b64, formula_b64s
+
+
+def _frontend_page_image(req: "ExplainSelectionRequest") -> str:
+    """前端截的那张（PDF.js 画布）→ 规范成裸 base64。"""
+    b64 = (req.page_image or "").strip()
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[-1]
+    return "".join(b64.split())
+
+
 @app.post("/api/paper/explain_selection_stream")
 async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Request):
     """Streaming variant of /api/paper/explain_selection using SSE.
@@ -3875,10 +4030,32 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
     paper_label = req.paper_title or "未知论文"
     source_desc = "PDF 英文原文" if req.source_type == "pdf" else ("中文译文" if req.source_type == "translation" else "论文选段")
 
+    # ⚠ 先把图准备好：有图才能在提示里告诉模型「公式以图为准」。
+    page_b64, formula_b64s = await _qa_page_images(req)
+
     user_msg_parts = [
         f"论文标题: 《{paper_label}》",
         f"【用户划选片段 ({source_desc})】:\n```text\n{req.selected_text.strip()}\n```",
     ]
+    if page_b64 or formula_b64s:
+        # 用户 2026-11-17：划译文里的句子提问时，公式在译文里是**图片**，
+        # 而文本上下文里只有公式的碎片（"2 4 3" 这种乱序残片）→
+        # 模型看不到公式推导，只能猜。→ 明确告诉它：图才是准的。
+        notes = []
+        if page_b64:
+            notes.append(
+                "第 1 张是**整页缩略图**（页面布局、图表位置参考）；"
+                "公式在它上面只有几十像素高，看不清是正常的。")
+        if formula_b64s:
+            notes.append(
+                f"后面 {len(formula_b64s)} 张是**该页公式的高清原图**"
+                "（从 PDF 原页按坐标逐个裁出，和译文里嵌的公式图完全一致）："
+                "凡是公式推导、符号、上下标、系数数值，**一律以这些高清公式图为准**。")
+        notes.append(
+            "文本上下文里的公式都是乱序碎片（分子、分母、上下标各占一行），"
+            "**不要根据上下文补全或猜测公式**；"
+            "看不清的地方请明说「图中看不清」，不要凭空编造。")
+        user_msg_parts.append("【附件说明】" + "".join(notes))
     if req.surrounding_context:
         # Scope budget, mirroring the router's advertised tiers
         # (term ~600-800 / mid 4-8K / wide 12-20K / full up to 60K).
@@ -3920,21 +4097,29 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
     # 抽取层对表格/图注只能拿到碎片 ("2 4 3" 这种上下标、坐标轴刻度),
     # 模型看到的是一堆没有意义的字符 —— 这正是「这个表需要注意什么」
     # 问不出答案的原因。截图走 OpenAI 兼容的 image_url (data URL)。
-    image_b64 = (req.page_image or "").strip()
-    if image_b64.startswith("data:"):
-        image_b64 = image_b64.split(",", 1)[-1]
-    image_b64 = "".join(image_b64.split())
-    if image_b64:
-        user_content = [
-            {"type": "text", "text": user_msg},
-            {
+    #
+    # ⚠ page_b64 / formula_b64s 已在上面用 `_qa_page_images()` 算好
+    #   （服务端按 PDF 坐标重渲染的整页图 + 该页公式的高清裁图）。
+    if page_b64 or formula_b64s:
+        content = [{"type": "text", "text": user_msg}]
+        idx = 0
+        if page_b64:
+            idx += 1
+            content.append({"type": "text",
+                            "text": f"【附件 {idx}】整页缩略图（布局参考）"})
+            content.append({
                 "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{image_b64}",
-                },
-            },
-        ]
-        user_msg = user_content
+                "image_url": {"url": f"data:image/png;base64,{page_b64}"},
+            })
+        for i, b64 in enumerate(formula_b64s, 1):
+            idx += 1
+            content.append({"type": "text",
+                            "text": f"【附件 {idx}】该页公式原图 第 {i}/{len(formula_b64s)} 个（高清）"})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            })
+        user_content = content
     else:
         user_content = user_msg
 

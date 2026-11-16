@@ -21,6 +21,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+try:  # 作为脚本跑 / 作为包被导入，两种都要能用
+    from _headless_browser import dump_dom, find_browser as _find_browser
+except ImportError:  # pragma: no cover
+    from microbench._headless_browser import dump_dom, find_browser as _find_browser
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -34,11 +39,6 @@ EDGE_CANDIDATES = [
 ]
 
 
-def find_browser() -> str | None:
-    for p in EDGE_CANDIDATES:
-        if Path(p).is_file():
-            return p
-    return shutil.which("msedge") or shutil.which("chrome")
 
 
 # 从 index.html 里抽出「画笔迹」那段逻辑，放到探针页面里真跑一遍
@@ -160,6 +160,17 @@ document.title = 'RESULT:' + JSON.stringify(results);
 """
 
 
+
+def find_browser() -> str | None:
+    """首选系统 Edge/Chrome；没有就退到 Playwright 的 Chromium。
+
+    ⚠ 必须把 Playwright 一起算进来：各探针的 main() 里都有
+      「找不到浏览器 → SKIP 整个护栏」的判断 —— 只找系统浏览器的话，
+      系统浏览器一没，护栏就**静默失效**了（AGENTS §4.16）。
+    """
+    return _find_browser()
+
+
 def run_probe(browser: str, ink_block: str) -> list[dict]:
     # 探针跑的是「等价实现」；它与 index.html 是否一致，由本文件末尾的
     #   **源码断言**把关（这里不做插值，避免把依赖函数内变量的代码块插进来）。
@@ -167,11 +178,8 @@ def run_probe(browser: str, ink_block: str) -> list[dict]:
     with tempfile.TemporaryDirectory() as td:
         f = Path(td) / "probe.html"
         f.write_text(html, encoding="utf-8")
-        p = subprocess.run(
-            [browser, "--headless", "--disable-gpu", "--no-sandbox",
-             "--virtual-time-budget=3000", "--dump-dom", f.resolve().as_uri()],
-            capture_output=True, timeout=120)
-        dom = p.stdout.decode("utf-8", errors="replace")
+        dom = dump_dom(f, browser=browser, window_size="1400,1000",
+                       virtual_time_budget=3000)
         m = re.search(r"RESULT:(\[.*?\])</title>", dom)
         if not m:
             raise RuntimeError("探针没返回结果（DOM %d 字节）" % len(dom))
