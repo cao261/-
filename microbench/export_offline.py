@@ -1276,6 +1276,28 @@ def current_extractor_version():
         return None
 
 
+def current_blocks_version():
+    """当前**段落切分**版本（`bilingual.BLOCK_TRANSLATION_VERSION`）。
+
+    ⚠ 2026-11-17 全面审查 P1-4：段落译文（对照模式）有**独立**的版本闸门。
+      段落切分算法一改 → 块编号/坐标全变 → 旧段落译文贴到新段落上就是
+      **左右栏对调、译文串行**（比整页译文过期更隐蔽，也更伤）。
+
+      桌面端靠 `/api/paper/page_blocks` 返回的 `blocks_version` 比对；
+      平板**访问不到桌面后端** → 只能像 `trans_ver` 一样把版本**烤进包里**，
+      由平板自己比对。取不到就返回 None（平板会一律丢弃段落译文，
+      fail closed —— 宁可没有对照视图，也不要错位的对照视图）。
+    """
+    try:
+        from microbench.bilingual import BLOCK_TRANSLATION_VERSION
+        return BLOCK_TRANSLATION_VERSION
+    except Exception as exc:
+        print(f"[导出器] ⚠ 取不到段落切分版本（{exc}）—— "
+              f"平板会丢弃全部段落译文（宁可没有，也不要错位的对照视图）",
+              file=sys.stderr)
+        return None
+
+
 def collect_translations() -> dict:
     """导出平板工作台时，把**译文快照**一起烤进去。
 
@@ -1386,7 +1408,11 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
     pdfs = getattr(notes[0], "_pdfs_all", {}) if notes else {}
     data_json = json.dumps({"notes": payload, "pdfs": pdfs,
                             "trans": collect_translations(),
-                            "trans_ver": current_extractor_version()},
+                            "trans_ver": current_extractor_version(),
+                            # ⚠ 段落切分版本（对照模式的独立闸门）——
+                            #   2026-11-17 全面审查 P1-4：平板拿不到服务端，
+                            #   必须靠这个版本自己比对，否则旧段落译文会错位。
+                            "blocks_ver": current_blocks_version()},
                            ensure_ascii=False)
     data_json = data_json.replace("</", "<\\/")
 

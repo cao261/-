@@ -5015,14 +5015,23 @@
           title: title,
         };
       } else {
-        try {
-          const r = await fetch(`/api/paper/find_pdf?title=${encodeURIComponent(title)}`);
-          found = await r.json();
-          if (found && found.found) {
-            _readerState.pdfPath = found.relative_path;
-          }
-        } catch (e) {
+        // ⚠ 2026-11-17 全面审查 S1：后端 `title` 是 `min_length=1`，
+        //   空标题会拿到 422，而下面的 catch 把它吞成「没找到」——
+        //   用户看到「未在 vault 中找到匹配的本地 PDF」，排查方向完全错。
+        //   → 标题为空就别问了，直接按「没找到」处理。
+        const titleQ = String(title || "").trim();
+        if (!titleQ) {
           found = { found: false };
+        } else {
+          try {
+            const r = await fetch(`/api/paper/find_pdf?title=${encodeURIComponent(titleQ)}`);
+            found = await r.json();
+            if (found && found.found) {
+              _readerState.pdfPath = found.relative_path;
+            }
+          } catch (e) {
+            found = { found: false };
+          }
         }
       }
 
@@ -8031,8 +8040,11 @@
     async function askPaperQuestion() {
       const qEl = document.getElementById("ask-paper-question");
       const question = (qEl ? qEl.value.trim() : "");
-      if (!question) {
-        showToast("请输入问题", true);
+      // ⚠ 2026-11-17 全面审查 S2：后端 ExplainRequest.question 是
+      //   `min_length=2`，前端只判空 → 单字符提问会拿到 422，
+      //   SSE 面板弹出原始校验错误（用户看不懂）。
+      if (question.length < 2) {
+        showToast(question ? "问题至少写两个字" : "请输入问题", true);
         return;
       }
       // 发出即清空：问下一题不用先手动删掉上一个问题
@@ -8085,8 +8097,9 @@
     async function crossSectionQA() {
       const qEl = document.getElementById("cross-qa-question");
       const question = (qEl ? qEl.value.trim() : "");
-      if (!question) {
-        showToast("请输入跨章节问题", true);
+      // ⚠ 同 S2：后端 CrossQARequest.question 同样是 `min_length=2`。
+      if (question.length < 2) {
+        showToast(question ? "问题至少写两个字" : "请输入跨章节问题", true);
         return;
       }
       if (_readerState.sections.length < 2) {
@@ -9161,24 +9174,38 @@
     async function saveAnnotationsToServer() {
       const pid = _annoPaperId();
       if (!pid) return false;
-      try {
-        const r = await fetch("/api/pdf/annotations/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          // deleted 一起发上去：服务端按 id 合并，别让另一台设备把已删的批注"复活"
-          body: JSON.stringify({
-            paper_id: pid,
-            annotations: _annoState.items,
-            deleted: _annoState.deleted,
-          }),
-        });
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        _annoState.deleted = [];
-        return true;
-      } catch (e) {
-        showToast("批注保存失败: " + (e.message || e), true);
-        return false;
+      // ⚠ 409 = 共享文件正被**另一台设备**写（服务端的乐观 CAS 撞满了）。
+      //   这是**可重试**的：服务端每次都会重新读、重新合并 → 重发同一条请求
+      //   不会丢对方的数据。2026-11-17 全面审查 P1-高 修好服务端 CAS 顺序后
+      //   加的：没有这层重试，跨设备同时标注会直接弹「保存失败」给用户。
+      const body = JSON.stringify({
+        paper_id: pid,
+        annotations: _annoState.items,
+        deleted: _annoState.deleted,
+      });
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const r = await fetch("/api/pdf/annotations/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            // deleted 一起发上去：服务端按 id 合并，别让另一台设备把已删的批注"复活"
+            body: body,
+          });
+          if (r.status === 409) {
+            // 冲突：等一下再发（服务端会重新读盘再合并）
+            await new Promise((res) => setTimeout(res, 250 * (attempt + 1)));
+            continue;
+          }
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          _annoState.deleted = [];
+          return true;
+        } catch (e) {
+          showToast("批注保存失败: " + (e.message || e), true);
+          return false;
+        }
       }
+      showToast("批注保存失败: 另一台设备正在写入同一份批注，请稍后再点一次保存", true);
+      return false;
     }
 
     function renderAnnoColorPicker() {
@@ -10466,20 +10493,42 @@
         defaultTool: "论文精读答疑",
       }).then((result) => {
         if (!result) return; // cancelled
+        // ⚠⚠ 2026-11-17 全面审查 D1（确证缺陷，实测 422）：
+        //   原来这里发的是 `raw_error: ""` / `root_cause: ""`，
+        //   而后端 TroubleshootRequest 这两个字段都是 `min_length=1`
+        //   → **必然 422**，「➕ 存入避坑库」一键保存从来就没成功过；
+        //   而且报错被写成「API 暂不可用」，把排查方向带偏（用户会去查网络）。
+        //   现在填**真内容**：原始问题（含引文/页码/出处）→ 错误现场，
+        //   解答的关键结论 → 根本原因。
+        const qa = _lastQAItem || {};
+        const answerText = String(result.solution || _lastAnswerText || "");
+        const rawError = [
+          "提问：" + String(qa.question || result.keyword || "").trim(),
+          qa.selection ? "引文：" + String(qa.selection).trim() : "",
+          qa.page ? "页码：第 " + qa.page + " 页" : "",
+          qa.title ? "出处：" + qa.title : "",
+        ].filter(Boolean).join("\n").slice(0, 10000);
+        const rootCause = ("结论（来自 AI 解答）：\n" + answerText.trim())
+          .slice(0, 5000);
+        // ⚠ 每个必填字段都要有兜底：用户把关键词清空 → 又是一次 422。
+        const payload = {
+          tool_name: String(result.tool || "").trim() || "论文精读答疑",
+          category: String(result.category || "").trim() || "TCAD仿真收敛",
+          error_keyword: String(result.keyword || "").trim()
+            || String(qa.question || "").trim().slice(0, 30) || "论文精读答疑",
+          raw_error: rawError || "论文精读答疑记录",
+          root_cause: rootCause || "见解决方案",
+          solution: answerText.slice(0, 5000) || "（无解答内容）",
+        };
         // Direct one-click save to 03_Knowledge/踩坑与排错日记.md
         fetch("/api/troubleshoot/add", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            tool_name: result.tool,
-            category: result.category,
-            error_keyword: result.keyword,
-            raw_error: "",
-            root_cause: "",
-            solution: result.solution,
-          }),
-        }).then(r => r.json()).then(data => {
-          if (data && data.status === "success") {
+          body: JSON.stringify(payload),
+        }).then(async (r) => {
+          let data = null;
+          try { data = await r.json(); } catch (e) { data = null; }
+          if (r.ok && data && data.status === "success") {
             showToast("✅ 已存入避坑知识库", false, 4000);
             loadStats();
           } else {
@@ -10488,7 +10537,12 @@
             const solEl = document.getElementById("tb-solution");
             if (kwEl) kwEl.value = result.keyword;
             if (solEl) solEl.value = result.solution;
-            showToast("API 暂不可用, 已预填到右侧避坑表单(请手动保存): " + (data.detail || ""), true);
+            // ⚠ 别把「请求体不合法」说成「API 暂不可用」—— 方向完全不一样。
+            const why = (data && data.detail) ? data.detail : ("HTTP " + r.status);
+            const head = (r.status === 422)
+              ? "请求参数不合法"
+              : (r.status >= 500 ? "服务端出错" : "保存失败");
+            showToast(head + ", 已预填到右侧避坑表单(请手动保存): " + why, true);
           }
         }).catch(() => {
           // Network failure → fall back to pre-fill UX

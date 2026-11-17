@@ -259,6 +259,11 @@ def test_behavioural_guard_files_are_still_there():
         "tests/test_qa_formula_images.py",            # 后端：公式高清图真的发给模型
         # ↓ 2026-11-17：5 个渲染护栏的浏览器回退链（系统 Edge 坏了不至于集体失效）
         "microbench/_headless_browser.py",
+        # ↓ 2026-11-17：**全面功能审查**那一轮（三份子审计的产物）
+        "tests/test_sync_cas_2026_11_17.py",             # 跨设备并发写（批注/快照/files）
+        "microbench/_test_tablet_qa_images.js",           # 平板划词带图 + 文本层几何
+        "microbench/_test_troubleshoot_save_frontend.js", # 一键存入避坑库（曾经必 422）
+        "tests/test_troubleshoot_save_frontend.py",       # 前后端载荷契约（拿后端模型校验）
     ]
     missing = [r for r in required if not (REPO / r).exists()]
     assert not missing, f"行为级护栏文件不见了: {missing}"

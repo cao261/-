@@ -584,7 +584,7 @@
         `<code class="math-error">${esc(f.tex.trim())}</code>`).join("");
     }
     return list.map((f) => {
-      const ck = (f.display ? "D" : "I") + " " + f.tex;
+      const ck = (f.display ? "D" : "I") + " " + f.tex;
       const hit = _mathCache.get(ck);
       if (hit !== undefined) return hit;
       let out;
@@ -798,6 +798,9 @@
     pendingSelection: "",  // 从 PDF 里划词带过来的原文
     pendingRegionImage: "", // 圈选区域裁出来的图（data URL），下次提问自动带上
     pendingRegionPage: 0,    // 圈选区域在第几页
+    // ⚠ 2026-11-17 全面审查 P0-1：划词提问要带的图（整页原文 + 高清公式图）。
+    //   原来平板划词**一张图都不发** → 模型看不到公式 → 只能猜。
+    pendingSelectionImages: [],
     aiHistory: new Map(),   // noteId -> [{role, content}] 多轮对话上下文
     // ⚠ 以前这里还有 `trans: new Map()` 和 `annos: new Map()` ——
     //   全文件**从来没有写入过**（译文走 state.transSeed / state.transVer，
@@ -805,6 +808,13 @@
     transSeed: {},          // 导出版里烤进来的译文 {safeKey: {pageNum: 译文}}
     transVer: null,         // 当前的抽取算法版本（判断译文是不是旧的）
     transStale: false,      // 这篇的译文是旧算法翻的（已作废）
+    // ⚠⚠ 2026-11-17 全面审查 P1-4：段落译文（对照模式）的**独立版本闸门**。
+    //   段落切分算法一改（BLOCK_TRANSLATION_VERSION +1），块编号/坐标全变
+    //   → 旧段落译文贴到新段落上就是**左右栏对调、译文串行**。
+    //   桌面端靠 /api/paper/page_blocks 返回的 blocks_version 比对，
+    //   平板访问不到后端 → 必须像 trans_ver 一样**把版本烤进平板包**。
+    blocksVer: null,        // 当前的段落切分版本（null = 不知道 → 一律丢弃）
+    blocksStale: false,     // 段落译文是旧版本切分的（已丢弃）
   };
 
   const FOLDERS = [
@@ -827,6 +837,8 @@
     if (raw && raw.trans) state.transSeed = raw.trans;
     // 当前的抽取算法版本 —— 用来判断云盘上的译文是不是旧算法翻的
     if (raw && raw.trans_ver != null) state.transVer = raw.trans_ver;
+    // ⚠ 段落切分算法版本（对照模式用）—— 2026-11-17 全面审查 P1-4
+    if (raw && raw.blocks_ver != null) state.blocksVer = raw.blocks_ver;
 
     const existing = await DB.allNotes();
     const have = new Map(existing.map((n) => [n.id, n]));
@@ -1917,6 +1929,18 @@
     "对本方向的价值与局限。分点写，不超过 600 字。" +
     CAPABILITY_BOUNDARY;
 
+  // ⚠⚠ 2026-11-17 全面审查 P0-1：带图提问时的**公式纪律**。
+  //   桌面端 11-17 真机对照实验：只给整页图，模型把 d_33^m 误读成 d_31^m；
+  //   给了按坐标裁的 scale=4 高清公式图才读对。
+  //   → 模型**必须**以公式图为准；图里没有的就说没有，**不许按上下文补全**
+  //     （错公式比没公式危险得多：用户会照着它去算）。
+  //   与桌面端 microbench/app.py 的提示词同口径。
+  const QA_IMAGE_RULE =
+    "\n\n【图片说明】下面附的是论文原页截图和按坐标裁出的**高清公式图**。" +
+    "凡是公式推导、符号、上下标、系数数值，**一律以这些高清公式图为准**；" +
+    "公式图里没有的内容**不要根据上下文补全或猜测**；" +
+    "如果公式图看不清或没有对应内容，就明确说「看不清 / 没有」，不要编。";
+
   const PROMPTS = {
     explain: (sel) => [
       { role: "system", content: SYS_RESEARCH },
@@ -2651,14 +2675,27 @@
     //
     // ⚠ 待发的圈选区域图**只跟"提问"走** —— 「翻译选中」「解读选中」
     //   是针对选中文字的，混进一张图只会让模型分不清在看什么。
+    const selImgs = kind === "ask" ? (state.pendingSelectionImages || []) : [];
     const imgAttached = kind === "ask"
-      ? !!(o.imageDataUrl || state.pendingRegionImage)
+      ? !!(o.imageDataUrl || state.pendingRegionImage || selImgs.length)
       : !!o.imageDataUrl;
     const base = PROMPTS[kind](
       kind === "ask"
         ? (sel || (imgAttached ? "" : bodyText.slice(0, 4000)))
         : (sel || bodyText.slice(0, 6000)),
       q);
+
+    // ⚠⚠ 2026-11-17 全面审查 P0-1：带了图就**必须**把「以公式图为准」的约束
+    //   写进提示词 —— 否则模型会去猜公式（错公式比没公式危险得多）。
+    //   这段与桌面端 app.py 的提示词同口径。
+    //   ⚠ 要写在 **base[1]**（user 消息）上，而不是 messages 上 ——
+    //   下面多轮上下文会用 base[1] 重建 messages，写在 messages 上会被覆盖。
+    if (kind === "ask" && imgAttached && base[1] && base[1].role === "user") {
+      base[1] = {
+        role: "user",
+        content: String(base[1].content || "") + QA_IMAGE_RULE,
+      };
+    }
 
     // 多轮上下文：把这一篇笔记之前的问答带上 —— 追问时模型才知道前文在讲什么。
     // ⚠ system 消息必须在最前面，所以历史插在 system 和本次 user 之间。
@@ -2671,25 +2708,38 @@
       messages = [base[0]].concat(ctx, [base[1]]);
     }
 
-    // ⚠ 带上图片（手写标注 / 圈选区域）—— OpenAI 兼容的 content 数组格式。
+    // ⚠ 带上图片（手写标注 / 圈选区域 / 划词的整页图与高清公式图）
+    //   —— OpenAI 兼容的 content 数组格式。
     //   手写是图形，文字描述不出来，得让模型直接看图。
     // ⚠ 2026-11-12：没有显式传图时，用「已选中的圈选区域」；
     //   用掉就清掉（免得下一句提问又带上同一张图）。
-    const img = (kind === "ask")
-      ? (o.imageDataUrl || state.pendingRegionImage || "")
-      : (o.imageDataUrl || "");
-    if (img) {
+    // ⚠⚠ 2026-11-17 全面审查 P0-1：现在是**多图**（整页原文 + 若干张高清公式图）。
+    //   每张图前面加一句说明，模型才知道哪张是整页、哪张是公式。
+    const imgs = [];
+    if (kind === "ask") {
+      const region = o.imageDataUrl || state.pendingRegionImage || "";
+      if (region) imgs.push({ url: region, label: "圈选区域（用户手写圈出的那块）" });
+      (state.pendingSelectionImages || []).forEach((it) => {
+        if (it && it.url) imgs.push(it);
+      });
+    } else if (o.imageDataUrl) {
+      imgs.push({ url: o.imageDataUrl, label: "圈选区域（用户手写圈出的那块）" });
+    }
+    if (imgs.length) {
       // ⚠ 用掉就清掉（不管用的是显式传的还是"已选中的圈选区域"）——
       //   留着的话，下一句提问会又带上同一张图。
       state.pendingRegionImage = "";
+      state.pendingSelectionImages = [];
       const last = messages[messages.length - 1];
       if (last && last.role === "user") {
+        const parts = [{ type: "text", text: String(last.content || "") }];
+        imgs.forEach((it) => {
+          parts.push({ type: "text", text: "【" + (it.label || "附件") + "】" });
+          parts.push({ type: "image_url", image_url: { url: it.url } });
+        });
         messages[messages.length - 1] = {
           role: "user",
-          content: [
-            { type: "text", text: String(last.content || "") },
-            { type: "image_url", image_url: { url: img } },
-          ],
+          content: parts,
         };
       }
     }
@@ -3159,9 +3209,25 @@
       const cached = await DB.getMeta(transCacheKey(key, cur), null);
       if (cached && Object.keys(cached).length) {
         // 段落译文（对照模式）也取本地缓存 —— 断网也能看对照视图
+        // ⚠ 2026-11-17 全面审查 P1-4：缓存键要带**段落切分版本**
+        //   （段落版本一升，缓存里的旧切分译文自动失效）。
         try {
-          const cachedBlocks = await DB.getMeta(blocksCacheKey(key, cur), null);
-          if (cachedBlocks && Object.keys(cachedBlocks).length) pdfState.blockTrans = cachedBlocks;
+          const bver = state.blocksVer;
+          if (bver != null) {
+            const cachedBlocks = await DB.getMeta(blocksCacheKey(key, bver), null);
+            if (cachedBlocks && Object.keys(cachedBlocks).length) {
+              // 逐页再核一次版本（缓存可能是别处写进去的）
+              const okBlocks = {};
+              let bad = false;
+              Object.keys(cachedBlocks).forEach((pn) => {
+                const rec = cachedBlocks[pn] || {};
+                if (Number(rec.version) === Number(bver)) okBlocks[pn] = rec;
+                else bad = true;
+              });
+              if (Object.keys(okBlocks).length) pdfState.blockTrans = okBlocks;
+              state.blocksStale = bad;
+            }
+          }
         } catch (e) { /* 段落缓存取不到不影响整页译文 */ }
         return cached;
       }
@@ -3180,16 +3246,31 @@
         const pages = {};
         // 对照模式的段落译文：电脑端翻好、跟着快照同步过来的。
         // ⚠ 平板访问不到电脑端的后端 —— 这是**唯一**的通道。
+        //
+        // ⚠⚠ 2026-11-17 全面审查 P1-4：段落译文有**独立**的版本闸门
+        //   （BLOCK_TRANSLATION_VERSION）。桌面端拿服务端返回的 blocks_version
+        //   比对，平板拿不到服务端 → 用**烤进包里**的 state.blocksVer。
+        //   对不上（或不知道版本）→ **丢弃这些段落**（state.blocksStale），
+        //   绝不能把旧切分的译文贴到新段落上 —— 那会让左右栏对调、译文串行。
+        //   ⚠ 整页译文不受影响（两者生命周期分开），继续用。
         const blocks = {};
+        const curBlocks = state.blocksVer;
+        let droppedBlocks = false;
         (data.pages || []).forEach((p) => {
           if (p && p.translation) pages[p.page_num] = p.translation;
           if (p && p.blocks && p.blocks.length) {
-            blocks[p.page_num] = { blocks: p.blocks, version: p.blocks_version };
+            const v = (p.blocks_version == null) ? null : Number(p.blocks_version);
+            if (curBlocks == null || v !== Number(curBlocks)) {
+              droppedBlocks = true;      // 版本对不上 → 丢
+              return;
+            }
+            blocks[p.page_num] = { blocks: p.blocks, version: v };
           }
         });
+        state.blocksStale = droppedBlocks;
         if (Object.keys(blocks).length) {
           pdfState.blockTrans = blocks;
-          try { await DB.setMeta(blocksCacheKey(key, cur), blocks); } catch (e) { /* 缓存失败不影响显示 */ }
+          try { await DB.setMeta(blocksCacheKey(key, curBlocks), blocks); } catch (e) { /* 缓存失败不影响显示 */ }
         } else {
           pdfState.blockTrans = null;
         }
@@ -3478,6 +3559,10 @@
   function pdfFitScale(page) {
     const vp = page.getViewport({ scale: 1 });
     let s = pdfColumnWidth() / vp.width;
+    // ⚠ 2026-11-17 全面审查 P1：容器宽度拿不到时（0 / NaN）会让 scale 变成 NaN
+    //   → 画布和文本层（--scale-factor）一起废掉 → **划词选到错的字**。
+    //   → 兜一个能用的倍率，宁可排版难看也不能让几何崩掉。
+    if (!isFinite(s) || s <= 0) s = 1;
     s = Math.max(0.25, Math.min(s, 3));
     return s * (pdfState.zoom || 1);
   }
@@ -3553,7 +3638,15 @@
         pdfStatus(trans
           ? `已载入译文 ${n} 页` + (annos && annos.length ? ` · 批注 ${annos.length} 条` : "")
           : (annos && annos.length ? `已载入批注 ${annos.length} 条` : ""));
-        setTimeout(() => { pdfStatus(""); }, 2600);
+        // ⚠ 2026-11-17 全面审查 P1-4：段落译文版本对不上已被丢弃 →
+        //   **告诉用户**（否则对照模式静默变成「只有整页译文」）。
+        if (state.blocksStale) {
+          setTimeout(() => {
+            pdfStatus("⚠ 段落译文是旧版切分的（坐标可能错位），已丢弃 —— "
+              + "在电脑上用「🔀 对照」重翻一次，同步过来就有了");
+          }, 2600);
+        }
+        setTimeout(() => { pdfStatus(""); }, 5200);
       } else if (state.transStale) {
         // ⚠ 译文是旧抽取算法翻的 —— 桌面端会整份作废重翻，平板也不能用
         pdfStatus("这篇的译文是旧版抽取算法翻的（栏序可能不对），已作废 —— "
@@ -3962,6 +4055,119 @@
     paintFormulaShots(n);
   }
 
+  // ------------------------------------------------------------------
+  // 划词提问的图片附件（2026-11-17 全面审查 P0-1）
+  //
+  // ⚠⚠ 缺陷原文：平板上「划词 → 问 AI」**一张图都不发**
+  //   （state.pendingSelection 只存文本），
+  //   而公式在译文里是**截图**（⟦FORMULA:x0,y0,x1,y1⟧ → 本地裁图）
+  //   → 模型看不到公式推导 → **只能猜**。
+  //   桌面端 11-17 修完这一条（整页图 + 按坐标裁的 scale=4 高清公式图），
+  //   平板还停在旧行为 —— 同一个缺陷，平板更严重（连整页图都没有）。
+  //   实测依据（桌面端真机对照实验）：只给整页图，模型把 d_33^m 误读成 d_31^m；
+  //   给了高清公式图才读对。
+  //
+  // 修法（复用平板**已有**的能力，不新造轮子）：
+  //   ① 整页上下文图：这一页已画好的 canvas → 缩到 ≤1400px 宽；
+  //   ② 高清公式图：这一页的公式坐标 → renderFormulaShot（scale=4，≈288 DPI）；
+  //      裁好的图本来就有缓存（pdfState.formulaShots[n]），直接复用；
+  //   ③ 提示词明说「一律以高清公式图为准 / 不要猜公式 / 看不清就说看不清」。
+  // ------------------------------------------------------------------
+
+  const QA_PAGE_IMG_MAX_W = 1400;   // 整页图最大宽（与桌面对齐）
+  const QA_FORMULA_IMG_MAX = 8;     // 公式图最多带几张（多了 token 扛不住）
+
+  /** 这一页的公式图（优先用缓存；没有就现裁）。 */
+  async function formulaShotsForQa(n) {
+    const out = [];
+    if (!n) return out;
+    const texts = [];
+    const rec = (pdfState.blockTrans || {})[n];
+    if (rec && rec.blocks) {
+      rec.blocks.forEach((b) => { if (b && b.translation) texts.push(b.translation); });
+    }
+    const whole = (pdfState.trans || {})[n];
+    if (whole) texts.push(typeof whole === "string" ? whole : (whole.translation || ""));
+    const items = [];
+    texts.forEach((txt) => {
+      formulaRectsOf(txt).forEach((r) => {
+        const key = formulaKeyOf(r);
+        if (!items.some((x) => x.key === key)) items.push({ key: key, rect: r });
+      });
+    });
+    if (!items.length) return out;
+    const cache = (pdfState.formulaShots && pdfState.formulaShots[n]) || {};
+    const doc = pdfState.doc;
+    let page = null;
+    for (const item of items) {
+      if (out.length >= QA_FORMULA_IMG_MAX) break;
+      let url = cache[item.key];
+      if (url === undefined) {
+        if (!doc) break;                 // PDF 已关 → 用缓存里已有的，够了
+        if (!page) { try { page = await doc.getPage(n); } catch (e) { break; } }
+        try { url = await renderFormulaShot(page, item.rect); } catch (e) { url = ""; }
+        if (pdfState.formulaShots && pdfState.formulaShots[n]) {
+          pdfState.formulaShots[n][item.key] = url;
+        }
+      }
+      if (url) out.push({ url: url, label: "公式原图（从 PDF 原页裁出，与论文一致）" });
+    }
+    return out;
+  }
+
+  /** 整页上下文图（这一页已画好的 canvas → 缩到 ≤1400px 宽）。 */
+  function pageContextImage(n) {
+    try {
+      const wrap = document.querySelector('[data-pdf-page="' + n + '"]');
+      const canvas = wrap && wrap.querySelector
+        ? wrap.querySelector(".tb-pdf-orig canvas") : null;
+      if (!canvas || !canvas.width || !canvas.height) return "";
+      const ratio = Math.min(1, QA_PAGE_IMG_MAX_W / canvas.width);
+      const cv = document.createElement("canvas");
+      cv.width = Math.max(1, Math.floor(canvas.width * ratio));
+      cv.height = Math.max(1, Math.floor(canvas.height * ratio));
+      const ctx = cv.getContext("2d");
+      if (!ctx) return "";
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.drawImage(canvas, 0, 0, cv.width, cv.height);
+      return cv.toDataURL("image/jpeg", 0.85);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  /** 划词落在第几页（靠 .tb-pdf-page 的 data-pdf-page）。 */
+  function selectionPageNo() {
+    try {
+      const s = window.getSelection();
+      if (!s || s.rangeCount === 0) return 0;
+      const rect = s.getRangeAt(0).getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) return 0;
+      const nodes = document.querySelectorAll(".tb-pdf-page");
+      for (let i = 0; i < nodes.length; i++) {
+        const node = nodes[i];
+        const r = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+        if (!r) continue;
+        if (rect.top >= r.top - 4 && rect.top <= r.bottom + 4) {
+          return parseInt(node.getAttribute("data-pdf-page") || "0", 10) || 0;
+        }
+      }
+    } catch (e) { /* 选不到就当没有页码 */ }
+    return 0;
+  }
+
+  /** 收集「这一页」能带的图：整页上下文 + 高清公式图。 */
+  async function qaImagesForPage(n) {
+    const out = [];
+    if (!n) return out;
+    const ctxImg = pageContextImage(n);
+    if (ctxImg) out.push({ url: ctxImg, label: "整页原文（布局参考）" });
+    const shots = await formulaShotsForQa(n);
+    shots.forEach((s) => out.push(s));
+    return out;
+  }
+
   /** 把某页的批注高亮画在原文上。 */
   function renderAnnoInto(annoLayer, n) {
     const list = (pdfState.annos || []).filter(
@@ -4270,7 +4476,8 @@
     }
     const pdfjsLib = await loadPdfJs();
     const page = await doc.getPage(n);
-    const viewport = page.getViewport({ scale: pdfFitScale(page) });
+    const fitScale = pdfFitScale(page);
+    const viewport = page.getViewport({ scale: fitScale });
     const dpr = window.devicePixelRatio || 1;
 
     const wrap = el("div", "tb-pdf-page lay-" + (pdfState.layout || "both"));
@@ -4285,6 +4492,13 @@
     const textLayer = el("div", "textLayer");
     textLayer.style.width = viewport.width + "px";
     textLayer.style.height = viewport.height + "px";
+    // ⚠⚠ 2026-11-17 全面审查 P1（桌面端 index.html:6004 早就设了，平板漏了）：
+    //   pdf.js 3.11 的文本层 CSS 用 `calc(var(--scale-factor) * W px)` 算每个
+    //   span 的宽高，**这个变量必须由调用方设**（pdf.js 自己不设 ——
+    //   实测 pdf.min.js 里只有 var() 的用法，没有 setProperty("--scale-factor")）。
+    //   变量没设 → calc 非法 → span 塌成 0 宽 → **文本层与画布完全错位**
+    //   → 平板上划词会选到**错的字**，批注高亮框也落在错位置。
+    textLayer.style.setProperty("--scale-factor", fitScale);
     orig.appendChild(textLayer);
     // 批注高亮层（盖在原文上）
     const annoLayer = el("div", "tb-pdf-anno-layer");
@@ -4590,9 +4804,21 @@
     body.addEventListener("scroll", hide, { passive: true });
 
     bubble.querySelectorAll("[data-pdf-ai]").forEach((b) => {
-      b.onclick = () => {
+      b.onclick = async () => {
         const text = bubble.dataset.text || "";
         const kind = b.dataset.pdfAi;
+        // ⚠⚠ 2026-11-17 全面审查 P0-1：**趁 PDF 还开着**把这一页的图抓好
+        //   （closePdf() 之后 canvas 就被释放了，事后补不回来）。
+        //   抓的是：整页原文（布局参考）+ 按坐标裁的**高清公式图**（scale=4）。
+        //   不带图 → 模型看不见公式 → 只能猜（桌面端实测：只给整页图会把
+        //   d_33^m 误读成 d_31^m）。
+        if (kind === "ask") {
+          try {
+            state.pendingSelectionImages = await qaImagesForPage(selectionPageNo());
+          } catch (e) {
+            state.pendingSelectionImages = [];
+          }
+        }
         hide();
         closePdf();
         // 交给 AI 面板处理
@@ -5262,6 +5488,14 @@
       // 译文快照的版本闸门（两端必须一致，否则用户看到旧算法翻的坏译文）
       loadTranslation: loadTranslation,
       transCacheKey: transCacheKey,
+      // ⚠ 划词提问的图片链路（2026-11-17 全面审查 P0-1）
+      //   「划词 → 问 AI 必须带整页图 + 高清公式图」这条只能靠行为级护栏钉住。
+      qaImagesForPage: qaImagesForPage,
+      formulaShotsForQa: formulaShotsForQa,
+      selectionPageNo: selectionPageNo,
+      pageContextImage: pageContextImage,
+      renderPdfPage: renderPdfPage,
+      pdfState: pdfState,
       state: state,
     };
   }

@@ -4913,6 +4913,49 @@ def _atomic_write_json(path: Path, obj, indent: int = 1) -> None:
     _atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent))
 
 
+def _atomic_copy_file(src: Path, dst: Path) -> None:
+    """把 src 拷成 dst，**原子**落地（同目录临时文件 → os.replace）。
+
+    ⚠ 2026-11-17 全面审查 P2-中：files 通道的「拉取还原」原来直接
+      `shutil.copyfile(blob, local)` —— 目标文件在拷贝进行中是**半截**的，
+      坚果云同步客户端可能把半截 PDF 上行，另一台设备拿到**坏 PDF**
+      （打开就报错，且同步客户端还会把这份半截文件当成新版本继续传）。
+      **推送端**早就是 tmp + os.replace（只有还原端没跟上 → 两端不对称）。
+
+    临时文件用 mkstemp 唯一命名（同 `_atomic_write_text`）：固定名会让两个
+    并发还原共用一个临时文件 → 互相覆盖 + FileNotFoundError。
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dst.parent), prefix=f".{dst.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    fd_taken = False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fd_taken = True
+            with open(src, "rb") as sf:
+                shutil.copyfileobj(sf, fh)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, dst)
+    except Exception:
+        if not fd_taken:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 class _TransientReadError(ValueError):
     """读文件时的**瞬时 I/O 故障**（文件被占用等）—— **不是**内容损坏。
 
@@ -5124,43 +5167,54 @@ def api_pdf_snapshot_save(req: SnapshotSaveRequest):
     #   挪进临界区、写盘之前调用（读之前不建目录，保持云端 M-3 的原意）。
     target = _snapshot_path(safe_id)
     with _snapshot_lock(safe_id):
-        try:
-            existing = _read_json_or_quarantine(target) or {}
-        except ValueError as e:
-            raise HTTPException(status_code=500, detail=_safe_err(e))
-        pages_out = _merge_snapshot_pages(existing, req, pages_out)
+        # ⚠⚠ 2026-11-17 全面审查：这里的锁是**进程内**的（threading.Lock），
+        #   只能挡住「本机两个写者」（两个标签页 / api_sync 线程池 vs 事件循环）。
+        #   **挡不住另一台设备**经坚果云写同一个文件 → 跨设备仍然是
+        #   「读旧值 → 合并 → 写回」，对方在这窗口里新翻的页会被整份盖掉
+        #   （表现为「A 翻的 1–5 页在 B 同步后消失」→ A 要重翻 = 重烧 token）。
+        #   → 锁内再套一层**跨设备乐观 CAS**（指纹取在读之前 + 撞满放弃）。
+        #   2026-11-15 那轮只合并了云端的 `_ensure_snapshot_dir()`，
+        #   跨设备这一层**一直缺着**（AGENTS.md §4.99）。
+        def _build(existing):
+            base = existing or {}
+            merged_pages = _merge_snapshot_pages(base, req, pages_out)
+            saved_at = _dt.datetime.now().isoformat(timespec="seconds")
+            payload = {
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                # 抽取算法版本：加载时对不上就整份作废（见 api_pdf_snapshot_load）
+                "extractor_version": EXTRACTOR_VERSION,
+                "paper_id": safe_id,
+                "paper_title": req.paper_title,
+                "relative_path": req.relative_path,
+                "paper_mtime": req.paper_mtime,
+                "paper_text_signature": req.paper_text_signature,
+                "pages": merged_pages,
+                "saved_at": saved_at,
+            }
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            if len(text.encode("utf-8")) > SNAPSHOT_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"快照过大(>{SNAPSHOT_MAX_BYTES // 1024 // 1024}MB),请减少保存页数",
+                )
+            saved_at_box[:] = [saved_at]
+            return text
 
-        payload = {
-            "schema_version": SNAPSHOT_SCHEMA_VERSION,
-            # 抽取算法版本：加载时对不上就整份作废（见 api_pdf_snapshot_load）
-            "extractor_version": EXTRACTOR_VERSION,
-            "paper_id": safe_id,
-            "paper_title": req.paper_title,
-            "relative_path": req.relative_path,
-            "paper_mtime": req.paper_mtime,
-            "paper_text_signature": req.paper_text_signature,
-            "pages": pages_out,
-            "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
-        }
-        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
-        if len(serialized.encode("utf-8")) > SNAPSHOT_MAX_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"快照过大(>{SNAPSHOT_MAX_BYTES // 1024 // 1024}MB),请减少保存页数",
-            )
-
+        saved_at_box: list = [""]
         try:
             # 写路径才建目录（云端 M-3 修的，合并时保留）：
             #   放在临界区内、真正写盘之前 —— 读路径仍然不建目录。
             _ensure_snapshot_dir()
-            _atomic_write_text(target, serialized)
+            serialized = _cas_update_json(target, _build) or ""
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"写盘失败: {_safe_err(e)}")
 
     return {
         "status": "success",
         "paper_id": safe_id,
-        "saved_at": payload["saved_at"],
+        "saved_at": saved_at_box[0],
         "saved_pages": len(req.pages),
         "bytes": len(serialized.encode("utf-8")),
         "path": str(target.relative_to(BASE_DIR)).replace("\\", "/"),
@@ -5743,6 +5797,7 @@ def _sync_pull_files() -> dict:
         res["disabled"] = True
         return res
     files_dir = _files_dir()
+    my_id = _device_id()
 
     for fp in sorted(files_dir.glob("*.json")):
         safe = fp.stem
@@ -5754,21 +5809,49 @@ def _sync_pull_files() -> dict:
 
         if meta.get("deleted"):
             local = _safe_local_pdf(rel)
-            if meta.get("propagate"):
-                # 联动删除：对方也把本地 PDF 删掉
-                if local is not None and local.exists():
-                    try:
-                        local.unlink()
-                        res["removed"].append(rel)
-                    except OSError as e:
-                        res["skipped"].append({"name": rel, "reason": str(e)})
-            else:
-                res["retained"].append(rel)     # 默认：本机保留
-            if blob.exists():
+            # ⚠⚠ 2026-11-17 全面审查 P2-中（实测复现）：
+            #   原来只要 meta 里 propagate=True 就删本地副本，**不区分是谁发起的**
+            #   → ① 发起端自己同步时也走这段 → **把自己那份也删了**，
+            #      同时云端实体被释放 → **不可恢复**；
+            #      ② 任何一台设备都能把对方发布的论文标成「删掉」。
+            #   现在：只有**发起方不是我**时，本机才删（联动删除的本意就是
+            #   「对方也删」）；发起端自己那份保留（要删由用户走正常的 vault 删除）。
+            requested_by_me = (meta.get("propagate_by") or "") == my_id
+            if meta.get("propagate") and not requested_by_me:
+                # 再加一道保险：本机这份必须**还是当初发布的那一版**（大小一致）
+                # 才删 —— 用户自己换过 PDF 的话，不该被一次同步删掉。
+                size_ok = True
                 try:
-                    blob.unlink()                # 释放云端空间
+                    if local is not None and local.exists() and meta.get("size"):
+                        size_ok = local.stat().st_size == int(meta["size"])
+                except (OSError, TypeError, ValueError):
+                    size_ok = False
+                if local is not None and local.exists():
+                    if size_ok:
+                        try:
+                            local.unlink()
+                            res["removed"].append(rel)
+                        except OSError as e:
+                            res["skipped"].append({"name": rel, "reason": str(e)})
+                    else:
+                        res["conflicts"].append(
+                            {"name": rel, "reason": "本机版本不同，未删除"})
+                # 对方也删了 → 云端实体这时才可以释放
+                if blob.exists():
+                    try:
+                        blob.unlink()                # 释放云端空间
+                    except OSError:
+                        pass
+                continue
+            # 默认：本机保留
+            res["retained"].append(rel)
+            if not meta.get("propagate") and blob.exists():
+                try:
+                    blob.unlink()                    # 释放云端空间
                 except OSError:
                     pass
+            # 联动删除且是**我**发起的 → 云端实体先留着
+            #   （等对方也删了再释放；否则「后悔了」就再也找不回来）。
             continue
 
         if not blob.exists():
@@ -5790,8 +5873,11 @@ def _sync_pull_files() -> dict:
             res["conflicts"].append({"name": rel, "reason": "本机版本不同，未覆盖"})
             continue
         try:
+            # ⚠ 原子落地（同目录临时文件 → os.replace）：
+            #   原来直接 shutil.copyfile → 目标在拷贝中是半截的，
+            #   坚果云可能把半截 PDF 上行给另一台设备。
             local.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(blob, local)
+            _atomic_copy_file(blob, local)
             res["restored"].append(rel)
         except OSError as e:
             res["skipped"].append({"name": rel, "reason": str(e)})
@@ -6133,17 +6219,27 @@ def api_sync_files_release(req: FileReleaseRequest):
 @app.post("/api/sync/files/propagate_delete")
 async def api_sync_files_propagate_delete(paper_id: str = Query(..., min_length=3,
                                                                 max_length=300)):
-    """把某篇论文标成「联动删除」：对方下次同步时也删掉本地 PDF。
+    """把某篇论文标成「联动删除」：**对方**下次同步时也删掉本地 PDF。
 
     不勾这个开关时，对方只会从云端释放实体，本地 PDF 保留（默认，安全）。
+
+    ⚠⚠ 2026-11-17 全面审查 P2-中：原来这个端点只写 `propagate/deleted`，
+      **不记录是谁发起的** → 执行端（`_sync_pull_files`）分不清「对方要求删」
+      和「我自己要删」，于是**发起端自己那份也被删掉了**，而且云端实体同时被
+      释放 → 不可恢复。
+      现在记录 `propagate_by`：只有**发起方不是我**时，对方才删本地副本；
+      发起端自己那份保留（要删由用户走正常的 vault 删除流程）。
     """
     safe = _safe_paper_key(paper_id)
     p = _file_meta_path(safe)
     meta = _safe_read_json(p) or {}
     if not meta:
         raise HTTPException(status_code=404, detail="共享目录里没有这篇论文")
+    if not (meta.get("relative_path") or ""):
+        raise HTTPException(status_code=400, detail="共享清单里没有这篇论文的相对路径")
     meta["propagate"] = True
     meta["deleted"] = True
+    meta["propagate_by"] = _device_id()
     meta["deleted_at"] = _dt.datetime.now().isoformat(timespec="seconds")
     _write_file_meta(safe, meta)
     return {"status": "success", "paper_id": paper_id,
@@ -6286,6 +6382,54 @@ def _anno_is_newer(a: str, b: str) -> bool:
     return (a or "") > (b or "")
 
 
+# 共享文件被「另一台设备」并发修改时的统一提示。
+# 409 = Conflict：客户端重试即可（服务端会重新读、重新合并）。
+SYNC_CONFLICT_DETAIL = ("共享文件正被另一台设备写入，本次操作已放弃"
+                         "（没有覆盖对方的数据），请稍后重试")
+
+
+def _cas_update_json(path: Path, build, *, attempts: int = 3, reader=None):
+    """乐观 CAS 的「读旧值 → 改 → 原子写回」，用于**跨设备共享**的 JSON。
+
+    `build(existing)` 返回要写入的**文本**；返回 None 表示「这次不用写」。
+
+    返回值：写入的文本（str）；`build` 返回 None 时返回 None（没写）。
+
+    ⚠⚠ 指纹必须在**读之前**取（2026-11-17 全面审查 P1-高，实测复现）：
+      指纹的作用是「标识我们即将读到的那一版」。
+      原来批注保存的写法是 **先读、后取指纹**，于是：
+        另一台设备在「读」与「取指纹」之间写了一次 →
+        我们拿到的是**新**指纹 → 写前比对**必然通过** →
+        用**旧基线**合并出来的内容整文件盖回去 →
+        对方刚写的批注**静默消失**，而两个接口都返回 200。
+      指纹取在读之前 → 那一窗口里的变化会被**比对出来** → 重读重合并。
+
+    ⚠⚠ CAS 撞满 attempts 必须**放弃**（fail closed → 409），不能强写：
+      强写 = 把「可能冲突」变成「确定丢数据」。
+      客户端拿到 409 会重试（重试是安全的：服务端会重新读、重新合并）。
+
+    `reader` 默认用 `_read_json_or_quarantine`（写路径上**必须**用它：
+    损坏文件若被当成「没有」，合并基数变空 → 写回时把磁盘上其它内容永久抹掉）。
+    """
+    read = reader or _read_json_or_quarantine
+    for _ in range(max(1, attempts)):
+        fingerprint = _file_fingerprint(path)      # ← 读**之前**取
+        try:
+            existing = read(path)
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=_safe_err(e))
+        text = build(existing)
+        if text is None:
+            return None
+        if _file_fingerprint(path) == fingerprint:
+            try:
+                _atomic_write_text(path, text)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"写盘失败: {_safe_err(e)}")
+            return text
+    raise HTTPException(status_code=409, detail=SYNC_CONFLICT_DETAIL)
+
+
 @app.get("/api/pdf/annotations/load")
 async def api_pdf_annotations_load(
     paper_id: str = Query(..., min_length=3, max_length=128),
@@ -6346,24 +6490,24 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
     #   合并基数就变成空列表 → 写回时把磁盘上**其它所有批注**永久抹掉，
     #   而用户看到的是「✅ 保存成功」—— 一条数据都不报错地消失，最难查。
     #   → 损坏时宁可让这次保存失败并告诉用户，也绝不静默清空。
-    payload: dict = {}
-    serialized = ""
-    for _attempt in range(3):
-        try:
-            existing = _read_json_or_quarantine(target)
-        except ValueError as e:
-            raise HTTPException(status_code=500, detail=_safe_err(e))
-        if not existing:
-            for legacy in _legacy_annotation_paths(safe_id):
-                existing = _safe_read_json(legacy)
-                if existing:
-                    break
-        fingerprint = _file_fingerprint(target)
+    # ⚠⚠ 2026-11-17 全面审查 P1-高（隔离实测复现）：原实现的指纹**取在读之后**
+    #   → 另一台设备若在「读」与「取指纹」之间写过，我们拿到的是**新**指纹，
+    #   写前比对必然通过 → 用**旧基线**合并出来的内容整文件盖回去 →
+    #   对方刚写的批注**静默消失**，而两个接口都返回 200。
+    #   现在统一走 `_cas_update_json`：指纹取在**读之前** + 撞满 3 轮**放弃**（409）。
+    saved_items: list = []
 
+    def _build(existing):
+        base = existing
+        if not base:
+            for legacy in _legacy_annotation_paths(safe_id):
+                base = _safe_read_json(legacy)
+                if base:
+                    break
         # 合并规则（删除墓碑最后应用，优先级高于 upsert）
         items = _merge_annotation_lists(
-            (existing or {}).get("annotations") or [], incoming, req.deleted or [])
-
+            (base or {}).get("annotations") or [], incoming, req.deleted or [])
+        saved_items[:] = items
         payload = {
             "paper_id": safe_id,
             "saved_at": now,
@@ -6371,28 +6515,28 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
             "schema_version": 2,
             "annotations": items,
         }
-        serialized = json.dumps(payload, ensure_ascii=False, indent=1)
-        if len(serialized.encode("utf-8")) > ANNOTATION_MAX_BYTES:
+        text = json.dumps(payload, ensure_ascii=False, indent=1)
+        if len(text.encode("utf-8")) > ANNOTATION_MAX_BYTES:
             raise HTTPException(
                 status_code=413,
                 detail=f"批注过多(>{ANNOTATION_MAX_BYTES // 1024 // 1024}MB),请先删掉一些",
             )
-        if _file_fingerprint(target) == fingerprint:
-            break   # 磁盘没被别人改 → 可以写
-        # 期间被另一台设备改了 → 下一轮重新读 + 重新合并（不丢对方的批注）
+        return text
 
     try:
         # ⚠ 原子写（坚果云同步目录）：先写同目录 .tmp 再 os.replace ——
         #   同步客户端只会看到旧文件或新文件，不会看到半截 JSON。
         #   （统一用 `_atomic_write_text`，别再各写一份。）
-        _atomic_write_text(target, serialized)
+        _cas_update_json(target, _build)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"批注写盘失败: {_safe_err(e)}")
 
     return {
         "status": "success",
         "paper_id": safe_id,
-        "saved": len(items),
+        "saved": len(saved_items),
         "updated_at": now,
         # 同 M-J：不给完整绝对路径（含 Windows 用户名 + 坚果云目录）。
         # 只给最后两段，用户照样能看出"批注写到哪个共享目录了"。
@@ -6406,24 +6550,41 @@ async def api_pdf_annotations_delete(
     paper_id: str = Query(..., min_length=3, max_length=128),
     annotation_id: str = Query(..., min_length=1, max_length=64),
 ):
-    """Delete one annotation by id. Idempotent."""
+    """Delete one annotation by id. Idempotent.
+
+    ⚠⚠ 2026-11-17 全面审查 P1-中（隔离实测复现）：原来这里是「读 → 整文件回写」，
+      **完全没有 CAS** —— 另一台设备若在窗口内新增了批注，
+      这次删除会把对方新加的批注**一起抹掉**（整文件覆盖，两个接口都返 200）。
+      现在走和保存路径同一个乐观 CAS：读 → 改 → 比对指纹 → 原子写。
+    """
     deleted = 0
-    for path in [_annotation_path(paper_id)] + _legacy_annotation_paths(paper_id):
-        data = _safe_read_json(path)
-        if not data:
+    paths = [_annotation_path(paper_id)] + _legacy_annotation_paths(paper_id)
+    for idx, path in enumerate(paths):
+        if not path.exists():
             continue
-        items = data.get("annotations") or []
-        kept = [a for a in items if a.get("id") != annotation_id]
-        if len(kept) == len(items):
-            continue
-        deleted += len(items) - len(kept)
-        payload = dict(data)
-        payload["annotations"] = kept
-        payload["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-        try:
-            _atomic_write_json(path, payload)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"批注删除失败: {_safe_err(e)}")
+        removed: list = []
+
+        def _build(existing, _removed=removed):
+            if not existing:
+                return None
+            items = existing.get("annotations") or []
+            kept = [a for a in items if a.get("id") != annotation_id]
+            if len(kept) == len(items):
+                return None          # 本来就没有这条 → 幂等
+            payload = dict(existing)
+            payload["annotations"] = kept
+            payload["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+            # ⚠ 只数**真的被删掉的那几条**（不是删除前的总数）——
+            #   否则前端会以为删掉了 N 条，其实只删了 1 条。
+            _removed[:] = [a for a in items if a.get("id") == annotation_id]
+            return json.dumps(payload, ensure_ascii=False, indent=1)
+
+        # ⚠ 主路径（共享目录里的那份）用**严格读**：文件损坏时宁可报错，
+        #   也不能当成「没有批注」→ 删不掉还假装成功。
+        #   旧位置的读用宽容版（别让一次删除整体失败）。
+        reader = _read_json_or_quarantine if idx == 0 else _safe_read_json
+        if _cas_update_json(path, _build, reader=reader) is not None:
+            deleted += len(removed)
     return {"status": "success", "paper_id": paper_id, "deleted": deleted}
 
 
