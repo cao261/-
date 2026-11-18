@@ -9778,30 +9778,38 @@
         .toLowerCase();
     }
 
-    // 候选标题：**当前视图**优先 —— 章节视图用 `_readerState.sections`，
-    // PDF 模式用服务端算的大纲。
+    // 当前这篇论文的**小节大纲**（服务端算的）。
     //
-    // ⚠ 为什么要按视图分：`openPdfDirect()` 会把 `_readerState.sections` 清空，
-    //   所以「sections 非空」= 用户正在看章节视图（此时大纲是上一篇的残留）。
+    // ⚠ 必须校验「这份大纲属于当前这篇论文」（§4.110）：
+    //   大纲是按论文路径缓存的，而 `_qaOutline` 是**模块级单例**——
+    //   换一篇论文、但还没触发新的 loadPdfDualColumn() 时，
+    //   `_qaOutline.sections` 里还是**上一篇**的小节
+    //   → 拿它当候选 = 跨论文串台（AI 总结的是上一节）。
+    function _qaOutlineSections() {
+      const secs = (_qaOutline && _qaOutline.sections) || [];
+      if (!secs.length) return [];
+      const cur = (_pdfState && _pdfState.relativePath)
+               || (_readerState && _readerState.pdfPath) || "";
+      if (!_qaOutline.path || !cur || _qaOutline.path !== cur) return [];
+      return secs;
+    }
+
+    // 候选标题：**小节大纲优先**，章节视图的语义章节兜底。
+    //
+    // ⚠ 判据是「**这份大纲属于当前这篇论文**」，不是「sections 非空」
+    //   （§4.110）：PDF 模式下 `_readerState.sections` 依然留着章节视图那份
+    //   （`openVaultPdf()` 填的），而对综述类论文它常常**只有「Full Text」一桶**
+    //   → 按「非空」判断会把候选锁死成 ["Full Text"]
+    //   → 用户在 PDF 原文里划「II. Experimental Procedure」永远命中不了
+    //   （2026-11-18 Playwright 真浏览器实测抓到的就是这个）。
+    //
+    //   为什么大纲优先：章节视图的标题是**语义桶**（Abstract/Introduction/Methods，
+    //   甚至整篇只有一桶），而大纲的标题是 PDF 里**真实的标题**
+    //   （「II. Experimental Procedure」）—— 后者才是用户说的「这一小节」。
+    //   `_matchQaHeading()` 取**归一化后最长**的命中 → 大纲里的真实标题优先。
     function _qaHeadingCandidates() {
       const out = [];
-      const secs = (_readerState && _readerState.sections) || [];
-      if (secs.length) {
-        secs.forEach((s, i) => {
-          out.push({
-            title: s.title || "",
-            level: 1,
-            page_start: s.page_start, page_end: s.page_end,
-            text: s.text || "",
-            formulas: [],
-            source: "section",
-            index: i,
-          });
-        });
-        return out;
-      }
-      const outlineSecs = (_qaOutline && _qaOutline.sections) || [];
-      for (const s of outlineSecs) {
+      for (const s of _qaOutlineSections()) {
         out.push({
           title: s.title || "",
           level: s.level || 1,
@@ -9811,6 +9819,18 @@
           source: "pdf",
         });
       }
+      const secs = (_readerState && _readerState.sections) || [];
+      secs.forEach((s, i) => {
+        out.push({
+          title: s.title || "",
+          level: 1,
+          page_start: s.page_start, page_end: s.page_end,
+          text: s.text || "",
+          formulas: [],
+          source: "section",
+          index: i,
+        });
+      });
       return out;
     }
 
@@ -9871,7 +9891,7 @@
       if (hit.source === "section" && typeof hit.index === "number") {
         const t = (_readerState.translations || [])[hit.index];
         if (t) return _stripQaMarkers(t);
-        return "";
+        // 这一节还没翻过 → 别急着返回空，继续往下找 PDF 页译文
       }
       const pages = (_pdfState && _pdfState.pages) || [];
       const chunks = [];
@@ -9883,7 +9903,29 @@
           chunks.push("[第 " + p + " 页译文]\n" + _stripQaMarkers(pg.translation));
         }
       }
-      return chunks.join("\n\n");
+      if (chunks.length) return chunks.join("\n\n");
+      // 章节视图里没有 PDF 页译文（`_pdfState.pages` 是空的）→
+      // 退到**章节视图自己那一节**的译文：用户正在读的就是它，
+      // 中文译文是用户真正在读的那份（§4.110）。
+      const secs = (_readerState && _readerState.sections) || [];
+      const trs = _readerState.translations || {};
+      let idx = null;
+      if (_readerSelState && _readerSelState.sectionIdx !== null &&
+          _readerSelState.sectionIdx !== undefined) {
+        idx = _readerSelState.sectionIdx;
+      } else if (hit.page_start) {
+        // 没有 sectionIdx → 找页码区间覆盖本小节的那一节
+        for (let i = 0; i < secs.length; i++) {
+          const s = secs[i] || {};
+          const sFrom = s.page_start || 0;
+          const sTo = s.page_end || sFrom;
+          if (sFrom && hit.page_start >= sFrom && hit.page_start <= sTo) { idx = i; break; }
+        }
+      }
+      if (idx !== null && idx !== undefined && trs[idx]) {
+        return _stripQaMarkers(trs[idx]);
+      }
+      return "";
     }
 
     // 小节上下文：标题 + 中文译文（有就带）+ 英文原文
@@ -10104,6 +10146,14 @@
       // 2. Build context for the new scope.
       const surroundingContext = _buildScopeContext(newScope);
 
+      // ⚠ 2026-11-18：提示里的「用户选中的是一个小节标题 → 下面是这一小节的完整正文」
+      //   **只有在上下文真的是这一小节时才成立**。
+      //   用户点 ⬆️/⬇️ 把范围调到别的档（wide/full/mid）后，上下文就换成整页/全文了
+      //   → 这时还报 selection_kind="heading" = **对模型说假话** → 它会以为
+      //   整页都是这一节 → 总结跑偏。
+      //   → 所以「是不是标题」要跟**实际用的 scope** 对齐。
+      const headingScoped = (newScope.mode === "section") && !!_qaHeadingHit;
+
       // 3. Replace the prior answer with a streaming placeholder so the
       //    user can see "AI 正在重新回答…" right where the old answer was.
       const streamTarget = answerBody.querySelector("[data-stream-target]");
@@ -10138,10 +10188,11 @@
         force_scope: newScope.mode,
         // 命中标题时，重新回答也要带着「本小节」的定位信息
         // （否则服务端会以为用户划的是半句话，提示里没有小节约束）。
-        selection_kind: _qaHeadingHit ? "heading" : "body",
-        heading_title: _qaHeadingHit ? (_qaHeadingHit.title || "") : "",
-        section_pages: _qaHeadingHit ? _sectionPageList(_qaHeadingHit) : [],
-        formula_rects_with_page: _qaHeadingHit ? _sectionFormulaRects(_qaHeadingHit) : [],
+        // ⚠ 只有**上下文确实是这一小节**时才报 heading（见上面的 headingScoped）。
+        selection_kind: headingScoped ? "heading" : "body",
+        heading_title: headingScoped ? (_qaHeadingHit.title || "") : "",
+        section_pages: headingScoped ? _sectionPageList(_qaHeadingHit) : [],
+        formula_rects_with_page: headingScoped ? _sectionFormulaRects(_qaHeadingHit) : [],
         // 用**答疑面板**自己选中的模型回答（与翻译用的模型互不影响）：
         // '' = 跟随默认 / 'agnes' = 备用 / 'deepseek-flash' = DeepSeek /
         // 'custom:xxx' = 用户自己的 API 模型

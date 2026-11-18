@@ -86,6 +86,7 @@ function sliceAll(src) {
     sliceBalanced(src, "const _SCOPE_CAPS", "{", "}"),
     sliceBalanced(src, "const _SCOPE_LADDER", "[", "]"),
     sliceFn(src, "function _normQaHeading(s) {"),
+    sliceFn(src, "function _qaOutlineSections() {"),
     sliceFn(src, "function _qaHeadingCandidates() {"),
     sliceFn(src, "function _matchQaHeading(selectionText) {"),
     sliceFn(src, "function _clipQaContext(text, budget) {"),
@@ -96,9 +97,11 @@ function sliceAll(src) {
     sliceFn(src, "function _sectionFormulaRects(hit) {"),
     sliceFn(src, "function _buildScopeContextRaw(scope) {"),
     sliceFn(src, "function _buildScopeContext(scope) {"),
+    sliceFn(src, "function _sliceAroundSelection(fullText, selection, budget) {"),
     sliceFn(src, "function _collectPageFormulaRects(pageNum) {"),
     sliceFn(src, "async function _ensureQaOutlineReady() {"),
     sliceFn(src, "async function submitReaderQA() {"),
+    sliceFn(src, "async function _refineQA(answerBody, direction, feedbackText) {"),
   ].join(NL + NL);
 }
 
@@ -116,8 +119,28 @@ function makeEl(id, tag) {
     innerHTML: "",
     dataset: {},
     disabled: false,
+    parentElement: { scrollTop: 0, scrollHeight: 0 },
     querySelector() { return null; },
     focus() {},
+  };
+}
+
+// 答疑面板里「上一版答案」那个容器（_refineQA 的入参）
+function makeAnswerBody(priorMode) {
+  const els = {
+    "[data-stream-target]": makeEl("stream"),
+    "[data-qa-scope-badge]": makeEl("badge"),
+    "[data-qa-model-badge]": makeEl("model"),
+    "[data-qa-stage-badge]": makeEl("stage"),
+  };
+  return {
+    dataset: {
+      question: "帮我总结这一小节",
+      priorAnswer: "上一版答案",
+      priorScope: "小节全文",
+      priorScopeMode: priorMode || "section",
+    },
+    querySelector(sel) { return els[sel] || null; },
   };
 }
 
@@ -226,7 +249,9 @@ return {
   setReaderState: (v) => { _readerState = v; },
   setSelState: (v) => { _readerSelState = v; },
   setOutline: (v) => { _qaOutline = v; },
+  setHeadingHit: (v) => { _qaHeadingHit = v; },
   getHeadingHit: () => _qaHeadingHit,
+  _refineQA,
 };
 `,
   );
@@ -271,6 +296,12 @@ function assertEq(actual, expected, msg) {
 function withOutline(api) {
   api.setOutline({
     path: "a/b.pdf", sections: OUTLINE, ready: true, loading: false, promise: null,
+  });
+  // ⚠ 大纲要「**属于当前这篇论文**」才会被采用（§4.110）→
+  //   当前论文也得指向同一路径，否则护栏里的大纲会被当成「别人的大纲」。
+  api.setReaderState({
+    title: "某论文", pdfPath: "a/b.pdf",
+    sections: [], translations: {}, activeSection: 0,
   });
 }
 
@@ -425,14 +456,14 @@ async function runSuite(src, label) {
       "正文提问不该带小节公式坐标");
   });
 
-  await check("章节视图（非 PDF 模式）→ 用章节自己的标题与译文", async () => {
+  await check("章节视图 → 命中大纲里的小节，且带上章节视图那一节的译文", async () => {
     const api3 = buildApi(src, makeEnv());
     api3.setOutline({
       path: "a/b.pdf", sections: OUTLINE, ready: true, loading: false, promise: null,
     });
-    // 章节视图：_readerState.sections 非空（PDF 模式会把它清空）
+    // 章节视图：_readerState.sections 是**语义章节**（Abstract/Introduction/…）
     api3.setReaderState({
-      title: "某论文",
+      title: "某论文", pdfPath: "a/b.pdf",
       sections: [
         { section: "introduction", title: "Introduction", text: "章节视图里的引言正文。",
           page_start: 1, page_end: 2 },
@@ -442,12 +473,72 @@ async function runSuite(src, label) {
       translations: ["章节视图里的引言译文。", ""],
       activeSection: 0,
     });
-    const hit = api3._matchQaHeading("Introduction");
+    const hit = api3._matchQaHeading("I. Introduction");
     assert(hit, "章节视图的标题没命中");
-    assertEq(hit.source, "section", "命中来源不对");
+    assertEq(hit.source, "pdf", "应命中大纲里的小节（PDF 里的真实标题）");
     const ctx = api3._buildSectionContext(hit, 16000);
-    assert(ctx.indexOf("章节视图里的引言正文") >= 0, "上下文里没有本节正文");
-    assert(ctx.indexOf("章节视图里的引言译文") >= 0, "上下文里没有本节译文");
+    assert(ctx.indexOf("This is the introduction body") >= 0,
+      "上下文里没有本小节正文：" + ctx.slice(0, 160));
+    assert(ctx.indexOf("章节视图里的引言译文") >= 0,
+      "上下文里没有章节视图那一节的译文（用户真正在读的那份）");
+  });
+
+  await check("大纲不可用 → 退回章节视图自己的标题与译文", async () => {
+    const api6 = buildApi(src, makeEnv());
+    api6.setOutline({
+      path: null, sections: [], ready: false, loading: false, promise: null,
+    });
+    api6.setReaderState({
+      title: "某论文", pdfPath: "a/b.pdf",
+      sections: [
+        { section: "methods", title: "Methods", text: "章节视图里的方法正文。",
+          page_start: 3, page_end: 4 },
+      ],
+      translations: ["章节视图里的方法译文。"],
+      activeSection: 0,
+    });
+    const hit = api6._matchQaHeading("Methods");
+    assert(hit, "没命中");
+    assertEq(hit.source, "section", "应退回章节视图自己的标题");
+    const ctx = api6._buildSectionContext(hit, 16000);
+    assert(ctx.indexOf("章节视图里的方法正文") >= 0, "上下文里没有章节正文");
+    assert(ctx.indexOf("章节视图里的方法译文") >= 0, "上下文里没有章节译文");
+  });
+
+  await check("PDF 模式下章节视图的 sections 残留 → 仍然用大纲（§4.110 复发防线）", async () => {
+    // ⚠ 这是 2026-11-18 Playwright 真浏览器实测抓到的真 bug：
+    //   openVaultPdf() 在 PDF 模式下**仍然**填了 _readerState.sections，
+    //   而综述类论文它常常只有「Full Text」一桶 →
+    //   旧判据（sections 非空就优先）把候选锁死成 ["Full Text"]
+    //   → 用户在 PDF 原文里划「II. Experimental Procedure」永远命中不了。
+    const api4 = buildApi(src, makeEnv());
+    withOutline(api4);
+    api4.setReaderState({
+      title: "某论文", pdfPath: "a/b.pdf",
+      sections: [
+        { section: "full_text", title: "Full Text", text: "整篇正文……",
+          page_start: 1, page_end: 8 },
+      ],
+      translations: {}, activeSection: 0,
+    });
+    const hit = api4._matchQaHeading("Experimental Procedure");
+    assert(hit, "没命中（旧 bug：候选被锁死成 ['Full Text']）");
+    assertEq(hit.title, "II. Experimental Procedure", "命中的不是大纲里的小节");
+    assertEq(hit.source, "pdf", "命中来源不是大纲");
+  });
+
+  await check("上一篇论文的大纲残留 → 不许当候选（跨论文串台）", async () => {
+    const api5 = buildApi(src, makeEnv());
+    api5.setOutline({
+      path: "old/previous.pdf", sections: OUTLINE, ready: true, loading: false, promise: null,
+    });
+    api5.setReaderState({
+      title: "另一篇论文", pdfPath: "a/b.pdf",
+      sections: [], translations: {}, activeSection: 0,
+    });
+    const hit = api5._matchQaHeading("II. Experimental Procedure");
+    assert(!hit, "拿上一篇论文的大纲当候选了：" +
+      JSON.stringify(hit && hit.title));
   });
 
   await check("上下文确实送出去了（本小节正文在 payload 里）", async () => {
@@ -456,6 +547,48 @@ async function runSuite(src, label) {
     assert(ctx.indexOf("constitutive equations") >= 0,
       "payload 的上下文里没有本小节正文：" + ctx.slice(0, 200));
     assert(ctx.length <= 17000, "上下文超预算：" + ctx.length);
+  });
+
+  // ---- ④ 重新回答（⬆️/⬇️ 调范围）时的**一致性** ----------------------
+  // ⚠ 服务端在 selection_kind="heading" 时会跟模型说「下面是这一小节的完整正文」。
+  //   用户把范围调到 wide/full 后，上下文已经换成整页/全文了
+  //   → 这时还报 heading = **对模型说假话** → 它以为整页都是这一节 → 总结跑偏。
+  const HEADING_HIT = {
+    title: "II. Experimental Procedure", page_start: 1, page_end: 2,
+    text: "constitutive equations …", source: "pdf",
+    formulas: [{ n: 1, page: 2, rect: [45.1, 138.3, 272.3, 169.5] }],
+  };
+
+  await check("重新回答：范围仍落在「小节全文」→ 继续报 heading + 小节定位", async () => {
+    const e = makeEnv();
+    const a = buildApi(src, e);
+    withOutline(a);
+    a.setHeadingHit(HEADING_HIT);
+    // 上一版是 mid → ⬆️ 升级到 section（小节全文）
+    await a._refineQA(makeAnswerBody("mid"), "up", "");
+    assertEq(e.asks.length, 1, "应发出一次重新回答请求");
+    const p = e.asks[0].payload;
+    assertEq(p.force_scope, "section", "scope 不对");
+    assertEq(p.selection_kind, "heading", "selection_kind 不对");
+    assertEq(p.heading_title, "II. Experimental Procedure", "标题不对");
+    assertEq(p.section_pages.length, 2, "section_pages 不对");
+    assertEq(p.formula_rects_with_page.length, 1, "公式坐标不对");
+  });
+
+  await check("重新回答：⬆️ 升到 wide（上下文已不是这一节）→ **别再报 heading**", async () => {
+    const e = makeEnv();
+    const a = buildApi(src, e);
+    withOutline(a);
+    a.setHeadingHit(HEADING_HIT);
+    // 上一版就是 section → ⬆️ 升级到 wide
+    await a._refineQA(makeAnswerBody("section"), "up", "");
+    const p = e.asks[0].payload;
+    assertEq(p.force_scope, "wide", "scope 不对");
+    assertEq(p.selection_kind, "body",
+      "上下文已经换成 wide 了还报 heading = 对模型说假话");
+    assertEq(p.heading_title, "", "heading_title 不该带");
+    assertEq(p.section_pages.length, 0, "section_pages 不该带");
+    assertEq(p.formula_rects_with_page.length, 0, "公式坐标不该带");
   });
 
   return { passed, failed };
@@ -506,9 +639,19 @@ const MUTATIONS = [
     to: "const _QA_SECTION_BUDGET = 999999;",
   },
   {
-    name: "章节视图里也去用 PDF 大纲（命中的是别的章节）",
-    from: "      const secs = (_readerState && _readerState.sections) || [];\n      if (secs.length) {",
-    to: "      const secs = (_readerState && _readerState.sections) || [];\n      if (false && secs.length) {",
+    name: "PDF 模式下章节视图的 sections 残留把候选锁死（§4.110 旧 bug 复发）",
+    from: "for (const s of _qaOutlineSections()) {",
+    to: "for (const s of ((_readerState && _readerState.sections) || [])) {",
+  },
+  {
+    name: "不校验大纲归属（上一篇论文的大纲被当成本篇的小节）",
+    from: "if (!_qaOutline.path || !cur || _qaOutline.path !== cur) return [];",
+    to: "if (false) return [];",
+  },
+  {
+    name: "重新回答时上下文已换成别的档，却还报 heading（对模型说假话）",
+    from: 'selection_kind: headingScoped ? "heading" : "body",',
+    to: 'selection_kind: _qaHeadingHit ? "heading" : "body",',
   },
 ];
 

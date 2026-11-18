@@ -67,6 +67,11 @@ function sliceAll(src) {
     //   这套护栏就会因为「函数不存在」而崩（2026-11-18 真跑过一次）。
     sliceLine(src, "const _QA_SECTION_BUDGET"),
     sliceFn(src, "function _normQaHeading(s) {"),
+    // ⚠ 2026-11-18 又加了一条依赖：_qaHeadingCandidates 改成先问
+    //   _qaOutlineSections()（校验「这份大纲属于当前这篇论文」）。
+    //   **必须一起切进来** —— 少切一个，这套护栏就会因为
+    //   「函数不存在」而崩（§4.109 同一个坑，踩第二次）。
+    sliceFn(src, "function _qaOutlineSections() {"),
     sliceFn(src, "function _qaHeadingCandidates() {"),
     sliceFn(src, "function _matchQaHeading(selectionText) {"),
     sliceFn(src, "function _clipQaContext(text, budget) {"),
