@@ -1446,7 +1446,7 @@
        侧边栏"。
 
        旧实现只是把高度压到 46px，面板仍然是 460px 宽 —— 屏幕上还是占着
-       一大块，挡着 PDF 原文。现在最小化 = 收成一条贴右边��的窄竖条
+       一大块，挡着 PDF 原文。现在最小化 = 收成一条贴右边的窄竖条
        （宽 44px），标题竖排显示，点一下就展开。
 
        关键点：收起的条必须**跟随面板的位置**（面板被拖到左边时，条也要
@@ -9866,11 +9866,18 @@
 
     // 超预算时**头尾都保留**（不是只留头部）——
     // 小节的结尾常常是结论/收束，只留头部等于把结论丢了。
+    //
+    // ⚠ 2026-11-19：省略标记**必须算进预算**。
+    //   旧写法标记是「额外」加的 → 产物比 budget 长几十个字
+    //   → 服务端再按 scope 上限裁一刀时，**恰好砍掉我们特意保留的尾部**
+    //     （小节的结论就在尾部）—— 前端白保留。
     function _clipQaContext(text, budget) {
       const s = String(text == null ? "" : text);
       if (!budget || s.length <= budget) return s;
-      const head = Math.floor(budget * 0.65);
-      const tail = Math.max(0, budget - head);
+      const MARK_RESERVE = 40;   // 省略标记大约 30 字，留够余量
+      const room = Math.max(0, budget - MARK_RESERVE);
+      const head = Math.floor(room * 0.65);
+      const tail = Math.max(0, room - head);
       const cut = s.length - head - tail;
       return s.slice(0, head)
         + "\n…（中间约 " + cut.toLocaleString() + " 字已省略）…\n"
@@ -9900,7 +9907,11 @@
       for (let p = from; p <= to && p > 0; p++) {
         const pg = pages.find(x => x.num === p);
         if (pg && pg.translation) {
-          chunks.push("[第 " + p + " 页译文]\n" + _stripQaMarkers(pg.translation));
+          // ⚠ 译文是**整页**翻的（译文按页存，不按小节存）→ 里面可能还有
+          //   本小节之外的段落。**如实标注**，否则模型会把摘要/引言当成本节内容
+          //   一起总结（2026-11-19）。
+          chunks.push("[第 " + p + " 页中文译文（整页翻译，含本页其他段落）]\n"
+            + _stripQaMarkers(pg.translation));
         }
       }
       if (chunks.length) return chunks.join("\n\n");

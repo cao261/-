@@ -267,6 +267,8 @@ def test_behavioural_guard_files_are_still_there():
         # ↓ 2026-11-18：「优化给 AI 的上下文」那一轮（选中标题 → 总结这一小节）
         "microbench/_test_qa_section_scope.js",         # 前端：标题命中 → 小节上下文 + 载荷
         "tests/test_qa_section_context.py",             # 后端：小节大纲抽取 + 标题场景提示
+        # ↓ 2026-11-19：「放松 AI 提示词 + 上下文准确性」那一轮
+        "tests/test_qa_prompt_relaxed.py",              # 后端：提示词契约 + 上下文形态一致 + 截断头尾都留
     ]
     missing = [r for r in required if not (REPO / r).exists()]
     assert not missing, f"行为级护栏文件不见了: {missing}"

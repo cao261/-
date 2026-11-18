@@ -383,6 +383,30 @@ async function runSuite(src, label) {
     assert(clipped.indexOf("结尾的结论") >= 0, "尾部丢了（只剩头部截断）");
   });
 
+  await check("截断结果**不超预算**（省略标记也算进去）", async () => {
+    // ⚠ 2026-11-19：省略标记是「额外」加的 → 产物比 budget 长几十个字
+    //   → 服务端再按 scope 上限裁一刀时，**恰好砍掉我们特意保留的尾部**
+    //     （小节的结论就在尾部）—— 前端白保留。
+    for (const budget of [2000, 8000, 16000]) {
+      const clipped = api._clipQaContext("X".repeat(budget * 3), budget);
+      assert(clipped.length <= budget,
+        "预算 " + budget + " 却裁出 " + clipped.length + " 字 → 服务端会再砍一刀");
+    }
+  });
+
+  await check("中文译文标签如实说明「整页翻译」（含本小节之外的段落）", async () => {
+    api.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, translation: "第一页的中文译文" }],
+    });
+    const hit = api._matchQaHeading("II. Experimental Procedure");
+    const ctx = api._buildSectionContext(hit, 16000);
+    assert(ctx.indexOf("整页") >= 0,
+      "译文标签没说「整页」→ 模型会把摘要/引言当成本节内容一起总结：" +
+      ctx.slice(0, 200));
+    api.setPdfState(null);
+  });
+
   await check("小节上下文不超预算（后端也会再卡一道）", async () => {
     const api2 = buildApi(src, makeEnv());
     withOutline(api2);

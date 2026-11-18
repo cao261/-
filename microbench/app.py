@@ -3672,20 +3672,38 @@ QA_TIMEOUT = 300
 QA_REASONING_EFFORT = "low"
 
 
-EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是一个微电子与集成电路领域资深学者与论文精读导师。
-用户在阅读微电子/半导体器件/TCAD/EDA学术论文时，划选了一段难以理解的文字、公式或技术论述向你提问。
+EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是论文精读导师。用户正在读一篇学术论文
+（领域不限于微电子/半导体 —— 以论文实际内容为准，不要预设领域、不要把别的领域的框架套上来），
+划选了一段文字、公式或小节标题向你提问。
 
-请根据用户划选的内容与论文上下文，提供详实、严谨、易于理解的中文解答：
-1. 【直击疑问】：首先明确针对用户提出的问题进行回答，解释重点突出。
-2. 【物理背景与器件机制】：如果涉及半导体物理（如载流子输运、能带结构、量子限制、自热效应、短沟道效应、界面缺陷等）或TCAD仿真（SDE几何构建、网格剖分、SDevice物理模型等），请结合专业背景深入透彻剖析。
-3. 【术语全称与公式拆解】：对涉及的专业缩写（如 DTCO, GAA-FET, CFET, SDE, SDevice, DIBL, SS）给出中英文全称与物理意义；对公式中的关键变量进行清晰解释，公式使用标准 LaTeX 排版（如 $I_{on}/I_{off}$, $\mu_{eff}$）。
-4. 【工程与研究启发】：结合当前先进节点（如 Sub-3nm/2nm）或前沿论文研究范式，指出该段内容对研究者有何启发或实操注意事项。
-5. 结构清晰，采用分段 Markdown 格式输出。
-6. 【能力边界（必须遵守）】：你没有联网能力，不能联网、不能搜索网页、不能打开任何链接、不能获取任何图片/实物照片/视频，也没有任何其他外部工具。你只能看到下面给出的论文片段与上下文。
-   - 若用户的问题需要这些外部能力（上网找图、查最新进展、要实物照片、找某个具体网址……），你要**先把能做的那部分答完**（例如这类器件/结构通常长什么样、该论文里对应的图号或章节、建议用什么检索关键词和数据库去查），然后在**回答的最后一句**用一句话说明："以上基于论文内容；我没有联网检索能力，无法直接为你找到图片/最新资料。"
-   - 不要把能力边界声明放在开头当第一句 —— 先给实质内容，边界放最后一句就够了。
-   - 绝不要为了"像是在搜索"而长时间空转推理；绝不要编造图片链接、网址、文献编号或 DOI；绝不要假装你看过图片或访问过网页。
-7. 【必须回答】：无论如何都要给出一段有实质内容的回答。确实做不到时也要写清"哪部分能做、哪部分做不到、你自己可以怎么拿到"，**不允许交白卷、不允许只思考不回答**。
+回答要求：
+1. **先回答问题本身**。用户问什么就先给什么：结论、定义、推导、步骤。
+   需要展开时再展开，顺序是先结论后细节。
+2. **长度服从问题，不要凑篇幅**。一个简单问题几句话答完即可；
+   用户问什么答什么，**没问的不要主动加**（背景综述、跨方向类比、研究展望、
+   文献推荐、实验建议等）。回答里每一段都要能对上用户的某个疑问。
+3. **不要套固定模板**。长答案可以用小标题组织，但小标题按内容需要起；
+   不要为了凑齐某几个栏目而写与问题无关的内容。
+4. **事实以论文为准，判断可以推理**。定义、数值、结论、图号这类事实只从
+   片段与上下文里取；片段里没有的，直接说"片段中未提及"，
+   不要凭记忆冒充论文结论。用户问的是可行性、原因、创新点这类判断题时，
+   可以基于片段内容做推理，但要把"论文说的"和"你的推断"分开讲清。
+5. 公式用标准 LaTeX（行内 $...$、独立 $$...$$），变量逐个解释清楚；
+   英文缩写首次出现时给出中英文全称。
+   **公式以附件里的高清原图为准**；图上看不清就说明看不清，
+   绝不凭空补全一个"看起来合理"的公式。
+6. **能力边界**：你**不能联网**、**不能搜索网页**、不能打开链接、
+   **不能获取任何图片/实物照片/视频**，也没有其他外部工具；
+   只能看到下面给出的论文片段、上下文与附件图。
+   - 需要外部资料时：先把能答的答完（必要时给出建议的检索关键词与数据库），
+     再在**回答的最后一句**用一句话说明
+     "我没有联网检索能力，无法直接为你找到图片/最新资料"；
+   - 不要把能力边界声明放在开头当第一句 —— 先给实质内容；
+   - 不要为了"像是在搜索"而长时间**空转**推理；
+   - 绝不编造网址、文献编号、DOI、图号，也绝不假装看过图片或访问过网页。
+7. **必须回答**：无论如何都要给出有实质内容的回答；
+   确实做不到时也要写清"哪部分能做、哪部分做不到、你自己可以怎么拿到"，
+   **不允许交白卷**、不允许只思考不回答。
 """
 
 
@@ -4194,6 +4212,31 @@ def _frontend_page_image(req: "ExplainSelectionRequest") -> str:
     return "".join(b64.split())
 
 
+def _clip_context_keep_ends(text: str, cap: int):
+    """上下文超预算时**头尾都留**（返回 ``(裁剪后的文本, 是否截断过)``）。
+
+    ⚠ 2026-11-19：旧写法是 ``text[:cap]`` —— **纯头部截断**。
+      前端 `_clipQaContext()` 特意保留了**尾部**（小节的结论在结尾，
+      AGENTS.md §4.107），服务端再从尾部硬砍一刀 → 结论被砍掉；
+      而「用户选的是标题」这个场景里，结论恰恰就在小节末尾。
+      → 两端统一用同一套「头 65% + 尾 35%」的算法。
+
+    上游已经省略过一次时（文本里带我们的省略标记）**不再叠第二个标记**，
+    否则模型会看到两个「中间已省略」，分不清各省略了多少。
+    """
+    s = (text or "").strip()
+    if cap <= 0 or len(s) <= cap:
+        return s, False
+    head = int(cap * 0.65)
+    tail = max(0, cap - head)
+    cut = len(s) - head - tail
+    if "…（中间" in s:
+        # 上游（前端）已经省略过 → 只保留头尾，不再加标记
+        return s[:head] + s[len(s) - tail:], True
+    marker = "\n…（中间约 {:,} 字已省略）…\n".format(cut)
+    return s[:head] + marker + s[len(s) - tail:], True
+
+
 @app.post("/api/paper/explain_selection_stream")
 async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Request):
     """Streaming variant of /api/paper/explain_selection using SSE.
@@ -4209,6 +4252,12 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
 
     paper_label = req.paper_title or "未知论文"
     source_desc = "PDF 英文原文" if req.source_type == "pdf" else ("中文译文" if req.source_type == "translation" else "论文选段")
+    # ⚠ 上下文形态决定「公式说明」怎么写（2026-11-19）——
+    #   section 档的英文原文里公式位置是【公式N】占位（对应下面的高清图），
+    #   其它档给的是 PDF.js 扁平文本 → 公式是**乱序碎片**。
+    #   两者用同一句话 = 对模型说错话 → 它会连带忽略【公式N】占位。
+    scope_mode = (req.force_scope or "").strip().lower()
+    is_section = scope_mode == "section"
 
     # ⚠ 先把图准备好：有图才能在提示里告诉模型「公式以图为准」。
     page_b64, formula_items = await _qa_page_images(req)
@@ -4235,10 +4284,21 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
                 notes.append(
                     "正文里的【公式1】【公式2】…与这些图**按顺序一一对应**，"
                     "引用公式时请带上编号。")
-        notes.append(
-            "文本上下文里的公式都是乱序碎片（分子、分母、上下标各占一行），"
-            "**不要根据上下文补全或猜测公式**；"
-            "看不清的地方请明说「图中看不清」，不要凭空编造。")
+        # ⚠ 这一句必须与**上下文的实际形态**一致，不能一刀切（2026-11-19）：
+        #   section 档：英文原文里公式位置是【公式N】占位，**不是碎片**
+        #     → 旧写法统一说「上下文里的公式都是乱序碎片、不要根据上下文补全」，
+        #       等于叫模型**别信正文里的公式** → 连【公式N】占位一起忽略掉。
+        #   其它档：给的是 PDF.js 扁平文本 → 公式确实是碎片，必须警告。
+        if is_section:
+            notes.append(
+                "上下文英文原文里，公式位置写成【公式1】【公式2】…，"
+                "**与上面的高清公式图按顺序一一对应**；"
+                "公式按图写，图上没有的符号不要凭印象补。")
+        else:
+            notes.append(
+                "上下文文本里的公式是 PDF 抽取出来的碎片（分子、分母、上下标各占一行），"
+                "**不要根据上下文补全或猜测公式**；"
+                "看不清的地方请明说「图中看不清」，不要凭空编造。")
         user_msg_parts.append("【附件说明】" + "".join(notes))
 
     # ---- 「用户选中的是一个小节标题」→ 明确告诉模型这是什么局面 ----
@@ -4255,12 +4315,14 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
         user_msg_parts.append(
             "【用户选中的是一个小节标题】\n"
             f"标题：{title}{page_desc}\n"
-            "下面给出的上下文是**这一小节的完整正文**"
-            "（含本小节的中文译文与英文原文，公式位置以【公式N】占位并配有高清原图）。\n"
-            "→ 用户要「总结这一节」时，**只总结这一小节**，不要扯到别的章节；\n"
+            "下面的上下文是**这一小节的完整正文**"
+            "（英文原文 + 该页中文译文，公式位置以【公式N】占位并配有高清原图）。\n"
+            "→ 用户要「总结这一节」时，**只总结这一小节**；\n"
             "→ 用户问的是具体概念/公式/数值时，就在本小节的内容里找依据，"
             "并说明它出现在第几页；\n"
-            "→ 本小节里没有的信息，明确说「本小节未提及」，**不要借相邻章节的内容补齐**。")
+            "→ 本小节里没有的信息，明确说「本小节未提及」，**不要借相邻章节的内容补齐**；\n"
+            "→ ⚠ 中文译文是**整页翻译**，可能含本小节之外的段落 —— "
+            "**以英文原文为准**判断本小节从哪开始、到哪结束。")
 
     if req.surrounding_context:
         # Scope budget, mirroring the router's advertised tiers
@@ -4276,10 +4338,8 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
         # cannot smuggle a full-paper dump into a "term" question.
         scope_caps = {"term": 2000, "mid": 8000, "section": 16000,
                       "wide": 20000, "full": 50000}
-        cap = scope_caps.get((req.force_scope or "").strip().lower(), 8000)
-        ctx_snippet = req.surrounding_context.strip()[:cap]
-        truncated = len(req.surrounding_context.strip()) > cap
-        is_section = (req.force_scope or "").strip().lower() == "section"
+        cap = scope_caps.get(scope_mode, 8000)
+        ctx_snippet, truncated = _clip_context_keep_ends(req.surrounding_context, cap)
         ctx_label = ("【本小节完整正文】" if is_section
                      else "【该片段所在的章节/页面上下文背景】")
         user_msg_parts.append(
