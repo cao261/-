@@ -1179,6 +1179,22 @@ class ExplainSelectionRequest(BaseModel):
                                                                    "**高清公式图**一起给模型 —— "
                                                                    "整页图会被降采样，公式在上面只有几十像素高，"
                                                                    "模型读不出来（用户原话：只能猜）。")
+    # ---- 「选中一个标题 → 总结这一小节」专用字段（2026-11-18）----
+    selection_kind: Optional[str] = Field(default=None, max_length=20,
+                                          description="用户选中的是标题还是正文："
+                                                      "heading / body。"
+                                                      "=heading 时服务端会在提示里明确告诉模型"
+                                                      "「用户选中的是本小节标题，"
+                                                      "下面给的是本小节完整正文」。")
+    heading_title: Optional[str] = Field(default="", max_length=300,
+                                          description="命中的小节标题（原文，含编号）")
+    section_pages: Optional[List[int]] = Field(default=None, max_length=60,
+                                               description="该小节涉及的页码（1 起）")
+    formula_rects_with_page: Optional[List[List[float]]] = Field(
+        default=None, max_length=200,
+        description="**小节内**公式的坐标：每项 [页码, x0, y0, x1, y1]"
+                    "（PDF 点，左上角原点）。服务端按页裁高清原图 —— "
+                    "小节可能跨页，光给「选中页」的公式图不够用。")
 
 
 class ReadTableRequest(BaseModel):
@@ -1833,6 +1849,73 @@ def _pdf_clip_png(pdf_path, page: int, rect: tuple, scale: float = 4.0,
         pix = pg.get_pixmap(clip=fitz.Rect(cx0, cy0, cx1, cy1),
                             matrix=fitz.Matrix(scale, scale), alpha=False)
         return pix.tobytes("png")
+
+
+# ---------------------------------------------------------------------------
+# PDF 小节大纲 —— 「选中一个标题 → 让 AI 总结这一小节」的地基（2026-11-18）
+# ---------------------------------------------------------------------------
+#
+# 用户 2026-11-18 的原话：
+#   「我一般的使用场景是选中一个标题，让 AI 先帮我总结一下这一小节的内容」
+#
+# 选中的是**标题**：标题本身没有信息量（就一行 "II. Experimental Procedure"），
+# 要回答「总结这一节」，上下文必须换成**这一节的完整正文**。
+#
+# 为什么必须由服务端算：
+#   · 前端拿到的是 PDF.js 的扁平化文本（没有行结构、左右栏交错），
+#     根本认不出「哪一行是标题」；
+#   · 正文要按**阅读顺序**跨页拼起来（双栏 + 跨栏表格 + 整宽图注），
+#     这正是抽取层的页级文本已经做对的事；
+#   · 公式坐标（⟦FORMULA:…⟧）也在页级文本里 → 顺手把「本节的公式 + 页号」
+#     一起交出去，服务端就能按坐标裁高清原图给模型。
+#
+# 缓存：按 (路径, mtime, 大小, 抽取版本) 记 —— 同一篇论文只算一次，
+# 改过 PDF（mtime 变）自动失效。
+
+_OUTLINE_CACHE: dict = {}
+_OUTLINE_CACHE_MAX = 6
+
+
+@app.get("/api/paper/outline")
+async def api_paper_outline(
+    relative_path: str = Query(..., min_length=3, max_length=500,
+                               description="相对 BASE_DIR 的 PDF 路径"),
+):
+    """返回这篇 PDF 的**小节大纲**。
+
+    每节：{index, title, title_plain, level, page_start, page_end,
+           text, chars, formulas:[{n, page, rect}]}
+      · title  带编号的整行（用户选中的就是它）
+      · text   本小节正文（公式已换成【公式N】占位，坐标在 formulas 里）
+      · formulas 里的 rect 是 PDF 点坐标（左上角原点）→ 服务端可裁高清图
+
+    ⚠ 抽取是**重活**（pdfplumber 逐页，8 页约 2s）→ 丢线程池跑，
+      别占着事件循环（AGENTS.md §4.58）。
+    """
+    try:
+        pdf_path = _safe_path(BASE_DIR, relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
+
+    from .paper_text import EXTRACTOR_VERSION, extract_outline
+    try:
+        st = pdf_path.stat()
+        key = (str(pdf_path), int(st.st_mtime), int(st.st_size), EXTRACTOR_VERSION)
+    except OSError:
+        key = (str(pdf_path), 0, 0, EXTRACTOR_VERSION)
+
+    cached = _OUTLINE_CACHE.get(key)
+    if cached is not None:
+        return dict(cached, cached=True)
+
+    outline = await asyncio.to_thread(extract_outline, pdf_path)
+    if len(_OUTLINE_CACHE) >= _OUTLINE_CACHE_MAX:
+        # 丢最老的一个（FIFO，够用；这里最多 6 篇论文）
+        _OUTLINE_CACHE.pop(next(iter(_OUTLINE_CACHE)))
+    _OUTLINE_CACHE[key] = outline
+    return dict(outline, cached=False)
 
 
 # ---------------------------------------------------------------------------
@@ -3975,11 +4058,101 @@ def _render_formula_crops_b64(pdf_path: Path, page: int, rects: list,
     return out
 
 
-async def _qa_page_images(req: "ExplainSelectionRequest"):
-    """给答疑模型准备图片：**整页缩略图** + **该页公式高清原图**。
+def _sanitize_formula_rects_with_page(items) -> list:
+    """校验「带页码」的公式坐标：[页码, x0, y0, x1, y1] → [(page, rect), ...]
 
-    返回 (page_b64, [formula_b64, ...])。两者都没有时才退回前端截的那张
-    （PDF.js 画布，偏糊，但总比没有强）。
+    ⚠ 与 `_sanitize_formula_rects` 同一个道理：这是**客户端可控的入参**，
+      NaN / Infinity / 反向坐标 / 页码越界都要逐条筛掉
+      （nan 走进 PyMuPDF 不会抛异常，会裁出一张空白图冒充公式）。
+    """
+    out = []
+    for it in list(items or [])[:16]:
+        try:
+            vals = [float(v) for v in it]
+        except (TypeError, ValueError):
+            continue
+        if len(vals) != 5:
+            continue
+        page = vals[0]
+        if page != page or page in (float("inf"), float("-inf")):
+            continue
+        if page < 1 or page != int(page):
+            continue
+        x0, y0, x1, y1 = vals[1:]
+        if any(v != v or v in (float("inf"), float("-inf")) for v in (x0, y0, x1, y1)):
+            continue
+        if x1 <= x0 or y1 <= y0:
+            continue
+        out.append((int(page), (x0, y0, x1, y1)))
+    return out
+
+
+def _render_formula_crops_by_page_b64(pdf_path: Path, items: list,
+                                      scale: float = 4.0) -> list:
+    """把「小节内」的公式（**可能跨页**）裁成高清 PNG。
+
+    返回 [{b64, page}, ...]。
+
+    为什么要单独一条路（2026-11-18）：
+      用户选的是**标题**，要总结的是**整个小节** —— 小节常常跨 2~4 页，
+      而老路径只裁「选中页」上的公式 → 跨页那一半的推导模型根本看不到
+      （§4.6：错公式比没公式危险得多）。
+
+    **一次打开 PDF** 裁全部（比每张都重开一次快得多）；
+    护栏与 `_pdf_clip_png` 一致：裁剪框限制在页面内 + max_pixels 兜底。
+    """
+    out = []
+    if not pdf_path or not Path(pdf_path).exists() or not items:
+        return out
+    try:
+        import base64
+        import fitz
+    except ImportError:
+        return out
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            for page, rect in items:
+                if page < 1 or page > doc.page_count:
+                    continue
+                pg = doc.load_page(page - 1)
+                pr = pg.rect
+                cx0 = max(pr.x0, min(rect[0], pr.x1))
+                cy0 = max(pr.y0, min(rect[1], pr.y1))
+                cx1 = min(pr.x1, max(rect[2], pr.x0))
+                cy1 = min(pr.y1, max(rect[3], pr.y0))
+                if cx1 - cx0 <= 0 or cy1 - cy0 <= 0:
+                    continue
+                if (cx1 - cx0) > pr.width or (cy1 - cy0) > pr.height:
+                    continue
+                w_pt, h_pt = cx1 - cx0, cy1 - cy0
+                pixels = (w_pt * scale) * (h_pt * scale)
+                sc = scale
+                if pixels > 4_000_000:
+                    sc = max(1.0, scale * (4_000_000 / pixels) ** 0.5)
+                try:
+                    pix = pg.get_pixmap(clip=fitz.Rect(cx0, cy0, cx1, cy1),
+                                        matrix=fitz.Matrix(sc, sc), alpha=False)
+                    out.append({
+                        "b64": base64.b64encode(pix.tobytes("png")).decode("ascii"),
+                        "page": page,
+                    })
+                except Exception:
+                    continue
+    except Exception:
+        return out
+    return out
+
+
+async def _qa_page_images(req: "ExplainSelectionRequest"):
+    """给答疑模型准备图片：**整页缩略图** + **公式高清原图**。
+
+    返回 (page_b64, formula_items)：
+      formula_items = [{"b64": ..., "page": n}, ...]
+      · **小节模式优先**（formula_rects_with_page）：公式可能跨页，
+        只给「选中页」的公式图，跨页那一半的推导模型就看不到；
+      · 否则退回老路径：选中页上的公式坐标（formula_rects）。
+
+    两者都没有时才退回前端截的那张（PDF.js 画布，偏糊，但总比没有强）。
     """
     page_num = req.page_num
     rel = (req.pdf_relative_path or "").strip()
@@ -3995,15 +4168,22 @@ async def _qa_page_images(req: "ExplainSelectionRequest"):
     page_b64 = ""
     if page_num:
         page_b64 = await asyncio.to_thread(_render_page_png_b64, pdf_path, page_num, 2.0)
-    rects = _sanitize_formula_rects(req.formula_rects)
-    formula_b64s = []
-    if rects and page_num:
-        formula_b64s = await asyncio.to_thread(
-            _render_formula_crops_b64, pdf_path, page_num, rects, 4.0)
-    if not page_b64 and not formula_b64s:
+
+    formula_items = []
+    with_page = _sanitize_formula_rects_with_page(req.formula_rects_with_page)
+    if with_page:
+        formula_items = await asyncio.to_thread(
+            _render_formula_crops_by_page_b64, pdf_path, with_page, 4.0)
+    if not formula_items:
+        rects = _sanitize_formula_rects(req.formula_rects)
+        if rects and page_num:
+            b64s = await asyncio.to_thread(
+                _render_formula_crops_b64, pdf_path, page_num, rects, 4.0)
+            formula_items = [{"b64": b, "page": page_num} for b in b64s]
+    if not page_b64 and not formula_items:
         # 服务端渲染失败 → 退回前端那张
         page_b64 = _frontend_page_image(req)
-    return page_b64, formula_b64s
+    return page_b64, formula_items
 
 
 def _frontend_page_image(req: "ExplainSelectionRequest") -> str:
@@ -4031,13 +4211,13 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
     source_desc = "PDF 英文原文" if req.source_type == "pdf" else ("中文译文" if req.source_type == "translation" else "论文选段")
 
     # ⚠ 先把图准备好：有图才能在提示里告诉模型「公式以图为准」。
-    page_b64, formula_b64s = await _qa_page_images(req)
+    page_b64, formula_items = await _qa_page_images(req)
 
     user_msg_parts = [
         f"论文标题: 《{paper_label}》",
         f"【用户划选片段 ({source_desc})】:\n```text\n{req.selected_text.strip()}\n```",
     ]
-    if page_b64 or formula_b64s:
+    if page_b64 or formula_items:
         # 用户 2026-11-17：划译文里的句子提问时，公式在译文里是**图片**，
         # 而文本上下文里只有公式的碎片（"2 4 3" 这种乱序残片）→
         # 模型看不到公式推导，只能猜。→ 明确告诉它：图才是准的。
@@ -4046,19 +4226,45 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
             notes.append(
                 "第 1 张是**整页缩略图**（页面布局、图表位置参考）；"
                 "公式在它上面只有几十像素高，看不清是正常的。")
-        if formula_b64s:
+        if formula_items:
             notes.append(
-                f"后面 {len(formula_b64s)} 张是**该页公式的高清原图**"
+                f"后面 {len(formula_items)} 张是**公式的高清原图**"
                 "（从 PDF 原页按坐标逐个裁出，和译文里嵌的公式图完全一致）："
                 "凡是公式推导、符号、上下标、系数数值，**一律以这些高清公式图为准**。")
+            if len(formula_items) > 1:
+                notes.append(
+                    "正文里的【公式1】【公式2】…与这些图**按顺序一一对应**，"
+                    "引用公式时请带上编号。")
         notes.append(
             "文本上下文里的公式都是乱序碎片（分子、分母、上下标各占一行），"
             "**不要根据上下文补全或猜测公式**；"
             "看不清的地方请明说「图中看不清」，不要凭空编造。")
         user_msg_parts.append("【附件说明】" + "".join(notes))
+
+    # ---- 「用户选中的是一个小节标题」→ 明确告诉模型这是什么局面 ----
+    # 用户 2026-11-18：「我一般的使用场景是选中一个标题，让 AI 先帮我总结一下
+    # 这一小节的内容」。选中的是**标题**（没有信息量），真正的上下文是
+    # **这一小节的完整正文** → 必须在提示里说清楚，否则模型会以为
+    # 「用户划了半句话」，然后去猜、去编。
+    if (req.selection_kind or "").strip().lower() == "heading":
+        title = (req.heading_title or "").strip()
+        pages = [p for p in (req.section_pages or []) if isinstance(p, int) and p > 0]
+        page_desc = ""
+        if pages:
+            page_desc = f"（第 {min(pages)}-{max(pages)} 页）"
+        user_msg_parts.append(
+            "【用户选中的是一个小节标题】\n"
+            f"标题：{title}{page_desc}\n"
+            "下面给出的上下文是**这一小节的完整正文**"
+            "（含本小节的中文译文与英文原文，公式位置以【公式N】占位并配有高清原图）。\n"
+            "→ 用户要「总结这一节」时，**只总结这一小节**，不要扯到别的章节；\n"
+            "→ 用户问的是具体概念/公式/数值时，就在本小节的内容里找依据，"
+            "并说明它出现在第几页；\n"
+            "→ 本小节里没有的信息，明确说「本小节未提及」，**不要借相邻章节的内容补齐**。")
+
     if req.surrounding_context:
         # Scope budget, mirroring the router's advertised tiers
-        # (term ~600-800 / mid 4-8K / wide 12-20K / full up to 60K).
+        # (term ~600-800 / mid 4-8K / section 16K / wide 12-20K / full up to 60K).
         #
         # The server used to hard-truncate the context to 10 000 chars
         # regardless of scope. That silently defeated the whole two-stage
@@ -4068,12 +4274,16 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
         # *builds* the context (the server has no paper text), but the
         # server now enforces the ceiling, so a buggy or hostile client
         # cannot smuggle a full-paper dump into a "term" question.
-        scope_caps = {"term": 2000, "mid": 8000, "wide": 20000, "full": 50000}
+        scope_caps = {"term": 2000, "mid": 8000, "section": 16000,
+                      "wide": 20000, "full": 50000}
         cap = scope_caps.get((req.force_scope or "").strip().lower(), 8000)
         ctx_snippet = req.surrounding_context.strip()[:cap]
         truncated = len(req.surrounding_context.strip()) > cap
+        is_section = (req.force_scope or "").strip().lower() == "section"
+        ctx_label = ("【本小节完整正文】" if is_section
+                     else "【该片段所在的章节/页面上下文背景】")
         user_msg_parts.append(
-            f"【该片段所在的章节/页面上下文背景】:\n{ctx_snippet}"
+            f"{ctx_label}:\n{ctx_snippet}"
             + ("\n(上下文过长, 已按所选 scope 截断)" if truncated else "")
         )
     # Feedback loop: when the user re-asks because they didn't like the
@@ -4098,9 +4308,9 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
     # 模型看到的是一堆没有意义的字符 —— 这正是「这个表需要注意什么」
     # 问不出答案的原因。截图走 OpenAI 兼容的 image_url (data URL)。
     #
-    # ⚠ page_b64 / formula_b64s 已在上面用 `_qa_page_images()` 算好
-    #   （服务端按 PDF 坐标重渲染的整页图 + 该页公式的高清裁图）。
-    if page_b64 or formula_b64s:
+    # ⚠ page_b64 / formula_items 已在上面用 `_qa_page_images()` 算好
+    #   （服务端按 PDF 坐标重渲染的整页图 + 公式的高清裁图）。
+    if page_b64 or formula_items:
         content = [{"type": "text", "text": user_msg}]
         idx = 0
         if page_b64:
@@ -4111,13 +4321,14 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
                 "type": "image_url",
                 "image_url": {"url": f"data:image/png;base64,{page_b64}"},
             })
-        for i, b64 in enumerate(formula_b64s, 1):
+        for i, item in enumerate(formula_items, 1):
             idx += 1
             content.append({"type": "text",
-                            "text": f"【附件 {idx}】该页公式原图 第 {i}/{len(formula_b64s)} 个（高清）"})
+                            "text": f"【附件 {idx}】公式原图 第 {i}/{len(formula_items)} 个"
+                                    f"（高清，第 {item.get('page', '?')} 页）"})
             content.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                "image_url": {"url": f"data:image/png;base64,{item['b64']}"},
             })
         user_content = content
     else:

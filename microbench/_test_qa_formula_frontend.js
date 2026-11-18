@@ -51,9 +51,31 @@ function sliceFn(src, marker) {
   throw new Error("函数没闭合：" + marker);
 }
 
+// 切一行（const _QA_SECTION_BUDGET = 16000; 这种单行语句）
+function sliceLine(src, marker) {
+  const start = src.indexOf(marker);
+  if (start < 0) throw new Error("找不到语句：" + marker);
+  const end = src.indexOf(NL, start);
+  return src.slice(start, end < 0 ? src.length : end);
+}
+
 function sliceAll(src) {
   return [
     sliceFn(src, "function _collectPageFormulaRects(pageNum) {"),
+    // ⚠ 2026-11-18：submitReaderQA 多了一条「选中标题 → 小节上下文」的支线，
+    //   它依赖下面这几个函数。**必须一起切进来** —— 少切一个，
+    //   这套护栏就会因为「函数不存在」而崩（2026-11-18 真跑过一次）。
+    sliceLine(src, "const _QA_SECTION_BUDGET"),
+    sliceFn(src, "function _normQaHeading(s) {"),
+    sliceFn(src, "function _qaHeadingCandidates() {"),
+    sliceFn(src, "function _matchQaHeading(selectionText) {"),
+    sliceFn(src, "function _clipQaContext(text, budget) {"),
+    sliceFn(src, "function _stripQaMarkers(text) {"),
+    sliceFn(src, "function _sectionChineseText(hit) {"),
+    sliceFn(src, "function _buildSectionContext(hit, budget) {"),
+    sliceFn(src, "function _sectionPageList(hit) {"),
+    sliceFn(src, "function _sectionFormulaRects(hit) {"),
+    sliceFn(src, "async function _ensureQaOutlineReady() {"),
     sliceFn(src, "async function submitReaderQA() {"),
   ].join("\n\n");
 }
@@ -129,6 +151,8 @@ let _currentQAPreset = "explain";
 let _lastAnswerText = "";
 let _lastQAItem = null;
 let _sessionQAList = [];
+let _qaOutline = { path: null, sections: [], ready: false, loading: false, promise: null };
+let _qaHeadingHit = null;
 const console = { error: () => {}, warn: () => {}, log: () => {} };
 `;
   const factory = new Function(

@@ -301,6 +301,261 @@ def extract_page_blocks(pdf_path, page_no: int) -> list[dict]:
     return blocks
 
 
+# ---------------------------------------------------------------------------
+# 小节大纲 —— 「选中一个标题 → 让 AI 总结这一小节」的地基（2026-11-18）
+# ---------------------------------------------------------------------------
+#
+# 用户 2026-11-18 的原话：
+#   「我一般的使用场景是选中一个标题，让 AI 先帮我总结一下这一小节的内容」
+#
+# 选中的是**标题** —— 标题本身没有信息量（就一行 "II. Experimental Procedure"），
+# 要回答「总结这一节」，上下文必须换成**这一节的完整正文**。
+#
+# 为什么必须放在抽取层做（而不是前端）：
+#   · 正文要按**阅读顺序**跨页拼起来（双栏 + 跨栏表格 + 整宽图注）——
+#     这正是页级文本已经做对的事（见上面「双栏顺序」那段说明）；
+#   · 前端拿到的是 PDF.js 的**扁平化文本**（`items.map(it => it.str).join(" ")`，
+#     没有行结构、左右栏交错）→ 根本认不出「哪一行是标题」；
+#   · 段落块层虽然带坐标，但**会漏行**（实测 JACERS 第 1 页的
+#     "I. Introduction" / "II. Experimental Procedure" 两个标题
+#     在块层里根本不存在 —— 块层从 band 边界起裁，把它们切没了），
+#     所以标题/正文都从**页级文本**取，块层只用来补公式坐标。
+#   · 公式坐标（⟦FORMULA:…⟧）本来就在页级文本里 → 顺手把
+#     「本节的公式 + 所在页号」一起交出去，服务端就能裁高清原图。
+#
+# ⚠ 标题识别是**保守**的（宁可漏，不要误判）：
+#   误判的代价不对称 —— 把一句正文当成标题 → 上下文锚到错误的节
+#   → AI 总结的是**别人那一节**（用户会立刻发现不对）；
+#   漏判的代价只是「这次退回普通上下文」（还是能答，只是范围差一点）。
+
+# 编号式标题：
+#   "I. Introduction" / "II. Experimental Procedure"   → 罗马数字
+#   "1. Introduction" / "1.1 Some Topic"               → 阿拉伯数字（可多级）
+#   "(1) Individual Phases in ME Composites"           → 括号数字（IEEE 常见）
+#   "A. Preliminaries"                                 → 字母（IEEE 二级标题）
+_OUTLINE_HEADING_RE = re.compile(
+    r"^(?:"
+    r"(?:\(?\d{1,2}(?:\.\d{1,2})*\)?\.?)"   # 1. / 1.1 / (1) / 1)
+    r"|(?:\(?[IVXLC]{1,6}\)?\.)"             # I. / II. / (I)
+    r"|(?:\(?[A-H]\)?\.)"                    # A. / (A)
+    r")\s+(?P<title>\S.*)$"
+)
+
+# 页级文本里的公式标记（坐标是 PDF 点，左上角原点）
+_OUTLINE_FORMULA_RE = re.compile(
+    r"⟦FORMULA:(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),"
+    r"(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)⟧")
+_OUTLINE_TABLE_RE = re.compile(r"⟦TABLE:[^⟧\n]*⟧")
+
+# 跑页眉/页码噪声（页级文本每页开头都有，进了上下文就是纯噪声）
+_OUTLINE_NOISE_RES = (
+    re.compile(r"^\d{1,4}$"),                 # 裸页码
+    re.compile(r"\bVol\.\s*\d+"),             # 期刊卷期页眉
+    re.compile(r"\bDOI\s*:"),                 # DOI 页眉
+)
+
+# 参考文献标题（到这儿正文就结束了，后面的书目不进上下文）
+_OUTLINE_REFERENCES_RE = re.compile(
+    r"^(?:\d{1,3}\s+)?references\s*$", re.IGNORECASE)
+
+# 标题里出现这些 → 是按语/编者按/参考文献条目，不是章节标题
+_OUTLINE_AUTHOR_RE = re.compile(r"[A-Z]\.\s")      # "M. Laletin" / "S. R. Shinde"
+_OUTLINE_TITLE_MAX_WORDS = 12
+_OUTLINE_TITLE_MAX_CHARS = 90
+
+# 标题里出现这些**小写动词/助动词** → 是正文句子，不是标题。
+#
+# 为什么要有（误判的代价不对称，§4.6 同款思路）：
+#   "3 Measurements were performed on the samples." 这种**编号开头的正文句**
+#   长得跟标题一模一样（编号 + 大写开头）→ 会被当成新标题 → 把真正的小节
+#   从中间劈成两半 → 用户问「总结这一节」，AI 拿到的是**半节**。
+#   而真标题里出现过去式动词的极少（标题是名词短语）。
+_OUTLINE_SENTENCE_VERBS = frozenset({
+    "is", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "did", "does", "do",
+    "can", "could", "may", "might", "must", "shall", "should",
+    "will", "would", "showed", "shown", "shows", "show",
+    "measured", "observed", "reported", "used", "based",
+    "obtained", "calculated", "found", "applied", "compared",
+    "performed", "conducted", "discussed", "described", "presented",
+    "developed", "proposed", "designed", "employed", "selected",
+    "evaluated", "estimated", "simulated", "fabricated", "prepared",
+})
+_OUTLINE_SENTENCE_VERB_RE = re.compile(
+    r"\b(?:%s)\b" % "|".join(sorted(_OUTLINE_SENTENCE_VERBS)))
+
+
+def _outline_heading_title(line: str) -> Optional[str]:
+    """这一行是不是**章节标题**？是就返回标题原文，否则 None。
+
+    判据（每一条都在真实论文上逐条验过，见
+    docs/HANDOFF_2026-11-18-QA-CONTEXT.md §2 的命中/误命中清单）：
+      ① 编号式开头（"I." / "2." / "(3)" / "A."）；
+      ② 标题首字是大写字母或汉字
+         （排除 "20 mV/cm-Oe. The ME effect…" 这种公式碎片行）；
+      ③ 标题里**至少有一个小写字母**
+         （排除 "31 ME" 这种纯缩写碎片 —— 也排除 "ME" 当标题）；
+      ④ 词数 ≤ 12、长度 ≤ 90（排除参考文献条目）；
+      ⑤ 不含作者名缩写模式 / "et al" / 邮箱 / em dash
+         （排除 "D. Johnson—contributing editor" 这种按语）；
+      ⑥ 不以 , ; : - 收尾（参考文献条目几乎都这样收尾）。
+    """
+    s = (line or "").strip()
+    if not s or len(s) > 120:
+        return None
+    m = _OUTLINE_HEADING_RE.match(s)
+    if not m:
+        return None
+    title = m.group("title").strip()
+    if not title:
+        return None
+    if len(title) > _OUTLINE_TITLE_MAX_CHARS:
+        return None
+    words = title.split()
+    if len(words) > _OUTLINE_TITLE_MAX_WORDS:
+        return None
+    # ② 首字必须是大写字母或汉字
+    if not re.match(r"^[A-Z\u4e00-\u9fff]", title):
+        return None
+    # ③ 至少一个小写字母（"ME" / "PZT" 这种纯缩写不算标题）
+    if not re.search(r"[a-z\u4e00-\u9fff]", title):
+        return None
+    # ⑤ 按语 / 参考文献条目
+    if "et al" in title or _OUTLINE_AUTHOR_RE.search(title):
+        return None
+    if any(ch in title for ch in ("—", "@", "http", "DOI")):
+        return None
+    # ⑤b 编号开头的**正文句**（"3 Measurements were performed…"）→ 不是标题
+    if _OUTLINE_SENTENCE_VERB_RE.search(title):
+        return None
+    # ⑥ 收尾标点
+    if title.endswith((",", ";", ":", "-")):
+        return None
+    return title
+
+
+def _outline_heading_level(num: str) -> int:
+    """标题的层级：罗马/一级数字 = 1，二级（字母、括号编号、多级数字）= 2。"""
+    raw = (num or "").strip()
+    n = raw.strip("(). ")
+    if not n:
+        return 1
+    if raw.startswith("("):
+        # 括号编号（IEEE 常见的 "(1)" / "(A)"）= 二级标题
+        return 2
+    if re.match(r"^[IVXLC]+$", n):
+        return 1
+    if re.match(r"^[A-H]$", n):
+        return 2
+    if "." in n:
+        return 2
+    return 1
+
+
+def extract_outline(pdf_path, max_pages: int = 200) -> dict:
+    """PDF 的**小节大纲**：标题 + 本小节正文 + 本节的公式坐标。
+
+    返回：
+      {"pages": 总页数, "truncated": 是否因页数上限被截断, "sections": [
+          {"index": 0,
+           "title": "I. Introduction",
+           "level": 1,
+           "page_start": 1, "page_end": 1,
+           "text": "本小节正文（⟦FORMULA⟧ 已换成【公式N】占位）",
+           "chars": 3210,
+           "formulas": [{"n": 1, "page": 1, "rect": [x0, y0, x1, y1]}]}]}
+
+    正文里的公式被替换成 **【公式N】** 占位（N 从 1 开始，按出现顺序），
+    同时把坐标记进 formulas —— 服务端按同一顺序裁高清原图，
+    模型看到的第 N 张图就对应正文里的第 N 个【公式N】。
+    """
+    out = {"pages": 0, "truncated": False, "sections": []}
+    pages_text: list = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(pdf_path)) as doc:
+            total = len(doc.pages)
+            out["pages"] = total
+            limit = max(1, int(max_pages))
+            if total > limit:
+                out["truncated"] = True
+                limit = limit
+            for i in range(min(total, limit)):
+                try:
+                    txt = _extract_page_text(doc.pages[i])
+                except Exception:
+                    txt = ""
+                pages_text.append((i + 1, txt or ""))
+    except Exception:
+        print(f"[MicroBench] 小节大纲抽取失败: {traceback.format_exc()}",
+              file=sys.stderr)
+        return out
+
+    sections: list = []
+    cur = {"index": 0, "title": "(前言/摘要)", "title_plain": "(前言/摘要)",
+           "level": 0,
+           "page_start": 1, "page_end": 1, "parts": [], "formulas": [],
+           "last_page": 1}
+
+    def _close(sec):
+        sec["page_end"] = sec.get("last_page") or sec["page_start"]
+        sec["text"] = "\n".join(sec["parts"])
+        sec["chars"] = len(sec["text"])
+        sec.pop("parts", None)
+        sec.pop("last_page", None)
+        return sec
+
+    for page_no, text in pages_text:
+        for raw in (text or "").split("\n"):
+            line = raw.strip()
+            if not line:
+                continue
+            if any(rx.search(line) for rx in _OUTLINE_NOISE_RES):
+                continue
+            # 参考文献段：正文到此为止（后面全是书目，别灌进上下文）
+            if _OUTLINE_REFERENCES_RE.match(line):
+                sections.append(_close(cur))
+                cur = None
+                # 书目**不进**任何小节（实测 JACERS 的参考文献有 10023 字，
+                # 进了上下文就是纯噪声 + 纯 token 浪费）
+                break
+            title = _outline_heading_title(line)
+            if title:
+                sections.append(_close(cur))
+                m = _OUTLINE_HEADING_RE.match(line)
+                num = m.group(0).split(None, 1)[0] if m else ""
+                cur = {"index": len(sections),
+                       # 标题存**带编号的整行** —— 用户在 PDF 上看到、选中的
+                       # 就是这一串（"I. Introduction"），匹配要跟它对齐。
+                       "title": line,
+                       "title_plain": title,
+                       "level": _outline_heading_level(num),
+                       "page_start": page_no, "page_end": page_no,
+                       "parts": [], "formulas": [], "last_page": page_no}
+                continue
+            # 正文行：公式标记换成占位，坐标记账
+            cur["last_page"] = page_no
+            line = _OUTLINE_TABLE_RE.sub("【表格】", line)
+
+            def _sub_formula(m, _cur=cur, _page=page_no):
+                rect = [float(m.group(1)), float(m.group(2)),
+                        float(m.group(3)), float(m.group(4))]
+                _cur["formulas"].append({
+                    "n": len(_cur["formulas"]) + 1,
+                    "page": _page,
+                    "rect": rect,
+                })
+                return "【公式%d】" % len(_cur["formulas"])
+
+            cur["parts"].append(_OUTLINE_FORMULA_RE.sub(_sub_formula, line))
+
+    if cur is not None:
+        sections.append(_close(cur))
+    # 空节（只有标题、正文被噪声吃光）留着但标记出来 —— 前端要能跳过
+    out["sections"] = sections
+    return out
+
+
 _PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,4}\s*$")
 _SENTENCE_END_RE = re.compile(r"[.!?。！？]")
 # 抽取层插入的标记（公式/表格）。页尾截断必须避开它们内部的小数点。

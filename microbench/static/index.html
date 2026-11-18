@@ -5054,6 +5054,10 @@
         return;
       }
 
+      // 「选中一个标题 → 让 AI 总结这一小节」：后台先把**小节大纲**拉下来。
+      // （服务端算，约 2s/8 页；不阻塞阅读，也不阻塞 PDF 渲染。）
+      try { fetchQaOutline(found.relative_path); } catch (e) { /* 拉不到就当没有 */ }
+
       // Load PDF.js document
       placeholder.style.display = "none";
       listEl.innerHTML = `<div class="pdf-translation-loading">📥 正在加载 PDF (${escapeHtml(found.file_name)})…</div>`;
@@ -9696,14 +9700,249 @@
     // chose what we chose.
     // ---------------------------------------------------------------
     // -----------------------------------------------------------------------
+    // 「选中一个标题 → 总结这一小节」（2026-11-18）
+    //
+    // 用户原话：「我一般的使用场景是选中一个标题，让 ai 先帮我总结一下
+    // 这一小节的内容」。
+    //
+    // 选中的是**标题** —— 标题本身没有信息量（就一行 "II. Experimental
+    // Procedure"），要回答「总结这一节」，上下文必须换成**这一节的完整正文**。
+    //
+    // 三个关键决定：
+    //   ① 大纲由**服务端**算（/api/paper/outline）—— 前端拿到的是 PDF.js 的
+    //      扁平化文本（`items.map(it => it.str).join(" ")`，没有行结构、
+    //      左右栏交错），根本认不出「哪一行是标题」；
+    //   ② 命中标题就**跳过 LLM 路由**（省一次 3~8s 往返，而且更确定：
+    //      「总结这一节」不需要模型去猜该给多少上下文）；
+    //   ③ 上下文给「本节中文译文 + 本节英文原文 + 本节公式高清图」——
+    //      中文是用户真正在读的东西，英文是权威表述，公式必须给原图。
+    // -----------------------------------------------------------------------
+
+    const _QA_SECTION_BUDGET = 16000;   // 必须与后端 scope_caps["section"] 一致
+
+    // 大纲缓存（同一篇论文只拉一次；服务端也按 mtime 缓存）
+    let _qaOutline = { path: null, sections: [], ready: false, loading: false, promise: null };
+    // 当前命中的标题（构建上下文时用；_refineQA 也要用）
+    let _qaHeadingHit = null;
+
+    async function fetchQaOutline(relativePath) {
+      if (!relativePath) return null;
+      if (_qaOutline.path === relativePath) {
+        if (_qaOutline.ready) return _qaOutline;
+        if (_qaOutline.promise) return _qaOutline.promise;
+      }
+      _qaOutline = { path: relativePath, sections: [], ready: false,
+                     loading: true, promise: null };
+      _qaOutline.promise = (async () => {
+        try {
+          const res = await fetch("/api/paper/outline?relative_path=" +
+                                  encodeURIComponent(relativePath));
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const data = await res.json();
+          if (_qaOutline.path !== relativePath) return null;  // 期间换论文了
+          _qaOutline.sections = Array.isArray(data.sections) ? data.sections : [];
+          _qaOutline.ready = true;
+          return _qaOutline;
+        } catch (e) {
+          console.warn("[qa-outline] 大纲拉取失败:", e && e.message);
+          _qaOutline.ready = false;
+          return null;
+        } finally {
+          if (_qaOutline.path === relativePath) {
+            _qaOutline.loading = false;
+            _qaOutline.promise = null;
+          }
+        }
+      })();
+      return _qaOutline.promise;
+    }
+
+    // 大纲还没算完就等一下（最多 6 秒）——
+    // 用户刚打开论文就划词提问时，服务端首次算大纲要 ~2s（8 页），
+    // 等它算完才能认得出「用户选的是标题」。
+    async function _ensureQaOutlineReady() {
+      const p = _qaOutline && _qaOutline.promise;
+      if (!p) return;
+      try {
+        await Promise.race([p, new Promise(r => setTimeout(r, 6000))]);
+      } catch (e) { /* 大纲失败就当没有，走普通上下文 */ }
+    }
+
+    // 标题归一化：去掉所有空白与标点，只留下字母/数字/汉字。
+    // 这样 "II. Experimental Procedure" / "II Experimental Procedure"
+    // / "ii. experimental procedure" 归一化后完全一致。
+    function _normQaHeading(s) {
+      return String(s == null ? "" : s)
+        .replace(/[\s\u3000]+/g, "")
+        .replace(/[.,;:!?'"“”‘’()\[\]{}<>《》、，。；：·…—\-]/g, "")
+        .toLowerCase();
+    }
+
+    // 候选标题：**当前视图**优先 —— 章节视图用 `_readerState.sections`，
+    // PDF 模式用服务端算的大纲。
+    //
+    // ⚠ 为什么要按视图分：`openPdfDirect()` 会把 `_readerState.sections` 清空，
+    //   所以「sections 非空」= 用户正在看章节视图（此时大纲是上一篇的残留）。
+    function _qaHeadingCandidates() {
+      const out = [];
+      const secs = (_readerState && _readerState.sections) || [];
+      if (secs.length) {
+        secs.forEach((s, i) => {
+          out.push({
+            title: s.title || "",
+            level: 1,
+            page_start: s.page_start, page_end: s.page_end,
+            text: s.text || "",
+            formulas: [],
+            source: "section",
+            index: i,
+          });
+        });
+        return out;
+      }
+      const outlineSecs = (_qaOutline && _qaOutline.sections) || [];
+      for (const s of outlineSecs) {
+        out.push({
+          title: s.title || "",
+          level: s.level || 1,
+          page_start: s.page_start, page_end: s.page_end,
+          text: s.text || "",
+          formulas: Array.isArray(s.formulas) ? s.formulas : [],
+          source: "pdf",
+        });
+      }
+      return out;
+    }
+
+    // 用户选中的这一段，是不是某个小节的标题？
+    //
+    // ⚠ 误判的代价不对称（§4.6 同款思路）：把正文当成标题 → 上下文锚到
+    //   **别的节** → AI 总结的是别人那一节，用户一眼就看出不对；
+    //   漏判的代价只是「这次退回普通上下文」，还是能答。
+    // → 所以判定收紧：标题本身要够长（≥6 个归一化字符），
+    //   选区不能比标题长太多（≤1.6 倍），只选一部分也要够长（≥一半）。
+    function _matchQaHeading(selectionText) {
+      const sel = _normQaHeading(selectionText);
+      if (!sel || sel.length < 3 || sel.length > 100) return null;
+      let best = null;
+      let bestLen = 0;
+      for (const sec of _qaHeadingCandidates()) {
+        const t = _normQaHeading(sec.title);
+        if (!t) continue;
+        let hit = false;
+        if (sel === t) {
+          hit = true;
+        } else if (t.length >= 6 && sel.length >= 4 &&
+                   t.includes(sel) && sel.length / t.length >= 0.5) {
+          hit = true;   // 只选了标题的一部分
+        } else if (t.length >= 6 && sel.includes(t) &&
+                   sel.length <= t.length * 1.6) {
+          hit = true;   // 选了标题（可能多带了标点/空白）
+        }
+        if (hit && t.length > bestLen) { best = sec; bestLen = t.length; }
+      }
+      return best;
+    }
+
+    // 超预算时**头尾都保留**（不是只留头部）——
+    // 小节的结尾常常是结论/收束，只留头部等于把结论丢了。
+    function _clipQaContext(text, budget) {
+      const s = String(text == null ? "" : text);
+      if (!budget || s.length <= budget) return s;
+      const head = Math.floor(budget * 0.65);
+      const tail = Math.max(0, budget - head);
+      const cut = s.length - head - tail;
+      return s.slice(0, head)
+        + "\n…（中间约 " + cut.toLocaleString() + " 字已省略）…\n"
+        + (tail > 0 ? s.slice(s.length - tail) : "");
+    }
+
+    // 译文里的 ⟦FORMULA:…⟧ / ⟦TABLE:…⟧ 标记对模型没有意义（坐标它也用不上），
+    // 换成中文占位，别让一堆坐标噪声占掉上下文预算。
+    function _stripQaMarkers(text) {
+      return String(text == null ? "" : text)
+        .replace(/⟦FORMULA:[^⟧\n]*⟧/g, "【公式】")
+        .replace(/⟦TABLE:[^⟧\n]*⟧/g, "【表格】");
+    }
+
+    // 本小节的中文译文（章节视图 = 本节译文；PDF 模式 = 本节所在页的整页译文）
+    function _sectionChineseText(hit) {
+      if (!hit) return "";
+      if (hit.source === "section" && typeof hit.index === "number") {
+        const t = (_readerState.translations || [])[hit.index];
+        if (t) return _stripQaMarkers(t);
+        return "";
+      }
+      const pages = (_pdfState && _pdfState.pages) || [];
+      const chunks = [];
+      const from = hit.page_start || 0;
+      const to = hit.page_end || 0;
+      for (let p = from; p <= to && p > 0; p++) {
+        const pg = pages.find(x => x.num === p);
+        if (pg && pg.translation) {
+          chunks.push("[第 " + p + " 页译文]\n" + _stripQaMarkers(pg.translation));
+        }
+      }
+      return chunks.join("\n\n");
+    }
+
+    // 小节上下文：标题 + 中文译文（有就带）+ 英文原文
+    function _buildSectionContext(hit, budget) {
+      if (!hit) return "";
+      const cap = budget || _QA_SECTION_BUDGET;
+      const parts = [];
+      const pageDesc = (hit.page_start && hit.page_end)
+        ? "（第 " + hit.page_start + "-" + hit.page_end + " 页）" : "";
+      parts.push("【小节】" + (hit.title || "") + pageDesc);
+      const zh = _sectionChineseText(hit);
+      const en = hit.text || "";
+      if (zh) {
+        const zhBudget = Math.floor(cap * 0.4);
+        parts.push("【本小节中文译文（机器翻译，供快速理解）】\n" +
+                   _clipQaContext(zh, zhBudget));
+        parts.push("【本小节英文原文（权威表述；公式位置为【公式N】占位，"
+          + "对应的公式高清原图见附件）】\n" +
+          _clipQaContext(en, Math.max(0, cap - zhBudget)));
+      } else {
+        parts.push("【本小节英文原文（公式位置为【公式N】占位，"
+          + "对应的公式高清原图见附件）】\n" + _clipQaContext(en, cap));
+      }
+      return parts.join("\n\n");
+    }
+
+    // 本小节涉及哪些页（上限 12 页，别把整篇都塞进去）
+    function _sectionPageList(hit) {
+      if (!hit || !hit.page_start) return [];
+      const from = hit.page_start;
+      const to = Math.max(from, hit.page_end || from);
+      const out = [];
+      for (let p = from; p <= to && out.length < 12; p++) out.push(p);
+      return out;
+    }
+
+    // 本小节的公式坐标 → [页码, x0, y0, x1, y1]
+    function _sectionFormulaRects(hit) {
+      if (!hit || !Array.isArray(hit.formulas)) return [];
+      const out = [];
+      for (const f of hit.formulas) {
+        if (!f || !Array.isArray(f.rect) || f.rect.length !== 4) continue;
+        const page = Number(f.page);
+        if (!page || page < 1) continue;
+        out.push([page, f.rect[0], f.rect[1], f.rect[2], f.rect[3]]);
+        if (out.length >= 16) break;
+      }
+      return out;
+    }
+
+    // -----------------------------------------------------------------------
     // Scope caps — MUST mirror the backend (app.py `scope_caps`).
     // The server truncates surrounding_context to these limits before it
     // reaches the LLM, so the client has to apply the same numbers: the
     // badge must report what is really sent, and the request field itself
     // (max_length=50000) must never be exceeded.
-    //   term=2K · mid=8K · wide=20K · full=50K
+    //   term=2K · mid=8K · section=16K · wide=20K · full=50K
     // -----------------------------------------------------------------------
-    const _SCOPE_CAPS = { term: 2000, mid: 8000, wide: 20000, full: 50000 };
+    const _SCOPE_CAPS = { term: 2000, mid: 8000, section: 16000, wide: 20000, full: 50000 };
     // Backend field limit for surrounding_context is 50000 — leave headroom.
     const _MAX_CONTEXT_CHARS = 48000;
     // Hard ceiling for any client-side scope budget. The router may answer
@@ -9830,6 +10069,9 @@
     const _SCOPE_LADDER = [
       { mode: "term", budget: 800,  label: "紧邻上下文 (~800 字)" },
       { mode: "mid",  budget: 8000, label: "章节上下文 (~8K 字)" },
+      // 「小节全文」这一档：选中标题时自动命中（2026-11-18）。
+      // 放在 mid 与 wide 之间，⬆️ 升级 = 看得更宽，⬇️ 收窄 = 回到页面级。
+      { mode: "section", budget: _QA_SECTION_BUDGET, label: "小节全文 (~16K 字)" },
       { mode: "wide", budget: 20000, label: "摘要+当前章节+结论 (~20K 字)" },
       { mode: "full", budget: _MAX_SCOPE_BUDGET, label: "全文摘要 (~45K 字)" },
     ];
@@ -9894,6 +10136,12 @@
         feedback: (feedbackText || "").slice(0, 2000),
         prior_answer: (priorAnswer || "").slice(0, 8000),
         force_scope: newScope.mode,
+        // 命中标题时，重新回答也要带着「本小节」的定位信息
+        // （否则服务端会以为用户划的是半句话，提示里没有小节约束）。
+        selection_kind: _qaHeadingHit ? "heading" : "body",
+        heading_title: _qaHeadingHit ? (_qaHeadingHit.title || "") : "",
+        section_pages: _qaHeadingHit ? _sectionPageList(_qaHeadingHit) : [],
+        formula_rects_with_page: _qaHeadingHit ? _sectionFormulaRects(_qaHeadingHit) : [],
         // 用**答疑面板**自己选中的模型回答（与翻译用的模型互不影响）：
         // '' = 跟随默认 / 'agnes' = 备用 / 'deepseek-flash' = DeepSeek /
         // 'custom:xxx' = 用户自己的 API 模型
@@ -9963,6 +10211,14 @@
       const selText = _readerSelState.text || "";
 
       // 2. Build per-scope output.
+      if (scope.mode === "section") {
+        // 「选中了一个标题」→ 上下文 = **本小节的完整正文**（2026-11-18）。
+        // 命中标题时由 submitReaderQA 直接给这个 scope（不走 LLM 路由）。
+        const hit = _qaHeadingHit;
+        if (!hit) return "";
+        return _buildSectionContext(hit, scope.budget || _QA_SECTION_BUDGET);
+      }
+
       if (scope.mode === "term") {
         // Tight window around the selection (≈ budget chars). Don't
         // include the section header here — definitions are usually
@@ -10034,7 +10290,8 @@
       const raw = _buildScopeContextRaw(scope) || "";
       const cap = _SCOPE_CAPS[scope.mode] || 8000;
       const limit = Math.min(cap, _MAX_CONTEXT_CHARS);
-      return raw.length > limit ? raw.slice(0, limit) : raw;
+      // ⚠ 超预算时**头尾都保留**（原来只留头部 → 长章节的结论段直接丢了）。
+      return _clipQaContext(raw, limit);
     }
 
     function triggerQAPreset(type) {
@@ -10232,7 +10489,25 @@
       // returns {mode, budget, reason}; if it fails (network, timeout, LLM
       // down) we silently fall back to the keyword heuristic so the main
       // QA flow is never blocked.
-      const scope = await _routeQuestionScope(question, _currentQAPreset, _readerSelState.text || "");
+      //
+      // ⚠ 例外（2026-11-18）：**选中的是标题**时直接走「小节全文」，
+      //   不问路由 —— ① 省一次 3~8s 往返；② 「总结这一节」该给多少上下文
+      //   是确定的（就是这一节），让模型去猜反而可能猜错。
+      await _ensureQaOutlineReady();
+      const headingHit = _matchQaHeading(_readerSelState.text || "");
+      _qaHeadingHit = headingHit;
+      let scope;
+      if (headingHit) {
+        scope = {
+          mode: "section",
+          budget: _QA_SECTION_BUDGET,
+          label: "小节全文 · " + (headingHit.title || ""),
+          source: "heading",
+          reason: "选中的内容是章节标题 → 上下文换成本小节完整正文",
+        };
+      } else {
+        scope = await _routeQuestionScope(question, _currentQAPreset, _readerSelState.text || "");
+      }
       const surroundingContext = _buildScopeContext(scope);
       // Surface the chosen scope to the user so the trade-off is visible.
       // They can always click a different preset to override the heuristic.
@@ -10241,7 +10516,8 @@
         const actualChars = (surroundingContext || "").length;
         const sourceTag = scope.source === "ai"
           ? "🧭 AI 路由"
-          : (scope.source === "preset" ? "⚙️ preset" : "🔑 关键词 fallback");
+          : (scope.source === "preset" ? "⚙️ preset"
+            : (scope.source === "heading" ? "🎯 标题命中" : "🔑 关键词 fallback"));
         scopeBadge.textContent = `${sourceTag} · ${scope.label} · 实际 ${actualChars.toLocaleString()} 字`;
         scopeBadge.title =
           `mode=${scope.mode} · 上限 ${scope.budget.toLocaleString()}\n` +
@@ -10285,6 +10561,15 @@
         // falls back to the mid cap (8000) and silently truncates the
         // wide (20K) / full (50K) contexts.
         force_scope: scope.mode,
+        // ---- 「选中的是标题」专用（2026-11-18）----
+        // 后端据此在提示里明确告诉模型「用户选中的是本小节标题，
+        // 下面给的是本小节完整正文」，并且按 section 档截断上下文。
+        selection_kind: headingHit ? "heading" : "body",
+        heading_title: headingHit ? (headingHit.title || "") : "",
+        section_pages: headingHit ? _sectionPageList(headingHit) : [],
+        // 本小节**所有页**的公式坐标（[页码,x0,y0,x1,y1]）——
+        // 小节常常跨页，只给选中页的公式图，跨页那一半的推导模型看不到。
+        formula_rects_with_page: headingHit ? _sectionFormulaRects(headingHit) : [],
         // 用**答疑面板**自己选中的模型回答（与翻译用的模型互不影响）：
         // '' = 跟随默认 / 'agnes' = 备用 / 'deepseek-flash' = DeepSeek /
         // 'custom:xxx' = 用户自己的 API 模型

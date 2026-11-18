@@ -264,6 +264,9 @@ def test_behavioural_guard_files_are_still_there():
         "microbench/_test_tablet_qa_images.js",           # 平板划词带图 + 文本层几何
         "microbench/_test_troubleshoot_save_frontend.js", # 一键存入避坑库（曾经必 422）
         "tests/test_troubleshoot_save_frontend.py",       # 前后端载荷契约（拿后端模型校验）
+        # ↓ 2026-11-18：「优化给 AI 的上下文」那一轮（选中标题 → 总结这一小节）
+        "microbench/_test_qa_section_scope.js",         # 前端：标题命中 → 小节上下文 + 载荷
+        "tests/test_qa_section_context.py",             # 后端：小节大纲抽取 + 标题场景提示
     ]
     missing = [r for r in required if not (REPO / r).exists()]
     assert not missing, f"行为级护栏文件不见了: {missing}"
