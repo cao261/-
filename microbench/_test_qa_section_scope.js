@@ -28,7 +28,7 @@ const path = require("path");
 
 const TARGET = process.argv[2]
   ? path.resolve(process.argv[2])
-  : path.join(__dirname, "static", "index.html");
+  : require("path").join(__dirname, "static", "index.html");
 const SRC = fs.readFileSync(TARGET, "utf8").replace(/\r\n/g, "\n");
 const NL = String.fromCharCode(10);
 
@@ -84,9 +84,16 @@ function sliceAll(src) {
     sliceLine(src, "const _MAX_CONTEXT_CHARS"),
     sliceLine(src, "const _MAX_SCOPE_BUDGET"),
     sliceBalanced(src, "const _SCOPE_CAPS", "{", "}"),
+    sliceBalanced(src, "const _QA_ROUTER_MODES", "[", "]"),
     sliceBalanced(src, "const _SCOPE_LADDER", "[", "]"),
     sliceFn(src, "function _normQaHeading(s) {"),
     sliceFn(src, "function _qaOutlineSections() {"),
+    sliceFn(src, "function _qaSectionPayload(sec) {"),
+    sliceFn(src, "function _qaSectionCoversPage(sec, pageNum) {"),
+    sliceFn(src, "function _qaSelectionPointPt(pageNum, selRects) {"),
+    sliceFn(src, "function _qaBlockAtPoint(blocks, px, py) {"),
+    sliceFn(src, "async function _qaSectionByGeometry(pool, pageNum, selRects) {"),
+    sliceFn(src, "async function _findQaSectionBySelection(selectionText, pageNum, selRects) {"),
     sliceFn(src, "function _qaHeadingCandidates() {"),
     sliceFn(src, "function _matchQaHeading(selectionText) {"),
     sliceFn(src, "function _clipQaContext(text, budget) {"),
@@ -188,8 +195,10 @@ function makeEnv() {
   elements["qa-question-input"].value = "帮我总结这一小节";
   const asks = [];
   const routerCalls = [];
-  return {
+  const env = {
     elements, asks, routerCalls,
+    // 每一页的段落块（真前端里由 ensurePageBlocks → /api/paper/page_blocks 拿）
+    blocksByPage: {},
     document: {
       getElementById(id) { return elements[id] || null; },
       querySelector() { return null; },
@@ -210,6 +219,8 @@ function makeEnv() {
       return Promise.resolve();
     },
   };
+  env.ensurePageBlocks = async (pageNum) => (env.blocksByPage[pageNum] || []);
+  return env;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,12 +239,17 @@ let _lastQAItem = null;
 let _sessionQAList = [];
 let _qaOutline = { path: null, sections: [], ready: false, loading: false, promise: null };
 let _qaHeadingHit = null;
+let _qaSectionBySelection = null;
 const console = { error: () => {}, warn: () => {}, log: () => {} };
 `;
   const factory = new Function(
     "document", "showToast", "escapeHtml", "_aiFormatMs", "formatMarkdownLite",
     "_persistLocalState", "_routeQuestionScope",
     "_captureSelectionPageImage", "askLLMStream",
+    // ⚠ 新加：版面几何判定要拿这一页的段落块（真前端里是 ensurePageBlocks）
+    "ensurePageBlocks",
+    // ⚠ new Function 的作用域里没有 require / __dirname（§4.109 同款坑）
+    "require", "__dirname",
     prelude + js + `
 return {
   _matchQaHeading,
@@ -241,6 +257,7 @@ return {
   _buildSectionContext,
   _clipQaContext,
   _buildScopeContext,
+  _buildScopeContextRaw,
   submitReaderQA,
   scopeCaps: _SCOPE_CAPS,
   scopeLadder: _SCOPE_LADDER,
@@ -250,6 +267,10 @@ return {
   setSelState: (v) => { _readerSelState = v; },
   setOutline: (v) => { _qaOutline = v; },
   setHeadingHit: (v) => { _qaHeadingHit = v; },
+  setSectionBySelection: (v) => { _qaSectionBySelection = v; },
+  findSectionBySelection: _findQaSectionBySelection,
+  scopeCapsJson: JSON.stringify(_SCOPE_CAPS),
+  routerModes: _QA_ROUTER_MODES.slice(),
   getHeadingHit: () => _qaHeadingHit,
   _refineQA,
 };
@@ -259,6 +280,8 @@ return {
     env.document, env.showToast, env.escapeHtml, env._aiFormatMs,
     env.formatMarkdownLite, env._persistLocalState, env._routeQuestionScope,
     env._captureSelectionPageImage, env.askLLMStream,
+    env.ensurePageBlocks,
+    require, __dirname,
   );
 }
 
@@ -312,6 +335,8 @@ async function runSuite(src, label) {
   log("\n=== " + label + " ===");
   const env = makeEnv();
   const api = buildApi(src, env);
+  envScopeCapsJson = api.scopeCapsJson;
+  envRouterModesJson = JSON.stringify(api.routerModes);
   withOutline(api);
 
   // ---- ① 标题识别 ---------------------------------------------------------
@@ -615,6 +640,193 @@ async function runSuite(src, label) {
     assertEq(p.formula_rects_with_page.length, 0, "公式坐标不该带");
   });
 
+  // ---- ⑤ section 档打通（2026-11-19）--------------------------------------
+  await check("router 白名单含 section 档（与后端 QA_SCOPE_MODES 对齐）", async () => {
+    const api12 = buildApi(src, makeEnv());
+    const modes = api12.routerModes;
+    assert(modes.indexOf("section") >= 0,
+      "前端 router 白名单里没有 section 档 —— router 返回 section 会被判非法");
+    assertEq(modes.length, 5, "白名单档位数不对：" + JSON.stringify(modes));
+  });
+
+  await check("划正文 → 能定位它落在哪个小节（section 档才有用）", async () => {
+    const api8 = buildApi(src, makeEnv());
+    withOutline(api8);
+    const hit = await api8.findSectionBySelection("constitutive equations");
+    assert(hit, "没定位到所属小节");
+    assertEq(hit.title, "II. Experimental Procedure", "定位到的小节不对");
+  });
+
+  await check("选区太短 → **不**定位（宁可不认，也不给错小节）", async () => {
+    const api9 = buildApi(src, makeEnv());
+    withOutline(api9);
+    assert(!await api9.findSectionBySelection("the"), "太短的选区也敢定位小节");
+    assert(!await api9.findSectionBySelection(""), "空选区也敢定位小节");
+  });
+
+  await check("选区不在这篇论文里 → 不定位", async () => {
+    const api10 = buildApi(src, makeEnv());
+    withOutline(api10);
+    assert(!await api10.findSectionBySelection("一段完全不属于本文的外部文字xyz"),
+      "把不相干的选区也定位到了某个小节");
+  });
+
+  await check("section 档但没命中小节 → **不能给空上下文**（落回当前页）", async () => {
+    const api11 = buildApi(src, makeEnv());
+    withOutline(api11);
+    api11.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, text: "第 1 页的正文内容", translation: "" }],
+    });
+    api11.setSelState({ text: "Experimental Procedure", source: "pdf",
+                        pageNum: 1, sectionIdx: null, rects: [] });
+    const ctx = api11._buildScopeContextRaw({ mode: "section", budget: 12000 });
+    assert(ctx && ctx.length > 0,
+      "section 档没命中小节时给了**空上下文** → 模型只拿到划的那一句");
+    assert(ctx.indexOf("第 1 页的正文内容") >= 0,
+      "没有落回当前页上下文：" + String(ctx).slice(0, 120));
+  });
+
+  // ---- ⑥ 划正文时**定位到哪个小节**（2026-11-19 真机实测抓到的错）------------
+  //
+  // ⚠ 实测：JACERS 综述里「magnetostrictive one」这一句**同时**出现在
+  //     I. Introduction(p1, 3758 字) / II. Experimental Procedure(p1-2, 1015 字)
+  //     / (3) Resonance Enhancement(p7, 2492 字) 三个小节里。
+  //   旧判据「多个小节都包含时取**正文最长**的」→ 永远选 I. Introduction
+  //   → 用户在第 2 页划的这句，AI 却去总结 I. Introduction（**别人那一节**）。
+  //   现在按**位置**判：页码 → 版面几何；都定不了就不给（落回当前页）。
+  const OUTLINE_MULTI = [
+    { index: 0, title: "I. Introduction", level: 1, page_start: 1, page_end: 1,
+      text: "T HE magnetoelectric effect is defined … magnetostrictive one appears in the intro too",
+      chars: 120, formulas: [] },
+    { index: 1, title: "II. Experimental Procedure", level: 1, page_start: 1, page_end: 2,
+      text: "The ME effect in piezoelectric magnetostrictive one laminates …",
+      chars: 90, formulas: [] },
+    { index: 2, title: "(3) Resonance Enhancement", level: 2, page_start: 7, page_end: 7,
+      text: "Resonance enhancement discussion magnetostrictive one …",
+      chars: 80, formulas: [] },
+  ];
+
+  // 同一页里两个候选 + 真实段落块（bbox 是页面绝对 pt）
+  const OUTLINE_GEO = [
+    { index: 0, title: "I. Introduction", level: 1, page_start: 1, page_end: 1,
+      text: "Introduction body paragraph one magnetostrictive one appears in the intro too",
+      chars: 90, formulas: [] },
+    { index: 1, title: "II. Experimental Procedure", level: 1, page_start: 1, page_end: 2,
+      text: "where a is transverse ME voltage coefficient and v is the volume fraction magnetostrictive one",
+      chars: 110, formulas: [] },
+  ];
+
+  // 两个候选的正文里有**同一段共用文字** → 几何指认不唯一
+  const OUTLINE_GEO_AMB = [
+    { index: 0, title: "I. Introduction", level: 1, page_start: 1, page_end: 1,
+      text: "shared phrase magnetostrictive one appears in both sections here",
+      chars: 70, formulas: [] },
+    { index: 1, title: "II. Experimental Procedure", level: 1, page_start: 1, page_end: 2,
+      text: "shared phrase magnetostrictive one appears in both sections here as well",
+      chars: 80, formulas: [] },
+  ];
+
+  function apiWithOutline(sections, env) {
+    const a = buildApi(src, env || makeEnv());
+    a.setOutline({
+      path: "a/b.pdf", sections, ready: true, loading: false, promise: null,
+    });
+    a.setReaderState({
+      title: "某论文", pdfPath: "a/b.pdf",
+      sections: [], translations: {}, activeSection: 0,
+    });
+    return a;
+  }
+
+  await check("同一句在 3 个小节里出现 → 按**页码**定，不按「谁最长」", async () => {
+    const api = apiWithOutline(OUTLINE_MULTI);
+    // 用户在**第 2 页**划的这句 → 正确答案：II. Experimental Procedure
+    const hit = await api.findSectionBySelection("magnetostrictive one", 2, []);
+    assert(hit, "没定位到小节");
+    assertEq(hit.title, "II. Experimental Procedure",
+      "定位到的小节不对（旧判据会选最长的 I. Introduction）");
+  });
+
+  await check("页码落在第 7 页 → 选那一页的小节", async () => {
+    const api = apiWithOutline(OUTLINE_MULTI);
+    const hit = await api.findSectionBySelection("magnetostrictive one", 7, []);
+    assert(hit, "没定位到小节");
+    assertEq(hit.title, "(3) Resonance Enhancement", "第 7 页应定位到该小节");
+  });
+
+  await check("没有页码线索 → 认不出就返回 null（不猜「最长的」）", async () => {
+    const api = apiWithOutline(OUTLINE_MULTI);
+    const hit = await api.findSectionBySelection("magnetostrictive one", null, []);
+    assert(!hit, "没有位置线索也敢定位（旧判据 = 取最长的那个）");
+  });
+
+  await check("同一页多个候选 → 用版面几何定（选区落在哪个段落块）", async () => {
+    const env = makeEnv();
+    const api = apiWithOutline(OUTLINE_GEO, env);
+    api.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, ptW: 612, ptH: 792 }],
+    });
+    env.blocksByPage[1] = [
+      { i: 0, kind: "body", col: "L", bbox: [31, 150, 270, 250],
+        text: "where a is transverse ME voltage coefficient and v is the volume fraction" },
+      { i: 1, kind: "body", col: "L", bbox: [31, 260, 270, 400],
+        text: "Introduction body paragraph one" },
+    ];
+    // 选区在页面上 20% 的高度 → 落在第 1 个块里 → 那个块属于 II. Experimental Procedure
+    const hit = await api.findSectionBySelection("magnetostrictive one", 1,
+      [{ x: 0.05, y: 0.2, w: 0.1, h: 0.01 }]);
+    assert(hit, "没定位到小节");
+    assertEq(hit.title, "II. Experimental Procedure", "几何判定选错了小节");
+  });
+
+  await check("块的文本同时落在两个候选小节里 → 认不出（不猜）", async () => {
+    const env = makeEnv();
+    const api = apiWithOutline(OUTLINE_GEO_AMB, env);
+    api.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, ptW: 612, ptH: 792 }],
+    });
+    env.blocksByPage[1] = [
+      { i: 0, kind: "body", col: "L", bbox: [31, 150, 270, 250],
+        text: "shared phrase magnetostrictive one appears in both sections here" },
+    ];
+    const hit = await api.findSectionBySelection("magnetostrictive one", 1,
+      [{ x: 0.05, y: 0.2, w: 0.1, h: 0.01 }]);
+    assert(!hit, "指认不唯一也敢给一个小节（宁可落回当前页）");
+  });
+
+  await check("选区落在任何段落块之外 → 认不出（不猜）", async () => {
+    const env = makeEnv();
+    const api = apiWithOutline(OUTLINE_GEO, env);
+    api.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, ptW: 612, ptH: 792 }],
+    });
+    env.blocksByPage[1] = [
+      { i: 0, kind: "body", col: "L", bbox: [31, 150, 270, 250],
+        text: "where a is transverse ME voltage coefficient and v is the volume fraction" },
+    ];
+    // 选区在页面 95% 的高度（页脚区域）→ 离任何块都很远
+    const hit = await api.findSectionBySelection("magnetostrictive one", 1,
+      [{ x: 0.05, y: 0.95, w: 0.1, h: 0.01 }]);
+    assert(!hit, "离所有块都很远的选区也敢定位");
+  });
+
+  await check("页面没渲染（拿不到物理尺寸）→ 认不出", async () => {
+    const env = makeEnv();
+    const api = apiWithOutline(OUTLINE_GEO, env);
+    api.setPdfState({ relativePath: "a/b.pdf", pages: [{ num: 1 }] });
+    env.blocksByPage[1] = [
+      { i: 0, kind: "body", col: "L", bbox: [31, 150, 270, 250],
+        text: "where a is transverse ME voltage coefficient and v is the volume fraction" },
+    ];
+    const hit = await api.findSectionBySelection("magnetostrictive one", 1,
+      [{ x: 0.05, y: 0.2, w: 0.1, h: 0.01 }]);
+    assert(!hit, "没有页面物理尺寸也敢定位");
+  });
+
   return { passed, failed };
 }
 
@@ -677,7 +889,54 @@ const MUTATIONS = [
     from: 'selection_kind: headingScoped ? "heading" : "body",',
     to: 'selection_kind: _qaHeadingHit ? "heading" : "body",',
   },
+  {
+    name: "页码过滤失效（同一句在多个小节里时又挑到最长的那个）",
+    from: "if (onPage.length) pool = onPage;",
+    to: "if (false) pool = onPage;",
+  },
+  {
+    name: "几何指认不唯一也硬给（猜错小节）",
+    from: "if (hit.length !== 1) return null;",
+    to: "if (false) return null;",
+  },
+  {
+    name: "定不了小节时硬给候选里第一个（宁给错也不给少）",
+    from: "        return null;      // 定不了 → 不给错的小节",
+    to: "        return _qaSectionPayload(pool[0]);",
+  },
+  {
+    name: "选区坐标换算比例写错（几何定位全偏）",
+    from: "return { x: (x + w / 2) * pg.ptW, y: (y + h / 2) * pg.ptH };",
+    to: "return { x: (x + w / 2) * pg.ptW, y: (y + h / 2) * 10 };",
+  },
 ];
+
+let envScopeCapsJson = "";
+let envRouterModesJson = "";
+
+// ⚠ 参数错位不会立刻报错（没用到那个参数就静默过）→ 显式数一遍
+function _factoryArgCounts(src) {
+  const decl = src.match(/const factory = new Function\(([\s\S]*?)\n  \);/);
+  const call = src.match(/return factory\(([\s\S]*?)\n  \);/);
+  if (!decl || !call) return null;
+  const names = decl[1]
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("//") && !l.startsWith("prelude"))
+    .join(" ")
+    .split(",")
+    .map((s) => s.trim().replace(/^"|"$/g, ""))
+    .filter(Boolean);
+  const args = call[1]
+    .split("\n")
+    .map((l) => l.trim().replace(/,$/, ""))
+    .filter((l) => l && !l.startsWith("//"))
+    .join(" ")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return { names, args };
+}
 
 async function main() {
   console.log("被测文件: " + TARGET);
@@ -716,6 +975,14 @@ async function main() {
     }
   }
 
+  const counts = _factoryArgCounts(SRC);
+  if (counts && counts.names.length !== counts.args.length) {
+    console.log("  FAIL  factory 形参 " + counts.names.length +
+      " 个 / 实参 " + counts.args.length + " 个 —— **参数错位**");
+    result.failed += 1;
+  }
+  console.log("SCOPE_CAPS_JSON: " + (envScopeCapsJson || "{}"));
+  console.log("ROUTER_MODES_JSON: " + (envRouterModesJson || "[]"));
   console.log("\n============================================================");
   console.log("PASS " + result.passed + "  FAIL " + result.failed +
               "  (变异捕获 " + mutationCaught + "/" + MUTATIONS.length + ")");

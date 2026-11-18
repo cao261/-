@@ -1152,10 +1152,10 @@ class ExplainSelectionRequest(BaseModel):
     prior_answer: Optional[str] = Field(default="", max_length=8000,
                                         description="上一轮的回答全文(供 LLM 知道之前答了什么)")
     force_scope: Optional[str] = Field(default="", max_length=20,
-                                        description="上下文预算档位 (term|mid|wide|full)。"
+                                        description="上下文预算档位 (term|mid|section|wide|full)。"
                                                     "客户端按所选 scope 构造 surrounding_context 并随请求下发; "
                                                     "服务端据此对上下文做**上限截断**"
-                                                    "(term=2K / mid=8K / wide=20K / full=50K 字符), "
+                                                    "(term=2K / mid=8K / section=16K / wide=20K / full=50K 字符), "
                                                     "防止客户端或路由器的预算失控。"
                                                     "留空则按 mid 的上限处理。")
     page_image: Optional[str] = Field(default=None, max_length=4_000_000,
@@ -3713,36 +3713,81 @@ EXPLAIN_SELECTION_SYSTEM_PROMPT = r"""你是论文精读导师。用户正在读
 # Stage 1 of the selection-QA flow: a small "router" LLM call that reads the
 # user's selection + question and decides how much surrounding context to
 # attach before the main answer call. Returns one of:
-#   - "term" : ~600 chars around the selection (lookups: abbreviations, single
-#              symbol definitions, narrow factual questions)
-#   - "mid"  : current page/section (single-paragraph explain, mechanism,
-#              engineering insight)
-#   - "wide" : abstract + active section + conclusion (innovation / method /
-#              cross-section reasoning)
-#   - "full" : multi-section slice up to 60K chars (whole-paper overview /
-#              cross-chapter comparison)
-# Why two stages instead of keywords: keyword heuristics (e.g. "创新点" →
-# wide) miss open-ended questions like "这种方法在我自己的工艺节点上能用吗"
-# which need a full chapter or more. An LLM router costs ~200 tokens and
-# 3-8 seconds — far cheaper than attaching a full chapter to a one-line
-# abbreviation question and diluting the model's attention.
+#   - "term"    : ~600-2000 chars around the selection (lookups: abbreviations,
+#                 single symbol definitions, single value lookups, yes/no checks)
+#   - "mid"     : current page / current subsection (single-paragraph explain,
+#                 mechanism, local derivation)
+#   - "section" : one whole subsection (8000-16000 chars) — questions whose
+#                 unit is "this section" ("这一节讲了什么" / 这节的方法)
+#   - "wide"    : abstract + active section + conclusion (innovation / method /
+#                 cross-section reasoning)
+#   - "full"    : multi-section slice up to 50K chars (whole-paper overview /
+#                 cross-chapter comparison)
+#
+# ⚠ 2026-11-19：两处修正（实测数据见 docs/HANDOFF_2026-11-19-QA-SCOPE-ROUTER-AND-SECTION-LOCATE.md，
+#   审计日志在 logs/qa_router/{before,after,after2,after3}/）：
+#   ① **加 section 档** —— 旧提示词里根本没有它，而前端 `_SCOPE_CAPS` 早就有
+#      （2026-11-18 引入）。结果「这一节讲了什么」被判成 mid（6000 字 = 当前页），
+#      小节跨页时**后半页直接漏掉**（AGENTS.md §4.108）。
+#   ② 删掉「若问题开放、不能确定 → 选更大一档」—— 实测它让 router 对
+#      「这一节有提到退火温度吗」这种是/否问题也给 6000 字，
+#      无关内容稀释注意力（用户原话：「回答的很多不需要的内容」）。
 # ---------------------------------------------------------------------------
 
 QA_SCOPE_ROUTER_PROMPT = r"""你是论文问答的"上下文路由器"。
-基于用户划选的片段 + 用户的提问,判断回答这个问题最少需要多少上下文。
+根据用户划选的片段 + 用户的提问，判断回答这个问题**最少需要**多少上下文。
 
-可选 mode:
-- "term" : 紧邻上下文 ~600-800 字。仅术语查全称、单符号/缩写定义、单值查表。
-- "mid"  : 当前章节 4-8K 字。解释单段、物理机制、工程启发、局部推导。
-- "wide" : 摘要 + 当前章节 + 结论 12-20K 字。创新点、方法实现、章节间对比、综述式问题。
-- "full" : 全文摘要 60K 字。整篇主旨、跨章节贡献对比、"整体讲了什么"。
+判断标准是「回答这个问题需要的证据**在论文里的哪个位置、有多少**」，
+**不是**「问题看起来有多复杂」：
+给多了会稀释模型的注意力（无关内容越多，答案越容易跑偏、越容易编）；
+给少了会答不上来。
+
+按证据位置选档：
+  证据只在选区附近               → "term"
+  证据要跨一段话或一页           → "mid"
+  证据要覆盖一整个小节           → "section"
+  证据要跨小节/跨部分（对比、可行性、方法的意义）→ "wide"
+  证据要覆盖整篇                 → "full"
+
+⚠ 不要凭「问题看起来复杂」往大档升，也不要凭「看起来简单」往小档降 ——
+  只看证据在哪儿。
+⚠ 几个容易判错的：
+  · 公式/参数的「推导过程」「为什么是这个式子」→ 至少 "mid"
+    （要符号定义与前后推导，选区紧邻几行不够）；
+  · 「能不能用在我这里」「有什么启发」「值不值得做」这类可行性/判断题 → "wide"
+    （要看方法描述与结论，不是只看选区）；
+  · 「这里有没有提到 X」「X 是多少」「X 的全称」→ "term"（紧邻即可，不必给整页）；
+  · **选区里根本没有答案所需的证据** → 说明答案在更远的地方 → **往大选一档**。
+
+可选 mode（各档实际会给的内容 / budget 区间，必须与下表逐字一致）：
+- "term"    紧邻上下文：选区前后 ~600-2000 字。
+             用于 术语/缩写查全称、单个符号或参数的定义、单个数值查表、
+                   是/否式的局部确认（"这里有没有提到 X"）。
+- "mid"     当前页 / 当前小节的正文，~2000-8000 字。
+             用于 解释一段话、一个公式的含义与推导、一个物理机制、
+                   某段论述的因果关系。
+- "section" 整个小节的正文，~8000-16000 字。
+             用于 问题的单位明确是"一节"——「这一节/本节/这段/这部分讲了什么」
+                   「这节的方法是什么」「本节的结论」，或小节跨页、很长。
+- "wide"    摘要 + 当前部分 + 结论，~12000-20000 字。
+             用于 跨节对比、与其他部分的联系、创新点在哪、方法的意义。
+- "full"    全文，~20000-50000 字。
+             用于 整篇讲了什么、主旨、跨章节贡献对比。
 
 只看 (selected_text + question) 这两个输入做判断 — 不要编造论文内容。
-若问题开放、不能确定 → 选更大一档 (mid 提到 wide,wide 提到 full)。
 
 严格只返回 JSON,不要任何额外文字:
-{"mode": "<term|mid|wide|full>", "reason": "<一句话依据>", "budget": <整数字符数>}
+{"mode": "<term|mid|section|wide|full>", "reason": "<一句话依据>", "budget": <整数字符数>}
 """
+
+
+# ⚠ 各档的**上下文上限** —— 必须与前端 `index.html` 的 `_SCOPE_CAPS`
+#   以及 `api_explain_selection_stream` 里的 `scope_caps` **逐字一致**
+#   （徽标显示的字数要等于真发出去的字数，AGENTS.md §4.107）。
+#   抽成模块级常量：router 端点也要用它来夹 budget。
+QA_SCOPE_CAPS = {"term": 2000, "mid": 8000, "section": 16000,
+                 "wide": 20000, "full": 50000}
+QA_SCOPE_MODES = ("term", "mid", "section", "wide", "full")
 
 
 class ClassifyQAScopeRequest(BaseModel):
@@ -3824,7 +3869,11 @@ async def api_classify_qa_scope(req: ClassifyQAScopeRequest):
         )
 
     mode = str(data.get("mode", "")).strip().lower()
-    if mode not in ("term", "mid", "wide", "full"):
+    # ⚠ 2026-11-19：白名单里加了 "section"（前端 `_SCOPE_CAPS` 早就有这一档，
+    #   但 router 提示词里没有 → 判成 mid → 小节跨页时后半页漏掉）。
+    #   ⚠ 白名单必须与前端 `index.html` 的白名单**逐字一致** ——
+    #   不一致 = router 返回的档位在前端被判「非法」→ 抛错 → 静默退回关键词启发式。
+    if mode not in QA_SCOPE_MODES:
         raise HTTPException(status_code=502, detail=f"router mode 非法: {mode}")
 
     try:
@@ -3834,6 +3883,10 @@ async def api_classify_qa_scope(req: ClassifyQAScopeRequest):
     # Clamp into reasonable bounds so a runaway router can't blow up the
     # downstream prompt budget.
     budget = max(300, min(budget, 80000))
+    # ⚠ 再按**该档的上限**夹一道：router 偶尔给 60000（full 档），
+    #   而 full 的上限是 50000 → 服务端会再砍一刀，
+    #   「router 说的 budget」与「真发出去的字数」对不上（AGENTS.md §4.107）。
+    budget = min(budget, QA_SCOPE_CAPS[mode])
 
     return {
         "mode": mode,
@@ -4336,8 +4389,9 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
         # *builds* the context (the server has no paper text), but the
         # server now enforces the ceiling, so a buggy or hostile client
         # cannot smuggle a full-paper dump into a "term" question.
-        scope_caps = {"term": 2000, "mid": 8000, "section": 16000,
-                      "wide": 20000, "full": 50000}
+        # ⚠ 各档上限与前端 `index.html` 的 `_SCOPE_CAPS` 逐字一致
+        #   （模块级常量 `QA_SCOPE_CAPS`，见 §QA scope router 那段注释）。
+        scope_caps = QA_SCOPE_CAPS
         cap = scope_caps.get(scope_mode, 8000)
         ctx_snippet, truncated = _clip_context_keep_ends(req.surrounding_context, cap)
         ctx_label = ("【本小节完整正文】" if is_section

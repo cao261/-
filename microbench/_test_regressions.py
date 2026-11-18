@@ -162,14 +162,64 @@ desc = (ExplainSelectionRequest.model_fields["force_scope"].description or "").l
 check("截断" in desc, "force_scope documents that the server enforces a cap")
 check("term" in desc and "full" in desc, "force_scope documents all four tiers")
 
-# The clamp lives inside the stream endpoint, so exercise the tiers through
-# the real request handler rather than re-implementing the table here.
-_src = inspect.getsource(
-    __import__("microbench.app", fromlist=["app"]).api_explain_selection_stream
-)
-for tier, cap in (("term", "2000"), ("mid", "8000"), ("wide", "20000"), ("full", "50000")):
-    check(f'"{tier}": {cap}' in _src, f"scope tier '{tier}' caps context at {cap} chars")
-check("[:10000]" not in _src, "the old unconditional 10 000-char truncation is gone")
+# ⚠ 2026-11-19：这几条原来读**源码文本**找字面量（`"term": 2000`），
+#   上游把 scope_caps 抽成常量 `QA_SCOPE_CAPS` 之后就**假红**了 ——
+#   「护栏比代码差」（AGENTS.md §4.92 同款：改坏行为也照样绿的那种）。
+#   → 改成**行为级**：真打端点，拦下**真正发给模型**的那条 user 消息，
+#     数一数上下文到底给了多少字。
+import asyncio
+from microbench import app as _app_mod
+from microbench import llm as _llm_mod
+
+_cap_probe = {}
+
+
+async def _fake_chat_stream_async(messages=None, **kwargs):
+    _cap_probe["messages"] = messages or []
+    if False:      # 必须是异步生成器
+        yield ""
+
+
+async def _capture_user_msg(tier):
+    _cap_probe.clear()
+    req = _app_mod.ExplainSelectionRequest(
+        question="这一节讲了什么？",
+        selected_text="选中的片段",
+        surrounding_context="甲" * 50000,
+        force_scope=tier,
+    )
+    resp = await _app_mod.api_explain_selection_stream(req, request=None)
+    async for _chunk in resp.body_iterator:
+        pass
+    for m in (_cap_probe.get("messages") or []):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        return "".join(p.get("text", "") for p in (c or [])
+                       if isinstance(p, dict))
+    return ""
+
+
+_orig_is_configured = _llm_mod.is_configured
+_orig_chat_stream = _llm_mod.chat_stream_async
+_llm_mod.is_configured = lambda: True
+_llm_mod.chat_stream_async = _fake_chat_stream_async
+try:
+    for tier, cap in (("term", 2000), ("mid", 8000), ("section", 16000),
+                      ("wide", 20000), ("full", 50000)):
+        # 上下文全是「甲」→ 数「甲」个数 = 真正发给模型的上下文字数
+        _n = asyncio.run(_capture_user_msg(tier)).count("甲")
+        check(_n <= cap, f"scope tier '{tier}' caps context at {cap} chars")
+        check(_n >= cap - 10,
+              f"scope tier '{tier}' delivers the whole budget ({_n}/{cap})")
+    _n_full = asyncio.run(_capture_user_msg("full")).count("甲")
+    check(_n_full > 10000,
+          "the old unconditional 10 000-char truncation is gone")
+finally:
+    _llm_mod.is_configured = _orig_is_configured
+    _llm_mod.chat_stream_async = _orig_chat_stream
 
 # ---------------------------------------------------------------------------
 print("\n[6] Test-suite hygiene: the cleanup must not delete real vault notes")

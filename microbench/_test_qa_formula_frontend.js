@@ -72,6 +72,12 @@ function sliceAll(src) {
     //   **必须一起切进来** —— 少切一个，这套护栏就会因为
     //   「函数不存在」而崩（§4.109 同一个坑，踩第二次）。
     sliceFn(src, "function _qaOutlineSections() {"),
+    sliceFn(src, "function _qaSectionPayload(sec) {"),
+    sliceFn(src, "function _qaSectionCoversPage(sec, pageNum) {"),
+    sliceFn(src, "function _qaSelectionPointPt(pageNum, selRects) {"),
+    sliceFn(src, "function _qaBlockAtPoint(blocks, px, py) {"),
+    sliceFn(src, "async function _qaSectionByGeometry(pool, pageNum, selRects) {"),
+    sliceFn(src, "async function _findQaSectionBySelection(selectionText, pageNum, selRects) {"),
     sliceFn(src, "function _qaHeadingCandidates() {"),
     sliceFn(src, "function _matchQaHeading(selectionText) {"),
     sliceFn(src, "function _clipQaContext(text, budget) {"),
@@ -135,6 +141,8 @@ function makeEnv() {
     }),
     _buildScopeContext: () => "桩上下文",
     _captureSelectionPageImage: () => "data:image/png;base64,AAAA",
+    // 定位小节那条链要用页面段落块（真前端里是 /api/paper/page_blocks）
+    ensurePageBlocks: async () => [],
     askLLMStream(btn, url, payload, opts) {
       asks.push({ btn, url, payload, opts });
       return Promise.resolve();
@@ -158,12 +166,16 @@ let _lastQAItem = null;
 let _sessionQAList = [];
 let _qaOutline = { path: null, sections: [], ready: false, loading: false, promise: null };
 let _qaHeadingHit = null;
+let _qaSectionBySelection = null;
 const console = { error: () => {}, warn: () => {}, log: () => {} };
 `;
   const factory = new Function(
     "document", "showToast", "escapeHtml", "_aiFormatMs", "formatMarkdownLite",
     "_persistLocalState", "_routeQuestionScope", "_buildScopeContext",
     "_captureSelectionPageImage", "askLLMStream",
+    // ⚠ 2026-11-19：submitReaderQA 现在会定位「划的正文落在哪个小节」
+    //   → 那条链依赖 ensurePageBlocks（页面段落块）
+    "ensurePageBlocks",
     prelude + js + `
 return {
   _collectPageFormulaRects,
@@ -178,6 +190,7 @@ return {
     env.document, env.showToast, env.escapeHtml, env._aiFormatMs,
     env.formatMarkdownLite, env._persistLocalState, env._routeQuestionScope,
     env._buildScopeContext, env._captureSelectionPageImage, env.askLLMStream,
+    env.ensurePageBlocks,
   );
 }
 

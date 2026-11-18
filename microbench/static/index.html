@@ -6092,7 +6092,12 @@
         transList.appendChild(transBlock);
       }
 
-      return { num: pageNum, canvas, text: items, translated: false, translating: false };
+      // ⚠ ptW/ptH：页面**物理尺寸**（pt，1/72 英寸）。
+      //   划选时记下的高亮矩形是**归一化**的（0~1），要换算成页面坐标
+      //   才能和服务端 page_blocks 的 bbox（页面绝对 pt）对上
+      //   → 才能判断「选中的这句话落在哪个段落块、哪个小节」。
+      return { num: pageNum, canvas, text: items, translated: false, translating: false,
+               ptW: viewport0.width, ptH: viewport0.height };
     }
 
     function renderTextLayerFallback(tc, container, viewport) {
@@ -9724,6 +9729,8 @@
     let _qaOutline = { path: null, sections: [], ready: false, loading: false, promise: null };
     // 当前命中的标题（构建上下文时用；_refineQA 也要用）
     let _qaHeadingHit = null;
+    // 划的是**正文**时，定位它落在哪个小节里（router 判 section 档时用）
+    let _qaSectionBySelection = null;
 
     async function fetchQaOutline(relativePath) {
       if (!relativePath) return null;
@@ -9864,6 +9871,126 @@
       return best;
     }
 
+    // 小节 → 统一的小节对象（前端内部用）
+    function _qaSectionPayload(sec) {
+      if (!sec) return null;
+      return {
+        title: sec.title || "",
+        level: sec.level || 1,
+        page_start: sec.page_start, page_end: sec.page_end,
+        text: sec.text || "",
+        formulas: Array.isArray(sec.formulas) ? sec.formulas : [],
+        source: "pdf",
+      };
+    }
+
+    // 这个小节覆盖第几页？（页码 1-based，和 PDF 页号、大纲 page_start 同一套）
+    function _qaSectionCoversPage(sec, pageNum) {
+      const ps = sec && sec.page_start;
+      const pe = sec && sec.page_end;
+      if (typeof ps !== "number" || !pageNum) return false;
+      const end = (typeof pe === "number") ? pe : ps;
+      return ps <= pageNum && pageNum <= end;
+    }
+
+    // 选区落在页面上的**物理位置**（pt）——
+    // 靠划选时记下的归一化矩形 + 页面物理尺寸换算（§4.97：文本层要设 scale-factor，
+    // 这里用的是同一套渲染坐标，所以归一化矩形和页面尺寸是一对）。
+    function _qaSelectionPointPt(pageNum, selRects) {
+      if (!pageNum || !Array.isArray(selRects) || !selRects.length) return null;
+      const pages = (_pdfState && _pdfState.pages) || [];
+      const pg = pages.find(p => p && p.num === pageNum);
+      if (!pg || !pg.ptW || !pg.ptH) return null;
+      const r = selRects[0];
+      if (!r) return null;
+      const x = Number(r.x) || 0, y = Number(r.y) || 0;
+      const w = Number(r.w) || 0, h = Number(r.h) || 0;
+      return { x: (x + w / 2) * pg.ptW, y: (y + h / 2) * pg.ptH };
+    }
+
+    // 找到包含这个点的**段落块**（服务端 page_blocks 的几何：bbox 是页面绝对 pt）
+    function _qaBlockAtPoint(blocks, px, py) {
+      let near = null, nearDist = Infinity;
+      for (const b of (blocks || [])) {
+        const bb = b && b.bbox;
+        if (!Array.isArray(bb) || bb.length < 4) continue;
+        const x0 = Number(bb[0]), y0 = Number(bb[1]);
+        const x1 = Number(bb[2]), y1 = Number(bb[3]);
+        if (!isFinite(x0) || !isFinite(y0) || !isFinite(x1) || !isFinite(y1)) continue;
+        if (px >= x0 && px <= x1 && py >= y0 && py <= y1) return b;   // 点在块内
+        const dx = Math.max(x0 - px, 0, px - x1);
+        const dy = Math.max(y0 - py, 0, py - y1);
+        const d = dx * dx + dy * dy;
+        if (d < nearDist) { nearDist = d; near = b; }
+      }
+      // 点不在任何块里 → 只有「贴着某块」（12pt 内）才认，
+      // 否则宁可认不出（§4.6：给错内容比不给更糟）
+      if (near && nearDist <= 144) return near;
+      return null;
+    }
+
+    // 同一页里多个小节都含这句 → 用**版面几何**判：
+    //   选区落在哪个段落块 → 那个块属于哪个小节 → 就是答案。
+    async function _qaSectionByGeometry(pool, pageNum, selRects) {
+      if (!Array.isArray(pool) || pool.length < 2) return null;
+      const pt = _qaSelectionPointPt(pageNum, selRects);
+      if (!pt) return null;
+      let blocks = null;
+      try { blocks = await ensurePageBlocks(pageNum); } catch (e) { blocks = null; }
+      if (!blocks || !blocks.length) return null;
+      const blk = _qaBlockAtPoint(blocks, pt.x, pt.y);
+      if (!blk) return null;
+      // 块文本的前 30 个归一化字符 → 去候选小节正文里找
+      const key = _normQaHeading(blk.text || "").slice(0, 30);
+      if (!key) return null;
+      const hit = pool.filter(sec =>
+        _normQaHeading(sec.text || "").includes(key));
+      if (hit.length !== 1) return null;   // 指认不唯一 → 不猜
+      return hit[0];
+    }
+
+    // 划的**正文**落在哪个小节里？
+    //
+    // ⚠ 为什么需要（2026-11-19）：router 会把「这一节讲了什么」判成 section 档，
+    //   但用户划的往往是**正文**而不是标题 → `_matchQaHeading()` 命不中
+    //   → 旧写法 section 档就返回**空上下文**。
+    //   → 这里用「选区文本是不是这个小节正文的一部分」来反查所属小节。
+    //
+    // ⚠ 判据为什么是**页码**而不是「谁最长」（2026-11-19 真机实测抓到的错）：
+    //   「magnetostrictive one」这句同时出现在
+    //     I. Introduction(p1, 3758 字) / II. Experimental Procedure(p1-2, 1015 字)
+    //     / (3) Resonance Enhancement(p7, 2492 字) 三个小节里
+    //   → 旧写法「取正文最长的」= 永远选 I. Introduction
+    //   → 但用户是在**第 2 页**划的这句 → 正确答案应该是 II. Experimental Procedure
+    //   → AI 总结的是别人那一节，用户一眼就看出不对（§4.6 同款：给错内容比不给更糟）。
+    //
+    // 现在是四层：
+    //   ① 选区文本命中哪些小节（正文包含）→ 候选集；
+    //   ② **页码过滤**：候选里覆盖「划词那一页」的才可能是答案；
+    //   ③ 还剩多个 → **版面几何**：选区落在哪个段落块，那个块属于哪个小节；
+    //   ④ 还是定不了 → **返回 null**（落回 mid 档给当前页），不猜。
+    async function _findQaSectionBySelection(selectionText, pageNum, selRects) {
+      const sel = _normQaHeading(selectionText);
+      if (!sel || sel.length < 8) return null;
+      const cands = _qaOutlineSections().filter(sec => {
+        const body = _normQaHeading(sec.text || "");
+        return !!body && body.includes(sel);
+      });
+      if (!cands.length) return null;
+      let pool = cands;
+      if (typeof pageNum === "number" && pageNum > 0) {
+        const onPage = cands.filter(sec => _qaSectionCoversPage(sec, pageNum));
+        if (onPage.length) pool = onPage;
+      }
+      if (pool.length === 1) return _qaSectionPayload(pool[0]);
+      if (pool.length > 1) {
+        const geo = await _qaSectionByGeometry(pool, pageNum, selRects);
+        if (geo) return _qaSectionPayload(geo);
+        return null;      // 定不了 → 不给错的小节
+      }
+      return null;
+    }
+
     // 超预算时**头尾都保留**（不是只留头部）——
     // 小节的结尾常常是结论/收束，只留头部等于把结论丢了。
     //
@@ -9996,6 +10123,10 @@
     //   term=2K · mid=8K · section=16K · wide=20K · full=50K
     // -----------------------------------------------------------------------
     const _SCOPE_CAPS = { term: 2000, mid: 8000, section: 16000, wide: 20000, full: 50000 };
+    // ⚠ router 返回的档位白名单 —— 必须与后端 `QA_SCOPE_MODES` **逐字一致**
+    //   （2026-11-19）。少一个 → router 返回的档位被判「非法」→ 抛错 →
+    //   **静默**退回关键词启发式 → 用户看不出发生了什么。
+    const _QA_ROUTER_MODES = ["term", "mid", "section", "wide", "full"];
     // Backend field limit for surrounding_context is 50000 — leave headroom.
     const _MAX_CONTEXT_CHARS = 48000;
     // Hard ceiling for any client-side scope budget. The router may answer
@@ -10034,7 +10165,10 @@
         }
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
-        if (!data || !["term", "mid", "wide", "full"].includes(data.mode)) {
+        // ⚠ 白名单必须与后端 `QA_SCOPE_MODES` **逐字一致**（2026-11-19）。
+        //   少一个 → router 返回的档位在这里被判「非法」→ 抛错 →
+        //   静默退回关键词启发式 → 用户看到的是「关键词 fallback」而不是路由结果。
+        if (!data || !_QA_ROUTER_MODES.includes(data.mode)) {
           throw new Error("router 返回 mode 非法");
         }
         // The router can answer 80000; clamp it here or the context we
@@ -10042,8 +10176,9 @@
         const budget = Math.min(Number(data.budget) || 8000, _MAX_SCOPE_BUDGET);
         const label = ({
           term: "紧邻上下文",
-          mid:  "章节上下文",
-          wide: "摘要+当前章节+结论",
+          mid:  "当前页/当前小节",
+          section: "整个小节",
+          wide: "摘要+当前部分+结论",
           full: "全文摘要",
         })[data.mode] + ` (~${budget.toLocaleString()} 字)`;
         return {
@@ -10276,9 +10411,16 @@
       if (scope.mode === "section") {
         // 「选中了一个标题」→ 上下文 = **本小节的完整正文**（2026-11-18）。
         // 命中标题时由 submitReaderQA 直接给这个 scope（不走 LLM 路由）。
-        const hit = _qaHeadingHit;
-        if (!hit) return "";
-        return _buildSectionContext(hit, scope.budget || _QA_SECTION_BUDGET);
+        const hit = _qaHeadingHit || _qaSectionBySelection;
+        if (hit) {
+          return _buildSectionContext(hit, scope.budget || _QA_SECTION_BUDGET);
+        }
+        // ⚠ 2026-11-19：**绝不能返回空上下文**。
+        //   router 现在会判 section 档（「这一节讲了什么」），
+        //   而用户划的可能是**正文**而不是标题 → 命不中小节 →
+        //   旧写法直接 return "" → 模型只拿到划的那一句 → 答得很差。
+        //   → 落回 mid 的锚点逻辑（当前页/当前小节）。
+        return _buildScopeContextRaw({ ...scope, mode: "mid" });
       }
 
       if (scope.mode === "term") {
@@ -10558,6 +10700,15 @@
       await _ensureQaOutlineReady();
       const headingHit = _matchQaHeading(_readerSelState.text || "");
       _qaHeadingHit = headingHit;
+      // ⚠ 划的是**正文**时，也可能落在某个小节里（router 判 section 档时会用）
+      //   页码 + 选区矩形是**位置证据**：同一句话可能在多个小节里出现
+      //   （实测「magnetostrictive one」同时在 3 个小节里），
+      //   只看文本会挑错小节 → AI 总结的是别人那一节（§4.6）。
+      _qaSectionBySelection = headingHit ? null :
+        await _findQaSectionBySelection(
+          _readerSelState.text || "",
+          _readerSelState.pageNum,
+          _readerSelState.rects || []);
       let scope;
       if (headingHit) {
         scope = {
