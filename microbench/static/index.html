@@ -8425,6 +8425,34 @@
     }
 
 
+    // -------------------------------------------------------------------
+    // 整篇问答的请求体（2026-11-19，25353 台）
+    //
+    // ⚠️ 原来这里内联着 `_readerState.sections.slice(0, 20)` —— 长论文
+    // 20+ 节时，后半部分（**恰恰是用户正在问的那部分**）被**静默丢弃**，
+    // 模型于是回答「我的上下文里没有这一节，我只能猜」。
+    // 后端上限已放宽到 100，真正的上下文预算由后端按需分配
+    // （见 microbench/qa_context.py 的 pick_context）。
+    //
+    // 抽成独立函数是为了能被**行为级**测试直接调用
+    // （microbench/_test_focus_context.js 从 index.html 抽真代码跑）。
+    // -------------------------------------------------------------------
+    function _buildExplainPayload(question) {
+      const active = _readerState.activeSection;
+      return {
+        // Backend caps: question 500 / sections max 100 / paper_title 300.
+        question: (question || "").slice(0, 500),
+        sections: (_readerState.sections || []).map(s => ({
+          section: s.section, title: s.title, number: s.number || "",
+          text: s.text, page_start: s.page_start, page_end: s.page_end,
+        })),
+        // 用户当前所在的那一节 → 必须出现在上下文里
+        focus_index: (active !== null && active !== undefined) ? active : null,
+        paper_title: (_readerState.title || "").slice(0, 300),
+        model: _pdfTransModel || "",
+      };
+    }
+
     async function askPaperQuestion() {
       const qEl = document.getElementById("ask-paper-question");
       const question = (qEl ? qEl.value.trim() : "");
@@ -8449,13 +8477,7 @@
         </div>
         <div class="reader-section-body" data-stream-target style="white-space:pre-wrap; min-height:1.4em;">⏳ AI 解读中...</div>`;
       const streamTarget = el.querySelector("[data-stream-target]");
-      await askLLMStream(askBtn, "/api/paper/explain_stream", {
-        // Backend caps: question 500 / sections max 20 / paper_title 300.
-        question: (question || "").slice(0, 500),
-        sections: _readerState.sections.slice(0, 20).map(s => ({ section: s.section, title: s.title, text: s.text })),
-        paper_title: (_readerState.title || "").slice(0, 300),
-        model: _pdfTransModel || "",
-      }, {
+      await askLLMStream(askBtn, "/api/paper/explain_stream", _buildExplainPayload(question), {
         onChunk: (chunk, full) => {
           // Live typing effect: append raw text (no markdown formatting
           // mid-stream — too expensive and janky)
@@ -8502,10 +8524,10 @@
       // Collect selected sections (default: all non-references sections)
       const checked = Array.from(document.querySelectorAll(".cross-qa-section-cb:checked"))
         .map(cb => parseInt(cb.dataset.idx, 10));
-      // The backend accepts at most 20 sections — a paper that splits into
-      // more than 20 would 422. Cap the list and drop the selected indices
-      // that fall outside the capped range.
-      const MAX_SECTIONS = 20;
+      // ⚠️ 不要再 `.slice(0, 20)`（2026-11-19，25353 台）：长论文的后半部分
+      // 会被**静默丢弃**，用户勾到的那一节可能根本不在请求里。
+      // 后端上限已放宽到 100（该限的是每节字符预算，不是节数）。
+      const MAX_SECTIONS = 100;
       const cappedSections = _readerState.sections.slice(0, MAX_SECTIONS);
       const sections = (checked.length >= 2
         ? checked.filter(i => Number.isInteger(i) && i >= 0 && i < cappedSections.length)
