@@ -269,6 +269,8 @@ def test_behavioural_guard_files_are_still_there():
         "tests/test_qa_section_context.py",             # 后端：小节大纲抽取 + 标题场景提示
         # ↓ 2026-11-19：「放松 AI 提示词 + 上下文准确性」那一轮
         "tests/test_qa_prompt_relaxed.py",              # 后端：提示词契约 + 上下文形态一致 + 截断头尾都留
+        # ↓ 2026-11-19：「答疑浮层：键消失 / 拖动 / X 键」那一轮
+        "microbench/_test_qa_panel_render.py",          # 渲染：夜色主题主按钮对比度 / 拖动边界 / 按钮状态
     ]
     missing = [r for r in required if not (REPO / r).exists()]
     assert not missing, f"行为级护栏文件不见了: {missing}"

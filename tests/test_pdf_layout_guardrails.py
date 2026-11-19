@@ -41,6 +41,8 @@ PY_SUITES = [
      "桌面端对照模式（左栏译文回左栏 / 右栏回右栏 / 标题公式表格各归各位）"),
     ("microbench/_test_tablet_bilingual_render.py",
      "平板端对照模式（译文按原文分栏 / 公式标记不甩坐标 / 没数据时给提示）"),
+    ("microbench/_test_qa_panel_render.py",
+     "答疑浮层（夜色主题主按钮对比度 / 拖动不把面板推出屏幕 / 收起竖条拖动不误展开 / 按钮状态不复位）"),
 ]
 
 
