@@ -59,6 +59,24 @@ function sliceLine(src, marker) {
   return src.slice(start, end < 0 ? src.length : end);
 }
 
+// 切一个「括号配对」的语句（const _SCOPE_CAPS = {...} 这种多行的）
+function sliceBalanced(src, marker, openCh, closeCh) {
+  const start = src.indexOf(marker);
+  if (start < 0) throw new Error("找不到语句：" + marker);
+  const open = src.indexOf(openCh, start);
+  if (open < 0) throw new Error("语句后面没有 " + openCh + "：" + marker);
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === openCh) depth += 1;
+    else if (c === closeCh) {
+      depth -= 1;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  throw new Error("语句没闭合：" + marker);
+}
+
 function sliceAll(src) {
   return [
     sliceFn(src, "function _collectPageFormulaRects(pageNum) {"),
@@ -66,6 +84,10 @@ function sliceAll(src) {
     //   它依赖下面这几个函数。**必须一起切进来** —— 少切一个，
     //   这套护栏就会因为「函数不存在」而崩（2026-11-18 真跑过一次）。
     sliceLine(src, "const _QA_SECTION_BUDGET"),
+    // ⚠ _buildScopeContextBundle 用到 _SCOPE_CAPS / _MAX_CONTEXT_CHARS
+    sliceBalanced(src, "const _SCOPE_CAPS", "{", "}"),
+    sliceLine(src, "const _MAX_CONTEXT_CHARS"),
+    sliceLine(src, "const _MAX_SCOPE_BUDGET"),
     sliceFn(src, "function _normQaHeading(s) {"),
     // ⚠ 2026-11-18 又加了一条依赖：_qaHeadingCandidates 改成先问
     //   _qaOutlineSections()（校验「这份大纲属于当前这篇论文」）。
@@ -84,6 +106,24 @@ function sliceAll(src) {
     sliceFn(src, "function _stripQaMarkers(text) {"),
     sliceFn(src, "function _sectionChineseText(hit) {"),
     sliceFn(src, "function _buildSectionContext(hit, budget) {"),
+    // ⚠ 2026-11-19：上下文改成**分段结构** → submitReaderQA 这条链又多了
+    //   一批依赖。**必须一起切进来**（§4.109 同一个坑，第三次）。
+    sliceFn(src, "function _qaCtxPart(label, kind, text) {"),
+    sliceFn(src, "function _qaCtxJoin(parts) {"),
+    sliceFn(src, "function _qaCtxParts(parts, budget) {"),
+    sliceFn(src, "function _qaAnchorText() {"),
+    sliceFn(src, "function _qaPageDesc(sec) {"),
+    sliceFn(src, "function _qaSectionsForPage(pageNum) {"),
+    sliceFn(src, "function _qaSearchableText() {"),
+    sliceFn(src, "function _qaSectionFamily(outline, cur) {"),
+    sliceFn(src, "function _buildSectionContextParts(hit, budget) {"),
+    sliceFn(src, "function _buildScopeContextParts(scope) {"),
+    sliceFn(src, "function _buildScopeContextLegacy(scope, mode) {"),
+    sliceFn(src, "function _buildScopeContextBundle(scope) {"),
+    sliceFn(src, "function _renderQaContextBox(answerBody, parts, text) {"),
+    sliceFn(src, "function _buildScopeContextRaw(scope) {"),
+    sliceFn(src, "function _buildScopeContext(scope) {"),
+    sliceFn(src, "function _sliceAroundSelection(fullText, selection, budget) {"),
     sliceFn(src, "function _sectionPageList(hit) {"),
     sliceFn(src, "function _sectionFormulaRects(hit) {"),
     sliceFn(src, "async function _ensureQaOutlineReady() {"),
@@ -106,8 +146,42 @@ function makeEl(id, tag) {
     dataset: {},
     disabled: false,
     querySelector() { return null; },
+    // ⚠ 上下文可视化会把折叠面板插进答题区 → 桩要能接住
+    appendChild(child) { return child; },
     focus() {},
   };
+}
+
+// 「上下文可视化」要 createElement → 补一个最小 DOM 桩
+function makeCtxEl(tag) {
+  const el = makeEl("", tag);
+  el.children = [];
+  el.setAttribute = (k, v) => { el[k] = v; };
+  el.appendChild = (child) => { el.children.push(child); return child; };
+  el.querySelector = (sel) => {
+    const m = /\[([a-z-]+)\]$/.exec(sel);
+    if (!m) return null;
+    const attr = m[1].replace(/^data-/, "");
+    if (el._byAttr && el._byAttr[attr]) return el._byAttr[attr];
+    return null;
+  };
+  const _html = el.innerHTML;
+  Object.defineProperty(el, "innerHTML", {
+    get() { return _html; },
+    set(v) {
+      el._html = v;
+      el._byAttr = {};
+      const re = /data-([a-z-]+)/g;
+      let m2;
+      while ((m2 = re.exec(v)) !== null) {
+        const child = makeCtxEl("div");
+        child.setAttribute("data-" + m2[1], "1");
+        el._byAttr[m2[1]] = child;
+        el.children.push(child);
+      }
+    },
+  });
+  return el;
 }
 
 function makeEnv() {
@@ -130,6 +204,8 @@ function makeEnv() {
     document: {
       getElementById(id) { return elements[id] || null; },
       querySelector() { return null; },
+      // ⚠ 上下文可视化要 createElement（§4.109 同款坑：新增依赖要同步进桩）
+      createElement(tag) { return makeCtxEl(tag); },
     },
     showToast(msg, isErr) { toasts.push({ msg: String(msg), isErr: !!isErr }); },
     escapeHtml(s) { return String(s == null ? "" : s); },

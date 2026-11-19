@@ -94,6 +94,21 @@ function sliceAll(src) {
     sliceFn(src, "function _qaBlockAtPoint(blocks, px, py) {"),
     sliceFn(src, "async function _qaSectionByGeometry(pool, pageNum, selRects) {"),
     sliceFn(src, "async function _findQaSectionBySelection(selectionText, pageNum, selRects) {"),
+    // ⚠ 2026-11-19：上下文改成**分段结构** → 这条链的依赖必须一起切进来
+    //   （§4.109 同款坑：少切一个 → 整套以 ReferenceError 崩）。
+    sliceFn(src, "function _qaCtxPart(label, kind, text) {"),
+    sliceFn(src, "function _qaCtxJoin(parts) {"),
+    sliceFn(src, "function _qaCtxParts(parts, budget) {"),
+    sliceFn(src, "function _qaAnchorText() {"),
+    sliceFn(src, "function _qaPageDesc(sec) {"),
+    sliceFn(src, "function _qaSectionsForPage(pageNum) {"),
+    sliceFn(src, "function _qaSearchableText() {"),
+    sliceFn(src, "function _qaSectionFamily(outline, cur) {"),
+    sliceFn(src, "function _buildSectionContextParts(hit, budget) {"),
+    sliceFn(src, "function _buildScopeContextParts(scope) {"),
+    sliceFn(src, "function _buildScopeContextLegacy(scope, mode) {"),
+    sliceFn(src, "function _buildScopeContextBundle(scope) {"),
+    sliceFn(src, "function _renderQaContextBox(answerBody, parts, text) {"),
     sliceFn(src, "function _qaHeadingCandidates() {"),
     sliceFn(src, "function _matchQaHeading(selectionText) {"),
     sliceFn(src, "function _clipQaContext(text, budget) {"),
@@ -115,6 +130,39 @@ function sliceAll(src) {
 // ---------------------------------------------------------------------------
 // 最小 DOM 桩
 // ---------------------------------------------------------------------------
+// 「上下文可视化」要 createElement + appendChild + querySelector → 补一个最小 DOM 桩
+function makeCtxEl(tag) {
+  const el = makeEl("", tag);
+  el.children = [];
+  el.setAttribute = (k, v) => { el[k] = v; };
+  el.appendChild = (child) => { el.children.push(child); return child; };
+  el.querySelector = (sel) => {
+    const m = /\[([a-z-]+)\]$/.exec(sel);
+    if (!m) return null;
+    const attr = m[1].replace(/^data-/, "");   // [data-xxx] → xxx
+    if (el._byAttr && el._byAttr[attr]) return el._byAttr[attr];
+    return null;
+  };
+  // innerHTML 被赋值时，按已知的 data-* 标记造出子节点
+  const _html = el.innerHTML;
+  Object.defineProperty(el, "innerHTML", {
+    get() { return _html; },
+    set(v) {
+      el._html = v;
+      el._byAttr = {};
+      const re = /data-([a-z-]+)/g;
+      let m2;
+      while ((m2 = re.exec(v)) !== null) {
+        const child = makeCtxEl("div");
+        child.setAttribute("data-" + m2[1], "1");
+        el._byAttr[m2[1]] = child;
+        el.children.push(child);
+      }
+    },
+  });
+  return el;
+}
+
 function makeEl(id, tag) {
   return {
     id,
@@ -128,11 +176,15 @@ function makeEl(id, tag) {
     disabled: false,
     parentElement: { scrollTop: 0, scrollHeight: 0 },
     querySelector() { return null; },
+    // ⚠ 上下文可视化会把折叠面板插进答题区 → 桩要能接住
+    appendChild(child) { return child; },
     focus() {},
   };
 }
 
 // 答疑面板里「上一版答案」那个容器（_refineQA 的入参）
+// ⚠ 2026-11-19：现在还要撑住「上下文可视化」那个折叠面板
+//   （submitReaderQA / _refineQA 都会插它）→ 桩要能 insertBefore / appendChild。
 function makeAnswerBody(priorMode) {
   const els = {
     "[data-stream-target]": makeEl("stream"),
@@ -140,6 +192,18 @@ function makeAnswerBody(priorMode) {
     "[data-qa-model-badge]": makeEl("model"),
     "[data-qa-stage-badge]": makeEl("stage"),
   };
+  const parent = {
+    children: [],
+    insertBefore(node, ref) {
+      const idx = this.children.indexOf(ref);
+      if (idx >= 0) this.children.splice(idx, 0, node);
+      else this.children.push(node);
+      return node;
+    },
+  };
+  els["[data-stream-target]"].parentElement = parent;
+  parent.children.push(els["[data-stream-target]"]);
+  const byAttr = {};
   return {
     dataset: {
       question: "帮我总结这一小节",
@@ -147,7 +211,49 @@ function makeAnswerBody(priorMode) {
       priorScope: "小节全文",
       priorScopeMode: priorMode || "section",
     },
-    querySelector(sel) { return els[sel] || null; },
+    querySelector(sel) {
+      const m = /\[([a-z-]+)\]$/.exec(sel);
+      if (m && byAttr[m[1]]) return byAttr[m[1]];
+      return els[sel] || null;
+    },
+    appendChild(node) {
+      parent.children.push(node);
+      if (node && node["data-qa-context-box"]) byAttr["data-qa-context-box"] = node;
+      return node;
+    },
+    _parent: parent,
+    _byAttr: byAttr,
+  };
+}
+
+// 「上下文可视化」的答题容器（要能 insertBefore 那个折叠面板）
+function makeCtxAnswerBody() {
+  const stream = makeEl("stream");
+  const parent = {
+    children: [],
+    insertBefore(node, ref) {
+      const idx = this.children.indexOf(ref);
+      if (idx >= 0) this.children.splice(idx, 0, node);
+      else this.children.push(node);
+      if (node && node["data-qa-context-box"]) byAttr["data-qa-context-box"] = node;
+      return node;
+    },
+  };
+  stream.parentElement = parent;
+  parent.children.push(stream);
+  const byAttr = {};
+  return {
+    dataset: {},
+    querySelector(sel) {
+      const m = /\[([a-z-]+)\]$/.exec(sel);
+      if (!m) return null;
+      if (byAttr[m[1]]) return byAttr[m[1]];
+      if (m[1] === "data-stream-target") return stream;
+      return null;
+    },
+    appendChild(node) { parent.children.push(node); return node; },
+    _byAttr: byAttr,
+    _parent: parent,
   };
 }
 
@@ -202,6 +308,8 @@ function makeEnv() {
     document: {
       getElementById(id) { return elements[id] || null; },
       querySelector() { return null; },
+      // ⚠ 上下文可视化要 createElement（§4.109 同款坑：新增依赖要同步进桩）
+      createElement(tag) { return makeCtxEl(tag); },
     },
     showToast() {},
     escapeHtml(s) { return String(s == null ? "" : s); },
@@ -258,6 +366,12 @@ return {
   _clipQaContext,
   _buildScopeContext,
   _buildScopeContextRaw,
+  // ⚠ 2026-11-19：分段上下文 + 可视化
+  _buildScopeContextParts,
+  _buildScopeContextBundle,
+  _buildSectionContextParts,
+  _qaCtxJoin,
+  _renderQaContextBox,
   submitReaderQA,
   scopeCaps: _SCOPE_CAPS,
   scopeLadder: _SCOPE_LADDER,
@@ -671,7 +785,7 @@ async function runSuite(src, label) {
       "把不相干的选区也定位到了某个小节");
   });
 
-  await check("section 档但没命中小节 → **不能给空上下文**（落回当前页）", async () => {
+  await check("section 档但没命中小节 → **不能给空上下文**（落回当前页的小节）", async () => {
     const api11 = buildApi(src, makeEnv());
     withOutline(api11);
     api11.setPdfState({
@@ -683,8 +797,12 @@ async function runSuite(src, label) {
     const ctx = api11._buildScopeContextRaw({ mode: "section", budget: 12000 });
     assert(ctx && ctx.length > 0,
       "section 档没命中小节时给了**空上下文** → 模型只拿到划的那一句");
-    assert(ctx.indexOf("第 1 页的正文内容") >= 0,
-      "没有落回当前页上下文：" + String(ctx).slice(0, 120));
+    // 落回的是「当前页涉及的**真小节**」（比 PDF.js 扁平页文本强：
+    // 顺序对、公式是【公式N】占位而不是碎片）。
+    assert(ctx.indexOf("【当前页涉及的小节（按论文阅读顺序）】") >= 0,
+      "没有落回当前页的小节上下文：" + String(ctx).slice(0, 160));
+    assert(ctx.indexOf("This is the introduction body") >= 0,
+      "当前页的小节正文没进去：" + String(ctx).slice(0, 160));
   });
 
   // ---- ⑥ 划正文时**定位到哪个小节**（2026-11-19 真机实测抓到的错）------------
@@ -827,6 +945,186 @@ async function runSuite(src, label) {
     assert(!hit, "没有页面物理尺寸也敢定位");
   });
 
+  // ---- ⑦ 上下文 = 分段结构 + 真小节 + 选区前置 + 可视化（2026-11-19）----
+  //
+  // ⚠ 这几条盯的是**实测抓到的问题**：
+  //   ① wide/full 给的是章节视图的「Full Text 一桶」→ 没有小节结构，
+  //      而且那一桶是 PDF.js 扁平文本（左右栏交错 + 公式碎片 "k 50.94.20"）；
+  //   ② 用户划的那句在上下文里落在 **95.4%** 处 → 模型第一眼看不到；
+  //   ③ 用户**看不见**这次到底送了什么。
+  await check("wide 档按**真小节**给（不是「Full Text 一桶」）", async () => {
+    const api = buildApi(src, makeEnv());
+    withOutline(api);
+    const parts = api._buildScopeContextParts({ mode: "wide", budget: 20000 });
+    const labels = parts.map(p => p.label).join(" | ");
+    assert(parts.length >= 2, "wide 档只有一段：" + labels);
+    assert(labels.indexOf("Full Text") < 0,
+      "wide 档还在用「Full Text 一桶」：" + labels);
+    assert(labels.indexOf("摘要/前言") >= 0, "wide 档没有摘要节：" + labels);
+    assert(labels.indexOf("结论/末节") >= 0, "wide 档没有结论节：" + labels);
+  });
+
+  await check("full 档给出**全部**真小节（不是只前 8 节、也不是一桶）", async () => {
+    const api = buildApi(src, makeEnv());
+    withOutline(api);
+    const parts = api._buildScopeContextParts({ mode: "full", budget: 50000 });
+    assertEq(parts.length, OUTLINE.length, "full 档的小节数不对");
+    const labels = parts.map(p => p.label).join(" | ");
+    assert(labels.indexOf("Full Text") < 0, "full 档还在用一桶：" + labels);
+    assert(labels.indexOf("V. Summary") >= 0, "full 档漏了最后一节：" + labels);
+  });
+
+  await check("mid 档用**真小节正文**（不是 PDF.js 扁平页文本）", async () => {
+    const api = buildApi(src, makeEnv());
+    withOutline(api);
+    api.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, text: "扁平页文本：PDF.js 左右栏交错的样子", translation: "" }],
+    });
+    api.setSelState({ text: "This is the introduction body", source: "pdf",
+                      pageNum: 1, sectionIdx: null, rects: [] });
+    const text = api._qaCtxJoin(api._buildScopeContextParts({ mode: "mid", budget: 8000 }));
+    assert(text.indexOf("This is the introduction body") >= 0,
+      "mid 档没给当前页的小节正文：" + text.slice(0, 160));
+    assert(text.indexOf("扁平页文本") < 0,
+      "mid 档还在用 PDF.js 扁平页文本（左右栏交错）");
+  });
+
+  await check("没有小节大纲 → 退回页文本，但**如实标注**它的形态", async () => {
+    const api = buildApi(src, makeEnv());
+    api.setOutline({ path: null, sections: [], ready: false, loading: false, promise: null });
+    api.setReaderState({ title: "某论文", pdfPath: "a/b.pdf",
+                         sections: [], translations: {}, activeSection: 0 });
+    api.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, text: "第 1 页的正文内容", translation: "" }],
+    });
+    api.setSelState({ text: "第 1 页的正文内容", source: "pdf",
+                      pageNum: 1, sectionIdx: null, rects: [] });
+    const text = api._qaCtxJoin(api._buildScopeContextParts({ mode: "mid", budget: 8000 }));
+    assert(text.indexOf("第 1 页的正文内容") >= 0,
+      "没有大纲时连页文本都没给：" + text.slice(0, 120));
+    assert(text.indexOf("扁平文本") >= 0,
+      "没有如实标注文本形态（模型会以为是整理好的正文）：" + text.slice(0, 160));
+  });
+
+  await check("划正文 → 选区句**前置**到第一段（模型第一眼就能看到）", async () => {
+    const api = buildApi(src, makeEnv());
+    withOutline(api);
+    api.setSectionBySelection({
+      title: "II. Experimental Procedure", level: 1, page_start: 1, page_end: 2,
+      text: "The ME effect in piezoelectric laminates. 【公式1】 constitutive equations.",
+      formulas: [], source: "pdf",
+    });
+    api.setSelState({ text: "constitutive equations", source: "pdf",
+                      pageNum: 1, sectionIdx: null, rects: [] });
+    const bundle = api._buildScopeContextBundle({ mode: "section", budget: 16000 });
+    assert(bundle.parts.length > 0, "没构造出分段");
+    assertEq(bundle.parts[0].kind, "selection", "第一段不是「用户划选的片段」");
+    assert(bundle.parts[0].text.indexOf("constitutive equations") >= 0,
+      "第一段里没有用户划的那句");
+    assert(bundle.text.indexOf("constitutive equations") >= 0,
+      "最终上下文里没有用户划的那句");
+  });
+
+  await check("**所有档位**：用户划的那句一定在最终上下文里", async () => {
+    const api = buildApi(src, makeEnv());
+    withOutline(api);
+    api.setSelState({ text: "constitutive equations", source: "pdf",
+                      pageNum: 1, sectionIdx: null, rects: [] });
+    for (const mode of ["term", "mid", "section", "wide", "full"]) {
+      const bundle = api._buildScopeContextBundle({ mode: mode, budget: 8000 });
+      assert(bundle.text.indexOf("constitutive equations") >= 0,
+        mode + " 档的上下文里没有用户划的那句 → 模型无从下手");
+    }
+  });
+
+  // 带层级的大纲（顶层节 + 子节）—— wide 档要能给出「整个大节」
+  const OUTLINE_TREE = [
+    { index: 0, title: "(前言/摘要)", level: 0, page_start: 1, page_end: 1,
+      text: "摘要正文", chars: 4, formulas: [] },
+    { index: 1, title: "II. Experimental Procedure", level: 1, page_start: 1, page_end: 2,
+      text: "大节正文", chars: 4, formulas: [] },
+    { index: 2, title: "(1) Individual Phases", level: 2, page_start: 2, page_end: 2,
+      text: "子节一正文", chars: 5, formulas: [] },
+    { index: 3, title: "(2) All Ceramic", level: 2, page_start: 2, page_end: 3,
+      text: "子节二正文", chars: 5, formulas: [] },
+    { index: 4, title: "V. Summary", level: 1, page_start: 7, page_end: 8,
+      text: "结论正文", chars: 4, formulas: [] },
+  ];
+
+  await check("wide 档给的是**整个大节**（顶层节 + 它的所有子节）", async () => {
+    const api = buildApi(src, makeEnv());
+    api.setOutline({ path: "a/b.pdf", sections: OUTLINE_TREE, ready: true, loading: false, promise: null });
+    api.setReaderState({ title: "某论文", pdfPath: "a/b.pdf",
+                         sections: [], translations: {}, activeSection: 0 });
+    api.setSectionBySelection({
+      title: "(1) Individual Phases", level: 2, page_start: 2, page_end: 2,
+      text: "子节一正文", formulas: [], source: "pdf",
+    });
+    const text = api._qaCtxJoin(api._buildScopeContextParts({ mode: "wide", budget: 20000 }));
+    assert(text.indexOf("大节正文") >= 0, "wide 档没给顶层大节：" + text.slice(0, 200));
+    assert(text.indexOf("子节一正文") >= 0, "wide 档没给选区所在子节：" + text.slice(0, 200));
+    assert(text.indexOf("子节二正文") >= 0,
+      "wide 档没给同大节的其他子节：" + text.slice(0, 240));
+    assert(text.indexOf("结论正文") >= 0, "wide 档没给结论：" + text.slice(0, 240));
+  });
+
+  await check("mid 档带上用户正在读的**中文译文**（如实标注是整页翻译）", async () => {
+    const api = buildApi(src, makeEnv());
+    withOutline(api);
+    api.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, text: "英文页文本", translation: "第一页的中文译文" }],
+    });
+    api.setSelState({ text: "This is the introduction body", source: "pdf",
+                      pageNum: 1, sectionIdx: null, rects: [] });
+    const text = api._qaCtxJoin(api._buildScopeContextParts({ mode: "mid", budget: 8000 }));
+    assert(text.indexOf("第一页的中文译文") >= 0,
+      "mid 档没带中文译文：" + text.slice(0, 200));
+    assert(text.indexOf("整页翻译") >= 0,
+      "没如实标注译文是整页翻译：" + text.slice(0, 240));
+  });
+
+  await check("term 档用**真小节**切窗（不是 PDF.js 扁平页文本）", async () => {
+    const api = buildApi(src, makeEnv());
+    withOutline(api);
+    api.setPdfState({
+      relativePath: "a/b.pdf",
+      pages: [{ num: 1, text: "扁平页文本：PDF.js 左右栏交错的样子", translation: "" }],
+    });
+    api.setSelState({ text: "This is the introduction body", source: "pdf",
+                      pageNum: 1, sectionIdx: null, rects: [] });
+    const text = api._qaCtxJoin(api._buildScopeContextParts({ mode: "term", budget: 2000 }));
+    assert(text.indexOf("This is the introduction body") >= 0,
+      "term 档没包含选区句：" + text.slice(0, 160));
+    assert(text.indexOf("扁平页文本") < 0, "term 档还在用扁平页文本切窗");
+  });
+
+  await check("上下文可视化：折叠面板列出分段 + 显示实际发出的原文", async () => {
+    const api = buildApi(src, makeEnv());
+    withOutline(api);
+    api.setSelState({ text: "constitutive equations", source: "pdf",
+                      pageNum: 1, sectionIdx: null, rects: [] });
+    const bundle = api._buildScopeContextBundle({ mode: "section", budget: 16000 });
+    const body = makeCtxAnswerBody();
+    api._renderQaContextBox(body, bundle.parts, bundle.text);
+    assertEq(body._parent.children.length, 2, "折叠面板没插进答题区（应插在答案前面）");
+    const box = body._parent.children[0];
+    assert(box && box["data-qa-context-box"], "插进去的不是折叠面板");
+    const summary = box._byAttr["qa-context-summary"];
+    assert(summary, "没有摘要行");
+    assert(summary.textContent.indexOf("本次送给 AI 的上下文") >= 0,
+      "摘要行没说清楚这是什么：" + summary.textContent);
+    assert(summary.textContent.indexOf(bundle.text.length.toLocaleString()) >= 0,
+      "摘要行的字数不对：" + summary.textContent);
+    const list = box._byAttr["qa-context-parts"];
+    assert(list, "没有分段清单");
+    assertEq(list.children.length, bundle.parts.length, "分段清单的条数不对");
+    const pre = box._byAttr["qa-context-text"];
+    assertEq(pre.textContent, bundle.text, "面板里显示的原文与实际发出的不一致");
+  });
+
   return { passed, failed };
 }
 
@@ -909,6 +1207,28 @@ const MUTATIONS = [
     from: "return { x: (x + w / 2) * pg.ptW, y: (y + h / 2) * pg.ptH };",
     to: "return { x: (x + w / 2) * pg.ptW, y: (y + h / 2) * 10 };",
   },
+  {
+    name: "wide 档又退回「Full Text 一桶」（没有小节结构）",
+    from: "const outline = _qaOutlineSections();\n        if (outline.length >= 2) {",
+    to: "const outline = _qaOutlineSections();\n        if (false) {",
+  },
+  {
+    name: "full 档只给前 2 节（后面的内容全丢）",
+    from: "return _qaCtxParts(outline.map(s =>",
+    to: "return _qaCtxParts(outline.slice(0, 2).map(s =>",
+  },
+  {
+    name: "mid 档不用真小节（又用 PDF.js 扁平页文本，左右栏交错）",
+    // ⚠ 必须**唯一**：JS 的 String.replace 只改**第一处**命中 →
+    //   目标串出现两次时会改错函数，变异自检就会误报「没抓到」。
+    from: "const hit = _qaSectionBySelection;\n        const onPage = _qaSectionsForPage(_readerSelState.pageNum);",
+    to: "const hit = _qaSectionBySelection;\n        const onPage = [];",
+  },
+  {
+    name: "选区句不前置（模型第一眼看不到用户问的那句）",
+    from: "if (!already || rel > 0.35) {",
+    to: "if (false) {",
+  },
 ];
 
 let envScopeCapsJson = "";
@@ -947,6 +1267,16 @@ async function main() {
   for (const m of MUTATIONS) {
     if (!SRC.includes(m.from)) {
       console.log("  FAIL  变异 [" + m.name + "] 没匹配到源码 —— 变异自检本身失效");
+      result.failed += 1;
+      continue;
+    }
+    // ⚠ 2026-11-19：JS 的 String.replace 只改**第一处**命中 →
+    //   目标串在源码里出现多次时会**改错地方** → 变异没生效 → 误报「没抓到」。
+    //   （踩过一次：`const onPage = _qaSectionsForPage(...)` 在两个函数里都有。）
+    const hits = SRC.split(m.from).length - 1;
+    if (hits > 1) {
+      console.log("  FAIL  变异 [" + m.name + "] 目标串在源码里出现 " + hits +
+                  " 处 —— 改的可能不是要改的那个函数");
       result.failed += 1;
       continue;
     }

@@ -10066,28 +10066,80 @@
       return "";
     }
 
-    // 小节上下文：标题 + 中文译文（有就带）+ 英文原文
-    function _buildSectionContext(hit, budget) {
-      if (!hit) return "";
+    // -----------------------------------------------------------------------
+    // 上下文 = **分段结构**（2026-11-19）
+    //
+    // 为什么不再拼成一坨字符串：
+    //   ① 「可视化」要能说清「这次送了什么」—— 只有分段才说得清；
+    //   ② 用户划的那句必须在上下文里、而且**要在最前面**
+    //      （实测：section 档里它落在 95.4% 处 → 模型第一眼看不到用户关心的句子）；
+    //   ③ 各档的**来源**不同（真小节 / 整页译文 / PDF.js 扁平文本），
+    //      必须分别标注，否则模型会把「整页译文」当成本节内容（§4.113）。
+    //
+    // 一段上下文：{ label, kind, text }
+    //   kind: selection（用户划选） / section（小节英文原文） /
+    //         translation（中文译文） / page（整页文本） / note（提示）
+    // -----------------------------------------------------------------------
+    function _qaCtxPart(label, kind, text) {
+      return {
+        label: label == null ? "" : String(label),
+        kind: kind || "note",
+        text: text == null ? "" : String(text),
+      };
+    }
+
+    function _qaCtxJoin(parts) {
+      return (parts || []).map(p => {
+        if (!p) return "";
+        if (!p.text) return p.label || "";
+        return p.label ? (p.label + "\n" + p.text) : p.text;
+      }).filter(Boolean).join("\n\n");
+    }
+
+    // 分段各自裁剪，**总和不超过 budget**（要给标签和分隔符留位置，
+    // 否则外面那层全局裁剪会再砍一刀，把小节结尾的结论砍掉 —— §4.107）。
+    function _qaCtxParts(parts, budget) {
+      const list = (parts || []).filter(Boolean);
+      const cap = Math.max(400, (budget || 8000) - 600);
+      let total = 0;
+      for (const p of list) total += (p.text ? p.text.length : 0);
+      if (total <= cap) return list;
+      const k = cap / total;
+      return list.map(p => {
+        if (!p || !p.text) return p;
+        const keep = Math.max(0, Math.floor(p.text.length * k));
+        if (keep >= p.text.length) return p;
+        return Object.assign({}, p, { text: _clipQaContext(p.text, keep) });
+      });
+    }
+
+    // 小节上下文（分段）：标题 + 中文译文（有就带）+ 英文原文
+    function _buildSectionContextParts(hit, budget) {
+      if (!hit) return [];
       const cap = budget || _QA_SECTION_BUDGET;
       const parts = [];
       const pageDesc = (hit.page_start && hit.page_end)
         ? "（第 " + hit.page_start + "-" + hit.page_end + " 页）" : "";
-      parts.push("【小节】" + (hit.title || "") + pageDesc);
+      parts.push(_qaCtxPart("【小节】" + (hit.title || "") + pageDesc, "section", ""));
       const zh = _sectionChineseText(hit);
       const en = hit.text || "";
       if (zh) {
         const zhBudget = Math.floor(cap * 0.4);
-        parts.push("【本小节中文译文（机器翻译，供快速理解）】\n" +
-                   _clipQaContext(zh, zhBudget));
-        parts.push("【本小节英文原文（权威表述；公式位置为【公式N】占位，"
-          + "对应的公式高清原图见附件）】\n" +
-          _clipQaContext(en, Math.max(0, cap - zhBudget)));
+        parts.push(_qaCtxPart("【本小节中文译文（机器翻译，供快速理解）】", "translation",
+                              _clipQaContext(zh, zhBudget)));
+        parts.push(_qaCtxPart("【本小节英文原文（权威表述；公式位置为【公式N】占位，"
+                              + "对应的公式高清原图见附件）】", "section",
+                              _clipQaContext(en, Math.max(0, cap - zhBudget))));
       } else {
-        parts.push("【本小节英文原文（公式位置为【公式N】占位，"
-          + "对应的公式高清原图见附件）】\n" + _clipQaContext(en, cap));
+        parts.push(_qaCtxPart("【本小节英文原文（公式位置为【公式N】占位，"
+                              + "对应的公式高清原图见附件）】", "section",
+                              _clipQaContext(en, cap)));
       }
-      return parts.join("\n\n");
+      return parts;
+    }
+
+    function _buildSectionContext(hit, budget) {
+      return _qaCtxJoin(_buildSectionContextParts(hit, budget));
     }
 
     // 本小节涉及哪些页（上限 12 页，别把整篇都塞进去）
@@ -10290,7 +10342,11 @@
       }
 
       // 2. Build context for the new scope.
-      const surroundingContext = _buildScopeContext(newScope);
+      const ctxBundle = _buildScopeContextBundle(newScope);
+      const surroundingContext = ctxBundle.text;
+      // ⚠ 上下文**可视化**：让用户看见「这一轮模型到底看到了什么」
+      //   （上下文对不对，只有看得见才能判断 —— 用户 2026-11-19 原话）。
+      _renderQaContextBox(answerBody, ctxBundle.parts, surroundingContext);
 
       // ⚠ 2026-11-18：提示里的「用户选中的是一个小节标题 → 下面是这一小节的完整正文」
       //   **只有在上下文真的是这一小节时才成立**。
@@ -10387,101 +10443,337 @@
       });
     }
 
-    // Build context for the chosen scope. Resolves the "current page" or
-    // "current section" first, then layers in wider material for wide/full.
-    function _buildScopeContextRaw(scope) {
-      // 1. Identify the anchor: PDF page object OR section object.
-      let anchorText = "";
-      let anchorLabel = "";
+    // -----------------------------------------------------------------------
+    // 上下文 = **分段结构**（2026-11-19）
+    //
+    // ⚠ 为什么 wide/full 不再用章节视图（2026-11-19 真机实测抓到的）：
+    //   PDF 模式下 `_readerState.sections` 常常只有「Full Text」**一桶**
+    //   （§4.110 记过这个残留）→ wide 给的是 `[Section Full Text (摘要/引言)]`
+    //   一整篇**没有小节结构**的文字；full 给的是 `[Full Text]` 一桶 43,767 字。
+    //   而且那一桶是 **PDF.js 扁平文本**（左右栏交错 + 公式碎片，如 "k 50.94.20"）。
+    //   → 改用**真小节大纲**（服务端按论文阅读顺序算的，公式是【公式N】占位）。
+    //
+    // ⚠ 为什么必须分段（而不是拼成一坨）：
+    //   ① 用户要能**看见**这次送了什么 → 只有分段才说得清；
+    //   ② 用户划的那句必须在上下文里、而且**要在最前面**
+    //      （实测 section 档里它落在 95.4% 处 → 模型第一眼看不到用户关心的句子）；
+    //   ③ 各档的**来源**不同（真小节 / 整页译文 / PDF.js 扁平文本），
+    //      必须分别标注，否则模型会把「整页译文」当成本节内容（§4.113）。
+    // -----------------------------------------------------------------------
+
+    // 锚点：当前页（PDF.js 扁平文本）或章节视图当前那一节
+    function _qaAnchorText() {
+      let text = "";
+      let label = "";
       if (_readerSelState.pageNum && _pdfState && _pdfState.pages) {
         const pObj = _pdfState.pages.find(p => p.num === _readerSelState.pageNum);
-        if (pObj) { anchorText = pObj.text || ""; anchorLabel = `[Page ${_readerSelState.pageNum}]`; }
+        if (pObj) { text = pObj.text || ""; label = "[Page " + _readerSelState.pageNum + "]"; }
       }
-      if (!anchorText && _readerSelState.sectionIdx !== null && _readerState.sections) {
+      if (!text && _readerSelState.sectionIdx !== null && _readerState.sections) {
         const sObj = _readerState.sections[_readerSelState.sectionIdx];
-        if (sObj) { anchorText = sObj.text || ""; anchorLabel = `[Section ${sObj.title || ""}]`; }
+        if (sObj) { text = sObj.text || ""; label = "[Section " + (sObj.title || "") + "]"; }
       }
-      if (!anchorText && _readerState.sections && _readerState.sections[_readerState.activeSection]) {
+      if (!text && _readerState.sections && _readerState.sections[_readerState.activeSection]) {
         const sObj = _readerState.sections[_readerState.activeSection];
-        anchorText = sObj.text || ""; anchorLabel = `[Section ${sObj.title || ""}]`;
+        text = sObj.text || ""; label = "[Section " + (sObj.title || "") + "]";
       }
+      return { text: text, label: label };
+    }
+
+    // 小节的页码描述（第 1-2 页）
+    function _qaPageDesc(sec) {
+      if (!sec || !sec.page_start) return "";
+      const from = sec.page_start;
+      const to = Math.max(from, sec.page_end || from);
+      return "（第 " + from + "-" + to + " 页）";
+    }
+
+    // 覆盖某一页的**真小节**（服务端大纲；没有大纲 → 空数组）
+    function _qaSectionsForPage(pageNum) {
+      if (typeof pageNum !== "number" || pageNum <= 0) return [];
+      return _qaOutlineSections().filter(s => _qaSectionCoversPage(s, pageNum));
+    }
+
+    // 「能拿到选区的那段正文」—— 优先**真小节**（按论文阅读顺序、公式是占位），
+    //   没有小节才退回 PDF.js 扁平页文本（左右栏交错）。
+    function _qaSearchableText() {
+      const hit = _qaSectionBySelection;
+      if (hit && hit.text) return hit.text;
+      const onPage = _qaSectionsForPage(_readerSelState.pageNum);
+      if (onPage.length) {
+        return onPage.map(s => s.text || "").join("\n\n");
+      }
+      return _qaAnchorText().text;
+    }
+
+    // 某个小节所属的「家族」= 它所在的**顶层节 + 该顶层节的所有子节**。
+    //   （大纲是扁平的：level 1 = "II. Experimental Procedure"，
+    //     level 2 = "(1) Individual Phases…" …）
+    //   → 「wide」档给这一族 = 真正把「这一大节」给全，而不是给一桶全文。
+    function _qaSectionFamily(outline, cur) {
+      if (!cur || !outline || !outline.length) return cur ? [cur] : [];
+      let i = outline.indexOf(cur);
+      if (i < 0) {
+        // ⚠ `_qaSectionBySelection` 是 `_qaSectionPayload()` 造的**副本**，
+        //   不是大纲里那一条 → indexOf 找不到 → 按「标题 + 起始页」认回去。
+        i = outline.findIndex(s => (s.title || "") === (cur.title || "")
+                                && s.page_start === cur.page_start);
+      }
+      if (i < 0) return [cur];
+      let top = i;
+      while (top > 0 && (outline[top].level || 1) > 1) top -= 1;
+      const out = [];
+      for (let k = top; k < outline.length; k++) {
+        const s = outline[k];
+        if (k > top && (s.level || 1) <= 1) break;
+        out.push(s);
+      }
+      return out.length ? out : [cur];
+    }
+
+    // Build context for the chosen scope —— **分段**。
+    function _buildScopeContextParts(scope) {
+      const mode = (scope && scope.mode) || "mid";
+      const budget = (scope && scope.budget) || (_SCOPE_CAPS[mode] || 8000);
       const selText = _readerSelState.text || "";
 
-      // 2. Build per-scope output.
-      if (scope.mode === "section") {
+      // ---- section：本小节完整正文 ----
+      if (mode === "section") {
         // 「选中了一个标题」→ 上下文 = **本小节的完整正文**（2026-11-18）。
         // 命中标题时由 submitReaderQA 直接给这个 scope（不走 LLM 路由）。
         const hit = _qaHeadingHit || _qaSectionBySelection;
-        if (hit) {
-          return _buildSectionContext(hit, scope.budget || _QA_SECTION_BUDGET);
-        }
+        if (hit) return _qaCtxParts(_buildSectionContextParts(hit, budget), budget);
         // ⚠ 2026-11-19：**绝不能返回空上下文**。
         //   router 现在会判 section 档（「这一节讲了什么」），
         //   而用户划的可能是**正文**而不是标题 → 命不中小节 →
         //   旧写法直接 return "" → 模型只拿到划的那一句 → 答得很差。
-        //   → 落回 mid 的锚点逻辑（当前页/当前小节）。
-        return _buildScopeContextRaw({ ...scope, mode: "mid" });
+        //   → 落回 mid（当前页 / 当前页涉及的小节）。
+        return _buildScopeContextParts({ ...scope, mode: "mid" });
       }
 
-      if (scope.mode === "term") {
+      // ---- term：选区前后紧邻 ----
+      if (mode === "term") {
         // Tight window around the selection (≈ budget chars). Don't
         // include the section header here — definitions are usually
         // resolved by the surrounding sentence, not the heading.
-        const tight = _sliceAroundSelection(anchorText, selText, scope.budget);
-        return tight
-          ? `${anchorLabel}\n${tight}`
-          : `(未在 ${anchorLabel} 文本中找到用户划选片段,改用段落头部)\n${anchorText.slice(0, scope.budget)}`;
-      }
-
-      if (scope.mode === "mid") {
-        // Current page/section, head-truncated to budget.
-        const body = anchorText ? anchorText.slice(0, scope.budget) : "";
-        return body ? `${anchorLabel}\n${body}` : "";
-      }
-
-      // wide / full: only meaningful in section-view (we need _readerState.sections).
-      // PDF dual-column mode degrades gracefully: take the current page +
-      // its 2 neighbors, head-truncated to scope.budget.
-      if (!_readerState.sections || !_readerState.sections.length) {
-        // PDF mode fallback — extend across nearby pages.
-        if (scope.mode === "wide" || scope.mode === "full") {
-          const allText = (_pdfState?.pages || [])
-            .map(p => `[Page ${p.num}]\n${p.text || ""}`).join("\n\n");
-          const sliced = _sliceAroundSelection(allText, selText, scope.budget)
-            || allText.slice(0, scope.budget);
-          return `⚠️ PDF 双栏视图无完整章节索引,已拼接相邻页面:\n${sliced}`;
+        // ⚠ 切窗的**素材**优先用真小节（按论文阅读顺序），
+        //   退而才用 PDF.js 扁平页文本（左右栏交错、公式是碎片）。
+        const anchor = _qaAnchorText();
+        const tight = _sliceAroundSelection(_qaSearchableText(), selText, budget);
+        if (tight) {
+          return _qaCtxParts([
+            _qaCtxPart("【选区前后紧邻片段（" + (anchor.label || "当前页") + "）】",
+                       "selection", tight),
+          ], budget);
         }
+        return _qaCtxParts([
+          _qaCtxPart("【注意】未在 " + (anchor.label || "当前页")
+                     + " 的文本中找到用户划选片段，改用该页开头。", "note", ""),
+          _qaCtxPart("【" + (anchor.label || "当前页") + " 开头】", "page",
+                     (anchor.text || "").slice(0, budget)),
+        ], budget);
       }
 
-      if (scope.mode === "wide") {
-        // abstract / intro (first section) + active / selected section + conclusion (last).
-        const sections = _readerState.sections;
+      // ---- mid：选区所在小节（**真小节**，按论文阅读顺序）→ 退到当前页 ----
+      if (mode === "mid") {
+        const hit = _qaSectionBySelection;
+        const onPage = _qaSectionsForPage(_readerSelState.pageNum);
+        if (hit || onPage.length) {
+          const secs = hit ? [hit] : onPage;
+          const body = secs.map(s =>
+            "【小节】" + (s.title || "") + _qaPageDesc(s) + "\n" + (s.text || "")
+          ).join("\n\n");
+          const parts = [
+            _qaCtxPart(hit
+              ? "【选区所在小节】" + (hit.title || "") + _qaPageDesc(hit)
+              : "【当前页涉及的小节（按论文阅读顺序）】", "section", body),
+          ];
+          // 用户真正在读的是**中文译文** → 带上（如实标注它是整页翻译）
+          const zh = _sectionChineseText(secs[0]);
+          if (zh) {
+            parts.push(_qaCtxPart("【本小节所在页的中文译文（整页翻译，含本页其他段落）】",
+                                  "translation", zh));
+          }
+          return _qaCtxParts(parts, budget);
+        }
+        // 没有大纲 → 退回 PDF.js 扁平页文本（**如实标注**它的形态）
+        const anchor = _qaAnchorText();
+        if (!anchor.text) return [];
+        return _qaCtxParts([
+          _qaCtxPart("【" + (anchor.label || "当前页")
+                     + " 原文（PDF.js 扁平文本，左右栏交错；公式为碎片）】",
+                     "page", anchor.text),
+        ], budget);
+      }
+
+      // ---- wide：摘要 + 选区所在的**整个大节** + 结论（**真小节大纲**）----
+      if (mode === "wide") {
+        const outline = _qaOutlineSections();
+        if (outline.length >= 2) {
+          const cur = _qaSectionBySelection
+            || _qaSectionsForPage(_readerSelState.pageNum)[0]
+            || outline[0];
+          const picks = [];
+          const push = (sec, role) => {
+            if (!sec || picks.some(p => p.sec === sec)) return;
+            picks.push({ sec: sec, role: role });
+          };
+          push(outline[0], "摘要/前言");
+          // ⚠ 「wide」要真的**宽**：给当前**顶层小节连同它的所有子节**
+          //   （例：选区在 "II. Experimental Procedure" → 连 (1)(2)(3)(4) 一起给）
+          //   → 这才是「这一大节」，而不是一桶没结构的全文。
+          const family = _qaSectionFamily(outline, cur);
+          family.forEach((s, i) => push(s, i === 0 ? "选区所在大节" : "同大节 · 子节"));
+          push(outline[outline.length - 1], "结论/末节");
+          return _qaCtxParts(picks.map(p =>
+            _qaCtxPart("【" + p.role + "】" + (p.sec.title || "") + _qaPageDesc(p.sec),
+                       "section", p.sec.text || "")
+          ), budget);
+        }
+        return _buildScopeContextLegacy(scope, "wide");
+      }
+
+      // ---- full：全篇**按小节**给（不是「Full Text 一桶」）----
+      const outline = _qaOutlineSections();
+      if (outline.length) {
+        return _qaCtxParts(outline.map(s =>
+          _qaCtxPart("【小节】" + (s.title || "") + _qaPageDesc(s),
+                     "section", s.text || "")
+        ), budget);
+      }
+      return _buildScopeContextLegacy(scope, "full");
+    }
+
+    // 没有真小节大纲时的老路子。⚠ PDF 模式下章节视图常常只有「Full Text」一桶
+    //   → 这里明确按「按页码顺序拼接全文」处理，并如实标注文本形态。
+    function _buildScopeContextLegacy(scope, mode) {
+      const budget = scope.budget || (_SCOPE_CAPS[mode] || 8000);
+      const selText = _readerSelState.text || "";
+      const sections = (_readerState && _readerState.sections) || [];
+      const oneBucket = sections.length === 1;   // 「Full Text 一桶」→ 不可用
+      if (!sections.length || oneBucket) {
+        const allText = (_pdfState && _pdfState.pages || [])
+          .map(p => "[Page " + p.num + "]\n" + (p.text || "")).join("\n\n");
+        const sliced = _sliceAroundSelection(allText, selText, budget)
+          || allText.slice(0, budget);
+        return _qaCtxParts([
+          _qaCtxPart("【无小节索引：已按页码顺序拼接全文"
+                     + "（PDF.js 扁平文本，左右栏交错；公式为碎片）】",
+                     "page", sliced),
+        ], budget);
+      }
+      if (mode === "wide") {
         const chunks = [];
-        const per = Math.max(2000, Math.floor(scope.budget / 3));
+        const per = Math.max(2000, Math.floor(budget / 3));
         if (sections[0] && (sections[0].text || "").length > 200) {
-          chunks.push(`[Section ${sections[0].title || "1"} (摘要/引言)]\n${(sections[0].text || "").slice(0, per)}`);
+          chunks.push(_qaCtxPart("[Section " + (sections[0].title || "1") + " (摘要/引言)]",
+                                 "section", (sections[0].text || "").slice(0, per)));
         }
         const activeIdx = _readerSelState.sectionIdx !== null
-          ? _readerSelState.sectionIdx
-          : _readerState.activeSection;
+          ? _readerSelState.sectionIdx : _readerState.activeSection;
         if (activeIdx != null && sections[activeIdx] && activeIdx !== 0) {
-          chunks.push(`[当前选中: ${sections[activeIdx].title || `Section ${activeIdx+1}`}]\n${(sections[activeIdx].text || "").slice(0, per)}`);
+          chunks.push(_qaCtxPart("[当前选中: "
+                                 + (sections[activeIdx].title || "Section " + (activeIdx + 1)) + "]",
+                                 "section", (sections[activeIdx].text || "").slice(0, per)));
         }
         if (sections.length > 1) {
           const last = sections[sections.length - 1];
           if (last !== sections[0] && (last.text || "").length > 200) {
-            chunks.push(`[末节: ${last.title || sections.length}] (结论)\n${(last.text || "").slice(0, per)}`);
+            chunks.push(_qaCtxPart("[末节: " + (last.title || sections.length) + "] (结论)",
+                                   "section", (last.text || "").slice(0, per)));
           }
         }
-        return chunks.join("\n\n---\n\n");
+        return _qaCtxParts(chunks, budget);
       }
+      // full
+      const per = Math.max(1500, Math.floor(budget / Math.min(sections.length, 8)));
+      return _qaCtxParts(sections.slice(0, 8).map((sec, i) =>
+        _qaCtxPart("[" + (sec.title || "Section " + (i + 1)) + "]", "section",
+                   (sec.text || "").slice(0, per))
+      ), budget);
+    }
 
-      // mode === "full"
-      const sections = _readerState.sections;
-      const per = Math.max(1500, Math.floor(scope.budget / Math.min(sections.length, 8)));
-      return sections.slice(0, 8).map((sec, i) =>
-        `[${sec.title || `Section ${i+1}`}]\n${(sec.text || "").slice(0, per)}`
-      ).join("\n\n---\n\n");
+    // 旧的字符串入口（护栏与外部调用都走它）
+    function _buildScopeContextRaw(scope) {
+      return _qaCtxJoin(_buildScopeContextParts(scope));
+    }
+
+    // -----------------------------------------------------------------------
+    // 「本次送给 AI 的上下文」**可视化**（2026-11-19）
+    //
+    // 用户原话：「继续做给 ai 上下文的优化和可视化，确保正常划线问问题，
+    //            ai 都能得到合适的上下文」。
+    //   → 上下文对不对，只有**看得见**才能判断。
+    //   → 折叠面板放在徽标行下面、答案上面：一眼看到「模型这次看到了什么」。
+    // -----------------------------------------------------------------------
+    function _renderQaContextBox(answerBody, parts, text) {
+      if (!answerBody || !document.createElement) return;
+      let box = answerBody.querySelector("[data-qa-context-box]");
+      if (!box) {
+        box = document.createElement("details");
+        box.setAttribute("data-qa-context-box", "1");
+        box.style.cssText = "margin:0 0 12px; padding:0; border:1px solid var(--card-border-subtle);"
+          + " border-radius:6px; background:var(--bg-canvas-subtle);";
+        box.innerHTML = '<summary data-qa-context-summary style="cursor:pointer; padding:6px 10px;'
+          + ' font-size:11px; color:var(--text-muted); user-select:none;"></summary>'
+          + '<div data-qa-context-parts style="padding:2px 10px 8px; display:flex;'
+          + ' flex-direction:column; gap:3px;"></div>'
+          + '<pre data-qa-context-text style="margin:0; padding:8px 10px; max-height:300px;'
+          + ' overflow:auto; white-space:pre-wrap; word-break:break-word;'
+          + ' font-size:11px; line-height:1.6; color:var(--text-main);'
+          + ' border-top:1px solid var(--card-border-subtle);"></pre>';
+        const stream = answerBody.querySelector("[data-stream-target]");
+        if (stream && stream.parentElement) stream.parentElement.insertBefore(box, stream);
+        else answerBody.appendChild(box);
+      }
+      const total = (text || "").length;
+      const list = (parts || []).filter(p => p && (p.text || p.label));
+      const summary = box.querySelector("[data-qa-context-summary]");
+      if (summary) {
+        summary.textContent = "🔍 本次送给 AI 的上下文 · " + total.toLocaleString()
+          + " 字 · " + list.length + " 段（点开看模型到底看到了什么）";
+      }
+      const listEl = box.querySelector("[data-qa-context-parts]");
+      if (listEl) {
+        listEl.innerHTML = "";
+        for (const p of list) {
+          const row = document.createElement("div");
+          row.style.cssText = "font-size:10.5px; color:var(--text-muted); line-height:1.5;";
+          row.textContent = "· " + (p.label || p.kind)
+            + (p.text ? "（" + p.text.length.toLocaleString() + " 字）" : "");
+          listEl.appendChild(row);
+        }
+      }
+      const pre = box.querySelector("[data-qa-context-text]");
+      // ⚠ 用 textContent 不用 innerHTML —— 上下文是论文正文，必须原样且安全。
+      if (pre) pre.textContent = text || "";
+    }
+
+    // 构造上下文（分段 + 最终文本）
+    //   ⚠ 「用户划选的那句」必须**在最前面**：实测 section 档里它落在 95.4% 处
+    //   → 模型第一眼看不到用户关心的那句 → 容易答偏。
+    function _buildScopeContextBundle(scope) {
+      const mode = (scope && scope.mode) || "mid";
+      let parts = _buildScopeContextParts(scope);
+      const selText = String(_readerSelState.text || "").trim();
+      const isHeading = !!_qaHeadingHit;
+      if (selText && !isHeading) {
+        const nSel = _normQaHeading(selText);
+        const nJoined = _normQaHeading(_qaCtxJoin(parts));
+        const at = nSel ? nJoined.indexOf(nSel) : -1;
+        const already = at >= 0;
+        const rel = already ? at / Math.max(1, nJoined.length) : 1;
+        // 已经在前 35% → 不重复；否则**前置**一份（几十字，成本极低）
+        if (!already || rel > 0.35) {
+          parts = [_qaCtxPart("【用户划选的片段（请围绕它回答；完整上下文见下）】",
+                              "selection", selText)].concat(parts);
+        }
+      }
+      const raw = _qaCtxJoin(parts);
+      const cap = _SCOPE_CAPS[mode] || 8000;
+      const limit = Math.min(cap, _MAX_CONTEXT_CHARS);
+      const text = _clipQaContext(raw, limit);
+      return { parts: parts, text: text };
     }
 
     // Same as _buildScopeContextRaw, but clamped to what the backend will
@@ -10491,11 +10783,8 @@
     // always reports the length that is really sent (and the request can
     // never 422 on surrounding_context).
     function _buildScopeContext(scope) {
-      const raw = _buildScopeContextRaw(scope) || "";
-      const cap = _SCOPE_CAPS[scope.mode] || 8000;
-      const limit = Math.min(cap, _MAX_CONTEXT_CHARS);
       // ⚠ 超预算时**头尾都保留**（原来只留头部 → 长章节的结论段直接丢了）。
-      return _clipQaContext(raw, limit);
+      return _buildScopeContextBundle(scope).text;
     }
 
     function triggerQAPreset(type) {
@@ -10721,7 +11010,10 @@
       } else {
         scope = await _routeQuestionScope(question, _currentQAPreset, _readerSelState.text || "");
       }
-      const surroundingContext = _buildScopeContext(scope);
+      const ctxBundle = _buildScopeContextBundle(scope);
+      const surroundingContext = ctxBundle.text;
+      // ⚠ 上下文**可视化**：折叠面板显示「这次送了什么、每一段多少字、原文长什么样」
+      _renderQaContextBox(answerBody, ctxBundle.parts, surroundingContext);
       // Surface the chosen scope to the user so the trade-off is visible.
       // They can always click a different preset to override the heuristic.
       const scopeBadge = answerBody && answerBody.querySelector("[data-qa-scope-badge]");
