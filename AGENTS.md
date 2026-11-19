@@ -4460,6 +4460,56 @@ btn.innerHTML = originalHTML;         // → 跑完恢复成它 → 按钮永久
 - **别用「固定像素位移」当拖动的判据** —— 要有阈值（3px），
   否则手抖一下也会被当成拖动（然后 click 被吞掉 → 用户点不动）。
 
+### 4.124 整篇问答的上下文也是「按顺序取前 N」—— 长论文后半部分照样丢（2026-11-19，25353 台）
+
+**症状**：用户让 AI 总结某一节，AI 回答「我的上下文里没有这一节，我只能猜」。
+用户判断：「是不是因为论文太长了，那个问题出现的位置是一篇长论文的后半部分」。
+
+**根因不在模型，在截断策略**。`/api/paper/explain_stream`（整篇问答）
+是这么拼上下文的：
+
+```python
+sections = req.sections[:20]
+for s in sections:
+    text = (s.get("text") or "")[:6000]
+    if total_chars + len(chunk) > 24000:
+        break          # ← 超预算就停，**后面全部丢掉**
+```
+
+前端同款：`_readerState.sections.slice(0, 20)`；
+后端 `ExplainRequest.sections` 的 `max_length=20` → 25 节直接 **422**。
+
+**实测（20 节 × 3000 字，问第 18 节）**：发出去的 prompt 里**只有前 6 节**，
+第 18 节根本不在；把同一节挪到第 3 位 → 它就出现了。
+→ **位置决定生死**，用户说的「长论文 + 后半部分」完全正确。
+
+**⚠️ 与 30461 台那条路径的分工（别改错地方）**：
+- **划词答疑**（`explain_selection_stream`）→ 30461 台已重做成
+  scope 机制（term/mid/section/wide/full + 真小节定位 + 分段结构），
+  **不要动**（§4.107~4.118）。
+- **整篇问答**（`explain_stream`）→ 30461 台**没碰**，就是本节修的。
+
+**修法**（新增 `microbench/qa_context.py` 的 `pick_context`）：
+1. **焦点节永远保留** —— 用户当前所在/正在问的那一节（前端给 `focus_index`）；
+2. **问题命中的节优先** —— 「第 N 节 / Chapter N / Section IV」按序号匹配
+   （阿拉伯/中文/罗马都认），另加「列表第 N 个」兜底；
+3. 其余按原顺序补，预算用完为止；
+4. **单节超长 → 头尾各取一半**（原来 `[:6000]` 是头截断，长节的结论会被切掉）；
+5. 装不进去的节**在提问里明说**，让模型知道边界而不是默默猜；
+6. `ExplainRequest/CrossQARequest.sections` 上限 20 → 100
+   （该限的是**字符预算**，不是节数）。
+
+**护栏**：`tests/test_qa_context.py`（21 条）+ `microbench/_test_focus_context.js`
+（node 抽 index.html 真代码跑 `_buildExplainPayload`）。
+**反向验证**：把 `pick_context` 退回旧的 break 逻辑 → 端点级与纯函数级全部变红；
+把前端真代码改坏（退回 slice(0,20) / focus_index 写死 null）→ node 护栏变红。
+
+> 教训：**「按顺序取前 N」和「按需取」是两种完全不同的上下文策略**。
+> 短文档看不出差别，长文档上「用户问的那一节」能不能被读到，
+> 完全取决于截断是不是顺序的。
+> 排查这类问题不要猜 —— **把真正发出去的 prompt 抓下来看**（monkeypatch 掉
+> LLM 调用即可），一眼就能看到哪一节在、哪一节不在。
+
 ## 5. 通用教训（从上面提炼的原则）
 1. **先定位根因，再改代码。** 拿不准就在可疑位置加 `console.log` 探针 + 用浏览器的
    `query(kind=console)` 看，比盯着代码猜快得多。

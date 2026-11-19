@@ -71,6 +71,7 @@ from .plot_compare import (
 )
 from .paper_text import (fetch_full_text, split_into_sections,
                           extract_text_from_pdf, extract_page_text_with_glyphs)
+from .qa_context import pick_context  # 整篇问答的上下文装配：按需取节，不按顺序取前 N
 from . import glyphs as glyphs_mod
 from . import pdf_cache
 from . import paperid
@@ -1124,8 +1125,17 @@ class OpenVaultPdfRequest(BaseModel):
 
 class ExplainRequest(BaseModel):
     question: str = Field(..., min_length=2, max_length=500)
-    sections: list = Field(..., min_length=1, max_length=20,
+    # ⚠️ 上限 20 → 100（2026-11-19，25353 台）：长论文常常 20+ 节。
+    # 原来这个 20 是为了躲「sections 最多 20」的硬上限，结果**后半部分的节
+    # 根本送不进来**（实测 25 节直接 422，前端为了不报错就 .slice(0,20)
+    # 静默丢弃 —— 正好把用户正在问的那一节丢掉了）。
+    # 真正该限的是**上下文总字符数**（见 qa_context.QA_CONTEXT_BUDGET），
+    # 不是节数 —— 节数多了可以按需挑，挑不中的不必进上下文。
+    sections: list = Field(..., min_length=1, max_length=100,
                             description="paper sections [{title, text}, ...]")
+    focus_index: Optional[int] = Field(default=None, ge=0, le=999,
+                                       description="用户当前所在/正在问的那一节的下标 —— "
+                                                   "该节必须出现在上下文里")
     paper_title: Optional[str] = Field(default="", max_length=300)
     model: Optional[str] = Field(default="", max_length=64,
                                  description="用哪个模型回答：'' = 跟随默认, "
@@ -3633,7 +3643,10 @@ CROSS_QA_SYSTEM_PROMPT = """你是学术论文跨章节综合分析助手, 帮�
 class CrossQARequest(BaseModel):
     question: str = Field(..., min_length=2, max_length=500)
     # Accept either specific section indices OR all sections from the paper
-    sections: list = Field(..., min_length=2, max_length=20,
+    # ⚠️ 上限 20 → 100（2026-11-19，25353 台）：长论文 20+ 节时，20 节之外
+    # 的部分送不进来（前端为了不报错就 .slice(0,20) 静默丢弃）。
+    # 该限的是**每节的字符预算**（per_section_budget），不是节数。
+    sections: list = Field(..., min_length=2, max_length=100,
                            description="至少 2 个章节 [{section, title, text}, ...]")
     selected_indices: Optional[list[int]] = Field(default=None,
                                                    description="用户勾选的章节索引列表; 为空则用全部")
@@ -3928,23 +3941,36 @@ async def api_explain_stream(req: ExplainRequest, request: Request):
             detail="AI 解读需要 LLM 配置。请在 .env 中设置 LLM_API_KEY。",
         )
 
-    sections = req.sections[:20]
-    context_parts = []
-    total_chars = 0
-    for s in sections:
-        title = s.get("title", s.get("section", "?"))
-        text = (s.get("text") or "")[:6000]
-        chunk = f"[{s.get('section', '?')}] {title}\n{text}"
-        if total_chars + len(chunk) > 24000:
-            break
-        context_parts.append(chunk)
-        total_chars += len(chunk)
-    context = "\n\n---\n\n".join(context_parts)
+    # ⚠️ 上下文装配（2026-11-19，25353 台重写）：原来是
+    #     for s in sections: ... if total > 24000: break
+    # ——「按论文顺序取前 N 节」。长论文（实测 20 节 / 每节 3000 字）问
+    # **第 18 节** 时，发出去的 prompt 里只有**前 6 节**，那一节根本不在 →
+    # 模型只能回答「我的上下文里没有这一节，我只能猜」。
+    # 现在改成 qa_context.pick_context：焦点节（用户当前所在的那一节）永远保留，
+    # 问题命中的节优先，其余按顺序补，单节超长则头尾各取一半。
+    #
+    # ⚠️ 划词答疑那条路径（explain_selection_stream）**不用这个** ——
+    #   那边有更细的 scope 机制（term/mid/section/wide/full，见 QA_SCOPE_CAPS）。
+    context, ctx_meta = pick_context(
+        req.sections,
+        question=req.question,
+        focus_index=req.focus_index,
+    )
     paper_label = req.paper_title or "未命名论文"
+    dropped_note = ""
+    if ctx_meta.get("dropped"):
+        labels = ctx_meta.get("labels") or {}
+        names = [labels.get(i) or f"第 {i + 1} 节" for i in ctx_meta["dropped"][:12]]
+        dropped_note = (
+            f"\n（论文共 {len(req.sections)} 节，本篇上下文装了 "
+            f"{len(ctx_meta['included'])} 节。未装入的节：{'、'.join(names)}"
+            f"{' …' if len(ctx_meta['dropped']) > 12 else ''}。"
+            f"若你要问的正是未装入的那节，请把提问焦点移到那一节，或直接在那里划词提问。）"
+        )
     user_msg = (
         f"论文标题: {paper_label}\n\n"
         f"--- 论文内容 (节选) ---\n{context}\n--- 论文内容结束 ---\n\n"
-        f"用户问题: {req.question}"
+        f"用户问题: {req.question}{dropped_note}"
     )
 
     async def event_gen():
