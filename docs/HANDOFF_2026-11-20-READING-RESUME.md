@@ -124,7 +124,7 @@ trans: { scrollerId: "pdf-translations-container", listId: "pdf-translations-lis
 
 > ⚠ **没有新增「读源码文本当护栏」**（元护栏上限仍是 131）。
 
-### 3.2 真机端到端（`tmp/live_readpos_test.py`，不在仓库）
+### 3.2 真机端到端（浏览器）：`microbench/_live_readpos_test.py`（桌面真应用）
 
 真应用 `http://127.0.0.1:5000/` + 真论文（JACERS 综述 8 页）+ 真 PDF.js：
 
@@ -144,6 +144,41 @@ trans: { scrollerId: "pdf-translations-container", listId: "pdf-translations-lis
 
 ⚠ 实测脚本**拦截了 `/api/paper/translate_page`** —— 不烧用户 LLM 额度；
 也**没碰 `/api/sync*`** —— 不写坚果云共享目录。
+
+### 3.3 **桌面端真应用**验收（`microbench/_live_readpos_test.py`）
+
+浏览器页面刷新 ≠ 关掉应用。这一轮补了**真应用**的验收
+（`desktop.py` → pywebview → Edge WebView2）：
+
+| 与浏览器的差别 | 真应用 |
+|---|---|
+| localStorage 位置 | `logs/webview_profile`（WebView2 用户目录） |
+| 启动 URL | `?v=<随机 hex>`，**没有 `open_pdf`** → 必须从「仓库论文库」下拉框里点开 |
+| 服务生命周期 | 应用自己起、自己停（跟你双击快捷方式一致） |
+
+驱动方式：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`
+→ Playwright `connect_over_cdp` 接进**真窗口**操作（不另开浏览器）。
+
+实测结果（**0 失败项**）：
+
+```
+① 第一次启动真应用（--open 直开这篇）→ 滚到第 5 页页内 100px
+   ✓ 进度写进了真应用的 localStorage   [page=5 delta=-100 ratio=0.13]
+② 向应用窗口发 WM_CLOSE（模拟点 X 关窗）
+   ✓ 应用进程确实退出了                [5.0s 后退出]
+③ 第二次启动真应用（**不带 --open**）→ 在「仓库论文库」下拉框里选中这篇 → onchange
+   ✓ 下拉框里能选中这篇论文并触发打开   [PICKED]
+   ✓ 重开后左栏确实滚起来了              [scrollTop=3307]
+   ✓ 重开后回到**同一行**（页内误差 ≤ 3px）[期望 100 实际 100]
+   ✓ 重开后进度记录仍在（没被清掉）
+```
+
+**像素级佐证**：把「关闭前」的画面整体平移 N 个设备像素后与「重开后」比对 ——
+**最佳位移 = 0 设备像素、像素差异率 0.000%** → 两张截图**完全一致**，就是同一屏同一行。
+
+⚠ 脚本**只杀属于本应用 profile 的 WebView2 进程** ——
+这台机器上还有 **Windows 自己的** WebView2 组件（通知中心/小组件），
+一刀切 `taskkill /IM msedgewebview2.exe` 会把系统组件一起打死。
 
 ---
 
@@ -178,6 +213,9 @@ python microbench/_test_readpos_resume.py
 python -m pytest tests -q -m "not slow"
 python -m microbench._test_regressions
 
-# 真机端到端（脚本在 tmp，不在仓库）
-python 'C:\Users\30461\.minimax\tmp\live_readpos_test.py'
+# 真机端到端（浏览器 + 桌面真应用，脚本在仓库里）
+python microbench/_live_readpos_test.py
+```
+
+> ⚠ 这条脚本会**真的起一个应用窗口**并**关掉它**，别在用户正在用的时候跑。
 ```
