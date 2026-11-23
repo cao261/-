@@ -194,14 +194,17 @@
 ## 7. 验收
 
 ```
-python -m pytest tests -q -m "not slow"     # 1642 passed / 1 skipped / 12 deselected（11m30s，全绿）
+python -m pytest tests -q -m "not slow"     # 1654 passed / 1 skipped / 12 deselected（全绿）
 python microbench/_test_readpos_resume.py   # 24 PASS / 0 FAIL，变异 13/13
 python microbench/_test_qa_refine_payload.py# 14 PASS / 0 FAIL，变异 7/7
 python microbench/_test_tablet_export.py    # 48 PASS / 0 FAIL
 ```
 
-（基线是 **1629 passed / 1 skipped** → 现在 **1642 passed / 1 skipped**，
-+13 条全是这一轮新增的行为级护栏。）
+（基线是 **1629 passed / 1 skipped** → 现在 **1654 passed / 1 skipped**：
+多的 25 条 = 新增的 13 条行为级护栏 + 12 条参数化行尾护栏
+—— `tests/test_source_hygiene.py` 的 `_source_files()` 扫的是 **git 已跟踪**的文件，
+提交后新文件变成已跟踪 → 每个多覆盖 3 条（NUL 字节 / BOM / 行尾）。
+最后这次是 **pre-commit 钩子自己跑的**（项目自己的提交闸门，见 `.git/hooks/pre-commit`）。）
 
 真机（`http://127.0.0.1:5000`，用最终代码重启后复验）：
 - `GET /api/paper/outline` × 27 篇 → **27/27 HTTP 200**
