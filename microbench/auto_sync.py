@@ -387,7 +387,22 @@ def main() -> int:
     local = local.strip() if rc == 0 else ""
     log("本地 %s  远端 %s" % (head_short(), remote[:7]))
 
-    if not remote or remote == local:
+    # ⚠⚠ 2026-11-22 独立审查修：**读不到 origin/main ≠ 「已是最新」**。
+    #   旧写法把「remote 是空串」和「remote == local」合成了一条判据，
+    #   而 `git rev-parse origin/main` **失败时 remote 就是空串**
+    #   （远端没有 main 分支 / fetch 没建出这个 ref / 浅克隆 / refspec 写错）
+    #   → 旧实现报「没有新提交，无需同步」+ ok=True
+    #   → **同步其实根本没在工作**：对方设备的提交永远合不过来，
+    #     而日志说的是「一切正常」—— 这是最坏的失败方式（静默）。
+    if not remote:
+        result["action"] = "remote_ref_missing"
+        result["messages"].append(
+            "读不到 origin/main（远端可能没有 main 分支 / fetch 没建出这个 ref）"
+            "—— 不能当成「已是最新」，本轮不做同步")
+        log("!! 读不到 origin/main —— 不能当成「已是最新」，本轮不同步")
+        return finish()
+
+    if remote == local:
         result["action"] = "up_to_date"
         result["ok"] = True       # 「没有新东西」是**正常结束**，不是失败
         result["messages"].append("没有新提交，无需同步")

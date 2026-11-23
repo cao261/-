@@ -89,6 +89,11 @@ FUNCTIONS = [
     "_restoreSectionReadPos",
     "_readingProgress",
     "_applyReadingProgress",
+    # ---- 缩放 / 重排这条路上的位置处理（2026-11-22 独立审查加）----
+    "_readPosTargetFor",
+    "setReaderZoom",
+    "_pdfIsRelayoutBusy",
+    "_pdfRelayoutIfNeeded",
 ]
 DECLS = [
     "LS_READPOS_KEY",
@@ -100,6 +105,8 @@ DECLS = [
     "_readPosCurrent",
     "_readPosUserMoved",
     "_readPosExpected",
+    "_pdfResizeTimer",
+    "_pdfRelayoutBusyCount",
 ]
 
 
@@ -153,6 +160,22 @@ var __toasts = [];
 function showToast(msg) {{ __toasts.push(msg); }}
 function updateZoomLabel() {{}}
 function renderReader() {{}}
+function _persistLocalState() {{}}
+function _dedupePdfBlocks() {{}}
+
+// 探针桩：真函数 `loadPdfDualColumn` 太重（要 PDF.js），
+// 这里只替掉它「决定回到哪儿」那一步 —— 而**位置算法本身是真代码**
+// （`_readPosTargetFor`），所以探针测的是真逻辑，不是复刻。
+var __zoomTarget = null;
+function loadPdfDualColumn(opts) {{
+  var liveLeft = (opts && opts.liveAnchor && opts.liveAnchor.left)
+      || _readPosAnchor(_READPOS_PANES.pdf);
+  var liveRight = (opts && opts.liveAnchor && opts.liveAnchor.right)
+      || _readPosAnchor(_READPOS_PANES.trans);
+  __zoomTarget = _readPosTargetFor(liveLeft, liveRight,
+      (_pdfState && _pdfState.relativePath) || '');
+  return Promise.resolve();
+}}
 
 var _pdfZoom = 1.0;
 var _readerMode = "pdf";
@@ -160,6 +183,8 @@ var _pdfState = {{
   paperId: "probe_paper_1",
   relativePath: "01_Literature/probe.pdf",
   paperTitle: "探针论文",
+  pdfDoc: {{}},
+  rendering: {{generation: 0, cancelled: false}},
 }};
 var _readerState = {{
   pdfPath: "01_Literature/probe.pdf",
@@ -282,6 +307,88 @@ function run() {{
           jumped > 0, 'scrollTop=' + Math.round(jumped));
     check('跳页后有「已跳到第 3 页」的提示', __toasts.length > 0, J(__toasts));
 
+    // ================= ⑧ 关应用时不得把好位置覆盖成 null =================
+    // 真实顺序：读完 → 点「✕ 关闭阅读器」→ 关应用
+    //   → beforeunload / pagehide 触发采集 → 此刻两栏 display:none
+    //   → clientHeight 为 0 → _readPosAnchor 恒返回 null
+    //   → 旧实现整条 store[key]=rec → **刚存好的位置被覆盖成 null**
+    //   → 下次打开既不回位、也不提示（静默降级，§4.96 同型复发）
+    // ⑥ 清过译文块 → 先重新造出来，再采一次「好位置」
+    buildBlocks('pdf-translations-list', 'pdf-translation-block', 'pdf-trans-block-', 10, 200);
+    leftPane.scrollTop = 0;
+    var d3b = document.getElementById('pdf-page-block-3').getBoundingClientRect().top
+              - leftPane.getBoundingClientRect().top;
+    leftPane.scrollTop += d3b + 80;
+    rightPane.scrollTop = 300;
+    _captureReadPos();
+    var key2 = _readPosKey();
+    // 模拟「阅读器已关闭」
+    leftPane.style.display = 'none';
+    rightPane.style.display = 'none';
+    _captureReadPos();
+    var kept2 = _readPosStore()[key2];
+    check('阅读器关掉后再采集，**不得**把已存的位置覆盖成 null（左栏）',
+          !!kept2 && !!kept2.left && kept2.left.page === 3,
+          J(kept2 && kept2.left));
+    check('阅读器关掉后再采集，右栏位置也不该丢',
+          !!kept2 && !!kept2.right && kept2.right.page === 2,
+          J(kept2 && kept2.right));
+    check('阅读器关掉后再采集，顶层页码也不该退化成 0',
+          !!kept2 && kept2.page === 3, J(kept2 && kept2.page));
+    // 复原（后面的 ⑦ 要用）
+    leftPane.style.display = '';
+    rightPane.style.display = '';
+
+    // ================= ⑨ 缩放 / 重排不许把阅读位置弄丢 =================
+    // 真实顺序：滚到第 3 页 → 立刻点缩放（滚动落盘是 **400ms 防抖**，还没落盘）
+    //   → 缩放会先把两栏 DOM **全清空**（位置不抓就没了）
+    //   → 重排时再去 DOM 抓锚点**必然抓不到** → 只能回落到 localStorage
+    //   → 若没在清空前落盘 → 退回更早的那条 → **阅读位置跳页**
+    //   ⚠ 落盘时还必须带着**缩放前**的 zoom：比例换算靠它判断「缩放变了没有」
+    //     （§4.126）；若记的是新 zoom → 恢复时当成没变 → 直接套旧 px → 位置偏。
+    leftPane.scrollTop = 0;
+    rightPane.scrollTop = 0;
+    _captureReadPos();                       // store 里现在是「第 1 页」（更早的那条落盘）
+    var b3z = document.getElementById('pdf-page-block-3');
+    var d3z = b3z.getBoundingClientRect().top - leftPane.getBoundingClientRect().top;
+    leftPane.scrollTop += d3z + 80;          // 滚到第 3 页 + 80px（**不等** 400ms 防抖）
+    var zoomBefore = _pdfZoom;
+    __zoomTarget = null;
+    setReaderZoom(0.1);
+    await sleep(250);                        // 等 setTimeout(80) 里的重排桩跑完
+    var storeAfterZoom = _readPosStore()[_readPosKey()];
+    check('缩放前把当前位置落盘了（左栏第 3 页，不是更早的第 1 页）',
+          !!storeAfterZoom && !!storeAfterZoom.left && storeAfterZoom.left.page === 3,
+          J(storeAfterZoom && storeAfterZoom.left));
+    check('缩放前落盘的记录带着**缩放前**的 zoom（比例换算靠它判断）',
+          !!storeAfterZoom && Math.abs(storeAfterZoom.zoom - zoomBefore) < 0.001,
+          '记录 zoom=' + (storeAfterZoom && storeAfterZoom.zoom) + ' 缩放前=' + zoomBefore);
+    check('重排算出的回位目标是第 3 页（缩放不丢阅读位置）',
+          !!__zoomTarget && !!__zoomTarget.left && __zoomTarget.left.page === 3,
+          J(__zoomTarget && __zoomTarget.left));
+
+    // ---- 同一类问题：窗口宽度变化触发的重排 ----
+    leftList.innerHTML = '';
+    rightList.innerHTML = '';
+    buildBlocks('pdf-pages-list', 'pdf-page-block', 'pdf-page-block-', 10, 300);
+    buildBlocks('pdf-translations-list', 'pdf-translation-block', 'pdf-trans-block-', 10, 200);
+    leftPane.scrollTop = 0;
+    rightPane.scrollTop = 0;
+    _captureReadPos();                       // 更早的那条落盘 = 第 1 页
+    var b3r = document.getElementById('pdf-page-block-3');
+    var d3r = b3r.getBoundingClientRect().top - leftPane.getBoundingClientRect().top;
+    leftPane.scrollTop += d3r + 80;
+    __zoomTarget = null;
+    _pdfRelayoutIfNeeded(true);
+    await sleep(450);                        // 等 setTimeout(250) 里的重排桩跑完
+    var storeAfterRelayout = _readPosStore()[_readPosKey()];
+    check('重排前把当前位置落盘了（左栏第 3 页，不是更早的第 1 页）',
+          !!storeAfterRelayout && !!storeAfterRelayout.left && storeAfterRelayout.left.page === 3,
+          J(storeAfterRelayout && storeAfterRelayout.left));
+    check('重排算出的回位目标是第 3 页（窗口变化不丢阅读位置）',
+          !!__zoomTarget && !!__zoomTarget.left && __zoomTarget.left.page === 3,
+          J(__zoomTarget && __zoomTarget.left));
+
     // ================= ⑦ 存储上限 =================
     var big = {{}};
     for (var k = 0; k < 260; k++) big['p' + k] = {{updated_at: '2020-01-01T00:00:' + String(k % 60).padStart(2, '0') + '.000Z'}};
@@ -358,6 +465,18 @@ MUTATIONS = [
     ("跨设备跳页又只找译文块（原文页跳不过去）",
      [("        if (document.getElementById(pdfPane.idPrefix + prog.page)) {",
        "        if (false) {")]),
+    ("关应用时把已存的位置覆盖成 null（阅读器一关，续读位置就没了）",
+     [("      if (!left && prev && prev.left) left = prev.left;",
+       "      if (false) left = prev.left;")]),
+    ("缩放前不落盘（DOM 清空后才找位置 → 位置退回更早的那条 → 跳页）",
+     [('      try { _captureReadPos(); } catch (e) { console.warn("[readpos] 缩放前保存失败", e); }\n', "")]),
+    ("缩放前的落盘挪到了改 zoom 之后（比例换算失效 → 位置偏）",
+     [('      try { _captureReadPos(); } catch (e) { console.warn("[readpos] 缩放前保存失败", e); }\n', ''),
+      ("      _pdfZoom = Math.round(_pdfZoom * 100) / 100; // 2 decimals\n",
+       "      _pdfZoom = Math.round(_pdfZoom * 100) / 100; // 2 decimals\n"
+       "      try { _captureReadPos(); } catch (e) {}\n")]),
+    ("重排前不落盘（窗口宽度变了 → 位置退回更早的那条 → 跳页）",
+     [('        try { _captureReadPos(); } catch (e) { console.warn("[readpos] 重排前保存失败", e); }\n', "")]),
 ]
 
 

@@ -27,6 +27,60 @@ def check(cond, label):
     print(f"  {'PASS' if cond else 'FAIL'}  {label}")
 
 
+def hostile_payload_probe():
+    """用**真浏览器**验证：恶意载荷放进数据块后，后续脚本仍然执行。
+
+    机制（HTML 规范 script data state 家族）：
+      载荷里出现 `<!--` 且**紧跟 `<`** → 解析器进入
+      *script data double escape start* 状态 → 数据块的 `</script>`
+      **永远不闭合** → 后面内联的 app.js / KaTeX / PDF.js 整段被吞掉
+      → **平板工作台 / 离线阅读版整个报废**（打开只有一堆 JSON 文本）。
+
+    判据 = 后续 `<script>` 有没有真的执行（它会改 document.title）。
+    ⚠ 不能用「字符串出现在 DOM 里」当判据 —— --dump-dom 本来就含 script 原文。
+    """
+    sys.path.insert(0, str(REPO))
+    try:
+        from microbench import _headless_browser as hb
+        from microbench.export_offline import _escape_json_for_script
+    except Exception as e:  # pragma: no cover
+        return None, "无法导入导出模块/浏览器工具: %s" % e
+
+    browser = hb.find_playwright_chromium() or hb.find_system_browser()
+    if not browser:
+        return None, "找不到 Edge/Chrome（跳过浏览器实测）"
+
+    tpl = ("<!DOCTYPE html><html><head><title>NOT_EXECUTED</title></head><body>\n"
+           '<script type="application/json" id="d">{payload}</script>\n'
+           "<script>document.title = \"EXECUTED\";</script>\n</body></html>")
+    cases = [
+        ("<!-- 紧跟 <script>（已实测会报废的原始载荷）", "<!--<script>"),
+        ("<!-- 紧跟 <br>", "<!--<br>"),
+        ("<!-- 紧跟 <math>", "<!--<math>"),
+        ("正常正文", "普通正文"),
+    ]
+    out = []
+    with tempfile.TemporaryDirectory() as td:
+        for i, (label, hostile) in enumerate(cases):
+            payload = _escape_json_for_script(json.dumps({"x": hostile},
+                                                          ensure_ascii=False))
+            p = Path(td) / ("case_%02d.html" % i)
+            p.write_text(tpl.format(payload=payload), encoding="utf-8")
+            try:
+                dom = hb.dump_dom(p, browser=browser, virtual_time_budget=1200,
+                                  timeout=60)
+            except Exception as e:
+                out.append((label, False, "渲染失败: %s" % e))
+                continue
+            title = ""
+            k = dom.find("<title>")
+            if k >= 0:
+                j = dom.find("</title>", k)
+                title = dom[k + 7:j].strip()
+            out.append((label, title == "EXECUTED", title))
+    return out, None
+
+
 def main() -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -116,7 +170,25 @@ def main() -> int:
         return 1
     raw = m.group(1)
     check("</" not in raw.replace("<\\/", ""), "数据块里没有会提前关闭 script 的 </")
+    # ⚠⚠ 光没有 `</` 不够：`<!--` **紧跟 `<`** 会让解析器进入
+    #   script-data double-escape 状态 → 数据块的 `</script>` 永不闭合
+    #   → 后面内联的 app.js 全被吞掉 → 整个平板工作台报废。
+    #   → 数据块里必须**一个裸的 `<` 都没有**（`<` 全部写成 `\u003c`）。
+    check("<" not in raw,
+          "数据块里没有任何裸的 <（`<!--<` 会让整个应用报废）")
     payload = json.loads(raw.replace("<\\/", "</"))
+    # 转义必须**无损**：parse 回来要逐字相同（否则用户看到的正文被改了）
+    sys.path.insert(0, str(REPO))
+    try:
+        from microbench.export_offline import _escape_json_for_script
+        _probe = json.dumps({"x": "a<b><!--<script><!--"}, ensure_ascii=False)
+        _rt = json.loads(_escape_json_for_script(_probe))
+        check(_rt == {"x": "a<b><!--<script><!--"},
+              "转义是无损的（parse 回来逐字相同，正文一个字节都没变）")
+        check("<" not in _escape_json_for_script(_probe),
+              "转义后载荷里不再有裸的 <")
+    except Exception as e:
+        check(False, "转义函数不可用: %s" % e)
     notes = payload["notes"]
     check(len(notes) >= 30, f"导出了 {len(notes)} 篇笔记")
     check(all(n.get("id") for n in notes), "每篇都有 id")
@@ -137,6 +209,14 @@ def main() -> int:
     bad = [n["rel"] for n in notes
            for pid in (n.get("pdfs") or []) if pid not in pdfs]
     check(not bad, f"关联指向的都是清单里的 PDF (坏链 {len(bad)})")
+
+    print("\n[4c] 恶意载荷不得让整个应用报废（真浏览器实测）")
+    probe_rows, probe_err = hostile_payload_probe()
+    if probe_err:
+        print(f"  SKIP  {probe_err}")
+    else:
+        for label, executed, detail in probe_rows:
+            check(executed, f"恶意载荷下后续脚本仍执行: {label}  [{detail}]")
 
     print("\n[5] 内联的 JS 必须语法正确 (node --check)")
     blocks = re.findall(r"<script>\n(.*?)\n</script>", doc, re.S)

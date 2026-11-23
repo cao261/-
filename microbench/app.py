@@ -2393,7 +2393,7 @@ async def api_formula_image(
 
 
 @app.get("/api/vault/file")
-async def api_vault_file(
+def api_vault_file(
     relative_path: str = Query(..., min_length=3, max_length=500,
                                 description="相对 BASE_DIR 的 .md / .txt 路径"),
 ):
@@ -2442,7 +2442,7 @@ async def api_vault_file(
 
 
 @app.delete("/api/vault/file")
-async def api_vault_delete_file(
+def api_vault_delete_file(
     relative_path: str = Query(..., min_length=3, max_length=500,
                                description="相对 BASE_DIR 的 .md / .txt 路径"),
 ):
@@ -2517,7 +2517,7 @@ async def api_vault_delete_file(
 
 
 @app.post("/api/vault/reveal")
-async def api_vault_reveal(
+def api_vault_reveal(
     relative_path: str = Query(..., min_length=3, max_length=500,
                                description="相对 BASE_DIR 的路径"),
 ):
@@ -2763,8 +2763,11 @@ async def api_upload_pdf(
     save_to = _safe_path(target_dir, pdf_name)
     # ⚠ tmp + os.replace —— 直接 write_bytes 的话，写到一半被坚果云上传，
     #   另一台设备会拿到半截 PDF；而同名重复上传还会**静默覆盖**已有那篇。
+    # ⚠⚠ 写盘是**同步阻塞 I/O**，而且落点可能在坚果云 junction 里
+    #   （40MB 写进云同步目录可能要好几秒）→ 绝不能占着事件循环
+    #   （AGENTS §4.58 同型：无关请求从 15ms 变成秒级）。
     _tmp_pdf = save_to.with_suffix(".pdf.tmp")
-    _tmp_pdf.write_bytes(pdf_bytes)
+    await asyncio.to_thread(_tmp_pdf.write_bytes, pdf_bytes)
     os.replace(_tmp_pdf, save_to)
     pdf_saved_path = str(save_to.relative_to(BASE_DIR)).replace("\\", "/")
 
@@ -3814,7 +3817,7 @@ class ClassifyQAScopeRequest(BaseModel):
 async def api_classify_qa_scope(req: ClassifyQAScopeRequest):
     """
     Two-stage QA flow's stage 1: route a selection-QA request to the right
-    context scope (term / mid / wide / full). Uses a small LLM call with
+    context scope (term / mid / section / wide / full). Uses a small LLM call with
     json_mode so the answer is parseable; falls back to keyword heuristic
     on any parse error or LLM failure so the main QA flow never blocks.
     """
@@ -3830,7 +3833,7 @@ async def api_classify_qa_scope(req: ClassifyQAScopeRequest):
         f"【用户划选片段】:\n```text\n{req.selected_text.strip()[:2000]}\n```\n\n"
         f"【用户提问】:\n{req.question.strip()}\n\n"
         + (f"【UI preset 提示 (非强制)】: {preset_hint}\n" if preset_hint else "")
-        + "\n请按 system prompt 中的 4 档选择最合适的 mode,只返回 JSON。"
+        + "\n请按 system prompt 中的 %d 档选择最合适的 mode,只返回 JSON。" % len(QA_SCOPE_MODES)
     )
 
     try:
@@ -5327,6 +5330,26 @@ def _quarantine_corrupt(path: Path, reason: str) -> str:
         return f"文件内容损坏，且隔离失败（原文件仍在原处）: {path.name} ({reason})"
 
 
+def _path_is_shared(path: Path) -> bool:
+    """这个文件是不是在**跨设备共享**的同步根里（坚果云共享目录）。
+
+    ⚠⚠ 共享目录里的文件是**两台设备共用**的 → 改名隔离（`.corrupt-<stamp>`）
+      会把文件从共享根里挪走：
+        · 对方设备同步时看不到这个文件 → 只存在于对方的那几条数据丢失；
+        · 文件名从共享根消失 → 之后谁再保存都当成「新建」
+          → 合并基数变空 → 磁盘上其它内容被整份抹掉。
+      这正是本文件 6629 那条注释写着的规则 ——
+      「共享目录里的文件**不能**用改名隔离（会动到另一台设备的数据）」。
+      → 共享路径**只报错，一个字节都不动**。
+    """
+    try:
+        shared = Path(_sync_root()).resolve()
+        Path(path).resolve().relative_to(shared)
+        return True
+    except (ValueError, OSError, TypeError):
+        return False
+
+
 def _read_json_or_quarantine(path: Path) -> Optional[dict]:
     """读 JSON；**损坏的文件改名隔离并报错**，不当成"没有"。
 
@@ -5350,6 +5373,25 @@ def _read_json_or_quarantine(path: Path) -> Optional[dict]:
         * **文件刚好不存在**（exists 与 read 之间被删）→ 当成「没有旧值」，
           不是损坏。
     """
+    def _corrupt_msg(reason: str) -> str:
+        """内容损坏时的处理。
+
+        ⚠⚠ **共享目录里的文件只报错，绝不改名**（2026-11-22 独立审查实测复现）：
+          改名隔离会把文件从**两台设备共用**的坚果云目录里挪走 →
+            ① 对方同步时看不到这个文件 → 只存在于对方的数据丢失；
+            ② 文件名从共享根消失 → 之后谁再保存都当成「新建」
+               → 合并基数变空 → 磁盘上其它内容被整份抹掉。
+          而本文件自己 6629 那条注释写的就是这条规则 ——
+          拉取路径遵守了，保存/删除路径却违反。
+          → 规则集中在这里：**所有**读路径（批注保存/删除、files 清单…）
+            都自动受保护，不靠每个调用点记得传对 reader。
+        """
+        if _path_is_shared(path):
+            return (f"共享目录里的 {path.name} 内容损坏（{reason}）。"
+                    f"已原样保留：未改名、未覆盖；"
+                    f"请等坚果云同步正常后重试")
+        return _quarantine_corrupt(path, reason)
+
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -5358,7 +5400,7 @@ def _read_json_or_quarantine(path: Path) -> Optional[dict]:
         return None
     except UnicodeDecodeError as e:
         # 字节层面就不是合法 UTF-8 —— 这才是真·内容损坏
-        msg = _quarantine_corrupt(path, f"不是合法的 UTF-8: {e}")
+        msg = _corrupt_msg(f"不是合法的 UTF-8: {e}")
         print(f"[microbench] {msg}", file=sys.stderr)
         raise ValueError(msg) from e
     except OSError as e:
@@ -5372,7 +5414,7 @@ def _read_json_or_quarantine(path: Path) -> Optional[dict]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        msg = _quarantine_corrupt(path, f"JSON 解析失败: {e}")
+        msg = _corrupt_msg(f"JSON 解析失败: {e}")
         print(f"[microbench] {msg}", file=sys.stderr)
         raise ValueError(msg) from e
 
@@ -5380,7 +5422,7 @@ def _read_json_or_quarantine(path: Path) -> Optional[dict]:
     # 按 dict 合并，`.get()` 会抛 AttributeError；更糟的是 `or {}` 会把
     # 空数组悄悄当成"没有旧值" → 下一次写回清空数据。一并按损坏隔离。
     if not isinstance(data, dict):
-        msg = _quarantine_corrupt(path, f"顶层必须是对象，实际是 {type(data).__name__}")
+        msg = _corrupt_msg(f"顶层必须是对象，实际是 {type(data).__name__}")
         print(f"[microbench] {msg}", file=sys.stderr)
         raise ValueError(msg)
 
@@ -5573,7 +5615,7 @@ def api_pdf_snapshot_save(req: SnapshotSaveRequest):
 
 
 @app.delete("/api/pdf/snapshot/delete")
-async def api_pdf_snapshot_delete(
+def api_pdf_snapshot_delete(
     paper_id: str = Query(..., min_length=3, max_length=128),
 ):
     """Delete one snapshot file. Idempotent (returns success even if missing)."""
@@ -5983,13 +6025,169 @@ def _vault_pdfs() -> list:
 
 
 def _write_file_meta(safe: str, meta: dict) -> None:
+    """files/ 清单的**低层原子写**（整份覆盖）。
+
+    ⚠⚠ **生产写路径一律用 `_cas_update_file_meta`**（乐观 CAS + 字段合并）：
+       共享清单在坚果云同步根里、两台设备都写，
+       「读 → 整份覆盖写回」会把对方刚写的 deleted/propagate 静默抹掉
+       （SYNC_CONTRACT §4.1）。
+    → 本函数只用于「把一份完整清单落盘」这种**不读旧值**的场景，
+      以及测试给共享清单**播种**。
+
+    ⚠ 必须原子写（tmp + os.replace）：
+       这个目录在坚果云的同步范围内 —— 直接 write_text 的话，
+       写到一半就被坚果云上传了，另一台设备读到半截 JSON，
+       _safe_read_json 静默返回 None → 那篇 PDF 的清单凭空消失。
+    """
     meta["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
     path = _file_meta_path(safe)
-    # ⚠ 必须原子写（tmp + os.replace）。
-    #   这个目录在坚果云的同步范围内 —— 直接 write_text 的话，
-    #   写到一半就被坚果云上传了，另一台设备读到半截 JSON，
-    #   _safe_read_json 静默返回 None → 那篇 PDF 的清单凭空消失。
     _atomic_write_json(path, meta)
+
+
+def _cas_update_file_meta(safe: str, build) -> Optional[dict]:
+    """files/ 共享清单的乐观 CAS 写（读 → 改 → 整份写回）。
+
+    ⚠⚠ 这份清单在**坚果云同步根**里、**两台设备都写**（SYNC_CONTRACT §4.1）。
+       原来这里是「读 → 整份覆盖写回」→ 另一台设备在窗口里写的
+       `deleted` / `propagate` / `propagate_by` 会被**静默抹掉**
+       → 联动删除请求永远传不过去、墓碑消失，而两个接口都返 200
+       （实测场景：A 点「联动删除」与 B 同步/发布并发）。
+       → 现在走 `_cas_update_json`：指纹取在**读之前**、撞满 3 轮**放弃**（409）。
+
+    `build(meta)` 收到**磁盘上最新**的那一份，就地修改：
+      · 返回 True  → 写回
+      · 返回 False → 这次不用写（文件不动）
+    ⚠ 调用方要做的**判断**也必须放进 build 里（磁盘上那份可能已经变了），
+      只把「改字段」放进来是不够的（§4.109 同型）。
+
+    返回：写回后的 meta（dict）；没写返回 None。
+    """
+    path = _file_meta_path(safe)
+
+    def _build(existing):
+        meta = dict(existing or {})
+        if not build(meta):
+            return None
+        meta["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+        return json.dumps(meta, ensure_ascii=False, indent=1)
+
+    text = _cas_update_json(path, _build)
+    return json.loads(text) if text else None
+
+
+def _file_meta_link_delete_triple(meta: dict, my_id: str) -> bool:
+    """这份清单上有没有**别的设备**发起的「联动删除」请求。
+
+    「联动删除」是三个字段合起来表达的一件事：
+        deleted=True + propagate=True + propagate_by=<发起方>
+    读侧（`_sync_pull_files`）**先看 deleted 才看 propagate** ——
+    所以这三个字段只能**整组**保留或整组作废，拆开就没有意义了。
+    """
+    if not meta.get("propagate"):
+        return False
+    by = meta.get("propagate_by") or ""
+    return bool(by) and by != my_id
+
+
+# ---------------------------------------------------------------------------
+# files/ 清单的几种「补丁」构造器
+#
+# 每个都只做**一件事**，且**判断与修改都基于磁盘上最新的一份** ——
+# 判断放在外面（用读出来的旧值判断）正是当初丢数据的根源（§4.109 同型）。
+# ---------------------------------------------------------------------------
+def _patch_owner(my_id: str):
+    """清单没有归属 → 补上本机 id（其它字段一个都不动）。"""
+    def build(m: dict) -> bool:
+        if m.get("owner"):
+            return False
+        m["owner"] = my_id
+        return True
+    return build
+
+
+def _patch_touch(st, digest, my_id: str):
+    """内容没变（只是 mtime 动了）→ 只更新 size/mtime，必要时补归属。"""
+    def build(m: dict) -> bool:
+        if m.get("sha256") != digest:
+            return False        # 磁盘上那份已经是别的版本了 → 不写
+        m["size"] = st.st_size
+        m["mtime"] = st.st_mtime
+        if not m.get("owner"):
+            m["owner"] = my_id
+        return True
+    return build
+
+
+def _patch_publish(pid: str, rel: str, st, digest: str, my_id: str, now: str):
+    """发布/更新一篇论文的清单。
+
+    ⚠⚠ **归属是对方设备时，deleted / propagate / propagate_by 一个都不碰**
+       （2026-11-22 独立审查实测复现）：
+         A 点「联动删除」→ 清单上是 deleted+propagate+propagate_by=A；
+         B 同一时刻在同步发布 → 原来的「整份覆盖」把 A 那三个字段抹成
+         deleted=False / propagate=False → **联动删除请求永远传不过去**，
+         而 A、B 两边都返 200「已标记 / 已同步」。
+       → 归属是本机时，墓碑与联动删除由本机说了算（可清可设）。
+    """
+    def build(m: dict) -> bool:
+        prev_owner = m.get("owner") or ""
+        owned_by_other = bool(prev_owner) and prev_owner != my_id
+        m.update({
+            "paper_id": pid,
+            "relative_path": rel,
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "sha256": digest,
+            "blob": True,
+            "owner": my_id,                     # 谁发布的（墓碑只对发布者生效）
+            "published_at": m.get("published_at") or now,
+        })
+        if not owned_by_other:
+            # 归属是本机 → 墓碑 / 联动删除由本机说了算
+            m["deleted"] = False
+            if (m.get("propagate_by") or "") == my_id:
+                # 自己发起的联动删除：重新发布 = 我又把文件拿回来了 → 作废
+                m["propagate"] = False
+                m.pop("propagate_by", None)
+            else:
+                m.setdefault("propagate", False)
+        # 归属是**对方** → deleted / propagate / propagate_by 原样保留
+        return True
+    return build
+
+
+def _patch_tombstone(my_id: str):
+    """本机已经没有这篇了 → 标墓碑（只改 deleted / deleted_at）。"""
+    def build(m: dict) -> bool:
+        # 归属必须**此刻**还是本机 —— 读出来的那份可能已经被对方接管
+        if (m.get("owner") or "") != my_id:
+            return False
+        if m.get("deleted"):
+            return False
+        m["deleted"] = True
+        m["deleted_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+        return True
+    return build
+
+
+def _patch_release():
+    """释放云端实体 → 标记 blob 不在了（只改 blob / released_at）。"""
+    def build(m: dict) -> bool:
+        m["blob"] = False
+        m["released_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+        return True
+    return build
+
+
+def _patch_propagate_delete(my_id: str):
+    """「联动删除」：标墓碑 + 请求对方也删 + 记发起方。"""
+    def build(m: dict) -> bool:
+        m["propagate"] = True
+        m["deleted"] = True
+        m["propagate_by"] = my_id
+        m["deleted_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+        return True
+    return build
 
 
 def _device_id() -> str:
@@ -6068,8 +6266,11 @@ def _sync_push_files() -> dict:
                 and (blob.exists() or old.get("blob") is False)):
             if not old.get("owner"):
                 # 旧清单没有 owner：本机确实持有这份 PDF → 补上归属
-                old["owner"] = my_id
-                _write_file_meta(safe, old)
+                # ⚠ 走 CAS 合并（只补 owner，别的字段保留对方的）
+                try:
+                    _cas_update_file_meta(safe, _patch_owner(my_id))
+                except HTTPException:
+                    pass          # 撞满 3 轮 → 下一轮同步再补
             res["unchanged"] += 1
             continue
 
@@ -6081,12 +6282,15 @@ def _sync_push_files() -> dict:
 
         if old.get("sha256") == digest:
             # 内容其实没变（只是 mtime 动了，比如被 touch 过）→ 只更新清单
-            old.update({"size": st.st_size, "mtime": st.st_mtime})
-            if not old.get("owner"):
-                old["owner"] = my_id
-            _write_file_meta(safe, old)
-            res["unchanged"] += 1
-            continue
+            # ⚠ 走 CAS：判断也在**最新**那份上重做（磁盘上那份可能刚被对方改过）
+            try:
+                touched = _cas_update_file_meta(safe, _patch_touch(st, digest, my_id))
+            except HTTPException:
+                touched = None
+            if touched is not None:
+                res["unchanged"] += 1
+                continue
+            # 磁盘上那份已经变成别的版本了 → 落到下面「真的变了」那条路
 
         # 真的变了 → 传实体 + 更新清单
         try:
@@ -6097,20 +6301,12 @@ def _sync_push_files() -> dict:
             res["errors"].append({"name": rel, "reason": str(e)})
             continue
         now = _dt.datetime.now().isoformat(timespec="seconds")
-        meta = {
-            "paper_id": pid,
-            "relative_path": rel,
-            "size": st.st_size,
-            "mtime": st.st_mtime,
-            "sha256": digest,
-            "blob": True,
-            "deleted": False,
-            "propagate": False,
-            "owner": my_id,                     # 谁发布的（墓碑只对发布者生效）
-            "published_at": old.get("published_at") or now,
-            "updated_at": now,
-        }
-        _write_file_meta(safe, meta)
+        # ⚠ 走 CAS 合并：**保留**对方设备写的「联动删除」三件套
+        #   （原来是整份覆盖 → 对方在窗口里写的 deleted/propagate 被抹掉）
+        try:
+            _cas_update_file_meta(safe, _patch_publish(pid, rel, st, digest, my_id, now))
+        except HTTPException:
+            pass          # 撞满 3 轮 → 下一轮同步再补
         (res["published"] if not old else res["updated"]).append(rel)
 
     # 本地已经没有、但清单还在 → 墓碑
@@ -6129,10 +6325,12 @@ def _sync_push_files() -> dict:
         local = _safe_local_pdf(rel) if rel else None
         if local is not None and local.exists():
             continue        # 本机其实还有（可能只是路径挪了）→ 不标墓碑
-        meta["deleted"] = True
-        meta["deleted_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-        _write_file_meta(safe, meta)
-        res["deleted"].append(rel or safe)
+        # ⚠ 走 CAS 合并：只补 deleted/deleted_at，别的字段保留对方的
+        try:
+            if _cas_update_file_meta(safe, _patch_tombstone(my_id)) is not None:
+                res["deleted"].append(rel or safe)
+        except HTTPException:
+            pass          # 撞满 3 轮 → 下一轮同步再补
 
     return res
 
@@ -6544,26 +6742,42 @@ def api_sync_files_release(req: FileReleaseRequest):
 
     freed = 0
     released = []
+    errors: list[dict] = []
     for fp in targets:
         safe = fp.stem
         blob = _file_blob_path(safe)
         if blob.exists():
             try:
-                freed += blob.stat().st_size
+                size = blob.stat().st_size
                 blob.unlink()
-            except OSError:
+            except OSError as e:
+                # ⚠⚠ 释放失败**不许**算进 freed（2026-11-22 独立审查实测复现）：
+                #   原来是「先累加 size、再 unlink」，unlink 被坚果云的锁文件挡掉时，
+                #   字节**已经加进 freed**了 → 响应照样 status=success →
+                #   界面显示「已释放 N 篇，腾出 X MB」→ 用户据此删掉本地副本，
+                #   **实则云端那份还在**（§4.16「静默坏掉」的第 3 类）。
+                # → 只在**真的删掉之后**才累加；失败如实报出来。
+                detail = _safe_err(e)
+                errors.append({"paper_id": safe, "error": detail})
+                print(f"[sync] 释放云端实体失败 {safe}: {detail}", file=sys.stderr)
                 continue
+            freed += size          # ← 只在真的删掉之后才累加
         meta = _safe_read_json(fp) or {}
-        meta["blob"] = False
-        meta["released_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-        _write_file_meta(safe, meta)
-        released.append(meta.get("relative_path") or safe)
+        # ⚠ 走 CAS 合并：只补 blob/released_at，别把对方写的字段抹掉
+        try:
+            new_meta = _cas_update_file_meta(safe, _patch_release()) or meta
+        except HTTPException:
+            new_meta = meta
+        released.append(new_meta.get("relative_path") or safe)
 
     return {
-        "status": "success",
+        "status": "success" if not errors else "partial",
         "released": len(released),
         "freed_bytes": freed,
         "items": released,
+        # 释放失败的那些（如实体被坚果云锁住）—— 前端必须说出来，
+        # 否则用户会以为云端空间已经腾出来了。
+        "errors": errors,
     }
 
 
@@ -6588,13 +6802,14 @@ async def api_sync_files_propagate_delete(paper_id: str = Query(..., min_length=
         raise HTTPException(status_code=404, detail="共享目录里没有这篇论文")
     if not (meta.get("relative_path") or ""):
         raise HTTPException(status_code=400, detail="共享清单里没有这篇论文的相对路径")
-    meta["propagate"] = True
-    meta["deleted"] = True
-    meta["propagate_by"] = _device_id()
-    meta["deleted_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-    _write_file_meta(safe, meta)
+    my_id = _device_id()
+    # ⚠ 走 CAS 合并（保住别的设备写的字段；撞满 3 轮 → 409，让客户端重试）
+    try:
+        new_meta = _cas_update_file_meta(safe, _patch_propagate_delete(my_id)) or meta
+    except HTTPException:
+        raise
     return {"status": "success", "paper_id": paper_id,
-            "relative_path": meta.get("relative_path", "")}
+            "relative_path": new_meta.get("relative_path", "")}
 
 
 def _sync_files_status() -> dict:
@@ -6805,7 +7020,7 @@ async def api_pdf_annotations_load(
 
 
 @app.post("/api/pdf/annotations/save")
-async def api_pdf_annotations_save(req: AnnotationSaveRequest):
+def api_pdf_annotations_save(req: AnnotationSaveRequest):
     """Upsert annotations for one paper (write-through, atomic).
 
     **跨设备合并**：这台机器发来的列表不是"最终状态"，而是"我这边知道的部分"。
@@ -6878,6 +7093,8 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
         # ⚠ 原子写（坚果云同步目录）：先写同目录 .tmp 再 os.replace ——
         #   同步客户端只会看到旧文件或新文件，不会看到半截 JSON。
         #   （统一用 `_atomic_write_text`，别再各写一份。）
+        # ⚠⚠ reader 用**共享版严格读**：共享目录里的文件损坏时**只报错**，
+        #   **绝不改名隔离**（改名会动到另一台设备的数据 ——
         _cas_update_json(target, _build)
     except HTTPException:
         raise
@@ -6897,7 +7114,7 @@ async def api_pdf_annotations_save(req: AnnotationSaveRequest):
 
 
 @app.delete("/api/pdf/annotations/delete")
-async def api_pdf_annotations_delete(
+def api_pdf_annotations_delete(
     paper_id: str = Query(..., min_length=3, max_length=128),
     annotation_id: str = Query(..., min_length=1, max_length=64),
 ):
@@ -6930,8 +7147,9 @@ async def api_pdf_annotations_delete(
             _removed[:] = [a for a in items if a.get("id") == annotation_id]
             return json.dumps(payload, ensure_ascii=False, indent=1)
 
-        # ⚠ 主路径（共享目录里的那份）用**严格读**：文件损坏时宁可报错，
-        #   也不能当成「没有批注」→ 删不掉还假装成功。
+        # ⚠ 主路径（共享目录里的那份）用**共享版严格读**：文件损坏时宁可报错，
+        #   也不能当成「没有批注」→ 删不掉还假装成功；
+        #   而且**绝不改名隔离**（共享目录里的文件一动就动到另一台设备的数据）。
         #   旧位置的读用宽容版（别让一次删除整体失败）。
         reader = _read_json_or_quarantine if idx == 0 else _safe_read_json
         if _cas_update_json(path, _build, reader=reader) is not None:

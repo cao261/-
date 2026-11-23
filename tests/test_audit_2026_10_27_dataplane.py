@@ -573,3 +573,61 @@ def test_a_merge_conflict_is_also_rolled_back(three_repos, monkeypatch):
     assert result["action"] == "conflict", "合并冲突没被识别: %r" % (result,)
     assert _git(work, "rev-parse", "HEAD")[1] == pre_sha, "冲突后没有回退"
     assert _git(work, "status", "--porcelain")[1] == "", "冲突回退后工作区不干净"
+
+
+# ===========================================================================
+# ⑦ auto_sync：读不到 origin/main 时**不许**报「已是最新」
+# ===========================================================================
+
+def test_auto_sync_does_not_claim_up_to_date_when_origin_main_is_unreadable(
+        tmp_path, monkeypatch):
+    """读不到 origin/main 时不能报「已是最新」。
+
+    2026-11-22 独立审查实测：判定写成
+        `if not remote or remote == local: → up_to_date`
+    而 `remote` 来自 `git rev-parse origin/main` —— **这个命令失败时 remote 是空串**
+    → `not remote` 成立 → 报「没有新提交，无需同步」+ ok=True
+    → **同步其实根本没在工作**（远端没有 main 分支 / fetch 没建出这个 ref）
+    → 对方设备的提交永远合不过来，而日志写的是「一切正常」
+    —— 这是最坏的失败方式：静默。
+
+    场景用**真 git 仓**搭：远端的默认分支叫 master（没有 main）
+    → fetch 成功，但 `rev-parse origin/main` 读不到。
+
+    ⚠ 断言的是 auto_sync **真的返回了什么**（LAST_RESULT），不是读源码。
+    """
+    upstream = tmp_path / "upstream.git"
+    seed = tmp_path / "seed"
+    work = tmp_path / "work"
+
+    _git(tmp_path, "init", "--bare", "-b", "master", str(upstream))
+    _git(tmp_path, "init", "-b", "master", str(seed))
+    _git(seed, "config", "user.email", "audit@example.com")
+    _git(seed, "config", "user.name", "audit")
+    (seed / ".gitignore").write_text("logs/\n", encoding="utf-8")
+    (seed / "app.py").write_text("v1\n", encoding="utf-8")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-m", "v1")
+    _git(seed, "remote", "add", "origin", str(upstream))
+    _git(seed, "push", "-u", "origin", "master")
+    _git(tmp_path, "clone", str(upstream), str(work))
+    _git(work, "config", "user.email", "audit@example.com")
+    _git(work, "config", "user.name", "audit")
+
+    # 前置条件：fetch 能成功，但 origin/main 读不到
+    rc, _ = _git(work, "fetch", "origin", check=False)
+    assert rc == 0, "前置条件不成立：连 fetch 都失败了"
+    rc, _ = _git(work, "rev-parse", "origin/main", check=False)
+    assert rc != 0, "前置条件不成立：origin/main 居然读得到"
+
+    monkeypatch.setattr(auto_sync, "REPO", work)
+    monkeypatch.setattr(sys, "argv", ["auto_sync.py", "--no-apk"])
+    auto_sync.main()
+    res = auto_sync.LAST_RESULT
+
+    assert res["action"] != "up_to_date", \
+        "读不到 origin/main 却报「已是最新」—— 同步其实没在工作：%r" % (res,)
+    assert res["ok"] is False, \
+        "读不到 origin/main 必须当成失败（要有人来看），不能报成功：%r" % (res,)
+    assert any("origin/main" in m for m in res["messages"]), \
+        "消息里要说明是「读不到 origin/main」：%r" % (res["messages"],)

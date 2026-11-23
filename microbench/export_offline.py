@@ -104,6 +104,30 @@ KATEX_MISSING_HINT = (
 )
 
 
+def _escape_json_for_script(data_json: str) -> str:
+    """把 JSON 载荷里的 **所有 `<`** 转成 `\\u003c`（JSON 合法，parse 回来仍是 `<`）。
+
+    ⚠⚠ 为什么不能只处理 `</`（2026-11-22 独立审查 + **Edge / Chromium 双引擎实测**）：
+      `<script type="application/json">` 的内容走 HTML 的 **script data state** 家族。
+      载荷里只要出现 `<!--` 且**紧跟 `<`**（笔记正文里的 `<!--<br>`、
+      `<!--<math>`、代码块里的 HTML 片段…），解析器就会进入
+      *script data double escape start* 状态 →
+      **数据块的 `</script>` 永远不再闭合** →
+      后面的 app.js / KaTeX / PDF.js 整段被当成脚本文本吞掉 →
+      **平板工作台 / 离线阅读版整个报废**（打开只有一堆 JSON 文本）。
+
+      实测（system Edge 与 Playwright Chromium 结论一致）：
+        `<!--<script>`  → 后续 `<script>` **不执行**（报废）
+        `<!-- `（带空格）→ 正常
+        `<!--` + 字母 + `<` → 正常
+      → 只转义 `</` 挡不住这一类，必须把 `<` 整个干掉。
+
+    `<` → `\\u003c` 是 **JSON 合法转义**：`JSON.parse` 解回来仍然是 `<`，
+    **数据一个字节都不变**，只是「不在 HTML 源码里出现裸的 `<`」。
+    """
+    return data_json.replace("<", "\\u003c")
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """同目录唯一临时文件 + os.replace，绝不留下半截 HTML。
 
@@ -1066,7 +1090,7 @@ def build_html(notes: list[Note], katex_css: str) -> str:
     data_json = json.dumps({"notes": payload, "groups": groups}, ensure_ascii=False)
     # The JSON lives in a <script type="application/json">; the only sequence
     # that could break out of it is a literal "</script>".
-    data_json = data_json.replace("</", "<\\/")
+    data_json = _escape_json_for_script(data_json)
 
     generated = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -1414,7 +1438,7 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
                             #   必须靠这个版本自己比对，否则旧段落译文会错位。
                             "blocks_ver": current_blocks_version()},
                            ensure_ascii=False)
-    data_json = data_json.replace("</", "<\\/")
+    data_json = _escape_json_for_script(data_json)
 
     out = index
     # ⚠ 占位符必须**先**替换, 再内联 CSS/JS。
@@ -1527,7 +1551,7 @@ def build_pdfjs_assets() -> dict:
             raise RuntimeError(f"{name} 含 </script，不能直接内联")
 
     # PDF.js 的 CSS 会引用 images/ 下的图标。单文件产物里没有这些文件，
-    # 浏览���会去请求然后 404。能内联的就内联（gif 只有 2 KB），
+    # 浏览器会去请求然后 404。能内联的就内联（gif 只有 2 KB），
     # 仓库里本来就不存在的 svg 直接把引用删掉（可选的无障碍功能图标）。
     img_dir = base / "images"
     gif = img_dir / "loading-icon.gif"

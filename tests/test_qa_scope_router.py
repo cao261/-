@@ -114,6 +114,45 @@ def test_router_prompt_lists_all_five_modes():
         "router 提示词还在教它「拿不准就升档」—— 是/否问题会拿到整页"
 
 
+def test_router_user_message_states_the_real_mode_count(client, monkeypatch):
+    """router 发给模型的 user 消息里说的「档数」必须等于真实档数。
+
+    2026-11-22 独立审查实测：system prompt 早就列了 5 档
+    （term / mid / section / wide / full），但 **user 消息里还写着「4 档」**
+    —— 那是加 section 档之前留下的**陈旧文案**。
+    → 模型被告知「4 档」，而眼前列了 5 档 → 自相矛盾（§4.6：对模型说假话）。
+
+    ⚠ 断言的是**真发出去的请求**（拦下 `llm.chat` 的实参看内容），
+    不是 grep 源码 —— 改文案就能过的那种断言不算数。
+    """
+    from microbench import llm as llm_mod
+    from microbench.app import QA_SCOPE_MODES
+
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen["messages"] = kwargs.get("messages") or []
+        return json.dumps({"mode": "mid", "reason": "x", "budget": 8000},
+                          ensure_ascii=False)
+
+    monkeypatch.setattr(llm_mod, "is_configured", lambda: True)
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+
+    res = client.post("/api/paper/classify_qa_scope", json={
+        "selected_text": "x", "question": "y"})
+    assert res.status_code == 200, res.text
+
+    msgs = seen.get("messages") or []
+    assert msgs, "没抓到发给模型的请求 —— 这条断言就成恒真了"
+    user_msg = "\n".join(str(m.get("content", "")) for m in msgs
+                         if m.get("role") == "user")
+    m = re.search(r"(\d+)\s*档", user_msg)
+    assert m, "user 消息里根本没提档数：%r" % user_msg
+    assert int(m.group(1)) == len(QA_SCOPE_MODES), (
+        "user 消息说 %s 档，实际有 %d 档（%s）—— 对模型说假话"
+        % (m.group(1), len(QA_SCOPE_MODES), list(QA_SCOPE_MODES)))
+
+
 def test_router_prompt_describes_modes_with_the_real_caps():
     """提示词里各档的区间要与真实上限对得上（别写「60K」而实际是 50K）。"""
     from microbench.app import QA_SCOPE_CAPS, QA_SCOPE_ROUTER_PROMPT

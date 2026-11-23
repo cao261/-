@@ -4358,8 +4358,19 @@
       const key = _readPosKey();
       if (!key) return null;
       const inPdf = _readerMode === "pdf";
-      const left = inPdf ? _readPosAnchor(_READPOS_PANES.pdf) : null;
-      const right = inPdf ? _readPosAnchor(_READPOS_PANES.trans) : null;
+      let left = inPdf ? _readPosAnchor(_READPOS_PANES.pdf) : null;
+      let right = inPdf ? _readPosAnchor(_READPOS_PANES.trans) : null;
+      const store = _readPosStore();
+      const prev = (store[key] && typeof store[key] === "object") ? store[key] : null;
+      // ⚠⚠ 栏不可见时 anchor 恒为 null（阅读器已关 / 还没打开过）。
+      //   `beforeunload` / `pagehide` 是在**关应用**时触发的，
+      //   而用户最常见的顺序是「先关阅读器 → 再关应用」→ 那一刻两栏都
+      //   display:none → clientHeight 为 0 → anchor 恒 null。
+      //   原来整条 `store[key] = rec` → **把刚存好的位置覆盖成 null**
+      //   → 下次打开既不回位、也不弹提示（静默降级，§4.96 同型复发）。
+      //   → 新的采不到就**沿用旧的**，绝不许把好数据抹掉。
+      if (!left && prev && prev.left) left = prev.left;
+      if (!right && prev && prev.right) right = prev.right;
       const primary = left || right;
       const rec = {
         paper_id: (_pdfState && _pdfState.paperId) || "",
@@ -4375,7 +4386,6 @@
         scroll_top: primary ? primary.scroll_top : 0,
         updated_at: new Date().toISOString(),
       };
-      const store = _readPosStore();
       store[key] = rec;
       _writeReadPosStore(store);
       return rec;
@@ -4434,6 +4444,22 @@
       }
       const page = (rec.left && rec.left.page) || (rec.right && rec.right.page) || 0;
       return { leftOk: leftOk, rightOk: rightOk, page: page };
+    }
+
+    /**
+     * 这次重绘 / 重排要回到哪儿？
+     *
+     *   ① 有活锚点（同一篇的重绘，且 DOM 还在）→ 用它（最新、最准）
+     *   ② 没有 → 回落到本机记住的位置（localStorage）
+     *
+     * ⚠ 单独抽成一个函数，是为了**能被护栏直接跑**（探针里真调它）——
+     *   免得这条「回位目标怎么算」只能靠「读源码文本」来守（同型复发）。
+     */
+    function _readPosTargetFor(liveLeft, liveRight, relPath) {
+      if (liveLeft) {
+        return { left: liveLeft, right: liveRight, zoom: _pdfZoom };
+      }
+      return _getReadPos(_readPosKeyForPath(relPath));
     }
 
     /**
@@ -4880,6 +4906,15 @@
      * Re-runs loadPdfDualColumn() so each page canvas is re-rendered at new scale.
      */
     function setReaderZoom(deltaOrMode) {
+      // ⚠⚠ 缩放前先把「当前看到哪儿」**落盘**（2026-11-22 独立审查修）：
+      //   下面马上要把两栏的 DOM 全清空（位置不抓就没了），
+      //   而重排时 `loadPdfDualColumn` 是在**清空之后**才去读位置的
+      //   （读活 DOM 必然读不到 → 只能回落到 localStorage）
+      //   → 而落盘用的是**滚动防抖 400ms** → 「滚动完立刻缩放」会退回旧位置。
+      //   ⚠ 这一句必须在**改 `_pdfZoom` 之前**：落盘记录里带着 zoom，
+      //     比例换算（§4.126）靠它判断「缩放变了没有」——
+      //     若记的是新 zoom，恢复时会被当成「没变缩放」→ 直接套旧 px → 位置偏。
+      try { _captureReadPos(); } catch (e) { console.warn("[readpos] 缩放前保存失败", e); }
       if (!_pdfState || !_pdfState.pdfDoc) {
         // First time user toggles zoom before PDF is ready — just update label
         if (deltaOrMode === "fit") _pdfZoom = 1.0;
@@ -5253,6 +5288,9 @@
         const gen = (_pdfState.rendering.generation || 0) + 1;
         _pdfState.rendering.generation = gen;
         _pdfState.rendering.cancelled = true;
+        // ⚠ 清空前先落盘（跟 setReaderZoom 同理）：重排时的位置只能从
+        //   localStorage 回落到 —— DOM 已经被清空了，活锚点读不到。
+        try { _captureReadPos(); } catch (e) { console.warn("[readpos] 重排前保存失败", e); }
         document.getElementById("pdf-pages-list").innerHTML = "";
         loadPdfDualColumn({ keepTranslations: true, generation: gen });
       }, 250);
@@ -5488,9 +5526,7 @@
         // ---- 阅读进度续读：算出这次要回到哪儿 ----
         // 同一篇的重绘（缩放 / 重排）→ 用刚才从活 DOM 抓的位置；
         // 重新打开一篇 → 用本机记住的位置（localStorage）。
-        _readPosCurrent = (_liveLeft)
-          ? { left: _liveLeft, right: _liveRight, zoom: _pdfZoom }
-          : _getReadPos(_readPosKeyForPath(found.relative_path));
+        _readPosCurrent = _readPosTargetFor(_liveLeft, _liveRight, found.relative_path);
         _readPosRestored = false;
         _readPosUserMoved = { pdf: false, trans: false };
         _initReadPosTracking();
@@ -9171,7 +9207,15 @@
       if (!ok) return;
       try {
         const d = await postJson("/api/sync/files/release", { all: true });
-        showToast(`已释放 ${d.released} 篇云端 PDF，腾出 ${((d.freed_bytes || 0) / 1048576).toFixed(1)} MB`);
+        // ⚠ 释放失败的那几篇**必须说出来** —— 否则「腾出 X MB」是虚的，
+        //   用户据此删本地副本，实则云端那份还在（实体被坚果云锁住时常见）。
+        const bad = (d.errors || []).length;
+        if (bad) {
+          showToast(`已释放 ${d.released} 篇云端 PDF，腾出 ${((d.freed_bytes || 0) / 1048576).toFixed(1)} MB；`
+            + `另有 ${bad} 篇释放失败（文件被占用），云端那份还在，别急着删本地副本`, true);
+        } else {
+          showToast(`已释放 ${d.released} 篇云端 PDF，腾出 ${((d.freed_bytes || 0) / 1048576).toFixed(1)} MB`);
+        }
         await refreshSyncFilesInfo();
       } catch (e) {
         showToast("释放失败: " + (e.message || e), true);
@@ -10774,6 +10818,15 @@
       const question = answerBody.dataset.question || "";
       const priorAnswer = answerBody.dataset.priorAnswer || "";
       const priorMode = answerBody.dataset.priorScopeMode || "mid";
+      // ⚠ 用**提问当时的快照**，不是现在的实时选区（2026-11-22 独立审查实测复现）：
+      //   `_readerSelState` 会被**任何一次带选区的 mouseup** 改写 →
+      //   用户问完又划了别的段落，再点「⬆️ 多看点上下文」→
+      //   模型拿到的是「旧问题 + 新选区」→ 答偏。
+      const snapPageNum = answerBody.dataset.pageNum
+        ? parseInt(answerBody.dataset.pageNum, 10) : null;
+      const snapPdfPath = answerBody.dataset.pdfPath || "";
+      const snapSelText = answerBody.dataset.selText || "";
+      const snapSourceType = answerBody.dataset.sourceType || "general";
 
       // 1. Resolve the new scope.
       let newScope;
@@ -10834,11 +10887,25 @@
       await askLLMStream(submitBtn, "/api/paper/explain_selection_stream", {
         // Backend caps: selected_text 15000 / question 1000 / paper_title 300
         // / feedback 2000 / prior_answer 8000.
-        selected_text: (_readerSelState.text || "(用户未划选特定片段,提问全篇整体背景)").slice(0, 15000),
+        selected_text: (snapSelText || "(用户未划选特定片段,提问全篇整体背景)").slice(0, 15000),
         question: (question || "").slice(0, 1000),
         paper_title: (_readerState.title || "").slice(0, 300),
         surrounding_context: surroundingContext,
-        source_type: _readerSelState.source || "general",
+        source_type: snapSourceType,
+        // ⚠⚠ 重新回答也必须带 **pdf 路径 + 页码 + 公式坐标**（2026-11-22 修）：
+        //   缺了它们 → 服务端解析不出 PDF → 一张图都拿不到 → 连「附件说明」
+        //   都不生成 → 而上下文里的【公式N】是**裸占位** → 模型只见占位符
+        //   → **瞎编公式**（AGENTS §4.6：错公式比没公式危险得多）。
+        //   服务端拿到 pdf_relative_path + page_num 会按 PDF 原始坐标
+        //   **重渲染一张清晰整页图**（比浏览器画布清楚得多）。
+        pdf_relative_path: snapPdfPath || null,
+        page_num: snapPageNum || null,
+        // 浏览器那张截图只有当**当前选区还在同一页**时才发得出去
+        //   （否则截到的是用户后来划的别处 → 图文不符）。
+        page_image: (snapPageNum && (_readerSelState.pageNum === snapPageNum))
+          ? _captureSelectionPageImage() : null,
+        // 该页公式的坐标 → 服务端按坐标裁**高清公式原图**给模型
+        formula_rects: _collectPageFormulaRects(snapPageNum),
         feedback: (feedbackText || "").slice(0, 2000),
         prior_answer: (priorAnswer || "").slice(0, 8000),
         force_scope: newScope.mode,
@@ -11597,6 +11664,13 @@
           answerBody.dataset.priorModel = (meta && meta.model) || "";
           answerBody.dataset.priorScope = scope.label;
           answerBody.dataset.priorScopeMode = scope.mode;
+          // ⚠ 存**提问当时**的快照（2026-11-22 修）：
+          //   「重新回答」只读这里，**不读实时选区** ——
+          //   否则用户问完又划了别的段落，模型会拿到「旧问题 + 新选区」。
+          answerBody.dataset.pageNum = String(_readerSelState.pageNum || "");
+          answerBody.dataset.pdfPath = (_pdfState && _pdfState.relativePath) || "";
+          answerBody.dataset.selText = _readerSelState.text || "";
+          answerBody.dataset.sourceType = _readerSelState.source || "general";
 
           // Render action buttons AFTER successful streaming. Order matters:
           //   1. Refinement (close to the answer it refines)

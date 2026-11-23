@@ -13,6 +13,32 @@
 > 两台设备（25353 / 30461）之间**没有会话通道**（`session send` 只能投本机会话），
 > 交接一律走仓库：对方 `git pull` 就能拿到（`auto_sync.py` 每 2 小时也会自动同步，§4.19）。
 >
+> 📌 **2026-11-22「从头重做一遍代码审查 + 升级」那一轮**（用户：
+>    「重做一遍代码审查和升级，确保功能都能正常进行，确保修改能有益处再修改」）：
+>    ① **四路并行只读审查**（后端 API+同步 / 阅读器前端 / 模型层+抽取层 / 平板端）
+>       共 32 条发现 → 逐条取证后**修了 14 项**（3 P0 / 6 P1 / 5 P2），
+>       每项都配**行为级**护栏 + **变异自检**；
+>    ② **3 个 P0**：`extract_outline` 必崩（vault 27 篇里 **11 篇必 500**，
+>       真机复验 27/27 全过）、续读位置被 `null` 覆盖（关应用即丢进度）、
+>       导出产物报废（数据块里 `<!--<` → HTML 进入 script-data double-escape
+>       状态 → **平板工作台/离线阅读版整段挂掉**；Edge+Chromium 双引擎实测）；
+>    ③ **6 个 P1**：共享批注被改名隔离、`freed_bytes` 虚报、
+>       **7 个 async 端点阻塞事件循环**（含 `upload_pdf` 的 40MB 写盘）、
+>       files/ 共享清单**无 CAS**（跨设备并发写丢数据）、
+>       **「重新回答」缺 pdf 路径** → 服务端一张图都拿不到 → **模型瞎编公式**；
+>    ④ **真机端到端**（JACERS 综述）：带图的载荷让模型读出原文公式
+>       `α_ME = E/H (1)`；不带图则「这段里没有任何公式」→ 逼问就编；
+>    ⑤ **5 个 P2**：缩放/重排丢阅读位置（**注释里写了意图、实现却是死代码**）、
+>       router 对模型说「4 档」实际 5 档、
+>       auto_sync 读不到 `origin/main` 却报「已是最新」（**同步静默失效**）、
+>       CRLF 行尾事故、两处 U+FFFD 坏字符；
+>    ⑥ 基线 **1629 passed** → 终版 **1642 passed / 1 skipped（11m30s 全绿）**；
+>       新增/扩大护栏 7 套（真渲染 14+24+48 断言，变异 7/7+13/13 全被抓住）；
+>    ⑦ 坑记在 **§4.129~4.131**。
+>    ⚠ 本轮**只改本机**（没推 GitHub，25353 看不到）；
+>    ⚠ 平板端**只改了构建脚本**，**没重打 APK/HTML**
+>    （`tests/test_apk_delivery.py` 要求两者逐字节相同 → 要一起重打）。
+>    交接文档：[`docs/HANDOFF_2026-11-22-INDEPENDENT-AUDIT.md`](docs/HANDOFF_2026-11-22-INDEPENDENT-AUDIT.md)。
 > 📌 **2026-11-20「像看小说一样」的阅读进度续读」那一轮**（用户：
 >    「我这论文都很长嘛，我不想每次打开都要重新翻好久翻到我目前看的部分，
 >    需要你能做到像看小说一样，这次看到这里了，关掉应用，下次打开也还是这里」）：
@@ -4652,6 +4678,84 @@ for s in sections:
 > 完全取决于截断是不是顺序的。
 > 排查这类问题不要猜 —— **把真正发出去的 prompt 抓下来看**（monkeypatch 掉
 > LLM 调用即可），一眼就能看到哪一节在、哪一节不在。
+
+### 4.129 用 Python 脚本改源码 → 整篇变成 CRLF（2026-11-22）
+
+**症状**：改完源码跑 `pytest tests` → `tests/test_source_hygiene.py` 里
+`test_source_file_uses_expected_line_endings[microbench/app.py]` 变红：
+「app.py 里有 CRLF —— 仓库约定 .py/.js/.html/.css 全 LF」。
+
+**根因**：Windows 上 Python 文本模式写文件时，`open(path, "w")` 的
+`newline=None` **会把每个 `\n` 翻译成 `\r\n`**。
+→ 用「读全文 → 字符串替换 → 写回」的脚本改源码（AGENTS §2.2 要求的写法）
+   **必然**把整篇变成 CRLF。
+⚠ `git diff` 看不出来：`text=auto eol=lf` 会在 `git add` 时归一化，
+   所以 diff 只有几行、但工作区已经是 CRLF → **提交前本地测试先红**。
+
+**修法**：
+```python
+data = path.read_bytes()                 # 字节层面处理，别用文本模式
+data = data.replace(b"\r\n", b"\n")
+with open(path, "wb") as fh:             # 二进制写，别用 "w"
+    fh.write(data)
+```
+（`edit` 工具改文件不一定会引入 CRLF，但**改完必须**
+`git ls-files --eol <file>` 看 `w/lf`。）
+
+**护栏**：`tests/test_source_hygiene.py`（本来就存在）——
+它守的就是这条；这轮它**真的抓到了**（不是摆设）。
+
+> 教训：**改完源码先跑一遍行尾检查**（`git ls-files --eol`），
+> 别等全量测试才发现；CRLF 会让「本机全绿」和「提交出去」长得不一样。
+
+### 4.130 注释里写了「意图」≠ 实现做到了（2026-11-22）
+
+**症状**：缩放 PDF 后，阅读位置**跳回更早的地方**（用户正在读第 5 页，
+一点缩放就回到第 1 页）。
+
+**根因**：`loadPdfDualColumn` 里有一段注释：
+「缩放重绘 / 重排之前，先把『当前看到哪儿』抓下来 —— 下面马上要把两栏的
+DOM 全清空，位置不抓就没了」。**意图完全正确，实现却从来没生效**：
+真正清空 DOM 的是**调用方**（`setReaderZoom` / `_pdfRelayoutIfNeeded`
+在调 `loadPdfDualColumn` **之前**就 `innerHTML = ""` 了），
+而被调方再去读「活锚点」时 DOM 已经是空的 → **恒为 null** → 整段是死代码。
+→ 位置只能回落到 localStorage，而落盘是 **400ms 防抖** → 快速
+「滚动→缩放」必然退回旧位置。
+
+**修法**：**顺序**要对 —— 谁清 DOM，谁就负责在清之前把位置**落盘**；
+而且落盘必须在**改 `_pdfZoom` 之前**（记录里带着 zoom，
+比例换算靠它判断「缩放变了没有」，§4.126）。
+
+**护栏**：`microbench/_test_readpos_resume.py`（真实渲染，24 条断言，
+变异 13/13 全被抓住）—— 探针**真调** `setReaderZoom` / `_pdfRelayoutIfNeeded`，
+并把「回位目标怎么算」抽成真函数 `_readPosTargetFor` 供探针直接调用。
+
+> 教训：**注释写的是意图，调用顺序决定实现**。
+> 凡是「A 之前必须做 B」的逻辑，B 必须在 A 的**调用方**里，
+> 不能指望被调方自己补救。
+
+### 4.131 自动同步：「读不到远端」≠「已是最新」（2026-11-22）
+
+**症状**：`auto_sync.py` 每 2 小时跑一次，日志一直写「已是最新，无需同步」，
+但**对方设备的提交其实一次都没合过来**。
+
+**根因**：判定写成 `if not remote or remote == local: → up_to_date`，
+而 `remote` 来自 `git rev-parse origin/main` —— **这个命令失败时 remote 就是空串**
+（远端没有 main 分支 / fetch 没建出这个 ref / 浅克隆 / refspec 写错）
+→ `not remote` 成立 → 报「已是最新」+ `ok=True`。
+→ **同步根本没在工作，但报告说一切正常** —— 最坏的失败方式：静默。
+
+**修法**：把「读不到」和「没有新东西」**分成两条**：
+读不到 → `action="remote_ref_missing"` + `ok=False` + 明确消息
+（要有人来看），不许报成功。
+
+**护栏**：`tests/test_audit_2026_10_27_dataplane.py` 里
+`test_auto_sync_does_not_claim_up_to_date_when_origin_main_is_unreadable`
+—— 用**真 git 仓**搭出「远端默认分支叫 master（没有 main）」的场景，
+真跑 `auto_sync.main()`，断言它**没**报 `up_to_date` 且 `ok is False`。
+
+> 教训：**「查不到」和「查到了但没变化」是两种状态**，混在一起报成功
+> = 把故障藏起来。自动同步这种「没人盯着」的路径，失败必须可见。
 
 ## 5. 通用教训（从上面提炼的原则）
 1. **先定位根因，再改代码。** 拿不准就在可疑位置加 `console.log` 探针 + 用浏览器的

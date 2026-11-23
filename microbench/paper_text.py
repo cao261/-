@@ -505,7 +505,18 @@ def extract_outline(pdf_path, max_pages: int = 200) -> dict:
         sec.pop("last_page", None)
         return sec
 
+    # 参考文献段：**整篇正文到此为止**（后面全是书目，别灌进上下文）。
+    # ⚠⚠ 必须跳出**页**循环，不能只 break 行循环（2026-11-22 独立审查实测复现）：
+    #   原来只在行循环里 `break`，外层页循环继续 → 下一页的正文行走到
+    #   `cur["last_page"] = page_no`，而 cur 已被置成 None
+    #   → **TypeError: 'NoneType' object does not support item assignment**
+    #   → `GET /api/paper/outline` 500 → 前端只 console.warn 静默吞掉
+    #   → 「选中标题→小节上下文」「wide/full 用真小节」「按位置消歧」全部退化。
+    #   实测：vault 27 篇 PDF 里 **11 篇**（参考文献不在最后一页）必崩。
+    stop_pages = False
     for page_no, text in pages_text:
+        if stop_pages:
+            break
         for raw in (text or "").split("\n"):
             line = raw.strip()
             if not line:
@@ -518,6 +529,7 @@ def extract_outline(pdf_path, max_pages: int = 200) -> dict:
                 cur = None
                 # 书目**不进**任何小节（实测 JACERS 的参考文献有 10023 字，
                 # 进了上下文就是纯噪声 + 纯 token 浪费）
+                stop_pages = True
                 break
             title = _outline_heading_title(line)
             if title:
@@ -533,6 +545,11 @@ def extract_outline(pdf_path, max_pages: int = 200) -> dict:
                        "page_start": page_no, "page_end": page_no,
                        "parts": [], "formulas": [], "last_page": page_no}
                 continue
+            if cur is None:
+                # 兜底：参考文献之后不该再有正文行。真出现时**停在这里**，
+                #   绝不拿 None 当 dict 改（那正是上面那个 TypeError 的来源）。
+                stop_pages = True
+                break
             # 正文行：公式标记换成占位，坐标记账
             cur["last_page"] = page_no
             line = _OUTLINE_TABLE_RE.sub("【表格】", line)
@@ -2338,7 +2355,7 @@ def _extract_top_region(page, words, width, height, y_split, x_mid,
       译文读起来完全是乱的。
 
       所以这里用同一套「按带找栏缝」的判据把顶部区域也分栏:
-        - 真的双栏的带 → 左右分开，��左归左、右归右；
+        - 真的双栏的带 → 左右分开，左归左、右归右；
         - 整宽的带（页眉/标题/整宽图注）→ 单独成块，仍排最前；
         - 只有一栏有字的带 → 归那一栏。
     """

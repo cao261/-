@@ -273,6 +273,10 @@ def test_behavioural_guard_files_are_still_there():
         "microbench/_test_qa_panel_render.py",          # 渲染：夜色主题主按钮对比度 / 拖动边界 / 按钮状态
         # ↓ 2026-11-20：「像看小说一样」的阅读进度续读那一轮
         "microbench/_test_readpos_resume.py",           # 渲染：续读回位（页码 + 页内偏移）/ 缩放变了按比例换算
+        # ↓ 2026-11-22：独立代码审查那一轮
+        "microbench/_test_qa_refine_payload.py",         # 渲染：「重新回答」也带 pdf 路径/页码/公式坐标 + 用提问当时的快照
+        "tests/test_files_meta_cas.py",                  # files/ 共享清单的 CAS 合并（跨设备并发写不丢数据）
+        "tests/test_blocking_endpoints_off_event_loop.py",  # 6 个端点不许阻塞事件循环
     ]
     missing = [r for r in required if not (REPO / r).exists()]
     assert not missing, f"行为级护栏文件不见了: {missing}"
