@@ -182,7 +182,7 @@ function check(cond, label) {
   console.log("\n[2] Markdown 插值不能变成 HTML 属性（XSS）");
 
   /**
-   * 真��解析一个标签的属性名。
+   * 真正解析一个标签的属性名。
    *
    * ⚠ 不能用 `/on[a-z]+=/` 这种正则去扫 —— 属性**值**里出现的
    *   "onerror=" 只是文本，不是属性。正则分不清「属性名」和「属性值里的内容」。
@@ -297,11 +297,20 @@ function check(cond, label) {
 
   console.log("\n[6] 译文：paper_id 必须和电脑端的快照文件名对得上");
   const SNAP = path.join(__dirname, "..", "logs", "_pdf_snapshots");
-  if (!fs.existsSync(SNAP)) {
-    console.log("  SKIP  没有 logs/_pdf_snapshots（这台机器还没翻过论文）");
+  // ⚠ 判据是「有没有**快照文件**」，不是「目录在不在」。
+  //   目录可能在但里面是空的 —— 干净 clone（logs/ 被 .gitignore 排除）
+  //   或从没在这台机器上翻过论文时就是这样。
+  //   那样应当 SKIP 而不是 FAIL：否则每台新机器都会误报红，
+  //   真回归反而被淹没（2026-11-23 在干净 clone 上实测复现）。
+  const snapFiles = fs.existsSync(SNAP)
+    ? fs.readdirSync(SNAP).filter((f) => f.endsWith(".json"))
+    : [];
+  if (snapFiles.length === 0) {
+    console.log("  SKIP  没有 logs/_pdf_snapshots 的译文快照（这台机器还没翻过论文）");
   } else {
-    const stems = fs.readdirSync(SNAP).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5));
-    check(stems.length > 0, "找到了电脑端的译文快照");
+    const stems = snapFiles.map((f) => f.slice(0, -5));
+    check(new Set(stems).size === snapFiles.length,
+      "找到了电脑端的译文快照（" + snapFiles.length + " 份，文件名互不重复）");
     stems.forEach((stem) => {
       const data = JSON.parse(fs.readFileSync(path.join(SNAP, stem + ".json"), "utf8"));
       const rel = data.relative_path;
@@ -323,10 +332,14 @@ function check(cond, label) {
 
   console.log("\n[8] 译文里的公式要能渲染（这是论文阅读器的基本要求）");
   const SNAP2 = path.join(__dirname, "..", "logs", "_pdf_snapshots");
-  if (!fs.existsSync(SNAP2)) {
-    console.log("  SKIP  没有译文快照");
+  const snapFiles2 = fs.existsSync(SNAP2)
+    ? fs.readdirSync(SNAP2).filter((f) => f.endsWith(".json"))
+    : [];
+  // ⚠ 同上：目录在但没有快照文件 → SKIP，不是 FAIL。
+  if (snapFiles2.length === 0) {
+    console.log("  SKIP  没有译文快照（这台机器还没翻过论文）");
   } else {
-    const files = fs.readdirSync(SNAP2).filter((f) => f.endsWith(".json"));
+    const files = snapFiles2;
     let checked = 0, withMath = 0;
     files.forEach((f) => {
       const data = JSON.parse(fs.readFileSync(path.join(SNAP2, f), "utf8"));

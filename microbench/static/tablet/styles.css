@@ -36,7 +36,7 @@
 
 * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
 /* 组件规则里的 display (inline-flex / flex / block) 会盖掉 [hidden] 的默认
-   display:none —— 「原文 PDF」按钮于是��没关联 PDF 时也显示。这条必须全局兜底。 */
+   display:none —— 「原文 PDF」按钮于是在没关联 PDF 时也显示。这条必须全局兜底。 */
 [hidden] { display: none !important; }
 html,body { margin:0; padding:0; height:100%; overscroll-behavior:none; }
 body {

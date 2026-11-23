@@ -255,6 +255,14 @@ def test_chat_with_deepseek_sends_thinking_param(monkeypatch):
     monkeypatch.setattr(llm.primary_limiter, "acquire", lambda: 0.0)
     monkeypatch.setattr(llm.agnes_limiter, "acquire", lambda: 0.0)
     monkeypatch.setattr(llm, "_limiter_for", lambda rpm, mi: llm.primary_limiter)
+    # ⚠ 这条护栏必须**不依赖本机有没有配 key**。
+    #   它验的是「请求发出去的 URL / model / thinking 参数」，而 requests.post
+    #   已经被 mock 掉了 —— 真 key 根本用不到。以前它靠 .env 里的 LLM_API_KEY
+    #   兜底（DeepSeek 没配 key 时复用 LLM_API_KEY），可是 .env 被 .gitignore
+    #   排除 → 干净 clone / 新机器上必然报「自定义模型没有配置 API key」，
+    #   那是**假警报**（2026-11-23 在干净 clone 上实测复现）。
+    #   自己塞一个假 key：本条断言与真实密钥彻底解耦，任何机器都能跑。
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
 
     out = llm.chat(messages=[{"role": "user", "content": "hi"}],
                    model_name="deepseek-flash", disable_thinking=True)

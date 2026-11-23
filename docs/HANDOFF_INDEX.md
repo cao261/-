@@ -7,7 +7,24 @@
 ## 阅读顺序（按你的角色选）
 
 ### 谁都要看（本轮新增的几份）
-0. **[`HANDOFF_2026-11-22-INDEPENDENT-AUDIT.md`](HANDOFF_2026-11-22-INDEPENDENT-AUDIT.md)** ← **最新，先看这份**
+0. **[`HANDOFF_2026-11-23-REMOTE-VERIFICATION.md`](HANDOFF_2026-11-23-REMOTE-VERIFICATION.md)** ← **最新，先看这份**
+   **远端改动可用性验证**（用户：「在 25353 台拉取 origin/main，并复跑本轮新增护栏确认远端改动可用」）：
+   ⚠ **25353 没绑定本桌面**（`session list --source ssh/rc` 均为空），
+   且两台设备**没有会话通道** → 改用**从 GitHub 干净克隆**到临时目录、
+   在克隆树里复跑全套护栏 → **证明「远端代码本身可用」**；
+   25353 实际拉取靠它自己的 `auto_sync.py`（每 2 小时）或在它本地手动 `git pull`。
+   ① **干净克隆** → HEAD == origin/main，本轮 18 个改动文件与本地**逐字节一致**；
+   ② **5 套新护栏在克隆树全绿**：QA 载荷 14/14（变异 7/7）、续读 24/24（变异 13/13）、
+      平板导出 48/48、新增 pytest 18 passed、auto_sync 回归 1 passed、行尾卫生 678 passed；
+   ③ **克隆树起服务** → `GET /api/paper/outline` **27/27 全 200**（P0-1 修复在远端代码上生效）；
+   ④ 顺带抓到 **2 条假红**并修掉：护栏依赖 `.env` 与 `logs/_pdf_snapshots`
+      （都被 `.gitignore` 排除）→ 干净 clone 必红 → 改成「自带假 key」与「没快照就 SKIP」
+      （坑记 **AGENTS.md §4.132**）；
+   ⑤ 顺手清掉 **7 处 U+FFFD 坏字符** → 只留 4 处**刻意构造**的坏字符样本
+      （`replaced_pdf.py` 的清洗逻辑要认它，**不能动**）；
+   ⑥ 新增**两台机器都能直接跑**的自检脚本 `microbench/_verify_remote.py`
+      （git 对齐 + 每篇论文 outline + 可选护栏，退出码 0 = 全过）。
+0. **[`HANDOFF_2026-11-22-INDEPENDENT-AUDIT.md`](HANDOFF_2026-11-22-INDEPENDENT-AUDIT.md)** ← 上一轮
    **从头重做一遍代码审查 + 升级**（用户：「重做一遍代码审查和升级，确保功能都能正常进行，
    确保修改能有益处再修改」）：四路并行只读审查共 32 条发现 → **修了 14 项**
    （3 个 P0、6 个 P1、5 个 P2），每项配**行为级**护栏 + **变异自检**：

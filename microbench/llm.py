@@ -2544,7 +2544,7 @@ async def chat_async(
     custom_cfg = resolve_model_config(model_name) if model_name else None
     is_custom = bool(custom_cfg and custom_cfg.get("is_custom"))
     # 换模型（同一套 key/base_url 下的另一个模型名）—— 同步 chat() 一直有这步，
-    # 异步路径漏了 → 答疑时选了 M3.1-Flash 实际发出去的���是 M3
+    # 异步路径漏了 → 答疑时选了 M3.1-Flash 实际发出去的还是 M3
     # （2026-10-25 独立审查发现：用户"换模型"的诉求在答疑入口全部落空）
     # ⚠️ "agnes" 是**备用模型**的别名，不是模型名 —— 见 _apply_model_alias 的说明。
     is_fallback_alias = bool(custom_cfg and custom_cfg.get("is_fallback"))

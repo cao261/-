@@ -851,7 +851,7 @@
         //   拿它覆盖本地正文 = 刷新一次就把平板上的编辑抹掉；
         //   更糟的是 dirty 还留着 1、baseHash 却是旧文本的哈希 →
         //   下次 push 会把**旧文本写回坚果云**，把两边一起回滚。
-        //   （这正是「本地优先」被违反的��方。）
+        //   （这正是「本地优先」被违反的地方。）
         if (old) {
           return Object.assign({}, old, {
             title: old.title || r.title || "",
@@ -5102,7 +5102,7 @@
     if (s) {
       s.textContent = `${mode} · 待同步 ${state.dirtyCount}`;
     }
-    // 顶栏的云���状态标签
+    // 顶栏的云端状态标签
     const c = $("cloud-state");
     if (c) {
       const on = nativeBridge ? state.syncMode === "dav" : state.syncMode === "fsa";

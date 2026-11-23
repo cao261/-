@@ -104,7 +104,7 @@ check("payload/sends_all_sections", () => {
   const payload = api._buildExplainPayload("总结第 18 节");
   assert(payload.sections.length === 25,
     "只发了 " + payload.sections.length + " 节 —— 长论文后半部分被截断了");
-  assert(payload.sections[24].section === "SEC25", "最后���节没发出去");
+  assert(payload.sections[24].section === "SEC25", "最后一节没发出去");
 });
 
 check("payload/focus_index", () => {
