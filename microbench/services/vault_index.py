@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 from .. import generator as gen_mod
 from .. import paperid
+from ..generator import VAULT_REPLACED_PDF_DIR
 
 _INDEX_TTL_SECONDS = 5.0
 _INDEX_LOCK = threading.Lock()
@@ -184,7 +185,13 @@ def sync_index(base_dir: Path, force: bool = False) -> dict:
             lit_dir = base_dir / "01_Literature"
             if lit_dir.is_dir():
                 for pdf in lit_dir.rglob("*.pdf"):
-                    if not pdf.is_file() or any(pt.startswith(".") or pt == "05_译文替换版_PDF" for pt in pdf.parts):
+                    # ⚠ 「中译替换版」是**生成物**，不是论文原文 → 不进索引。
+                    # 目录名从 generator.VAULT_REPLACED_PDF_DIR 取（单一判据），
+                    # 别再在这里写字面量 —— 判据写两遍就会漏（2026-11-25 审计 P0）。
+                    if not pdf.is_file() or any(
+                        pt.startswith(".") or pt == VAULT_REPLACED_PDF_DIR
+                        for pt in pdf.parts
+                    ):
                         continue
                     rel = str(pdf.relative_to(base_dir)).replace("\\", "/")
                     seen_papers.add(rel)

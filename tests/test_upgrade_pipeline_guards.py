@@ -31,6 +31,71 @@ def test_sanitize_keeps_neutral_table_token_and_apply_restores_markdown():
     assert tr.TABLE_TEXT_FALLBACK in restored
 
 
+def test_translate_page_endpoint_puts_the_multimodal_table_back(client, sandbox, monkeypatch):
+    """⚠ **端点级**护栏（2026-11-25 审计 P0）。
+
+    旧顺序是 `sanitize_translation(...)` 在前、`table_map` 回填在后，
+    而清洗阶段就把 `⟦TABLE_n⟧` 销毁了 → 多模态抄好的表格**永远贴不回原位**。
+
+    ⚠ 为什么要端点级：函数级（`sanitize_translation` / `apply_table_map` 各测一遍）
+      只能证明**这两个函数**是对的，证明不了**端点把它们按对的顺序接在一起**。
+      本轮在另一处就栽了同型：判据写在了用户不走的路径上（§4.146）。
+    """
+    fitz = pytest.importorskip("fitz")
+    from microbench import app as app_mod
+    from microbench import llm as llm_mod
+
+    # 造一个**短页** PDF：抽出来的正文 < 100 字符 → 端点保留前端传来的 text
+    # （这样 ⟦TABLE:...⟧ 坐标标记一定在 page_text 里，表格分支才会被走到）
+    rel = "01_Literature/表格拼回样本.pdf"
+    pdf_path = sandbox / rel
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 90), "Short.", fontsize=11, fontname="helv")
+    doc.save(str(pdf_path))
+    doc.close()
+
+    seen = {}
+
+    async def fake_prepare_tables(page_text, pdf_path_, page_no, model=""):
+        # 真实 _prepare_tables 会把 ⟦TABLE:...⟧ 换成中性占位符 ⟦TABLE_n⟧，
+        # 并把多模态抄出的 Markdown 放进 table_map
+        seen["called"] = True
+        return ("表格前文 ⟦TABLE_0⟧ 表格后文",
+                {"⟦TABLE_0⟧": "| A | B |\n|---|---|\n| 1 | 2 |"})
+
+    monkeypatch.setattr(app_mod, "_prepare_tables", fake_prepare_tables)
+    monkeypatch.setattr(llm_mod, "is_configured", lambda: True)
+    monkeypatch.setattr(llm_mod, "chat", lambda **kw: "译文前 ⟦TABLE_0⟧ 译文后")
+
+    res = client.post("/api/paper/translate_page", json={
+        "paper_id": "tableback_xyz789",
+        "page": 1,
+        "text": "表格前文 ⟦TABLE:10,20,100,50⟧ 表格后文",
+        "relative_path": rel,
+        "force": True,
+    })
+    assert res.status_code == 200, res.text
+    assert seen.get("called"), "表格读图根本没被调用 —— 这条护栏就守不到东西"
+
+    translation = res.json()["translation"]
+    assert "| A | B |" in translation, \
+        f"抄好的表格没贴回译文里（占位符在清洗阶段就被销毁了）: {translation!r}"
+
+    # ⚠ 只断言「表在译文里」**不够** —— `apply_table_map` 有个兜底分支：
+    #   占位符不见了就把表格**追加到译文末尾**，表确实在译文里，但**没贴回原位**
+    #   （这正是 P0 的症状：表格永远回不到它该在的地方）。
+    # → 必须断言**位置**：表在「译文前」与「译文后」之间。
+    assert translation.index("译文前") < translation.index("| A | B |") \
+        < translation.index("译文后"), \
+        f"表格没贴回原位（被追加到末尾了）: {translation!r}"
+    assert "未能读出" not in translation, \
+        f"占位符被清洗阶段销毁了 → 表格只能兜底追加到末尾: {translation!r}"
+    assert "⟦TABLE_0⟧" not in translation, \
+        f"占位符漏给用户了: {translation!r}"
+
+
 def test_chunk_section_text_respects_hard_max_with_overlap():
     from microbench.translation import chunk_section_text
 

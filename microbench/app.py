@@ -56,6 +56,7 @@ from .generator import (
     ensure_vault_templates,
     _safe_path,             # exported once; used by all vault-file endpoints
     is_vault_content_path,  # vault 内容目录白名单（审计 2026-10-26 M-1）
+    VAULT_REPLACED_PDF_DIR,  # 「中译替换版」输出目录名（生成物，不是论文原文）
 )
 from .translation import (
     chunk_section_text,
@@ -2128,8 +2129,23 @@ async def api_page_blocks(relative_path: str, page: int = 1):
 # 译文从**快照**里拿（对照模式翻好的段落译文 + 段落坐标），
 # 不重新调模型 → 生成一份 PDF 只要一两秒。
 
-_REPLACED_DIR_NAME = "05_译文替换版_PDF"
+_REPLACED_DIR_NAME = VAULT_REPLACED_PDF_DIR
 _REPLACED_SUFFIX = "_中译替换版"
+
+
+def _is_replaced_output_pdf(parts) -> bool:
+    """这个 PDF 是不是「中译替换版」**生成物**（而不是论文原文）。
+
+    ⚠ **单一判据**（2026-11-25 审计 P0 的真正教训）：
+      「什么算论文原文」这个规则**只写了一遍是不够的** ——
+      这次它先只落在同步通道的 `_vault_pdfs()` 里，而前端真正点的
+      「从仓库论文库打开」走的是另一个端点（自己 rglob 一遍），
+      结果生成物照样出现在用户面前（实测列表里 27 篇混进 2 篇替换版）。
+
+      → 凡是扫「论文清单 / 找本地 PDF」的地方都走这个函数，
+        不允许再各写各的判据。
+    """
+    return _REPLACED_DIR_NAME in parts
 
 
 class ReplacedPdfRequest(BaseModel):
@@ -2704,6 +2720,11 @@ def api_find_pdf(
         if not cat_dir.is_dir():
             continue
         for pdf in cat_dir.rglob("*.pdf"):
+            # ⚠ 2026-11-25 审计 P0：排除「中译替换版」生成物 ——
+            #   生成物里是「原文页 + 中文替换页」交替的版面，
+            #   当成论文原文匹配出来，用户打开的是一份**排版完全不同**的 PDF。
+            if _is_replaced_output_pdf(pdf.relative_to(BASE_DIR).parts):
+                continue
             stem_clean = _norm(pdf.stem)
             score = 0
 
@@ -2877,6 +2898,13 @@ def api_list_vault_pdfs():
     ⚠ 2026-10-27 性能优化：同步 def（不是 async def）——
       `root.rglob("*.pdf")` 是同步磁盘扫描，在 async def 里直接调会
       **阻塞事件循环**（首屏那几个并发请求会被排成两批串行）。
+
+    ⚠⚠ 2026-11-25 审计 P0：**排除「中译替换版」生成物**。
+      这个端点就是前端「📂 从仓库论文库打开…」下拉的数据源，
+      用户在这里看到的就是「仓库里有哪些论文」——
+      生成物混进来 = 同一篇文章出现两份（原文 + 中译替换版），
+      点错一份打开的完全是另一个版面。
+      （此前这条只在同步通道的 `_vault_pdfs()` 生效，本端点自己扫一遍 → 漏了。）
     """
     from .generator import _safe_path
     root = _safe_path(BASE_DIR, "01_Literature")
@@ -2886,6 +2914,9 @@ def api_list_vault_pdfs():
             if not pdf.is_file():
                 continue
             rel = str(pdf.relative_to(BASE_DIR)).replace("\\", "/")
+            # 生成物不是论文原文 —— 见 _is_replaced_output_pdf 的说明
+            if _is_replaced_output_pdf(pdf.relative_to(BASE_DIR).parts):
+                continue
             try:
                 stat = pdf.stat()
                 size_kb = round(stat.st_size / 1024)
@@ -6125,7 +6156,7 @@ def _vault_pdfs() -> list:
             if parts[0] not in VAULT_CONTENT_DIRS:
                 continue
             # 生成物（中译替换版）不算「论文原文」
-            if _REPLACED_DIR_NAME in parts:
+            if _is_replaced_output_pdf(parts):
                 continue
             out.append((str(pdf.relative_to(BASE_DIR)).replace("\\", "/"), pdf))
     except OSError:

@@ -74,6 +74,57 @@ DPR=2 时 11MB），不是「画了才分配」。
 
 ---
 
+## 1.4 ⚠ 提交后的补修：**两处「护栏绿了但用户那边还是坏的」**
+
+> 这一节是本轮**最有价值的部分** —— 两笔 commit 落库后，真机复查发现的。
+> 两条都是同一个病根：**判据/断言停在了用户不走的路径上**。
+
+### ① P0「生成物当论文原文」只修了一半（坑记 §4.146）
+
+真机一查 `/api/paper/list_vault_pdfs`：**27 篇里混着 2 篇中译替换版**。
+
+**根因**：第一版只改了 `_vault_pdfs()`（**同步通道**用的清单），
+而前端「📂 从仓库论文库打开」走的是 `api_list_vault_pdfs` ——
+那个端点**自己 `rglob` 一遍**，压根没调那个排除。
+第一版护栏 `tests/test_vault_pdf_scope.py` 也**只测 `_vault_pdfs()`**
+→ 守的是一条用户不走的路径 → 绿得毫无意义。
+
+顺带查出**第三处**也没排除：`api_find_pdf`（按标题找本地 PDF）
+→ 搜「JACERS 综述」能直接搜出替换版。
+
+**修法**：
+1. 判据**收敛成单一函数** `app._is_replaced_output_pdf(parts)`；
+   常量归到 `generator.VAULT_REPLACED_PDF_DIR`（谁要判都从这一处取，
+   `services/vault_index.py` 里那个写字面量的也一并改掉）；
+2. **三个扫描点全部走它**：`_vault_pdfs()` / `api_list_vault_pdfs` / `api_find_pdf`；
+3. 护栏改成**真打端点**（`TestClient` 打上面两个端点）+ **变异自检**
+   （把判据改成永远失效 → 必须变红）。
+
+### ② P0-1 的端点级护栏第一版**太松**（坑记 §4.147）
+
+给「多模态抄的表有没有贴回译文」补端点级护栏时，第一版断言只写
+「译文里含 `| A | B |`」→ **把真代码改坏后它依然绿**。
+
+**根因**：`apply_table_map` 有个兜底分支 —— 标记不见了就把表格
+**追加到译文末尾**（「绝不丢内容」）。所以占位符被销毁时，
+表**确实在译文里**，只是**没贴回原位**（被甩到最后）——
+这正是 P0 的真实症状（「永远贴不回原位」），而「在不在」的断言抓不到。
+
+**修法**：判据要卡**位置** + 断言兜底文案没出现：
+```python
+assert translation.index("译文前") < translation.index("| A | B |") < translation.index("译文后")
+assert "未能读出" not in translation
+```
+
+### 变异自检怎么做的（两次都是真·产品代码变异）
+
+不是「在测试里 monkeypatch 掉判据」，而是**真的把产品代码改坏**，
+确认护栏变红，再改回来：
+- ① `if False and _is_replaced_output_pdf(...)` → 2 条端点断言变红；
+- ② 把 `⟦TABLE(?!_\d+⟧)` 的负向前瞻去掉（回到旧行为）→ 2 条变红。
+
+---
+
 ## 2. 平板 / APK：冻结解除（重要）
 
 **旧结论是错的。** 2026-11-23 写的「私钥已丢失、不敢重打 APK」不成立：
@@ -115,9 +166,16 @@ apksigner verify --print-certs MicroBench-平板工作台.apk
 ## 4. 验证结果（本机，30461 台）
 
 - 全量基线（Gemini 改动后、进我改动前）：**1691 passed / 1 skipped / 6m15s**。
-- 我的改动后：**1696 passed / 1 skipped / 12 deselected / 7m12s**（全绿）。
+- 我的改动后：**1742 passed / 1 skipped / 12 deselected / 5m08s**（全绿）。
+  （比基线多 51 条 = 本轮新增护栏 + 参数化行尾护栏覆盖了新文件。）
+- 回归护栏 `python -m microbench._test_regressions`：**46 passed / 0 failed**。
 - 新护栏单独跑：`_test_reader_overlay_render.py` 全绿 + 4/4 变异被抓住；
-  `_test_reader_markdown.js` 20 passed；`test_vault_pdf_scope.py` 4 passed。
+  `_test_reader_markdown.js` 20 passed；
+  `test_vault_pdf_scope.py` **7 passed**（真打端点 + 变异自检）；
+  `test_upgrade_pipeline_guards.py` **18 passed**（含 P0-1 端点级护栏）。
+- **两次真·产品代码变异**（不是 monkeypatch 判据，是真的把产品代码改坏）：
+  ① 三个扫描点的排除改成 `if False and ...` → 2 条端点断言变红；
+  ② 去掉 `_normalize_formula_markers` 的负向前瞻 → 2 条变红。
 - **真机端到端**：`_live_canvas_release_test.py` 6/6（真服务 + 真 PDF.js + 36 页论文）。
 - `tests/test_apk_delivery.py`：5 passed（APK 与仓库根 HTML 逐字节一致 + 证书一致）。
 - **被我的改动波及、又修回来的旧护栏 4 个**：
@@ -142,6 +200,10 @@ apksigner verify --print-certs MicroBench-平板工作台.apk
    别再写裸数字（§4.138）。
 4. `EXTRACTOR_VERSION` **仍然是 5**，**不要动**；段落级改动才评估
    `BLOCK_TRANSLATION_VERSION`（动了会作废另一台设备的段落快照）。
+5. ⚠ **「什么算论文原文」只准写一遍** —— 用 `app._is_replaced_output_pdf()`。
+   再写第二遍就是下一轮的 §4.146（坑记里记着两次漏网的现场）。
+6. ⚠ 断言「某个东西在结果里」之前，先看代码里**有没有兜底分支**
+   —— 有兜底时它一定会被塞进去，判据必须卡**位置**（§4.147）。
 
 ---
 
@@ -167,6 +229,9 @@ apksigner verify --print-certs MicroBench-平板工作台.apk
 | `microbench/_test_reader_overlay_render.py` | **新增**：真实浏览器浮层护栏 |
 | `microbench/_live_canvas_release_test.py` | **新增**：真机端到端（画布按需渲染/显存释放） |
 | `microbench/_test_reader_markdown.js` | 公式里的竖线用例 + 变异自检 |
-| `tests/test_vault_pdf_scope.py` | **新增**：vault 论文清单口径 |
+| `tests/test_vault_pdf_scope.py` | **新增**：vault 论文清单口径（后升级为**真打端点** + 变异自检） |
+| `tests/test_upgrade_pipeline_guards.py` | 新增 P0-1 的**端点级**护栏（表必须**贴回原位**，不是「在译文里」） |
+| `microbench/generator.py` | `VAULT_REPLACED_PDF_DIR` 常量（生成物目录名的**单一来源**） |
+| `microbench/services/vault_index.py` | 索引扫描改用共享常量（不再写字面量） |
 | `android/SIGNING.md` | 更正「私钥丢失」的错误前提 + 构建前必查 |
-| `AGENTS.md` | §4.138~4.144 坑记 + 顶部摘要 |
+| `AGENTS.md` | §4.138~4.147 坑记 + 顶部摘要 |
