@@ -92,7 +92,11 @@ def main() -> int:
                 break
         check("远处页的画布是空的（位图已释放 → 显存不被长论文撑爆）",
               far is not None,
-              "查了 " + str(total) + " 页都没找到空画布")
+              # ⚠ 成功/失败要给**不同的**文案：早先这里无论成败都打印失败那句
+              #   「查了 N 页都没找到空画布」→ 一眼看过去像红点，其实是通过的。
+              ("已释放：第 %d 页 canvas.width=%d" % (far[0], far[1]["w"]))
+              if far is not None
+              else ("查了 " + str(total) + " 页都没找到空画布"))
 
         if far:
             n = far[0]
