@@ -292,28 +292,6 @@ def read_cache(pdf_path: Path):
 # 为什么要管：缓存键随 (mtime,size) + EXTRACTOR_VERSION 变，一篇论文改一次
 # 就多一份文件，而且**没有任何地方会删旧的**（clear_cache 只有测试在调）。
 # 27 篇 × 几十个版本 = 磁盘上堆几百个 JSON，每个可能几百 KB。
-# 只在上限之上才动手，平时零开销。
-CACHE_MAX_FILES = 200
-_CACHE_PRUNE_BATCH = 40
-
-
-def _prune_old_cache_files() -> None:
-    """缓存文件超过软上限时，删掉最旧的一批（按 mtime）。"""
-    try:
-        files = list(CACHE_DIR.glob("*.json"))
-        if len(files) <= CACHE_MAX_FILES:
-            return
-        files.sort(key=lambda p: p.stat().st_mtime)
-        for f in files[:_CACHE_PRUNE_BATCH]:
-            try:
-                f.unlink()
-            except OSError:
-                pass
-    except Exception:
-        # 清理失败不该影响写入
-        pass
-
-
 def write_cache(pdf_path: Path, pages: list, key: str) -> None:
     """写缓存。失败就失败（性能优化，不该影响功能）。"""
     try:
@@ -335,7 +313,6 @@ def write_cache(pdf_path: Path, pages: list, key: str) -> None:
             except OSError:
                 pass
             raise
-        _prune_old_cache_files()
     except Exception as e:
         print(f"[pdfcache] 写缓存失败（忽略，不影响功能）: {e}", file=sys.stderr)
         return

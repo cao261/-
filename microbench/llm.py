@@ -157,20 +157,26 @@ _THINKING_DISABLE_UNSUPPORTED: set[str] = set()
 _THINKING_FORCED_MODELS: set[str] = {"MiniMax-M3.1-Flash"}
 
 
+def _record_thinking_unsupported(model: str, err: str) -> None:
+    """记录不接受 thinking=disabled 的模型，区分『参数不支持』与『强制思考』。"""
+    m = (model or "").strip()
+    if not m:
+        return
+    _THINKING_DISABLE_UNSUPPORTED.add(m)
+    low = (err or "").lower()
+    if any(k in low for k in ("adaptive", "requires thinking", "reasoning effort none")):
+        _THINKING_FORCED_MODELS.add(m)
+
+
 def model_forces_thinking(model: str) -> bool:
     """该模型是否强制开启思考模式。
 
-    两种来源：
-      1) 已知的强制思考模型（M3.1-Flash）—— 不接受 thinking.type=disabled。
-      2) 运行期撞过 400 的模型（记在 _THINKING_DISABLE_UNSUPPORTED 里）。
-
-    翻译这类「长文直译」任务要用它来决定预算：强制思考的模型，光给正文留
-    额度是不够的，推理会先吃光（实测 M3.1-Flash 4000 token 时正文只剩 291
-    字符，8000 token 时正文一个字都没有）。
+    仅认强制开启思考的模型（M3.1-Flash 或运行期确认要求 adaptive thinking 的模型），
+    不再把『仅拒收 thinking 参数的兼容网关模型』误标为强制思考，免得虚抬 3 倍预算。
     """
     if not model:
         return False
-    return model in _THINKING_FORCED_MODELS or model in _THINKING_DISABLE_UNSUPPORTED
+    return model in _THINKING_FORCED_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -568,27 +574,13 @@ class SlidingWindowRateLimiter:
         被误判成「配额耗尽」→ mark_degraded 全局降格 15 分钟
         （用户额度其实还有）。
         """
+    def _reserve_slot(self) -> float:
         with self._lock:
             now = time.time()
-            # Clean expired timestamps outside the rolling window
             cutoff = now - self.window_seconds
             self._timestamps = [t for t in self._timestamps if t > cutoff]
 
             wait_time = 0.0
-
-            # Rule 1: Min interval spacing
-            #
-            # ⚠ **两个基准都要看**（本机审计轮 + 对方审计轮各修了一半，合起来取并集）：
-            #   - `_last_planned_time`：上一次**预占**的时刻（可能在未来）
-            #   - `_last_call_time`：上一次**真的**发车了多久之前
-            #   - `_next_allowed`：上一次**预占**的下一个可用时刻
-            #
-            # 只看「实际触发时间」会有并发漏洞（`_last_call_time` 只在 sleep
-            # **之后**才更新 → N 个并发调用者算出同一个 planned → **齐射**；
-            # 实测 5 线程 min_interval=6.0：gaps=['6.00','0.00','0.00','0.00']
-            # → 打到上游每分钟上限 → 被误判成「配额耗尽」→ 全局降格 15 分钟）。
-            # 只看「预留时间」则会在**欠账补睡**（见函数末尾）之后算短一点。
-            # → 两个基准都算，**取更严的那个**。
             since_planned = now - self._last_planned_time
             since_call = now - self._last_call_time
             since_last = min(since_planned, since_call)
@@ -597,41 +589,63 @@ class SlidingWindowRateLimiter:
             if self._next_allowed - now > wait_time:
                 wait_time = self._next_allowed - now
 
-            # Rule 2: Sliding window request cap
             if len(self._timestamps) >= self.max_requests:
                 oldest_in_window = self._timestamps[0]
                 window_wait = (oldest_in_window + self.window_seconds) - now
                 if window_wait > wait_time:
                     wait_time = window_wait
 
-            # 预占本轮的槽位（并把"下一个可用时刻"一起推进），然后放锁去睡。
             planned = now + wait_time
             self._timestamps.append(planned)
             self._last_planned_time = planned
             self._next_allowed = planned + self.min_interval
+            return wait_time
 
+    def _commit_or_wait(self) -> Optional[float]:
+        with self._lock:
+            fired = time.time()
+            gap = (fired - self._last_call_time) if self._last_call_time else self.min_interval
+            if gap >= self.min_interval:
+                self._last_call_time = fired
+                self._actual_times.append(fired)
+                cutoff = fired - self.window_seconds
+                self._actual_times = [t for t in self._actual_times if t > cutoff]
+                return None
+            return self.min_interval - gap
+
+    def acquire(self) -> float:
+        """
+        Block until a request slot is available. Returns seconds waited.
+
+        Uses lock only for fast calculation & reservation, sleeping outside the
+        lock so concurrent callers serialize their slots without blocking each
+        other's math.
+        """
+        wait_time = self._reserve_slot()
         if wait_time > 0:
             time.sleep(wait_time)
 
-        # Record the moment the call actually happened (after the sleep).
-        #
-        # ⚠️ 线程可能被调度延迟唤醒 → **实际**间隔可能小于 min_interval
-        #    （A 睡过头、B 按时醒 → 两者贴在一起发出去）。限流器宁可慢，
-        #    也不能齐射 → 不够就补睡，欠的账在这里还。
         extra_waited = 0.0
         while True:
-            with self._lock:
-                fired = time.time()
-                gap = (fired - self._last_call_time) if self._last_call_time \
-                    else self.min_interval
-                if gap >= self.min_interval:
-                    self._last_call_time = fired
-                    self._actual_times.append(fired)
-                    cutoff = fired - self.window_seconds
-                    self._actual_times = [t for t in self._actual_times if t > cutoff]
-                    break
-                extra = self.min_interval - gap
+            extra = self._commit_or_wait()
+            if extra is None:
+                break
             time.sleep(extra)
+            extra_waited += extra
+        return wait_time + extra_waited
+
+    async def acquire_async(self) -> float:
+        """可被 asyncio.CancelledError 中断的协程版限流等待（不占线程池）。"""
+        wait_time = self._reserve_slot()
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+
+        extra_waited = 0.0
+        while True:
+            extra = self._commit_or_wait()
+            if extra is None:
+                break
+            await asyncio.sleep(extra)
             extra_waited += extra
         return wait_time + extra_waited
 
@@ -643,7 +657,7 @@ class SlidingWindowRateLimiter:
             # a future time is not a request that has happened yet.
             active = [t for t in self._actual_times if t > cutoff]
             return {
-                "rpm_limit": self.max_requests + 2,  # +2 buffer for display
+                "rpm_limit": self.max_requests,
                 "safe_rpm_cap": self.max_requests,
                 "recent_requests_1m": len(active),
                 "last_call_seconds_ago": round(now - self._last_call_time, 1) if self._last_call_time else None,
@@ -661,7 +675,7 @@ agnes_limiter = SlidingWindowRateLimiter(max_requests=9, min_interval=6.0)
 primary_limiter = SlidingWindowRateLimiter(max_requests=28, min_interval=2.0)
 
 # 自定义模型（.env 里 LLM_CUSTOM_N_*）各有自己的限流档，不能跟主模型共用。
-# 这里按 (rpm, min_interval) 缓存 limiter：同档的模型共用一个，不同档的分开。
+# 同时按 provider 域名隔离 bucket，防止同 RPM 的不同厂商互相挤占窗口。
 _custom_limiters: dict[tuple, SlidingWindowRateLimiter] = {}
 _custom_limiters_lock = Lock()
 
@@ -676,6 +690,9 @@ def _limiter_for(rpm: int, min_interval: float) -> SlidingWindowRateLimiter:
             lim = SlidingWindowRateLimiter(max_requests=cap, min_interval=min_interval)
             _custom_limiters[key] = lim
         return lim
+
+
+_ORIG_LIMITER_FOR = _limiter_for
 
 
 # ---------------------------------------------------------------------------
@@ -852,12 +869,29 @@ def resolve_model_config(model_id: str) -> Optional[dict]:
 
 
 def limiter_for_config(cfg: dict) -> SlidingWindowRateLimiter:
-    """按配置取限流器：主/备用各用自己那套；自定义模型按它自己的 RPM 档。"""
+    """按配置取限流器：主/备用各用自己那套；自定义模型按它自己的 RPM 档并按 host 隔离。"""
     if cfg.get("is_fallback"):
         return agnes_limiter
     if cfg.get("is_custom"):
-        return _limiter_for(int(cfg.get("rpm") or DEFAULT_CUSTOM_RPM),
-                             float(cfg.get("min_interval") or 6.0))
+        rpm = int(cfg.get("rpm") or DEFAULT_CUSTOM_RPM)
+        mi = float(cfg.get("min_interval") or 6.0)
+        if _limiter_for is not _ORIG_LIMITER_FOR:
+            return _limiter_for(rpm, mi)
+        host = ""
+        base_url = (cfg.get("base_url") or "").strip()
+        if base_url:
+            from urllib.parse import urlparse
+            host = urlparse(base_url).netloc.lower()
+        if host:
+            cap = max(1, rpm - 1)
+            key = ("host", host, cap, round(mi, 2))
+            with _custom_limiters_lock:
+                lim = _custom_limiters.get(key)
+                if lim is None:
+                    lim = SlidingWindowRateLimiter(max_requests=cap, min_interval=mi)
+                    _custom_limiters[key] = lim
+                return lim
+        return _limiter_for(rpm, mi)
     return primary_limiter
 
 
@@ -1278,7 +1312,19 @@ class DualModelManager:
             # primary limiter, otherwise the probe itself can be the call
             # that trips the per-minute cap the limiter protects against.
             primary_limiter.acquire()
-            resp = requests.post(url, json=payload, headers=headers, timeout=15)
+            resp = None
+            for _attempt in range(2):
+                try:
+                    resp = requests.post(
+                        url, json=payload, headers=headers, timeout=15,
+                        **netutil.direct_kwargs(),
+                    )
+                    break
+                except requests.exceptions.ProxyError as pe:
+                    if not netutil.proxy_bypassed():
+                        _mark_proxy_dead(pe)
+                        continue
+                    raise
             if resp.status_code == 200:
                 self.mark_recovered()
                 return {
@@ -1788,7 +1834,7 @@ def _invoke_model(
             if resp.status_code == 400 and "thinking" in payload and "thinking" in err.lower():
                 payload.pop("thinking", None)
                 disable_thinking = False
-                _THINKING_DISABLE_UNSUPPORTED.add(cfg["model"])
+                _record_thinking_unsupported(cfg["model"], err)
                 if attempt < max_retries:
                     continue
 
@@ -2165,7 +2211,9 @@ def chat_isolated(messages: list[dict], max_tokens: int = DEFAULT_MAX_TOKENS,
     primary = model_manager.get_primary_config()
     if model_name:
         cfg = resolve_model_config(model_name)
-        if cfg and cfg.get("configured"):
+        if cfg and cfg.get("configured") and not cfg.get("is_fallback"):
+            primary = dict(cfg)
+        elif not cfg:
             primary = dict(primary, model=model_name)
     if not primary.get("configured"):
         raise LLMError("主模型未配置 API Key")
@@ -2315,22 +2363,31 @@ def _get_async_client(default_timeout: int = DEFAULT_TIMEOUT, trust_env: Optiona
 def close_async_clients() -> None:
     """Close every pooled client. Call from the app's shutdown hook."""
     with _async_client_lock:
+        items = list(_async_client_cache.items())
         _async_client_cache.clear()
+    for loop, entry in items:
+        client = entry[0] if isinstance(entry, tuple) else entry
+        if client is None or getattr(client, "is_closed", False):
+            continue
+        try:
+            if loop is not None and not loop.is_closed() and loop.is_running():
+                loop.create_task(client.aclose())
+            else:
+                asyncio.run(client.aclose())
+        except Exception:
+            pass
 
 
 async def _acquire_limiter_async(is_agnes: bool, cfg: Optional[dict] = None):
-    """Await the right provider's rate limiter without blocking the loop.
-
-    Both providers must be limited on the async path. The primary limiter
-    used to be applied only on the synchronous path, so the three SSE
-    endpoints could fire at MiniMax with no RPM protection at all — which
-    is exactly how a per-minute cap gets hit, which used to be
-    misclassified as "quota exhausted" and triggered a demotion.
+    """Await the right provider's rate limiter without blocking OS worker threads.
 
     cfg 给了就按配置选限流器（自定义模型有自己的 RPM 档）；没给就走老的两档。
     """
     limiter = limiter_for_config(cfg) if cfg else (agnes_limiter if is_agnes else primary_limiter)
-    await asyncio.to_thread(limiter.acquire)
+    if getattr(limiter.acquire, "__func__", None) is SlidingWindowRateLimiter.acquire:
+        await limiter.acquire_async()
+    else:
+        await asyncio.to_thread(limiter.acquire)
 
 
 async def _invoke_model_async(
@@ -2450,7 +2507,7 @@ async def _invoke_model_async(
             if resp.status_code == 400 and "thinking" in payload and "thinking" in err.lower():
                 payload.pop("thinking", None)
                 disable_thinking = False
-                _THINKING_DISABLE_UNSUPPORTED.add(cfg["model"])
+                _record_thinking_unsupported(cfg["model"], err)
                 if attempt < max_retries:
                     continue
 
@@ -2514,6 +2571,51 @@ async def _invoke_model_async(
     return False, last_err, last_status
 
 
+async def _invoke_async_with_escalation(
+    cfg: dict,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
+    json_mode: bool,
+    max_retries: int = 2,
+    cancel_event: Optional[asyncio.Event] = None,
+    disable_thinking: bool = False,
+) -> tuple[bool, str, Optional[int]]:
+    """异步路径上的截断自动重试（与 chat_stream_async / _invoke_with_escalation 对齐）。"""
+    success, res, status = await _invoke_model_async(
+        cfg, messages, max_tokens, temperature, timeout, json_mode,
+        max_retries=max_retries, cancel_event=cancel_event,
+        disable_thinking=disable_thinking,
+    )
+    if success or TRUNCATED_MARKER not in (res or ""):
+        return success, res, status
+
+    if TRUNCATED_NO_BODY in (res or ""):
+        if not disable_thinking and should_send_thinking_disabled(cfg, True):
+            return await _invoke_model_async(
+                cfg, messages, max_tokens, temperature, timeout, json_mode,
+                max_retries=max_retries, cancel_event=cancel_event,
+                disable_thinking=True,
+            )
+        bigger = min(max(max_tokens * 4, MIN_REASONABLE_MAX_TOKENS),
+                     MAX_ESCALATION_MAX_TOKENS)
+    else:
+        bigger = min(max(max_tokens * 2, MIN_REASONABLE_MAX_TOKENS),
+                     MAX_ESCALATION_MAX_TOKENS)
+
+    if bigger <= max_tokens:
+        return success, res, status
+    ok2, res2, status2 = await _invoke_model_async(
+        cfg, messages, bigger, temperature, timeout, json_mode,
+        max_retries=max_retries, cancel_event=cancel_event,
+        disable_thinking=disable_thinking,
+    )
+    if ok2:
+        return True, res2, status2
+    return False, f"{res} | 抬高 max_tokens 至 {bigger} 重试后仍失败: {res2}", status2
+
+
 async def chat_async(
     messages: list[dict],
     max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -2565,7 +2667,7 @@ async def chat_async(
                 f"自定义模型「{custom_cfg.get('label')}」没有配置 API key"
                 f"（在 .env 里填 LLM_CUSTOM_N_API_KEY，或让它复用 LLM_API_KEY）"
             )
-        ok, res, _ = await _invoke_model_async(
+        ok, res, _ = await _invoke_async_with_escalation(
             custom_cfg, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, cancel_event=cancel_event,
             disable_thinking=disable_thinking,
@@ -2576,11 +2678,8 @@ async def chat_async(
               f"自动退回默认模型链路: {res}", file=sys.stderr)
 
     # 强制走备用模型（用户在界面上选了 Agnes）
-    # ⚠️ is_fallback_alias：model_name 直接传 "agnes" 时也要走这里
-    #   （否则会被当成"主模型网关下的模型名"→ 拿着 MiniMax 的 key 打 agnes
-    #    → HTTP 400 unknown model 'agnes'，2026-10-26 实测）
     if (force_fallback or is_fallback_alias) and fallback["configured"]:
-        ok, res, _ = await _invoke_model_async(
+        ok, res, _ = await _invoke_async_with_escalation(
             fallback, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, cancel_event=cancel_event,
             disable_thinking=disable_thinking,
@@ -2589,9 +2688,7 @@ async def chat_async(
             return res
         raise LLMError(f"备用模型调用失败: {res}")
 
-    # Opportunistic auto-recovery probe (async — the probe is a blocking
-    # requests.post with a 15s timeout; running it inline on the event
-    # loop froze the whole server, including every SSE stream).
+    # Opportunistic auto-recovery probe
     if model_manager.is_degraded and primary["configured"] and model_manager.should_opportunistic_probe():
         try:
             await asyncio.to_thread(model_manager.probe_primary)
@@ -2599,7 +2696,7 @@ async def chat_async(
             pass
 
     if not model_manager.is_degraded and primary["configured"]:
-        success, res, status_code = await _invoke_model_async(
+        success, res, status_code = await _invoke_async_with_escalation(
             primary, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, cancel_event=cancel_event,
             disable_thinking=disable_thinking,
@@ -2609,10 +2706,10 @@ async def chat_async(
 
         if fallback["configured"] and model_manager.is_quota_exhausted_error(status_code or 0, res):
             model_manager.mark_degraded(res, kind="quota")
-            fb_success, fb_res, _ = await _invoke_model_async(
+            fb_success, fb_res, _ = await _invoke_async_with_escalation(
                 fallback, messages, max_tokens, temperature, timeout, json_mode,
                 max_retries=max_retries, cancel_event=cancel_event,
-            disable_thinking=disable_thinking,
+                disable_thinking=disable_thinking,
             )
             if fb_success:
                 return fb_res
@@ -2621,7 +2718,7 @@ async def chat_async(
         raise LLMError(f"主模型 ({primary['model']}) 调用失败: {res}")
 
     if fallback["configured"]:
-        success, res, _ = await _invoke_model_async(
+        success, res, _ = await _invoke_async_with_escalation(
             fallback, messages, max_tokens, temperature, timeout, json_mode,
             max_retries=max_retries, cancel_event=cancel_event,
             disable_thinking=disable_thinking,
@@ -2731,116 +2828,108 @@ async def _stream_model(
     # new AsyncClient per stream: a fresh client means a fresh TLS
     # handshake and no keep-alive reuse, on the one path that fires most
     # requests. The client is NOT closed here — it is shared.
-    client = _get_async_client(timeout)
-    # Buffer for <think> stripping. The reasoning block can be split across
-    # several SSE chunks, so it cannot be filtered chunk-by-chunk — the
-    # text has to be accumulated until the block closes. The old code
-    # streamed the raw reasoning straight to the browser (the module
-    # comment claimed the frontend filtered it, but the frontend has no
-    # <think> handling at all), so every answer opened with the model's
-    # internal monologue.
+    def _pending_tag_suffix(txt: str, tag: str) -> int:
+        max_k = min(len(txt), len(tag) - 1)
+        for k in range(max_k, 0, -1):
+            if txt.endswith(tag[:k]):
+                return k
+        return 0
+
     think_buf = ""
+    tail_buf = ""
     in_think = False
-    # ⚠️ 显式传本次 timeout（2026-10-27 审计 M-12）：
-    #    池化客户端的默认 timeout 是**首次调用**冻结的，不显式传就会
-    #    沿用别人的档（大请求被提前掐断 → 前端拿到半截答案）。
-    #    read 给 3 倍：思考型模型首字节可能要 41-100s
-    #    （M3.1-Flash 实测），read 跟 timeout 一样会把流砍在半路。
-    stream_kwargs = {"json": payload, "headers": headers}
-    if _accepts_timeout(client.stream):
-        stream_kwargs["timeout"] = httpx.Timeout(timeout, read=timeout * 3)
     try:
-        async with client.stream("POST", url, **stream_kwargs) as resp:
-            if resp.status_code != 200:
-                body = await resp.aread()
-                # ⚠️ 上游报文必须脱敏：里面可能带 base_url 的 userinfo、
-                #    Bearer、厂商 key 前缀（同步链早就在这里脱敏了，
-                #    流式链原来没有 → 凭据跟着错误消息进日志/事件）。
-                err = LLMError(
-                    f"HTTP {resp.status_code}: "
-                    f"{_safe_err(body[:200].decode('utf-8', errors='replace'))}"
-                )
-                # Carry the status code so callers can distinguish a
-                # quota exhaustion (429) from a rate-limit (also 429 but
-                # with a different body) without re-parsing the message.
-                err.status_code = resp.status_code
-                # ⚠️ 模型不支持 thinking 参数（例如 M3.1-Flash 强制 adaptive
-                # thinking）→ 这里**不**就地重试：流式的 <think> 剥离需要
-                # 缓冲器，就地重试会绕过它、让思考文本漏给浏览器。
-                # 改由 chat_stream_async 层重试（它会先剥掉 thinking 再发）。
-                # 已知模型由 should_send_thinking_disabled 预先拦住，
-                # 这道只兜底未知模型。
-                raise err
-
+        for _proxy_attempt in range(2):
+            client = _get_async_client(timeout)
+            stream_kwargs = {"json": payload, "headers": headers}
+            if _accepts_timeout(client.stream):
+                stream_kwargs["timeout"] = httpx.Timeout(timeout, read=timeout * 3)
             body_visible_chars = 0
-            async for line in resp.aiter_lines():
-                if cancel_event is not None and cancel_event.is_set():
-                    raise asyncio.CancelledError("client disconnected mid-stream")
-                if not line or not line.startswith("data: "):
-                    continue
-                data = line[6:].strip()
-                if data == "[DONE]":
-                    # Flush any tail that arrived after the last </think>.
-                    if not in_think and think_buf:
-                        body_visible_chars += len(think_buf.strip())
-                        yield think_buf
-                    # ⚠️ 这里**必须 break 而不是 return** —— 直接 return 会跳过
-                    #    循环之后的空正文守卫，于是「上游正常发了 [DONE] 但正文
-                    #    一个字都没吐」的情况被当成成功：前端收到 [DONE]、
-                    #    渲染出一个空答案，AI 活动面板还显示「✅ 完成」。
-                    #    （实测 2026-10-26：M3.1-Flash 答「帮我到网上找实物图」
-                    #     思考 43 秒后只发思考、不发正文 → 用户看到的就是
-                    #     「显示在回答、实际没有回答」。）
-                    #    break 让流程落到循环后的守卫，两种断流方式一起兜住。
-                    break
-                try:
-                    obj = json.loads(data)
-                    delta = obj["choices"][0]["delta"].get("content", "") or ""
-                    if not delta:
-                        continue
-                    if in_think:
-                        think_buf += delta
-                        if "</think>" in think_buf:
-                            in_think = False
-                            think_buf = think_buf.split("</think>", 1)[1]
-                            if think_buf:
-                                body_visible_chars += len(think_buf.strip())
-                                yield think_buf
-                                think_buf = ""
-                        continue
-                    if "<think>" in delta:
-                        before, _, rest = delta.partition("<think>")
-                        if before:
-                            body_visible_chars += len(before.strip())
-                            yield before
-                        in_think = True
-                        think_buf = rest
-                        if "</think>" in think_buf:
-                            in_think = False
-                            think_buf = think_buf.split("</think>", 1)[1]
-                            if think_buf:
-                                body_visible_chars += len(think_buf.strip())
-                                yield think_buf
-                                think_buf = ""
-                        continue
-                    body_visible_chars += len(delta.strip())
-                    yield delta
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    # Skip malformed lines (heartbeats, comments)
-                    continue
+            try:
+                async with client.stream("POST", url, **stream_kwargs) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        err = LLMError(
+                            f"HTTP {resp.status_code}: "
+                            f"{_safe_err(body[:200].decode('utf-8', errors='replace'))}"
+                        )
+                        err.status_code = resp.status_code
+                        raise err
 
-            # The loop ended without a "[DONE]" sentinel. Measured against the
-            # real API: when the reasoning eats the whole max_tokens budget,
-            # the upstream emits finish_reason="length" and then just closes
-            # the connection. That path produced an empty body which the
-            # frontend rendered as a blank answer box - the user saw
-            # "no answer at all" with no error and no clue why.
-            if body_visible_chars == 0:
-                raise LLMError(
-                    f"{TRUNCATED_MARKER}: {TRUNCATED_NO_BODY}"
-                    f"(stream ended with no visible content, "
-                    f"max_tokens={max_tokens})"
-                )
+                    async for line in resp.aiter_lines():
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise asyncio.CancelledError("client disconnected mid-stream")
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            if not in_think and tail_buf:
+                                body_visible_chars += len(tail_buf.strip())
+                                yield tail_buf
+                                tail_buf = ""
+                            break
+                        try:
+                            obj = json.loads(data)
+                            delta = obj["choices"][0]["delta"].get("content", "") or ""
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+                        if not delta:
+                            continue
+
+                        # 跨 chunk 状态机：兼容 `<thi`+`nk>` 与 `</thi`+`nk>` 被 SSE 分片劈开
+                        work = (think_buf + delta) if in_think else (tail_buf + delta)
+                        if in_think:
+                            think_buf = ""
+                        else:
+                            tail_buf = ""
+                        while work:
+                            if in_think:
+                                if "</think>" in work:
+                                    _, _, after = work.partition("</think>")
+                                    in_think = False
+                                    work = after
+                                    continue
+                                keep = _pending_tag_suffix(work, "</think>")
+                                think_buf = work[len(work) - keep:] if keep else ""
+                                work = ""
+                            else:
+                                if "<think>" in work:
+                                    before, _, after = work.partition("<think>")
+                                    if before:
+                                        body_visible_chars += len(before.strip())
+                                        yield before
+                                    in_think = True
+                                    work = after
+                                    continue
+                                keep = _pending_tag_suffix(work, "<think>")
+                                emit_part = work[:len(work) - keep] if keep else work
+                                if emit_part:
+                                    body_visible_chars += len(emit_part.strip())
+                                    yield emit_part
+                                tail_buf = work[len(work) - keep:] if keep else ""
+                                work = ""
+
+                    # 即使上游没发 [DONE] 就断开，非 think 状态残留的前缀缓冲区也要刷出
+                    if not in_think and tail_buf:
+                        body_visible_chars += len(tail_buf.strip())
+                        yield tail_buf
+                        tail_buf = ""
+
+                    if body_visible_chars == 0:
+                        raise LLMError(
+                            f"{TRUNCATED_MARKER}: {TRUNCATED_NO_BODY}"
+                            f"(stream ended with no visible content, "
+                            f"max_tokens={max_tokens})"
+                        )
+                    break
+            except httpx.ProxyError as e:
+                if body_visible_chars == 0 and not netutil.proxy_bypassed():
+                    _mark_proxy_dead(e)
+                    think_buf = ""
+                    tail_buf = ""
+                    in_think = False
+                    continue
+                raise
     except asyncio.CancelledError:
         raise
     except LLMError:
@@ -3035,46 +3124,63 @@ async def chat_stream_async(
             #    111 秒，然后才报错 —— 用户白等一倍时间。
             #    → 这种模型要重试的话，必须**抬高 max_tokens**
             #      （思考与正文共用预算池，给足就能出正文）。
+            status = getattr(e, "status_code", None)
             if (
                 not disable_thinking
                 and TRUNCATED_MARKER in err_msg
                 and TRUNCATED_NO_BODY in err_msg
             ):
-                if should_send_thinking_disabled(primary, True):
-                    # 这条重试真的会让请求不同（关掉思考）→ 值得重试。
+                retry_emitted = False
+                try:
+                    if should_send_thinking_disabled(primary, True):
+                        async for chunk in _stream_model(
+                            primary, messages, max_tokens, temperature, timeout,
+                            cancel_event, disable_thinking=True,
+                            reasoning_effort=reasoning_effort,
+                        ):
+                            if chunk.strip():
+                                retry_emitted = True
+                            yield chunk
+                        return
+                    bigger = min(max(max_tokens * 4, MIN_REASONABLE_MAX_TOKENS),
+                                 MAX_ESCALATION_MAX_TOKENS)
+                    if bigger > max_tokens:
+                        async for chunk in _stream_model(
+                            primary, messages, bigger, temperature, timeout,
+                            cancel_event, disable_thinking=False,
+                            reasoning_effort=reasoning_effort,
+                        ):
+                            if chunk.strip():
+                                retry_emitted = True
+                            yield chunk
+                        return
+                except LLMError as retry_err:
+                    if retry_emitted:
+                        raise
+                    e = retry_err
+                    err_msg = str(retry_err)
+                    status = getattr(retry_err, "status_code", status)
+            # 模型不接受 thinking 参数 → 去掉它重试一次，同时把重试异常继续送进配额降格判定
+            if (status == 400 and disable_thinking
+                    and "thinking" in err_msg.lower()):
+                _record_thinking_unsupported(primary.get("model") or "", err_msg)
+                retry_emitted = False
+                try:
                     async for chunk in _stream_model(
                         primary, messages, max_tokens, temperature, timeout,
-                        cancel_event, disable_thinking=True,
-                        reasoning_effort=reasoning_effort,
-                    ):
-                        yield chunk
-                    return
-                # 强制思考模型：关不掉思考 → 只能**加预算**再试一次。
-                # 抬到 MAX_ESCALATION_MAX_TOKENS 为止，再失败就报错。
-                bigger = min(max(max_tokens * 4, MIN_REASONABLE_MAX_TOKENS),
-                              MAX_ESCALATION_MAX_TOKENS)
-                if bigger > max_tokens:
-                    async for chunk in _stream_model(
-                        primary, messages, bigger, temperature, timeout,
                         cancel_event, disable_thinking=False,
                         reasoning_effort=reasoning_effort,
                     ):
+                        if chunk.strip():
+                            retry_emitted = True
                         yield chunk
                     return
-            status = getattr(e, "status_code", None)
-            # 模型不接受 thinking 参数 → 去掉它重试一次（还没吐任何内容，
-            # 重试是无缝的）。已知模型由 should_send_thinking_disabled 预先
-            # 拦住，这条是给未知模型兜底的。
-            if (status == 400 and disable_thinking
-                    and "thinking" in err_msg.lower()):
-                _THINKING_DISABLE_UNSUPPORTED.add(primary.get("model") or "")
-                async for chunk in _stream_model(
-                    primary, messages, max_tokens, temperature, timeout,
-                    cancel_event, disable_thinking=False,
-                    reasoning_effort=reasoning_effort,
-                ):
-                    yield chunk
-                return
+                except LLMError as retry_err:
+                    if retry_emitted:
+                        raise
+                    e = retry_err
+                    err_msg = str(retry_err)
+                    status = getattr(retry_err, "status_code", status)
             # ⚠️ status 为 None 表示这不是 HTTP 状态码错误（网络中断、协议错误、
             #    URL 解析失败……）—— 那种情况**不能**当成配额耗尽。
             #    旧的宽松分支（"429" in err_msg）会把这类错误也算成配额耗尽
@@ -3188,7 +3294,13 @@ def summarize_paper(meta: dict) -> dict:
             temperature=0.3,
             json_mode=True,
         )
-        result = json.loads(raw)
+        cleaned = _strip_thinking_blocks(raw).strip()
+        fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", cleaned, re.S | re.I)
+        if fence:
+            cleaned = fence.group(1).strip()
+        result = json.loads(cleaned)
+        if not isinstance(result, dict):
+            raise json.JSONDecodeError("summary JSON root is not object", cleaned, 0)
         return {
             "tldr": str(result.get("tldr", "")).strip()[:200],
             "key_points": [str(p).strip() for p in result.get("key_points", [])][:5],

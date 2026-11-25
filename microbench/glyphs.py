@@ -25,8 +25,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -343,10 +345,39 @@ class GlyphDictionary:
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1,
-                                      sort_keys=True), encoding="utf-8")
-            tmp.replace(self.path)
+            merged = dict(self.data)
+            if self.path.exists():
+                try:
+                    disk_raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    if isinstance(disk_raw, dict):
+                        # 保留磁盘上新同步/并发写入的键，同时以本轮新识别条目更新
+                        base = {}
+                        for dk, dv in disk_raw.items():
+                            if isinstance(dv, dict) and dv.get("sym"):
+                                base[str(dk)] = {"sym": str(dv["sym"]), "shape": str(dv.get("shape") or "")}
+                            elif isinstance(dv, str) and dv:
+                                base[str(dk)] = {"sym": dv, "shape": ""}
+                        base.update(merged)
+                        merged = base
+                except Exception:
+                    pass
+            self.data = merged
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self.path.parent),
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+            )
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(merged, ensure_ascii=False, indent=1, sort_keys=True))
+                os.replace(tmp, self.path)
+            except Exception:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
             self.dirty = False
         except Exception as e:
             print(f"[MicroBench] 符号词典写入失败: {e}", file=sys.stderr)
@@ -473,8 +504,8 @@ def _parse_recognition(raw: str, n: int) -> dict[int, str]:
     if not raw:
         return out
     text = raw.strip()
-    # 优先解析 "1=×, 2=≈" 这种带编号的
-    for m in re.finditer(r"(\d{1,2})\s*[=＝:：]\s*(\S)", text):
+    # 优先解析 "1=×, 2=≈" / "1. ×, 2. ≈" / "1) ×" 这种带编号的
+    for m in re.finditer(r"(\d{1,2})\s*[=＝:：\.\)）、]\s*(\S)", text):
         try:
             idx = int(m.group(1))
         except ValueError:
@@ -484,9 +515,16 @@ def _parse_recognition(raw: str, n: int) -> dict[int, str]:
             out[idx] = sym
     if out:
         return out
-    # 退化：按顺序的逗号分隔列表
-    parts = [p.strip() for p in re.split(r"[,，、;；\s]+", text) if p.strip()]
-    for i, p in enumerate(parts[:n], start=1):
+    # 退化：按顺序的逗号分隔列表（剥除独立序号如 "1." 再按序分配，避免错位）
+    raw_parts = [p.strip() for p in re.split(r"[,，、;；\s]+", text) if p.strip()]
+    clean_parts: list[str] = []
+    for p in raw_parts:
+        if re.fullmatch(r"\d{1,2}[=＝:：\.\)）、]*", p):
+            continue
+        p = re.sub(r"^\d{1,2}[=＝:：\.\)）、]+", "", p).strip()
+        if p:
+            clean_parts.append(p)
+    for i, p in enumerate(clean_parts[:n], start=1):
         if len(p) == 1 and p in ALLOWED_SYMBOLS:
             out[i] = p
     return out
@@ -608,9 +646,10 @@ def resolve_document_glyphs(pages: list, pdf_source, model_name: str = "",
             for gi, g in enumerate(glyphs):
                 sk = "s:" + semantic_key(g.get("font", ""), g.get("cid", ""))
                 ent = reps.get(sk)
-                if ent is None:
+                if ent is None or not ent[0]:
                     png = _render_glyph(doc, p["page"], g)
-                    ent = (png or b"", _shape_bits_stable(png) if png else "", [])
+                    uses = ent[2] if ent is not None else []
+                    ent = (png or b"", _shape_bits_stable(png) if png else "", uses)
                     reps[sk] = ent
                 ent[2].append((p["page"], gi))
         stats["pages"] = len(pages)

@@ -26,8 +26,9 @@
 const fs = require("fs");
 const path = require("path");
 
-const TARGET = process.argv[2]
-  ? path.resolve(process.argv[2])
+const _posArg = process.argv.slice(2).find((a) => !a.startsWith("-"));
+const TARGET = _posArg
+  ? path.resolve(_posArg)
   : require("path").join(__dirname, "static", "index.html");
 const SRC = fs.readFileSync(TARGET, "utf8").replace(/\r\n/g, "\n");
 const NL = String.fromCharCode(10);
@@ -1134,7 +1135,9 @@ async function runSuite(src, label) {
 const MUTATIONS = [
   {
     name: "命中标题也不走「小节全文」（退回整页上下文）",
-    from: 'const headingHit = _matchQaHeading(_readerSelState.text || "");',
+    // ⚠ 2026-11-25：选区改成在 submitReaderQA 开头冻结的 `_selSnapshot`
+    //   → 目标串必须跟着真代码走，否则「变异自检本身失效」。
+    from: 'const headingHit = _matchQaHeading(_selSnapshot.text);',
     to: 'const headingHit = null;',
   },
   {
@@ -1259,49 +1262,52 @@ function _factoryArgCounts(src) {
 }
 
 async function main() {
+  const contractsOnly = process.argv.includes("--contracts-only");
   console.log("被测文件: " + TARGET);
   const result = await runSuite(SRC, "划词答疑 · 小节上下文");
 
-  console.log("\n=== 变异自检（断言必须能抓到回归）===");
   let mutationCaught = 0;
-  for (const m of MUTATIONS) {
-    if (!SRC.includes(m.from)) {
-      console.log("  FAIL  变异 [" + m.name + "] 没匹配到源码 —— 变异自检本身失效");
-      result.failed += 1;
-      continue;
-    }
-    // ⚠ 2026-11-19：JS 的 String.replace 只改**第一处**命中 →
-    //   目标串在源码里出现多次时会**改错地方** → 变异没生效 → 误报「没抓到」。
-    //   （踩过一次：`const onPage = _qaSectionsForPage(...)` 在两个函数里都有。）
-    const hits = SRC.split(m.from).length - 1;
-    if (hits > 1) {
-      console.log("  FAIL  变异 [" + m.name + "] 目标串在源码里出现 " + hits +
-                  " 处 —— 改的可能不是要改的那个函数");
-      result.failed += 1;
-      continue;
-    }
-    const mutated = SRC.replace(m.from, m.to);
-    const savedPassed = passed;
-    const savedFailed = failed;
-    passed = 0;
-    failed = 0;
-    quiet = true;
-    try {
-      await runSuite(mutated, "mutant");
-    } catch (e) {
-      failed += 1;
-    } finally {
-      quiet = false;
-    }
-    const mutantFailed = failed;
-    passed = savedPassed;
-    failed = savedFailed;
-    if (mutantFailed > 0) {
-      mutationCaught += 1;
-      console.log("  PASS  变异 [" + m.name + "] 被抓到了（" + mutantFailed + " 条失败）");
-    } else {
-      console.log("  FAIL  变异 [" + m.name + "] 没被抓到 —— 这套断言是恒真的！");
-      result.failed += 1;
+  if (!contractsOnly) {
+    console.log("\n=== 变异自检（断言必须能抓到回归）===");
+    for (const m of MUTATIONS) {
+      if (!SRC.includes(m.from)) {
+        console.log("  FAIL  变异 [" + m.name + "] 没匹配到源码 —— 变异自检本身失效");
+        result.failed += 1;
+        continue;
+      }
+      // ⚠ 2026-11-19：JS 的 String.replace 只改**第一处**命中 →
+      //   目标串在源码里出现多次时会**改错地方** → 变异没生效 → 误报「没抓到」。
+      //   （踩过一次：`const onPage = _qaSectionsForPage(...)` 在两个函数里都有。）
+      const hits = SRC.split(m.from).length - 1;
+      if (hits > 1) {
+        console.log("  FAIL  变异 [" + m.name + "] 目标串在源码里出现 " + hits +
+                    " 处 —— 改的可能不是要改的那个函数");
+        result.failed += 1;
+        continue;
+      }
+      const mutated = SRC.replace(m.from, m.to);
+      const savedPassed = passed;
+      const savedFailed = failed;
+      passed = 0;
+      failed = 0;
+      quiet = true;
+      try {
+        await runSuite(mutated, "mutant");
+      } catch (e) {
+        failed += 1;
+      } finally {
+        quiet = false;
+      }
+      const mutantFailed = failed;
+      passed = savedPassed;
+      failed = savedFailed;
+      if (mutantFailed > 0) {
+        mutationCaught += 1;
+        console.log("  PASS  变异 [" + m.name + "] 被抓到了（" + mutantFailed + " 条失败）");
+      } else {
+        console.log("  FAIL  变异 [" + m.name + "] 没被抓到 —— 这套断言是恒真的！");
+        result.failed += 1;
+      }
     }
   }
 
@@ -1314,10 +1320,13 @@ async function main() {
   console.log("SCOPE_CAPS_JSON: " + (envScopeCapsJson || "{}"));
   console.log("ROUTER_MODES_JSON: " + (envRouterModesJson || "[]"));
   console.log("\n============================================================");
-  console.log("PASS " + result.passed + "  FAIL " + result.failed +
-              "  (变异捕获 " + mutationCaught + "/" + MUTATIONS.length + ")");
+  const mutNote = contractsOnly
+    ? "(contracts-only 模式，变异自检由 test_qa_section_context.py 执行)"
+    : "(变异捕获 " + mutationCaught + "/" + MUTATIONS.length + ")";
+  console.log("PASS " + result.passed + "  FAIL " + result.failed + "  " + mutNote);
   console.log("============================================================");
-  process.exit(result.failed === 0 && mutationCaught === MUTATIONS.length ? 0 : 1);
+  const mutOk = contractsOnly || mutationCaught === MUTATIONS.length;
+  process.exit(result.failed === 0 && mutOk ? 0 : 1);
 }
 
 main().catch((e) => {

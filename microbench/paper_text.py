@@ -39,12 +39,16 @@ Section splitting: regex over numbered/Roman-numeral headings plus
 common keywords. Returns list of {title, text, page_start, page_end}.
 """
 
+import copy
 import io
 import re
 import sys
+import threading
 import traceback
 from typing import Optional
 from pathlib import Path
+
+from . import netutil
 
 # Module-level import. The SSRF-hardening patch introduced module-level
 # helpers that call requests.get(), but `requests` was only ever imported
@@ -90,9 +94,23 @@ def _download_pdf_bytes(url: str, max_bytes: int, allow_redirects: bool = False)
     `max_bytes`, and the response is always closed (the old code never
     closed the connection, leaving the socket to be reclaimed by the GC).
     """
-    resp = requests.get(
-        url, headers=HEADERS, timeout=60, stream=True, allow_redirects=allow_redirects
-    )
+    last_exc = None
+    resp = None
+    for _attempt in range(2):
+        try:
+            resp = requests.get(
+                url, headers=HEADERS, timeout=60, stream=True,
+                allow_redirects=allow_redirects, **netutil.direct_kwargs(),
+            )
+            break
+        except requests.exceptions.ProxyError as e:
+            last_exc = e
+            if not netutil.proxy_bypassed():
+                netutil.mark_proxy_dead(e)
+                continue
+            raise
+    if resp is None and last_exc is not None:
+        raise last_exc
     try:
         resp.raise_for_status()
         chunks = []
@@ -106,7 +124,10 @@ def _download_pdf_bytes(url: str, max_bytes: int, allow_redirects: bool = False)
                     f"PDF 超过 {max_bytes // (1024 * 1024)}MB 上限, 已中止下载"
                 )
             chunks.append(chunk)
-        return b"".join(chunks)
+        body = b"".join(chunks)
+        if b"%PDF-" not in body[:1024]:
+            raise ValueError("下载内容不是有效的 PDF 文件（可能被重定向到登录页或 HTML 页面）")
+        return body
     finally:
         resp.close()
 
@@ -289,10 +310,14 @@ def extract_page_blocks(pdf_path, page_no: int) -> list[dict]:
     blocks: list[dict] = []
     try:
         import pdfplumber
+        from .glyphs import strip_markers
         with pdfplumber.open(str(pdf_path)) as doc:
             if page_no < 1 or page_no > len(doc.pages):
                 return []
             _extract_page_text(doc.pages[page_no - 1], [], blocks)
+        for b in blocks:
+            if b.get("text"):
+                b["text"] = _clean_cid_markers(strip_markers(b["text"]))
     except Exception:
         import traceback
         print(f"[MicroBench] 段落块抽取失败: {traceback.format_exc()}",
@@ -452,6 +477,11 @@ def _outline_heading_level(num: str) -> int:
     return 1
 
 
+_OUTLINE_CACHE: dict[tuple, dict] = {}
+_OUTLINE_CACHE_LOCK = threading.Lock()
+_OUTLINE_CACHE_MAX = 32
+
+
 def extract_outline(pdf_path, max_pages: int = 200) -> dict:
     """PDF 的**小节大纲**：标题 + 本小节正文 + 本节的公式坐标。
 
@@ -470,9 +500,23 @@ def extract_outline(pdf_path, max_pages: int = 200) -> dict:
     模型看到的第 N 张图就对应正文里的第 N 个【公式N】。
     """
     out = {"pages": 0, "truncated": False, "sections": []}
+    p_obj = Path(pdf_path)
+    cache_key = None
+    try:
+        st = p_obj.stat()
+        cache_key = (str(p_obj.resolve()), st.st_mtime_ns, st.st_size, max(1, int(max_pages)))
+    except OSError:
+        cache_key = None
+    if cache_key is not None:
+        with _OUTLINE_CACHE_LOCK:
+            cached = _OUTLINE_CACHE.get(cache_key)
+            if cached is not None:
+                return copy.deepcopy(cached)
+
     pages_text: list = []
     try:
         import pdfplumber
+        from .glyphs import strip_markers
         with pdfplumber.open(str(pdf_path)) as doc:
             total = len(doc.pages)
             out["pages"] = total
@@ -483,6 +527,8 @@ def extract_outline(pdf_path, max_pages: int = 200) -> dict:
             for i in range(min(total, limit)):
                 try:
                     txt = _extract_page_text(doc.pages[i])
+                    if txt:
+                        txt = strip_markers(txt)
                 except Exception:
                     txt = ""
                 pages_text.append((i + 1, txt or ""))
@@ -570,6 +616,11 @@ def extract_outline(pdf_path, max_pages: int = 200) -> dict:
         sections.append(_close(cur))
     # 空节（只有标题、正文被噪声吃光）留着但标记出来 —— 前端要能跳过
     out["sections"] = sections
+    if cache_key is not None and out["pages"] > 0:
+        with _OUTLINE_CACHE_LOCK:
+            if len(_OUTLINE_CACHE) >= _OUTLINE_CACHE_MAX:
+                _OUTLINE_CACHE.pop(next(iter(_OUTLINE_CACHE)))
+            _OUTLINE_CACHE[cache_key] = copy.deepcopy(out)
     return out
 
 
@@ -1337,14 +1388,18 @@ def _mark_line_glyphs(line: dict, glyphs: list) -> str:
     occ = list(_CID_RE.finditer(text))
     if not occ:
         return text
-    # 把连续的 cid 归成组（中间只隔空格/制表符）
+    # 把连续的 cid 归成组（不能把 "(cid:3)=(cid:4)" 中的关系/运算符吞掉；
+    # 同时保留与 HEAD 一致的 ≤3 短隔断合并规则以免破坏 EXTRACTOR_VERSION 缓存一致性）
     groups: list[list[int]] = []
     k = 0
     while k < len(occ):
         j = k
-        while (j + 1 < len(occ)
-               and occ[j + 1].start() - occ[j].end() <= 3):
-            j += 1
+        while j + 1 < len(occ):
+            between = text[occ[j].end():occ[j + 1].start()]
+            if len(between) <= 3 and not any(op in between for op in "=<>+±×÷≤≥≈≠"):
+                j += 1
+            else:
+                break
         groups.append(list(range(k, j + 1)))
         k = j + 1
 
@@ -2227,6 +2282,10 @@ def _extract_page_text_raw(page, out_glyphs: Optional[list] = None,
     # 所以：**不靠词数决定是否双栏**，而是先探栏缝，探到了才走双栏路径。
     # 词数只作为"太少就不可能分栏"的兜底（真正分栏至少要每栏几个词）。
     if len(words) < _MIN_WORDS_FOR_COLUMNS:
+        if out_blocks is not None:
+            parts = _new_block_parts()
+            parts["span"].extend(_group_lines_into_blocks(_crop_lines(page, (0, 0, width, height)), "S"))
+            out_blocks.extend(_flatten_block_parts(parts))
         return plain
 
     # 1) 垂直方向：找到双栏开始的 y（整宽标题区结束的位置）
@@ -2234,6 +2293,10 @@ def _extract_page_text_raw(page, out_glyphs: Optional[list] = None,
 
     below = [w for w in words if w["top"] >= y_split]
     if len(below) < _MIN_BELOW_WORDS_FOR_COLUMNS:
+        if out_blocks is not None:
+            parts = _new_block_parts()
+            parts["span"].extend(_group_lines_into_blocks(_crop_lines(page, (0, 0, width, height)), "S"))
+            out_blocks.extend(_flatten_block_parts(parts))
         return plain
 
     # 2) 水平方向：在双栏区域找栏间空白
@@ -2902,7 +2965,7 @@ def _find_page(char_offset: int, page_boundaries: list[tuple[int, int]]) -> int:
 # ---------------------------------------------------------------------------
 
 def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
-                    glyph_resolver=None) -> dict:
+                    glyph_resolver=None, dict_path=None) -> dict:
     """
     Fetch the full text of a paper given an arXiv ID, DOI, or URL.
 
@@ -2991,19 +3054,26 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
             # Try Semantic Scholar's openAccessPdf field
             data = {}
             try:
-                with requests.get(
-                    f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
-                    headers=HEADERS,
-                    params={"fields": "title,authors,year,venue,openAccessPdf"},
-                    timeout=20,
-                ) as resp:
+                resp = None
+                for _attempt in range(2):
+                    try:
+                        resp = requests.get(
+                            f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+                            headers=HEADERS,
+                            params={"fields": "title,authors,year,venue,openAccessPdf"},
+                            timeout=20,
+                            **netutil.direct_kwargs(),
+                        )
+                        break
+                    except requests.exceptions.ProxyError as e:
+                        if not netutil.proxy_bypassed():
+                            netutil.mark_proxy_dead(e)
+                            continue
+                        raise
+                with resp:
                     if resp.status_code == 200:
                         data = resp.json()
                     else:
-                        # The unauthenticated Graph API rate-limits hard
-                        # (HTTP 429 is routine). Falling through with an
-                        # empty dict keeps the Crossref metadata path alive
-                        # instead of blowing up with an UnboundLocalError.
                         print(
                             f"[MicroBench] Semantic Scholar OA 查询返回 HTTP "
                             f"{resp.status_code} (DOI: {doi})",
@@ -3012,15 +3082,56 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
                 oa = data.get("openAccessPdf") or {}
                 pdf_url = oa.get("url") if isinstance(oa, dict) else None
                 if pdf_url:
-                    # The OA URL comes from an upstream API, not from the
-                    # user — but it is still an arbitrary URL, so it gets the
-                    # same SSRF treatment as a user-supplied one. Without
-                    # this, a crafted DOI whose metadata points at
-                    # 127.0.0.1 would make the server probe the LAN.
-                    _assert_public_http_url(pdf_url)
-                    pdf_bytes = _download_pdf_bytes(
-                        pdf_url, PDF_MAX_SIZE_MB * 1024 * 1024
-                    )
+                    # 跟踪并逐跳 SSRF 校验 OpenAccess 重定向链（最多 3 跳）
+                    cur_oa = pdf_url
+                    oa_bytes = None
+                    for _hop in range(4):
+                        _assert_public_http_url(cur_oa)
+                        oa_resp = None
+                        for _attempt in range(2):
+                            try:
+                                oa_resp = requests.get(
+                                    cur_oa, headers=HEADERS, timeout=60,
+                                    stream=True, allow_redirects=False,
+                                    **netutil.direct_kwargs(),
+                                )
+                                break
+                            except requests.exceptions.ProxyError as e:
+                                if not netutil.proxy_bypassed():
+                                    netutil.mark_proxy_dead(e)
+                                    continue
+                                raise
+                        try:
+                            if oa_resp.is_redirect or oa_resp.status_code in (301, 302, 303, 307, 308):
+                                if _hop >= 3:
+                                    break
+                                nxt = requests.compat.urljoin(
+                                    cur_oa, oa_resp.headers.get("Location", "")
+                                )
+                                if not nxt:
+                                    break
+                                cur_oa = nxt
+                                continue
+                            oa_resp.raise_for_status()
+                            chunks = []
+                            total = 0
+                            limit = PDF_MAX_SIZE_MB * 1024 * 1024
+                            for chunk in oa_resp.iter_content(chunk_size=64 * 1024):
+                                if not chunk:
+                                    continue
+                                total += len(chunk)
+                                if total > limit:
+                                    raise ValueError(
+                                        f"PDF 超过 {PDF_MAX_SIZE_MB}MB 上限, 已中止下载"
+                                    )
+                                chunks.append(chunk)
+                            cand = b"".join(chunks)
+                            if b"%PDF-" in cand[:1024]:
+                                oa_bytes = cand
+                            break
+                        finally:
+                            oa_resp.close()
+                    pdf_bytes = oa_bytes
                     if pdf_bytes:
                         source = "OpenAccess"
                         meta = {
@@ -3046,14 +3157,6 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
                     pass
 
     # --- Otherwise try direct URL ---
-    # SSRF guard: this path fetches an operator-supplied URL with no host
-    # allowlist and with redirects followed, so anything the machine can
-    # reach (localhost services, 169.254.169.254 metadata, LAN routers) is
-    # reachable too. MicroBench is a local single-user app, so this is not a
-    # remote attack surface, but a mistyped/hostile link (or a redirect from
-    # an otherwise-legitimate publisher link) should not silently probe the
-    # local network. Reject loopback / link-local / private / non-http(s)
-    # targets, and re-check after redirects by disabling redirect-following.
     if pdf_bytes is None and identifier.startswith("http"):
         try:
             _assert_public_http_url(identifier)
@@ -3062,10 +3165,19 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
             body = None
             # Follow up to 3 redirects manually, re-validating each hop.
             while True:
-                resp = requests.get(
-                    current, headers=HEADERS, timeout=60, stream=True,
-                    allow_redirects=False,
-                )
+                resp = None
+                for _attempt in range(2):
+                    try:
+                        resp = requests.get(
+                            current, headers=HEADERS, timeout=60, stream=True,
+                            allow_redirects=False, **netutil.direct_kwargs(),
+                        )
+                        break
+                    except requests.exceptions.ProxyError as e:
+                        if not netutil.proxy_bypassed():
+                            netutil.mark_proxy_dead(e)
+                            continue
+                        raise
                 try:
                     if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
                         if hops >= 3:
@@ -3081,23 +3193,27 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
                         continue
                     resp.raise_for_status()
                     ctype = resp.headers.get("Content-Type", "").lower()
-                    if "pdf" in ctype:
-                        # Stream with a running cap instead of `.content`,
-                        # which would buffer an unbounded body before the
-                        # size limit could be enforced.
-                        chunks = []
-                        total = 0
-                        limit = PDF_MAX_SIZE_MB * 1024 * 1024
-                        for chunk in resp.iter_content(chunk_size=64 * 1024):
-                            if not chunk:
-                                continue
-                            total += len(chunk)
-                            if total > limit:
-                                raise ValueError(
-                                    f"PDF 超过 {PDF_MAX_SIZE_MB}MB 上限, 已中止下载"
-                                )
-                            chunks.append(chunk)
-                        body = b"".join(chunks)
+                    chunks = []
+                    total = 0
+                    limit = PDF_MAX_SIZE_MB * 1024 * 1024
+                    first_probe = b""
+                    is_pdf_stream = "pdf" in ctype
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if not chunk:
+                            continue
+                        if not first_probe:
+                            first_probe = chunk[:1024]
+                            if not is_pdf_stream and b"%PDF-" not in first_probe:
+                                break
+                        total += len(chunk)
+                        if total > limit:
+                            raise ValueError(
+                                f"PDF 超过 {PDF_MAX_SIZE_MB}MB 上限, 已中止下载"
+                            )
+                        chunks.append(chunk)
+                    cand = b"".join(chunks)
+                    if b"%PDF-" in cand[:1024]:
+                        body = cand
                     break
                 finally:
                     resp.close()
@@ -3140,7 +3256,7 @@ def fetch_full_text(identifier: str, save_pdf_to: Optional[Path] = None,
     # glyph_resolver 是旧的单页接口，保留兼容（不再走它）。
     try:
         from .glyphs import resolve_document_glyphs
-        resolve_document_glyphs(pages, pdf_bytes, recognize=False)
+        resolve_document_glyphs(pages, pdf_bytes, recognize=False, dict_path=dict_path)
     except Exception:
         # 解析不了也要保证内部标记不外泄
         from .glyphs import strip_markers

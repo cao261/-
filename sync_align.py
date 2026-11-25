@@ -76,6 +76,10 @@ def _kill_old_service() -> None:
                        capture_output=True, timeout=60)
 
 
+def _direct_opener():
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def restart_service() -> bool:
     _kill_old_service()
     time.sleep(2)
@@ -89,14 +93,16 @@ def restart_service() -> bool:
          "--host", "127.0.0.1", "--port", "5000", "--log-level", "warning"],
         cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs,
     )
+    opener = _direct_opener()
     for _ in range(40):
         time.sleep(1)
-        try:
-            urllib.request.urlopen(API + "/api/stats", timeout=3).read()
-            print("      服务已就绪 → http://127.0.0.1:5000")
-            return True
-        except Exception:
-            continue
+        for path in ("/api/health", "/api/stats"):
+            try:
+                opener.open(API + path, timeout=3).read()
+                print("      服务已就绪 → http://127.0.0.1:5000")
+                return True
+            except Exception:
+                continue
     print("      服务启动超时（60 秒内没起来），请看 logs/ 或手动启动")
     return False
 
@@ -106,9 +112,9 @@ def sync() -> dict | None:
         API + "/api/sync", data=b"{}",
         headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=1800) as r:
+        with _direct_opener().open(req, timeout=1800) as r:
             return json.loads(r.read().decode("utf-8"))
-    except urllib.error.URLError as e:
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError) as e:
         print(f"      同步失败：{e}")
         return None
 

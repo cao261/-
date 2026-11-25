@@ -107,6 +107,8 @@ DECLS = [
     "_readPosExpected",
     "_pdfResizeTimer",
     "_pdfRelayoutBusyCount",
+    # ⚠ 2026-11-25：缩放防抖用的定时器（setReaderZoom 里要引用它）
+    "_pdfZoomReloadTimer",
 ]
 
 
@@ -162,6 +164,8 @@ function updateZoomLabel() {{}}
 function renderReader() {{}}
 function _persistLocalState() {{}}
 function _dedupePdfBlocks() {{}}
+// 缩放路径上的画布清理（真实现要 PDF.js，探针里用桩件顶掉）
+function _pdfCancelAllCanvasRenders() {{}}
 
 // 探针桩：真函数 `loadPdfDualColumn` 太重（要 PDF.js），
 // 这里只替掉它「决定回到哪儿」那一步 —— 而**位置算法本身是真代码**
@@ -355,7 +359,7 @@ function run() {{
     var zoomBefore = _pdfZoom;
     __zoomTarget = null;
     setReaderZoom(0.1);
-    await sleep(250);                        // 等 setTimeout(80) 里的重排桩跑完
+    await sleep(450);                        // 等缩放防抖（220ms）里的重排桩跑完
     var storeAfterZoom = _readPosStore()[_readPosKey()];
     check('缩放前把当前位置落盘了（左栏第 3 页，不是更早的第 1 页）',
           !!storeAfterZoom && !!storeAfterZoom.left && storeAfterZoom.left.page === 3,

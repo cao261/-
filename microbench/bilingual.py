@@ -136,7 +136,8 @@ def _flatten_inline_newlines(txt: str) -> str:
     "其中，a 为横向 ME 电压系数，v 为整体比\\nE,31\\nE 表示整个…"）。
     段落是一句话 → 行折必须合成空格。
     """
-    return re.sub(r"(?<!\n)\n(?!\n)", " ", txt or "").strip()
+    norm = (txt or "").replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"(?<!\n)\n(?!\n)", " ", norm).strip()
 
 
 def parse_block_translations(raw: str, want_ids: Optional[set[int]] = None) -> dict[int, str]:
@@ -292,7 +293,8 @@ async def translate_blocks(
                 deadline=deadline,
                 ret=None,
             )
-            got.update(parse_block_translations(again))
+            want_missing = {int(b.get("i", 0)) for b in missing}
+            got.update(parse_block_translations(again, want_ids=want_missing))
         except Exception:
             pass
 

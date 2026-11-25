@@ -51,7 +51,7 @@ _ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000
 
 # 明确指代「第几节」的说法 —— 只在这些语境里取数字，避免把「3 个实验」误判成节号
 _ORDINAL_PATTERNS = (
-    re.compile(r"第\s*([0-9]{1,3}|[一二三四五六七八九十百]{1,4})\s*[节章节章篇部]"),
+    re.compile(r"第\s*([0-9]{1,3}|[零一二三四五六七八九十百]{1,6})\s*[节章节章篇部]"),
     re.compile(r"\b(?:section|sec\.?|chapter|part)\s*([0-9]{1,3}|[IVXLC]{1,6})\b", re.I),
 )
 
@@ -66,20 +66,33 @@ _STOPWORDS = {
 
 
 def _cn_to_int(token: str) -> int | None:
-    """中文数字 → int（支持 一 ~ 九十九）。"""
+    """中文数字 → int（支持 一 ~ 九百九十九，含「百」「十」）。"""
     token = token.strip()
     if not token:
         return None
-    if all(c in _CN_DIGITS for c in token):
-        val = 0
-        for c in token:
-            val = val * 10 + _CN_DIGITS[c]
-        return val
+    if "百" in token:
+        head_b, _, rest = token.partition("百")
+        hundreds = _CN_DIGITS.get(head_b, 1) if head_b else 1
+        rest = rest.lstrip("零")
+        if not rest:
+            return hundreds * 100
+        sub = _cn_to_int(rest)
+        if sub is None:
+            return None
+        # 处理 "二百五" → 250 / "二百零五" → 205
+        if len(rest) == 1 and "零" not in token and rest in _CN_DIGITS and rest != "十":
+            return hundreds * 100 + sub * 10
+        return hundreds * 100 + sub
     if "十" in token:
         head, _, tail = token.partition("十")
         tens = _CN_DIGITS.get(head, 1) if head else 1
         ones = _CN_DIGITS.get(tail, 0) if tail else 0
         return tens * 10 + ones
+    if all(c in _CN_DIGITS for c in token):
+        val = 0
+        for c in token:
+            val = val * 10 + _CN_DIGITS[c]
+        return val
     return None
 
 
@@ -165,13 +178,34 @@ def _section_ordinal(section: dict) -> int | None:
     return None
 
 
+_DOTTED_ORDINAL_RE = re.compile(
+    r"(?:第\s*|(?:\b(?:section|sec\.?|chapter|part)\s*))(\d+(?:\.\d+)+)\b",
+    re.I,
+)
+
+
+def _extract_dotted_ordinals(question: str) -> set[str]:
+    if not question:
+        return set()
+    return {m.group(1) for m in _DOTTED_ORDINAL_RE.finditer(question)}
+
+
 def score_sections(sections: list[dict], question: str) -> list[float]:
     """给每个章节打「与问题的相关度」得分。"""
     ordinals = extract_ordinals(question)
+    dotted = _extract_dotted_ordinals(question)
     qwords = _question_keywords(question)
     scores: list[float] = []
     for pos, sec in enumerate(sections):
         score = 0.0
+        raw_num = str(sec.get("number") or "").strip().rstrip(".")
+        title = str(sec.get("title") or "")
+        if dotted and (
+            raw_num in dotted
+            or any(title.lstrip().startswith(d + " ") or title.lstrip().startswith(d + ".")
+                   for d in dotted)
+        ):
+            score += 120.0
         sec_ord = _section_ordinal(sec)
         if sec_ord and sec_ord in ordinals:
             score += 100.0
@@ -179,7 +213,6 @@ def score_sections(sections: list[dict], question: str) -> list[float]:
             # 兜底：用户说的「第 N 节」也可能就是**界面上第 N 个章节**
             # （论文自带的编号常常和列表顺序对不上，比如前面多一段 abstract）
             score += 60.0
-        title = str(sec.get("title") or "")
         for w in _title_keywords(title):
             if w in qwords:
                 score += 10.0
@@ -195,13 +228,21 @@ def score_sections(sections: list[dict], question: str) -> list[float]:
 # 装配
 # ---------------------------------------------------------------------------
 
+_ELLIPSIS_MARKER = "\n\n……（中间内容已省略）……\n\n"
+
+
 def _head_tail(text: str, limit: int) -> str:
-    """超长文本 → 头尾各取一半（保住开头与结论），中间用省略号连接。"""
+    """超长文本 → 头尾各取一半（保住开头与结论），总长严格不超过 limit。"""
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
-    head = limit // 2
-    tail = limit - head
-    return text[:head] + "\n\n……（中间内容已省略）……\n\n" + text[-tail:]
+    avail = limit - len(_ELLIPSIS_MARKER)
+    if avail < 20:
+        return text[:limit]
+    head = avail // 2
+    tail = avail - head
+    return text[:head] + _ELLIPSIS_MARKER + (text[-tail:] if tail > 0 else "")
 
 
 def _section_block(sec: dict, text: str) -> str:
@@ -245,20 +286,22 @@ def pick_context(
     dropped: list[int] = []
     labels = {i: _section_label(s, i) for i, s in enumerate(sections)}
 
+    _SEP = "\n\n---\n\n"
+
     def _take(idx: int, limit: int) -> bool:
         nonlocal used
         sec = sections[idx]
         text = str(sec.get("text") or "")
-        block = _section_block(sec, _head_tail(text, limit))
-        if used + len(block) > budget:
-            # 这一节塞不下了 → 给一个"塞得下"的份额（至少 800 字），
-            # 塞不下就整节跳过（宁可少一节，也不要半节糊弄）
-            room = budget - used
-            if room < 800:
-                return False
-            block = _section_block(sec, _head_tail(text, room))
+        sep_cost = len(_SEP) if picked else 0
+        header_only = len(_section_block(sec, ""))
+        max_body = min(limit, budget - used - sep_cost - header_only)
+        block = _section_block(sec, _head_tail(text, max(0, max_body)))
+        if used + sep_cost + len(block) > budget or (
+            max_body < len(text) and max_body < 800
+        ):
+            return False
         picked.append((idx, block))
-        used += len(block)
+        used += sep_cost + len(block)
         included.append(idx)
         return True
 
@@ -268,11 +311,14 @@ def pick_context(
         if _take(focus_index, QA_FOCUS_CHAR_LIMIT):
             focus_hit = True
     elif focus_text.strip():
-        # 划词答疑：前端直接把焦点节正文给了（独立字段，不受上下文截断影响）
-        block = f"[{focus_title or '当前小节'}]\n{_head_tail(focus_text.strip(), QA_FOCUS_CHAR_LIMIT)}"
-        picked.append((-1, block))
-        used += len(block)
-        focus_hit = True
+        # 划词答疑：前端直接把焦点节正文给了（独立字段，也受总预算约束）
+        head = f"[{focus_title or '当前小节'}]\n"
+        max_focus = max(0, min(QA_FOCUS_CHAR_LIMIT, budget - len(head)))
+        block = head + _head_tail(focus_text.strip(), max_focus)
+        if len(block) <= budget:
+            picked.append((-1, block))
+            used += len(block)
+            focus_hit = True
 
     # --- 2) 问题命中的节（按得分降序） -----------------------------------
     order = sorted(range(len(sections)), key=lambda i: (-scores[i], i))
@@ -292,7 +338,7 @@ def pick_context(
             break
 
     dropped = [i for i in range(len(sections)) if i not in included]
-    ctx = "\n\n---\n\n".join(block for _, block in picked)
+    ctx = _SEP.join(block for _, block in picked)
     return ctx, {
         "included": included,
         "dropped": dropped,

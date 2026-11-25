@@ -138,8 +138,12 @@ const ANNO_COLORS = [
 const applyFactory = new Function(
   "_annoState", "_wrapTextWithMark",
   sliceFn("applyAnnotationsToPage") + "\nreturn applyAnnotationsToPage;");
+// ⚠ 2026-11-25：openAnnoDrawer 现在会登记进 **Esc 栈**
+//   （否则抽屉开着时按 Esc = 整个阅读器被关掉，见 AGENTS §4.140）
+//   → 探针要提供这两个桩件，不然真代码跑到 `_escBind(...)` 就 ReferenceError。
 const drawerFactory = new Function(
   "document", "escapeHtml", "_ANNO_COLORS", "_annoState",
+  "_escBind", "closeAnnoDrawer",
   sliceFn("openAnnoDrawer") + "\nreturn openAnnoDrawer;");
 const originFactory = new Function(
   sliceFn("_resolveSelectionOrigin") + "\nreturn _resolveSelectionOrigin;");
@@ -196,7 +200,8 @@ console.log("== 标注列表按当前页定位 ==");
 
 function openDrawer(items, pageNum) {
   const state = { items: JSON.parse(JSON.stringify(items)) };
-  const fn = drawerFactory(documentStub, escapeHtml, ANNO_COLORS, state);
+  const fn = drawerFactory(documentStub, escapeHtml, ANNO_COLORS, state,
+                           function () {}, function () {});
   fn(pageNum);
   const list = domEls["anno-drawer-list"];
   return { state, list };

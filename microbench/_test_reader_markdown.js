@@ -31,9 +31,22 @@ const escapeHtml = (s) => String(s)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   .replace(/"/g, "&quot;");
 
-const factory = new Function("escapeHtml",
-  sliceFn("formatMarkdownLite") + "\n" + sliceFn("_matchMarkdownTable") +
-  "\nreturn {formatMarkdownLite, _matchMarkdownTable};");
+function sliceFnFrom(src, name) {
+  const start = src.indexOf("function " + name + "(");
+  if (start < 0) throw new Error("找不到函数 " + name);
+  const end = src.indexOf("\n    }\n", start);
+  if (end < 0) throw new Error("找不到 " + name + " 的结尾");
+  return src.slice(start, end + "\n    }\n".length);
+}
+
+function buildFactory(src) {
+  return new Function("escapeHtml",
+    sliceFnFrom(src, "formatMarkdownLite") + "\n" +
+    sliceFnFrom(src, "_matchMarkdownTable") +
+    "\nreturn {formatMarkdownLite, _matchMarkdownTable};");
+}
+
+const factory = buildFactory(SRC);
 const { formatMarkdownLite } = factory(escapeHtml);
 
 let pass = 0, fail = 0;
@@ -68,6 +81,56 @@ check("表格单元格里的公式仍被 KaTeX 占位", html3.includes('class="m
 
 const notTable = "这个句子里有个 | 竖线，但不是表格。";
 check("非表格不误判", !formatMarkdownLite(notTable).includes("<table"), formatMarkdownLite(notTable));
+
+// ---------------------------------------------------------------------------
+// 2026-11-25 审计 P1：含 `|` 的行内公式会把表格单元格**切碎**
+//
+// 根因：行内公式在更早的步骤已经还原成
+// `<span class="math-placeholder math-inline">P(A|B)</span>`，
+// 而切单元格用的 `split("|")` 不认这个占位 → 把公式里的竖线
+// 当成了单元格分隔符 → 单元格被拆成两半、公式本身也被劈开。
+// ---------------------------------------------------------------------------
+console.log("== 公式里的竖线（2026-11-25）==");
+const pipeMath = [
+  "| 量 | 值 |",
+  "|---|---|",
+  "| 联合概率 | $P(A|B)$ |",
+  "| 模长 | $|\\alpha|$ |",
+].join("\n");
+const htmlPM = formatMarkdownLite(pipeMath);
+check("公式里的竖线不拆单元格（2 行 × 2 格 = 4 个 <td>）",
+      (htmlPM.match(/<td/g) || []).length === 4, htmlPM);
+check("公式里的竖线原样保留",
+      htmlPM.includes("P(A|B)") && htmlPM.includes("|\\alpha|"), htmlPM);
+check("公式仍是 KaTeX 占位（没被劈成两段）",
+      (htmlPM.match(/math-placeholder math-inline/g) || []).length === 2, htmlPM);
+
+const pipeCode = [
+  "| 命令 | 说明 |",
+  "|---|---|",
+  "| `a | b` | 管道 |",
+].join("\n");
+const htmlPC = formatMarkdownLite(pipeCode);
+check("行内代码里的竖线也不拆单元格",
+      (htmlPC.match(/<td/g) || []).length === 2, htmlPC);
+
+// ---- 变异自检：把「保护公式占位」这一步改掉，断言必须变红 ----
+console.log("== 变异自检 ==");
+const MUT_TARGET = "s = s.replace(_ATOM_PH_RE, (m) => {";
+if (SRC.indexOf(MUT_TARGET) < 0 || SRC.indexOf(MUT_TARGET) !== SRC.lastIndexOf(MUT_TARGET)) {
+  check("变异目标串在源码里唯一（护栏本身没坏）", false,
+        "找不到或找到多处: " + MUT_TARGET);
+} else {
+  const mutatedSrc = SRC.replace(MUT_TARGET,
+                                 "s = s.replace(/NEVER_MATCHES_ZZZ/, (m) => {");
+  const mutatedFormat = buildFactory(mutatedSrc)(escapeHtml).formatMarkdownLite;
+  const mutatedHtml = mutatedFormat(pipeMath);
+  // ⚠ 判据是「公式内容还在不在」，不是「单元格个数」：
+  //   多出来的那一格会被表头列数裁掉 → 单元格数看着没变，
+  //   但公式已经被劈成 `$P(A` —— **内容被静默丢弃**，比多一格更伤。
+  check("变异被抓住（不再保护公式占位 → 公式被劈开、内容被丢弃）",
+        !mutatedHtml.includes("P(A|B)"), "变异后仍含 P(A|B)");
+}
 
 console.log("== 公式标记 ==");
 const marker = "其中，α 的值由下式给出：\n\n⟦FORMULA:45.1,138.3,272.3,169.5⟧\n\n后文继续。";

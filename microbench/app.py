@@ -2158,7 +2158,7 @@ def _default_replaced_out(src_rel: str) -> str:
 
 
 @app.post("/api/paper/build_replaced_pdf")
-async def api_build_replaced_pdf(req: ReplacedPdfRequest):
+def api_build_replaced_pdf(req: ReplacedPdfRequest):
     """生成「原文页 + 替换页」交替的译文替换版 PDF。
 
     - 原文页**原样保留**；替换页 = 同一页，正文英文被抹掉、中文原地填回，
@@ -2186,30 +2186,93 @@ async def api_build_replaced_pdf(req: ReplacedPdfRequest):
     if not pages_raw:
         raise HTTPException(status_code=404, detail="快照里没有已翻译的页面")
 
-    # ---- 版本闸门：段落坐标变了就不能贴旧译文 ----
-    from .bilingual import BLOCK_TRANSLATION_VERSION
-    saved_ver = None
+    # ---- 全量体检：这份论文到底有多少页能替换、多少页不能 ----
+    # ⚠ 用户 2026-11-24 报「有的页数没翻到」—— 根因有两类，**都要报出来**：
+    #   ① 只有整页译文、没有段落级译文的页（普通模式翻的）
+    #      → 没有坐标 → 物理上无法原地替换；
+    #   ② **根本没翻过**的页（压根不在快照里）
+    #      → 旧实现压根不统计这类页 → 用户毫无提示，只看到「几页还是英文」。
+    # → 这里一次性报全，前端据此提示 + 批量补翻。
+    try:
+        import fitz as _fitz
+        with _fitz.open(str(src_path)) as _d:
+            pdf_pages_total = _d.page_count
+    except Exception:
+        pdf_pages_total = 0
+
+    pages_with_blocks: list[int] = []
+    pages_only_fulltext: list[int] = []
+    seen_pages: set[int] = set()
     for pg in pages_raw:
-        if isinstance(pg, dict) and pg.get("blocks_version") is not None:
-            saved_ver = int(pg.get("blocks_version"))
-            break
-    if saved_ver is None:
+        if not isinstance(pg, dict):
+            continue
+        try:
+            pno = int(pg.get("page_num") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pno < 1:
+            continue
+        seen_pages.add(pno)
+        blocks = pg.get("blocks")
+        has_blocks = False
+        if isinstance(blocks, list):
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                bbox = b.get("bbox") or []
+                if len(bbox) < 4:
+                    continue
+                if (b.get("translation") or "").strip():
+                    has_blocks = True
+                    break
+        if has_blocks:
+            pages_with_blocks.append(pno)
+        elif (pg.get("translation") or "").strip():
+            pages_only_fulltext.append(pno)
+
+    pages_with_blocks.sort()
+    pages_only_fulltext.sort()
+    pages_never_translated = sorted(
+        p for p in range(1, (pdf_pages_total or 0) + 1)
+        if p not in seen_pages)
+
+    # ---- 版本闸门：段落坐标变了就不能贴旧译文（逐页检查，避免首空页遮蔽旧页）----
+    from .bilingual import BLOCK_TRANSLATION_VERSION
+    seen_versions: list[int] = []
+    for pg in pages_raw:
+        if not isinstance(pg, dict):
+            continue
+        ver = pg.get("blocks_version")
+        if ver is not None:
+            try:
+                ver_int = int(ver)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=409,
+                    detail="快照里存在非法 blocks_version，请重新用「🔀 对照」翻一次",
+                )
+            seen_versions.append(ver_int)
+            if ver_int != BLOCK_TRANSLATION_VERSION:
+                raise HTTPException(
+                    status_code=409,
+                    detail="段落切分算法已升级（v%d → v%d），旧的段落译文坐标可能错位，"
+                           "请重新用「🔀 对照」翻一次" % (ver_int, BLOCK_TRANSLATION_VERSION))
+        elif pg.get("blocks"):
+            raise HTTPException(
+                status_code=409,
+                detail="快照里有段落译文缺少 blocks_version，请重新用「🔀 对照」翻一次",
+            )
+    if not seen_versions:
         raise HTTPException(
             status_code=409,
             detail="快照里没有段落级译文（blocks）—— 请用「🔀 对照」模式翻几页并保存快照")
-    if saved_ver != BLOCK_TRANSLATION_VERSION:
-        raise HTTPException(
-            status_code=409,
-            detail="段落切分算法已升级（v%d → v%d），旧的段落译文坐标可能错位，"
-                   "请重新用「🔀 对照」翻一次" % (saved_ver, BLOCK_TRANSLATION_VERSION))
 
     page_blocks: dict = {}
     # ⚠ 有「整页译文」但**没有段落级译文**的页 —— 那些页**没法原地替换**
     #   （没有坐标就没地方写中文）→ 只能原样保留英文。
     #   用户 2026-11-17 报「我论文最后几页都没替换」—— 就是这个原因：
     #   那几页是在**普通模式**翻的（只有整页译文），而替换版只认段落级。
-    #   → 如实报告出去，前端据此提示并按段落重翻。
-    pages_without_blocks: list[int] = []
+    #   → 已在上面的体检里算好（pages_only_fulltext），这里只负责取块。
     for pg in pages_raw:
         if not isinstance(pg, dict):
             continue
@@ -2235,8 +2298,7 @@ async def api_build_replaced_pdf(req: ReplacedPdfRequest):
             ))
         if blocks:
             page_blocks[pno] = blocks
-        elif (pg.get("translation") or "").strip():
-            pages_without_blocks.append(pno)
+    pages_without_blocks = list(pages_only_fulltext)
     if not page_blocks:
         raise HTTPException(
             status_code=409,
@@ -2258,11 +2320,10 @@ async def api_build_replaced_pdf(req: ReplacedPdfRequest):
     except OSError:
         pass
 
-    # ---- 构建（CPU/IO 重活 → 丢线程池，别占事件循环）----
+    # ---- 构建（同步端点，由 FastAPI 线程池执行，不占事件循环）----
     t0 = time.time()
     try:
-        stats = await asyncio.to_thread(
-            build_replaced_pdf, src_path, out_path, page_blocks)
+        stats = build_replaced_pdf(src_path, out_path, page_blocks)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成译文替换版失败: {_safe_err(e)}")
     elapsed = round((time.time() - t0) * 1000)
@@ -2274,6 +2335,15 @@ async def api_build_replaced_pdf(req: ReplacedPdfRequest):
         "elapsed_ms": elapsed,
         # 有整页译文、但没有段落级译文的页 → 这些页**保留英文**（如实报告）
         "pages_without_blocks": sorted(pages_without_blocks),
+        # ---- 全量体检（2026-11-24）----
+        # 用户报「有的页数没翻到」→ 前端据此**如实告诉用户哪几页是英文**，
+        # 并提供一键批量补翻。旧实现只报 pages_without_blocks，
+        # **压根没翻过的页**根本不进名单 → 用户毫无提示。
+        "pdf_pages_total": pdf_pages_total,
+        "pages_with_blocks": pages_with_blocks,
+        "pages_only_fulltext": pages_only_fulltext,
+        "pages_never_translated": pages_never_translated,
+        "pages_missing": sorted(set(pages_only_fulltext) | set(pages_never_translated)),
     })
     return d
 
@@ -3496,7 +3566,8 @@ async def api_translate_section(req: TranslateRequest):
         )
 
     from .translation import (chunk_section_text, get_cache, merge_translation_parts,
-                              sanitize_translation, find_untranslated_runs)
+                              sanitize_translation, find_untranslated_runs,
+                              apply_table_map)
     cache = get_cache()
     curr_st = llm.get_llm_status()
     # 翻译可能走「翻译专用模型」，缓存键和上报都要用它，不能用主模型。
@@ -3550,7 +3621,10 @@ async def api_translate_section(req: TranslateRequest):
         raise HTTPException(status_code=500, detail=f"翻译失败: {_safe_err(e)}")
 
     # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
-    translation = sanitize_translation(merge_translation_parts(translated_parts))
+    translation = apply_table_map(
+        sanitize_translation(merge_translation_parts(translated_parts)),
+        None,
+    )
     if not translation:
         raise HTTPException(
             status_code=502,
@@ -3585,7 +3659,10 @@ async def api_translate_section(req: TranslateRequest):
                 chunks, _build_retry_msg, model, _m_name, _m_fallback, deadline,
                 call_info=None,
             )
-            retry_text = sanitize_translation(merge_translation_parts(retry_parts))
+            retry_text = apply_table_map(
+                sanitize_translation(merge_translation_parts(retry_parts)),
+                None,
+            )
             if retry_text and len(retry_text) >= len(translation) * 0.9:
                 translation = retry_text
                 leaked = find_untranslated_runs(translation)
@@ -4575,7 +4652,8 @@ async def api_translate_page(req: TranslatePageRequest):
         )
 
     from .translation import (chunk_section_text, get_cache, merge_translation_parts,
-                              sanitize_translation, find_untranslated_runs)
+                              sanitize_translation, find_untranslated_runs,
+                              apply_table_map)
     cache = get_cache()
     cfg = llm._config()
     # 翻译可能走「翻译专用模型」，缓存键和上报都要用它。
@@ -4676,20 +4754,11 @@ async def api_translate_page(req: TranslatePageRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"按页翻译失败: {_safe_err(e)}")
 
-    # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX
-    translation = sanitize_translation(merge_translation_parts(translated_parts))
-    # 把多模态抄好的表格拼回译文（位置由 ⟦TABLE_n⟧ 标记决定）
-    # 拼回译文时前后补空行：模型如果把标记写在句中，Markdown 表格会被插进
-    # 段落中间，前端的表格解析会把这一行前面的正文吞成表头第一格
-    # （2026-10-25 独立审查）。
-    if table_map:
-        for token, md in table_map.items():
-            if token in translation:
-                translation = translation.replace(token, f"\n\n{md}\n\n")
-            elif md and "未能读出" not in md:
-                # 模型偶尔会把标记弄丢 → 兜底：漏掉的表格追加到译文末尾，绝不丢内容
-                translation = f"{translation}\n\n{md}" if translation else md
-    translation = re.sub(r"\n{3,}", "\n\n", translation).strip()
+    # 合并分块译文（去掉 overlap 造成的重复句）并清洗 LaTeX，再把多模态抄好的表格拼回译文
+    translation = apply_table_map(
+        sanitize_translation(merge_translation_parts(translated_parts)),
+        table_map,
+    )
     if not translation:
         raise HTTPException(
             status_code=502,
@@ -4724,7 +4793,10 @@ async def api_translate_page(req: TranslatePageRequest):
                 chunks, _build_retry_msg, model, _m_name, _m_fallback, deadline,
                 call_info=None,
             )
-            retry_text = sanitize_translation(merge_translation_parts(retry_parts))
+            retry_text = apply_table_map(
+                sanitize_translation(merge_translation_parts(retry_parts)),
+                table_map,
+            )
             if retry_text and len(retry_text) >= len(translation) * 0.9:
                 translation = retry_text
                 leaked = find_untranslated_runs(translation)
@@ -4792,10 +4864,11 @@ async def api_translate_blocks(req: TranslateBlocksRequest):
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
 
-    from .bilingual import (BLOCK_TRANSLATION_VERSION, blocks_signature,
-                            concatenate_blocks, translate_blocks)
+    from .bilingual import (BLOCK_TRANSLATION_VERSION, UNTRANSLATED,
+                            blocks_signature, concatenate_blocks,
+                            translate_blocks)
     from .paper_text import extract_page_blocks
-    from .translation import get_cache
+    from .translation import get_cache, sanitize_translation
 
     # 抽取是**同步重活**（pdfplumber 解析一页 64~332ms）→ 丢线程池，
     # 别占着事件循环（AGENTS.md §4.58）
@@ -4880,7 +4953,7 @@ async def api_translate_blocks(req: TranslateBlocksRequest):
                     "请重试，或换用更听话的翻译模型（DeepSeek Flash / MiniMax-M3）。"),
         )
 
-    # 公式块 → 公式原图标记（前端 renderFormulaImages 换成从 PDF 裁下来的原图）
+    # 公式块 → 公式原图标记；表格块 → 多模态表格；正文块 → LaTeX/格式清洗
     for b in out_blocks:
         kind = b.get("kind")
         if kind == "formula":
@@ -4892,6 +4965,8 @@ async def api_translate_blocks(req: TranslateBlocksRequest):
         elif kind == "table":
             b["translation"] = (table_map.get(int(b.get("i", 0)))
                                 or "【表格未能读出，请对照原文】")
+        elif b.get("translation") and b["translation"] != UNTRANSLATED:
+            b["translation"] = sanitize_translation(b["translation"])
 
     translation = concatenate_blocks(out_blocks)
     if not translation.strip():
@@ -4920,7 +4995,8 @@ async def api_translate_blocks(req: TranslateBlocksRequest):
         "translated_blocks": sum(
             1 for b in out_blocks if (b.get("translation") or "").strip()),
     }
-    cache.put(cache_section_key, signature, model, result)
+    if not reason:
+        cache.put(cache_section_key, signature, model, result)
     return result
 
 
@@ -4936,7 +5012,10 @@ async def api_translation_cache_batch_lookup(req: TranslationCacheBatchRequest):
     hits: dict = {}
     misses = 0
     for item in req.keys:
-        cached = cache.get(item.section_key, item.text, item.model)
+        _, _, resolved_model = _resolve_translation_model(item.model)
+        cached = cache.get(item.section_key, item.text, resolved_model)
+        if not cached and item.model and item.model != resolved_model:
+            cached = cache.get(item.section_key, item.text, item.model)
         if cached:
             cached["from_cache"] = True
             hits[item.section_key] = cached
@@ -6013,12 +6092,42 @@ def _safe_local_pdf(relative_path: str):
 
 
 def _vault_pdfs() -> list:
-    """vault 里所有 PDF：[(相对路径, 绝对路径)]。"""
+    """vault 里所有 PDF：[(相对路径, 绝对路径)]。
+
+    ⚠⚠ 2026-11-25 审计 P0：**不能扫整个仓库**。
+    原来这里用 `BASE_DIR.rglob("*.pdf")` —— BASE_DIR 既是仓库根、又是
+    vault 根，仓库里还住着代码、文档、tests/，而 vault 里还躺着
+    **「中译替换版」这种生成物**（`<主题>/05_译文替换版_PDF/*.pdf`）。
+    一并扫进来造成两个真实问题：
+
+      ① 「从仓库论文库打开」的列表里出现**同名同源的两份 PDF**
+         （原文 + 中译替换版）→ 用户点错一份，行为完全不同；
+      ② files/ 同步通道把这些**生成物**也哈希同步进坚果云
+         → 云盘白占空间（替换版通常比原文还大），两台设备各同步一份。
+
+    → 收窄到两件事：
+      · 只收 vault 的**内容目录**（generator.VAULT_CONTENT_DIRS）里的 PDF；
+      · 排除「译文替换版」输出目录（它是生成物，不是论文原文）。
+
+    ⚠ 注意：这里**不改变任何既有文件的路径与文件名**（paper_id 哈希口径
+      不变，AGENTS.md 红线）—— 只是不再把生成物/仓库文件算进来。
+    """
+    from .generator import VAULT_CONTENT_DIRS
     out = []
     try:
         for pdf in sorted(BASE_DIR.rglob("*.pdf")):
-            if pdf.is_file():
-                out.append((str(pdf.relative_to(BASE_DIR)).replace("\\", "/"), pdf))
+            if not pdf.is_file():
+                continue
+            parts = pdf.relative_to(BASE_DIR).parts
+            if not parts:
+                continue
+            # 只收 vault 内容目录（排除仓库里的代码/文档/tests/logs）
+            if parts[0] not in VAULT_CONTENT_DIRS:
+                continue
+            # 生成物（中译替换版）不算「论文原文」
+            if _REPLACED_DIR_NAME in parts:
+                continue
+            out.append((str(pdf.relative_to(BASE_DIR)).replace("\\", "/"), pdf))
     except OSError:
         pass
     return out

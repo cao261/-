@@ -204,9 +204,13 @@ def extract_curve_from_image(
 
     sorted_xs = sorted(by_x.keys())
     if len(sorted_xs) > max_cols:
-        # Subsample: take every Nth column to keep payload small
-        stride = max(1, len(sorted_xs) // max_cols)
-        sorted_xs = sorted_xs[::stride]
+        # Evenly spaced sampling across overlap preserving both endpoints & capping at max_cols
+        if max_cols <= 1:
+            sorted_xs = sorted_xs[:max(1, max_cols)]
+        else:
+            last = len(sorted_xs) - 1
+            indices = [round(i * last / (max_cols - 1)) for i in range(max_cols)]
+            sorted_xs = [sorted_xs[idx] for idx in dict.fromkeys(indices)]
 
     points = []
     for x in sorted_xs:
@@ -392,7 +396,7 @@ def compute_metrics(
     rx = [r[0] for r in repro_sorted]
     ry = [r[1] for r in repro_sorted]
 
-    # Check x overlap
+    # Check x overlap and restrict metrics to overlapping repro points
     x_lo = max(px[0], rx[0])
     x_hi = min(px[-1], rx[-1])
     if x_hi <= x_lo:
@@ -400,15 +404,22 @@ def compute_metrics(
             f"paper 与 repro 的 x 范围无重叠 (paper {px[0]:.4g}~{px[-1]:.4g}, "
             f"repro {rx[0]:.4g}~{rx[-1]:.4g})"
         )
+    overlap_pts = [(xi, yi) for xi, yi in zip(rx, ry) if x_lo - 1e-12 <= xi <= x_hi + 1e-12]
+    if not overlap_pts:
+        raise ValueError(
+            f"paper 与 repro 的重叠区间 [{x_lo:.4g}, {x_hi:.4g}] 内没有 repro 数据点"
+        )
+    ov_rx = [pt[0] for pt in overlap_pts]
+    ov_ry = [pt[1] for pt in overlap_pts]
 
-    # Linearly interpolate paper onto repro's x grid
-    interpolated = _linear_interp(px, py, rx)
+    # Linearly interpolate paper onto repro's overlapping x grid
+    interpolated = _linear_interp(px, py, ov_rx)
 
     # Per-point diff
     diffs = []
     abs_errs = []
     rel_errs = []
-    for i, (xi, yi) in enumerate(zip(rx, ry)):
+    for i, (xi, yi) in enumerate(overlap_pts):
         paper_yi = interpolated[i]
         abs_err = yi - paper_yi
         abs_errs.append(abs(abs_err))
@@ -432,16 +443,16 @@ def compute_metrics(
     # Pearson correlation (between paper_yi interpolated and repro y)
     if n > 1:
         paper_mean = sum(interpolated) / n
-        repro_mean = sum(ry) / n
-        cov = sum((interpolated[i] - paper_mean) * (ry[i] - repro_mean) for i in range(n))
+        repro_mean = sum(ov_ry) / n
+        cov = sum((interpolated[i] - paper_mean) * (ov_ry[i] - repro_mean) for i in range(n))
         var_p = sum((p - paper_mean) ** 2 for p in interpolated)
-        var_r = sum((y - repro_mean) ** 2 for y in ry)
+        var_r = sum((y - repro_mean) ** 2 for y in ov_ry)
         denom = math.sqrt(var_p * var_r)
         pearson = cov / denom if denom > 1e-12 else 0.0
         # R^2 = 1 - SS_res / SS_tot
-        ss_res = sum((ry[i] - interpolated[i]) ** 2 for i in range(n))
-        ss_tot = sum((y - repro_mean) ** 2 for y in ry)
-        r2 = 1 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
+        ss_res = sum((ov_ry[i] - interpolated[i]) ** 2 for i in range(n))
+        ss_tot = sum((y - repro_mean) ** 2 for y in ov_ry)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else (1.0 if ss_res <= 1e-12 else 0.0)
     else:
         pearson = 0.0
         r2 = 0.0
@@ -488,9 +499,9 @@ def compute_metrics(
         # Per-point table (capped at 100 to avoid huge payloads)
         "per_point": [
             {
-                "x": rx[i],
+                "x": ov_rx[i],
                 "paper_y": interpolated[i],
-                "repro_y": ry[i],
+                "repro_y": ov_ry[i],
                 "abs_err": diffs[i],
                 "rel_err_pct": rel_errs[i],
             }
@@ -528,5 +539,5 @@ __all__ = [
     "extract_curve_from_image",
     "calibrate",
     "compute_metrics",
-    "parse_csv_points" if False else "_parse_csv_points",  # exposed via compute_metrics too
+    "_parse_csv_points",
 ]

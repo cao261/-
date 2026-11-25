@@ -434,12 +434,14 @@ async function runSuite(src, label) {
 const MUTATIONS = [
   {
     name: "把载荷里的 formula_rects 掏空（模型又只能猜了）",
-    from: "formula_rects: _collectPageFormulaRects(_readerSelState.pageNum),",
+    // ⚠ 2026-11-25：选区改成在 submitReaderQA 开头冻结的 `_selSnapshot`
+    //   → 目标串必须跟着真代码走，否则「变异自检本身失效」。
+    from: "formula_rects: _collectPageFormulaRects(_selSnapshot.pageNum),",
     to: "formula_rects: [],",
   },
   {
     name: "把页码置空（服务端连整页图都不渲染）",
-    from: "page_num: _readerSelState.pageNum || null,",
+    from: "page_num: _selSnapshot.pageNum || null,",
     to: "page_num: null,",
   },
   {

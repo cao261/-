@@ -213,6 +213,8 @@ function clearQAQuotedText(){{}}
 function submitReaderQA(){{}}
 function onQAModelChange(){{}}
 var _pdfTransModel = "";
+// ⚠ 2026-11-25：答疑模型（askLLMStream 登记 AI 活动时读它）
+var _qaModel = "";
 
 // ---------------- fetch 桩：可控「挂住 / 立刻返回」----------------
 // ⚠ 一定要**真的 abort 能 reject**：否则被顶掉的旧请求永远不 settle，

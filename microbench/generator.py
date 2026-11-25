@@ -12,6 +12,7 @@ import datetime
 import os
 import re
 import shutil
+import tempfile
 import time
 import threading
 from pathlib import Path
@@ -370,13 +371,42 @@ def _build_snippet(body: str, patterns: list, max_chars: int = 400) -> str:
 _VAULT_STATS_CACHE: dict | None = None
 _VAULT_STATS_TS: float = 0.0
 _VAULT_STATS_TTL = 30.0  # seconds
+_VAULT_STATS_LOCK = threading.Lock()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """同目录临时文件 + os.replace，避免写到一半导致笔记损坏。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    fd_taken = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd_taken = True
+            fh.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        if not fd_taken:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _invalidate_vault_stats_cache() -> None:
     """Drop the cached vault-stats dict (called by all save_* functions)."""
     global _VAULT_STATS_CACHE, _VAULT_STATS_TS
-    _VAULT_STATS_CACHE = None
-    _VAULT_STATS_TS = 0.0
+    with _VAULT_STATS_LOCK:
+        _VAULT_STATS_CACHE = None
+        _VAULT_STATS_TS = 0.0
 
 
 def _copy_stats(stats: dict) -> dict:
@@ -403,8 +433,9 @@ def get_vault_stats() -> dict:
     # next 30 seconds (e.g. setting `literature_total = 99999`).
     global _VAULT_STATS_CACHE, _VAULT_STATS_TS
     now = time.monotonic()
-    if _VAULT_STATS_CACHE is not None and (now - _VAULT_STATS_TS) < _VAULT_STATS_TTL:
-        return _copy_stats(_VAULT_STATS_CACHE)
+    with _VAULT_STATS_LOCK:
+        if _VAULT_STATS_CACHE is not None and (now - _VAULT_STATS_TS) < _VAULT_STATS_TTL:
+            return _copy_stats(_VAULT_STATS_CACHE)
 
     lit_dir = BASE_DIR / "01_Literature"
     repro_dir = BASE_DIR / "02_Reproduction"
@@ -468,9 +499,10 @@ def get_vault_stats() -> dict:
         "troubleshoot_count": trouble_count,
         "weekly_count": weekly_count,
     }
-    _VAULT_STATS_CACHE = result
-    _VAULT_STATS_TS = time.monotonic()
-    return result
+    with _VAULT_STATS_LOCK:
+        _VAULT_STATS_CACHE = result
+        _VAULT_STATS_TS = time.monotonic()
+    return _copy_stats(result)
 
 # ---------------------------------------------------------------------------
 # YAML frontmatter helpers
@@ -702,7 +734,7 @@ def save_literature_card(data: dict) -> dict:
     # a 500 that also leaked the user's absolute filesystem path to the
     # browser.
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(rendered, encoding="utf-8")
+    _atomic_write_text(file_path, rendered)
     _invalidate_vault_stats_cache()
     return {
         "status": "success",
@@ -778,7 +810,7 @@ def create_reproduction_workspace(data: dict) -> dict:
             f"复现工程 '{project_name}' 已存在, 请换一个名字, "
             f"或直接在 {readme_path} 上继续编辑。"
         )
-    readme_path.write_text(rendered, encoding="utf-8")
+    _atomic_write_text(readme_path, rendered)
     _invalidate_vault_stats_cache()
 
     return {
@@ -1057,7 +1089,7 @@ def save_bilingual_reading_card(data: dict) -> dict:
     # instead of failing with a raw "[Errno 2]" 500 that also leaks the
     # absolute filesystem path to the browser.
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(content, encoding="utf-8")
+    _atomic_write_text(file_path, content)
     _invalidate_vault_stats_cache()
 
     return {
@@ -1158,7 +1190,7 @@ status: 已完成
     # instead of failing with a raw "[Errno 2]" 500 that also leaks the
     # absolute filesystem path to the browser.
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(content, encoding="utf-8")
+    _atomic_write_text(file_path, content)
     _invalidate_vault_stats_cache()
 
     return {

@@ -82,15 +82,20 @@ def chunk_section_text(text: str,
             continue
 
         # Adding this paragraph would exceed target → flush & start new chunk
-        if current and current_len + para_len + 2 > target:
-            chunks.append("\n\n".join(current))
-            # Start next chunk with overlap from the previous one
-            overlap_text = _tail_overlap("\n\n".join(current), overlap)
+        sep = 2 if current else 0
+        if current and current_len + sep + para_len > target:
+            prev_chunk = "\n\n".join(current)
+            chunks.append(prev_chunk)
+            # Start next chunk with overlap from the previous one (respecting hard_max)
+            overlap_text = _tail_overlap(prev_chunk, overlap)
+            if overlap_text and len(overlap_text) + 2 + para_len > hard_max:
+                room = max(0, hard_max - para_len - 2)
+                overlap_text = _tail_overlap(prev_chunk, room) if room > 0 else ""
             current = [overlap_text, para] if overlap_text else [para]
-            current_len = sum(len(p) for p in current)
+            current_len = (len(overlap_text) + 2 + para_len) if overlap_text else para_len
         else:
             current.append(para)
-            current_len += para_len
+            current_len += sep + para_len
 
     if current:
         chunks.append("\n\n".join(current))
@@ -218,7 +223,20 @@ def _duplicate_paragraph_count(prev: str, nxt: str) -> int:
             b = " ".join(next_ps[:j])
             if not a or not b:
                 continue
-            if SequenceMatcher(None, a, b).ratio() >= _DUP_PARA_RATIO:
+            ratio = SequenceMatcher(None, a, b).ratio()
+            if ratio >= _DUP_PARA_RATIO:
+                # 防止「1 个共享长段 + 前后各自不同的短段」在 k==j>=2 时靠高整体相似度互相吞掉
+                if k == j and k >= 2:
+                    head_r = SequenceMatcher(None, prev_ps[-k], next_ps[0]).ratio()
+                    tail_r = SequenceMatcher(None, prev_ps[-1], next_ps[j - 1]).ratio()
+                    if head_r < 0.6 or tail_r < 0.6:
+                        continue
+                # 若 j > k（比前一轮多吞了后面段落），必须确认「多吞那段」确实让相似度上升，
+                # 否则只是 prefix 已完整匹配、后面紧跟着一小段全新译文（会被误吞）。
+                if j > k:
+                    prev_b = " ".join(next_ps[:j - 1])
+                    if SequenceMatcher(None, a, prev_b).ratio() >= ratio:
+                        continue
                 return j
     return 0
 
@@ -578,11 +596,29 @@ def _normalize_formula_markers(text: str) -> str:
 
     out = re.sub(r"⟦FORMULA:([^⟧]*)⟧", repl, text)
     out = out.replace("⟦FORMULA⟧", FORMULA_TEXT_FALLBACK)
-    # 表格标记：正常情况下服务端在翻译后已经用 Markdown 表格替换掉了。
-    # 万一漏了（模型把标记抄变形、或者走的是别的翻译入口），
-    # 这里换成一句人话，别把坐标漏给读者。
-    out = re.sub(r"⟦TABLE[^⟧]*⟧", TABLE_TEXT_FALLBACK, out)
+    # 表格标记：保留合法的中性占位符 ⟦TABLE_n⟧，让服务端在 sanitize 之后把多模态
+    # 抄出的 Markdown 表格拼回原位；其余残缺/带坐标的 ⟦TABLE...⟧ 换成可读提示。
+    out = re.sub(r"⟦TABLE(?!_\d+⟧)[^⟧]*⟧", TABLE_TEXT_FALLBACK, out)
     return out
+
+
+_NEUTRAL_TABLE_RE = re.compile(r"⟦TABLE_\d+⟧")
+
+
+def apply_table_map(text: str, table_map: dict[str, str] | None) -> str:
+    """把多模态抄好的表格填回 ⟦TABLE_n⟧ 占位符，并兜底清理未映射的残留占位符。"""
+    out = text or ""
+    if table_map:
+        for token, md in table_map.items():
+            if token in out:
+                # 拼回译文时前后补空行：模型若把标记写在句中，避免正文被吞成表头第一格
+                out = out.replace(token, f"\n\n{md}\n\n")
+            elif md and "未能读出" not in md:
+                # 模型偶尔会把标记弄丢 → 兜底：漏掉的表格追加到译文末尾，绝不丢内容
+                out = f"{out}\n\n{md}" if out else md
+    if "⟦TABLE_" in out:
+        out = _NEUTRAL_TABLE_RE.sub(TABLE_TEXT_FALLBACK, out)
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
 # ---------------------------------------------------------------------------

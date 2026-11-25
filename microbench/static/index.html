@@ -89,6 +89,21 @@
       --fg-inverse:      #EFECE6;
       --fg-inverse-muted:#A8A094;
 
+      /* ---------- Z-index ladder（2026-11-25 审计 P0） ----------
+         ⚠ 原来 `#toast` 与 `#reader-modal` **都是 z-index:1000**，而
+           `#reader-modal` 在 DOM 里排在 `#toast` **后面** → 同层级下后画的
+           盖住先画的 → 阅读器一打开，**所有 toast 全部不可见**
+           （续读回位、保存批注、替换版提示、模型降级提醒…全被吞掉）。
+         ⚠ 同一层级的两个 fixed 元素，谁在 DOM 里靠后就盖住谁 —— 所以
+           **提示类浮层必须比任何容器都高**，不能靠"谁写在后面"侥幸。
+         → 这里定一份**唯一**的阶梯，各处只准用 token，不准再写裸数字。 */
+      --z-base:   100;    /* 常规层 */
+      --z-sticky: 1200;   /* 吸顶条 / 浮动条 */
+      --z-reader: 1000;   /* 阅读器全屏容器（内部层级由它自己封顶） */
+      --z-float:  1600;   /* 答疑浮层（可拖动） */
+      --z-modal:  2000;   /* 模态框 */
+      --z-toast:  2400;   /* 全局提示 —— 必须高于一切模态与浮层 */
+
       /* ---------- Accent: terracotta (single primary) ---------- */
       --accent:            #A8482C;
       --accent-hover:      #8C3A22;
@@ -212,6 +227,18 @@
       --dark-bg: var(--surface-raised);
       --dark-surface: #232019;
       --dark-border: #34302A;
+
+      /* ⚠⚠ 2026-11-25 审计 P0：夜间模式下 `.studio-dark-card`
+         （组会周报 / 快速沉淀避坑经验 整张卡）**整张看不见**。
+         根因：`:root` 里 `--dark-text: var(--fg-inverse)`，而夜间主题把
+         `--fg-inverse` 改成了 **#15140F（近黑）**；同时夜间的
+         `--dark-bg` = `--surface-raised` = **#1E1C17（深）**
+         → **深底 + 深字**，对比度只剩 ~1.07:1（实测）。
+         ⚠ 这张卡在浅色主题下本来就是「深色卡」（底 = --surface-inverse），
+           所以夜间也必须用**浅色字** —— 不能跟着 --fg-inverse 走。
+         → 夜间显式重设：正文 #F0EDE6（≈14:1）/ 次要 #A49D91（≈6:1）。 */
+      --dark-text:       var(--fg-strong);   /* #F0EDE6 */
+      --dark-text-muted: var(--fg-muted);    /* #A49D91 */
 
       --sh-1: 0 1px 2px rgba(0, 0, 0, 0.32);
       --sh-2: 0 4px 14px rgba(0, 0, 0, 0.36);
@@ -817,7 +844,7 @@
       color: var(--dark-text);
     }
     .studio-dark-card .field-input::placeholder,
-    .studio-dark-card .field-textarea::placeholder { color: var(--fg-inverse-muted); opacity: 0.7; }
+    .studio-dark-card .field-textarea::placeholder { color: var(--dark-text-muted); opacity: 0.7; }
     .studio-dark-card .field-input:hover,
     .studio-dark-card .field-select:hover,
     .studio-dark-card .field-textarea:hover { border-color: #4A443C; }
@@ -828,7 +855,7 @@
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(168, 72, 44, 0.18);
     }
-    .studio-dark-card .field-label { color: var(--fg-inverse-muted); }
+    .studio-dark-card .field-label { color: var(--dark-text-muted); }
     [data-theme="night"] .studio-dark-card .field-select option { background: var(--dark-surface); color: var(--dark-text); }
     .studio-dark-card .btn-pill { background: var(--dark-text); color: var(--dark-bg); border-color: var(--dark-text); }
     .studio-dark-card .btn-pill:hover { background: var(--accent); border-color: var(--accent); color: var(--accent-on); }
@@ -971,7 +998,10 @@
       position: fixed;
       right: var(--s-10);
       bottom: var(--s-10);
-      z-index: 1000;
+      /* ⚠ 2026-11-25 审计 P0：原来这里是 1000，与 #reader-modal 同级，
+         而 #reader-modal 在 DOM 里靠后 → 阅读器打开期间 toast **全被盖住**。
+         → 改用 z-index 阶梯的 token（必须高于任何模态与浮层）。 */
+      z-index: var(--z-toast);
       display: none;
       max-width: min(420px, calc(100vw - 48px));
       padding: var(--s-3) var(--s-5);
@@ -1976,7 +2006,7 @@
       display: none;
       position: fixed;
       inset: 0;
-      z-index: 1000;
+      z-index: var(--z-reader);
       background: var(--surface-canvas);
     }
     /* ⚠️ width:100% 不能省 —— #reader-modal 打开时是 display:flex（行向 flex），
@@ -3509,7 +3539,11 @@
         const _aiQaTaskId = _aiTaskStart({
           kind: "qa",
           label: options.label || "AI 解答",
-          model: (_pdfTransModel || "") || "跟随默认",
+          // ⚠ 2026-11-25 审计 P1：这里原来登记的是 **_pdfTransModel（翻译模型）**
+          //   —— 答疑与翻译是**两个独立**的模型选择（`_qaModel` vs `_pdfTransModel`）。
+          //   → 用户选了「答疑用 Agnes 3.0 Flash」，AI 活动面板却显示翻译模型，
+          //     看起来像「选模型没生效」；排查方向直接被带偏。
+          model: (_qaModel || "") || "跟随默认",
           controller: controller,
           onStage: (stage, t) => {
             if (options.onStage) { try { options.onStage(stage, t); } catch (e) { /* 忽略 */ } }
@@ -3654,18 +3688,17 @@
         }
 
         let closed = false;
-        const onKey = (e) => {
-          if (e.key === "Escape") {
-            e.stopPropagation();
-            fire(null);
-          }
-        };
+        // ⚠ 2026-11-25 审计 P1：Esc 改走**统一栈**（见 _escRegister）。
+        //   原来这里自己往 document 上挂 keydown —— 而阅读器自己的 Esc
+        //   处理器也在 document 上 → 同一节点上的两个监听器，
+        //   stopPropagation 拦不住彼此 → 一次 Esc 既关弹窗又关掉整个阅读器。
+        const unregisterEsc = _escRegister(() => fire(null));
         const onClick = (e) => {
           // Only the backdrop itself, not children (inner panel)
           if (e.target === overlay) fire(null);
         };
         const cleanup = () => {
-          document.removeEventListener("keydown", onKey);
+          unregisterEsc();
           overlay.removeEventListener("click", onClick);
           overlay._dismissCleanup = null;
         };
@@ -3676,7 +3709,6 @@
           closeFn(r);
         };
 
-        document.addEventListener("keydown", onKey);
         overlay.addEventListener("click", onClick);
         overlay._dismissCleanup = cleanup;
         return fire;
@@ -3697,19 +3729,87 @@
       // —— 否则专注模式的 Esc 会和弹窗的 Esc 一起响应 → 两边都不响应
       // （zen 的让路逻辑 `if (_zenOverlayOpen()) return;` 会把 Esc 让给弹窗，
       //   而弹窗自己的 Esc 已经被别的键吃掉了 → 键盘陷阱）。
+      //
+      // ⚠⚠ 2026-11-25 审计 P1：**stopPropagation 根本拦不住同行监听器**。
+      //   阅读器自己的 Esc 处理器（`document.addEventListener`）与弹窗的
+      //   处理器是**同一个节点上的两个监听器** → stopPropagation 只阻止
+      //   「继续往父节点传」，**不阻止同一节点上的其它监听器**。
+      //   → 结果：按一次 Esc，弹窗关了，**整个阅读器也一起关了**（内容全丢）。
+      //   而且 `#sync-modal` / `#anno-editor` / `#anno-drawer` /
+      //   `#vault-save-modal` / `#keyword-picker-modal` 压根**没登记**到任何
+      //   Esc 机制 → 这些浮层开着时按 Esc = 直接关掉阅读器。
+      //
+      // → 改成一个**统一的 Esc 栈**（后进先出）：
+      //     谁打开就登记谁，Esc 永远只关**最上面**那一个；
+      //     栈空时才轮到阅读器自己响应。
       // ---------------------------------------------------------------
+      const _escStack = [];
+
+      /** 把一个「关闭函数」登记进 Esc 栈；返回注销句柄。 */
+      function _escRegister(closeFn) {
+        if (typeof closeFn !== "function") return function () {};
+        _escStack.push(closeFn);
+        return function () {
+          const i = _escStack.lastIndexOf(closeFn);
+          if (i >= 0) _escStack.splice(i, 1);
+        };
+      }
+
+      /** Esc 栈里还有没有浮层（阅读器的 Esc 要给它让路）。 */
+      function _escOverlayOpen() { return _escStack.length > 0; }
+
+      /**
+       * 把某个浮层元素登记进 Esc 栈（同一元素重复打开时先注销旧的）。
+       * 之前只有「快照弹窗 / 诊断弹窗」登记过，
+       * `#sync-modal` / `#anno-editor` / `#anno-drawer` 这三个
+       * 开着的时候按 Esc = **整个阅读器被关掉**（内容全丢）。
+       */
+      function _escBind(el, closeFn) {
+        if (!el) return;
+        if (el._escUnregister) { el._escUnregister(); el._escUnregister = null; }
+        el._escUnregister = _escRegister(closeFn);
+      }
+      function _escUnbind(el) {
+        if (el && el._escUnregister) {
+          el._escUnregister();
+          el._escUnregister = null;
+        }
+      }
+
+      // 单一的 Esc 入口。**注册时机最早**（脚本执行时就挂上），
+      // 所以它排在阅读器/专注模式的处理器**前面** →
+      // 栈非空时它处理完并 stopImmediatePropagation，同节点上的其它
+      // 处理器一律不再响应 → 一次按键只干一件事。
+      //
+      // ⚠ 出栈由**这里**做（pop），不依赖关闭函数自己注销 ——
+      //   关闭函数忘了注销时，栈会卡住一个已经关掉的浮层，
+      //   之后每次 Esc 都在关那个「早就不在了」的浮层 → Esc 彻底失灵。
+      //   （关闭函数里调 _escUnbind 是幂等的，两边都做也没关系。）
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        if (!_escStack.length) return;   // 没有浮层 → 交给阅读器自己处理
+        const t = e.target;
+        const tag = (t && t.tagName || "").toLowerCase();
+        // 输入框里的 Esc 不抢（用户在编辑批注正文，想取消编辑而已）
+        if (tag === "input" || tag === "textarea" || tag === "select"
+            || (t && t.isContentEditable)) return;
+        const closeFn = _escStack.pop();   // 先出栈，再关
+        if (!closeFn) return;
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        try { closeFn(); }
+        catch (err) { console.warn("[esc] 关闭浮层失败", err); }
+      });
+
       function _wireModalEsc(overlay, closeFn) {
         if (!overlay) return;
         if (overlay._escDismiss) overlay._escDismiss();
-        const onKey = (e) => {
-          if (e.key !== "Escape") return;
-          e.stopPropagation();
-          if (overlay._escDismiss) overlay._escDismiss();
-          closeFn();
-        };
-        document.addEventListener("keydown", onKey);
+        // ⚠ 登记进统一栈（不再自己往 document 上挂 keydown）
+        const unregister = _escRegister(() => {
+          try { closeFn(); } catch (e) { console.warn("[esc] 关闭弹窗失败", e); }
+        });
         overlay._escDismiss = () => {
-          document.removeEventListener("keydown", onKey);
+          unregister();
         };
       }
 
@@ -4793,6 +4893,10 @@
       if (!_readerEscHandler) {
         _readerEscHandler = (e) => {
           if (e.key !== "Escape") return;
+          // ⚠ 2026-11-25 审计 P1：有浮层开着 → **让给浮层**。
+          //   一次 Esc 只能干一件事：先关最上面那个弹窗/抽屉/编辑器，
+          //   而不是连整个阅读器一起关掉（内容全丢）。
+          if (_escOverlayOpen()) return;
           const t = e.target;
           const tag = (t && t.tagName || "").toLowerCase();
           if (tag === "input" || tag === "textarea" || tag === "select"
@@ -4834,6 +4938,11 @@
       if (_pdfState && _pdfState.rendering) {
         _pdfState.rendering.cancelled = true;
       }
+      // ⚠ 2026-11-25 审计 P1：关窗时**释放画布显存**。
+      //   原来关掉阅读器后，几十张整页位图还挂在 DOM 上（~880MB）
+      //   → 开着别的论文/网页就一直占着，标签页迟早被撑爆。
+      //   → 掐掉在飞的 RenderTask + 归零所有画布。
+      _pdfCancelAllCanvasRenders();
       // Hide Copilot elements
       const bubble = document.getElementById("reader-selection-bubble");
       if (bubble) bubble.style.display = "none";
@@ -4898,6 +5007,13 @@
       }
     }
 
+    // ⚠ 2026-11-25 审计 P1：缩放重绘的定时器（防抖用）。
+    //   原来缩放**完全没有防抖** —— 连点「放大」时每次点击都排一次重绘
+    //   （各自 80ms 后启动），多个重绘**并发**跑：各自清空列表、各自重建
+    //   _pdfState.pages → 后半篇译文被丢掉、页面来回闪。
+    // → 重绘一律走防抖：只保留最后一次点击。
+    let _pdfZoomReloadTimer = null;
+
     /**
      * PDF zoom controls (PDF dual-column view).
      *   setReaderZoom(-1)   → zoom -10%
@@ -4939,9 +5055,18 @@
       _dedupePdfBlocks();
       // Only clear the PDF canvas side — translations don't depend on zoom,
       // so we keep them (and re-use their LLM cache on subsequent fetches).
+      // ⚠ 先掐掉在飞的画布渲染（否则旧的 RenderTask 还在往一块已被清空的
+      //   画布上画 → 报错 + 白屏 + 显存白占）。
+      _pdfCancelAllCanvasRenders();
       document.getElementById("pdf-pages-list").innerHTML = "";
       // Schedule a new render loop after the old one observes its cancel flag
-      setTimeout(() => loadPdfDualColumn({ keepTranslations: true, generation: thisGen }), 80);
+      // ⚠ 2026-11-25 审计 P1：走**防抖**，只保留最后一次点击的那次重绘
+      //   （原因见 _pdfZoomReloadTimer 的注释）。
+      if (_pdfZoomReloadTimer) clearTimeout(_pdfZoomReloadTimer);
+      _pdfZoomReloadTimer = setTimeout(() => {
+        _pdfZoomReloadTimer = null;
+        loadPdfDualColumn({ keepTranslations: true, generation: thisGen });
+      }, 220);
     }
     function updateZoomLabel() {
       const el = document.getElementById("pdf-zoom-label");
@@ -6316,6 +6441,11 @@
         showToast("已继续 PDF 队列翻译");
         processNextInPdfQueue();
       } else {
+        // ⚠ 2026-11-25 审计 P1：原来暂停**只翻标志位**，已经排好的
+        //   setTimeout 还在 → 暂停后那一拍仍会触发一次 processNextInPdfQueue
+        //   （进去再判 _pdfQueuePaused 才停）→ 用户看到「暂停了还在翻页」。
+        // → 暂停时直接把定时器掐掉。
+        if (_pdfQueueTimer) { clearTimeout(_pdfQueueTimer); _pdfQueueTimer = null; }
         showToast("已暂停后续页面队列翻译");
       }
     }
@@ -6346,8 +6476,10 @@
       // 对照模式 → 找「还没做**段落**翻译」的页；否则找「还没做整页翻译」的页。
       // ⚠ 两个标志不能混用：段落翻译成功后也会把 translated 置 true
       //   （快照要收它），所以对照模式下必须按 blockTranslated 找。
+      // ⚠ blockFailed 的页要**跳过**：翻失败过一次就别再无限重试
+      //   （但它仍然算「没翻好」—— 统计口径看 blockTranslated）。
       const nextPage = _pdfState.bilingual
-        ? _pdfState.pages.find(p => !p.blockTranslated && !p.translating)
+        ? _pdfState.pages.find(p => !p.blockTranslated && !p.translating && !p.blockFailed)
         : _pdfState.pages.find(p => !p.translated && !p.translating);
       if (!nextPage) return;
 
@@ -6370,6 +6502,119 @@
       _pdfQueueTimer = setTimeout(() => {
         processNextInPdfQueue();
       }, 3200);
+    }
+
+    // =====================================================================
+    // 画布位图的「按需渲染 + 远端释放」（2026-11-25 审计 P1）
+    //
+    // 为什么：整页位图 = 2200×2800×4B ≈ **24MB/页**（DPR=2），
+    //   36 页论文 ≈ **880MB** → 长论文直接把标签页撑爆（白屏/OOM）。
+    //   以前还有两个尾巴问题：没有 RenderTask.cancel()、关阅读器不释放。
+    //
+    // 怎么做：位图**只在靠近视口时**存在。
+    //   · 靠近视口 → 画（IntersectionObserver 判定）
+    //   · 滚远了   → 把 canvas.width/height 归零（浏览器立刻回收显存）
+    //   · 滚回来   → 重画一次
+    //   DOM 结构 / 文本层 / 译文 / 批注高亮**全程保留** → 划词、批注、
+    //   对照视图、续读回位都不受影响。
+    // =====================================================================
+    let _pdfCanvasObserver = null;
+    // 视口外 1400px 内仍保留位图（滚动手感：提前画好，不用等）
+    const _PDF_CANVAS_MARGIN_PX = 1400;
+
+    function _pdfPageNearViewport(wrapper) {
+      if (!wrapper || !wrapper.getBoundingClientRect) return true;
+      const r = wrapper.getBoundingClientRect();
+      const vh = window.innerHeight || 1200;
+      const vw = window.innerWidth || 1600;
+      return (r.bottom > -_PDF_CANVAS_MARGIN_PX
+              && r.top < vh + _PDF_CANVAS_MARGIN_PX
+              && r.right > -200 && r.left < vw + 200);
+    }
+
+    function _pdfObserveCanvas(wrapper) {
+      if (!wrapper) return;
+      if (typeof IntersectionObserver === "undefined") {
+        // 没有 IO 的环境 → 退回「一律画出来」（护栏环境常见）
+        if (!wrapper._pdfPainted) _pdfPaintCanvas(wrapper);
+        return;
+      }
+      if (!_pdfCanvasObserver) {
+        _pdfCanvasObserver = new IntersectionObserver((entries) => {
+          for (const en of entries) {
+            const w = en.target;
+            if (en.isIntersecting) {
+              if (w._pdfRender && !w._pdfPainted) _pdfPaintCanvas(w);
+            } else {
+              _pdfReleaseCanvas(w);
+            }
+          }
+        }, { root: null, rootMargin: _PDF_CANVAS_MARGIN_PX + "px 0px" });
+      }
+      _pdfCanvasObserver.observe(wrapper);
+    }
+
+    async function _pdfPaintCanvas(wrapper) {
+      const st = wrapper && wrapper._pdfRender;
+      if (!st) return;
+      if (st.painting) { st.paintAgain = true; return; }
+      st.painting = true;
+      try {
+        const c = st.canvas;
+        if (!c.width || !c.height) {
+          // 位图被释放过 → 先把尺寸还回去（否则 PDF.js 画出来是 0×0）
+          c.width = Math.floor(st.renderViewport.width);
+          c.height = Math.floor(st.renderViewport.height);
+        }
+        const ctx = c.getContext("2d");
+        const task = st.pdfPage.render({
+          canvasContext: ctx, viewport: st.renderViewport,
+        });
+        st.renderTask = task;
+        try { await task.promise; }
+        catch (e) {
+          // 取消/被打断 → 半张图。稍后再试一次。
+          wrapper._pdfPainted = false;
+          setTimeout(() => { if (wrapper.isConnected) _pdfPaintCanvas(wrapper); }, 150);
+          return;
+        }
+        st.renderTask = null;
+        wrapper._pdfPainted = true;
+      } finally {
+        st.painting = false;
+        if (st.paintAgain) { st.paintAgain = false; _pdfPaintCanvas(wrapper); }
+      }
+    }
+
+    function _pdfReleaseCanvas(wrapper) {
+      const st = wrapper && wrapper._pdfRender;
+      if (!st || !wrapper._pdfPainted) return;
+      wrapper._pdfPainted = false;
+      try {
+        if (st.renderTask && typeof st.renderTask.cancel === "function") {
+          st.renderTask.cancel();
+        }
+      } catch (e) { /* 忽略 */ }
+      st.renderTask = null;
+      // 归零位图 → 浏览器立刻回收这一大块显存
+      try { st.canvas.width = 0; st.canvas.height = 0; } catch (e) { /* 忽略 */ }
+    }
+
+    /** 关阅读器 / 缩放重绘前：掐掉所有在飞的渲染任务 + 断开观察器。 */
+    function _pdfCancelAllCanvasRenders() {
+      if (_pdfCanvasObserver) {
+        try { _pdfCanvasObserver.disconnect(); } catch (e) { /* 忽略 */ }
+        _pdfCanvasObserver = null;
+      }
+      const listEl = document.getElementById("pdf-pages-list");
+      if (!listEl) return;
+      listEl.querySelectorAll(".pdf-page-block").forEach((w) => {
+        const st = w._pdfRender;
+        if (st && st.renderTask && typeof st.renderTask.cancel === "function") {
+          try { st.renderTask.cancel(); } catch (e) { /* 忽略 */ }
+          st.renderTask = null;
+        }
+      });
     }
 
     async function renderPdfPage(pageNum) {
@@ -6408,8 +6653,17 @@
 
       const canvas = document.createElement("canvas");
       canvas.className = "pdf-page-canvas";
-      canvas.width = Math.floor(renderViewport.width);
-      canvas.height = Math.floor(renderViewport.height);
+      // ⚠⚠ 位图**按需分配**：先**不分配**显存（width/height 归零），
+      //   需要画的时候由 `_pdfPaintCanvas` 按 renderViewport 还原。
+      //   为什么不能一上来就按尺寸分配：
+      //   → `<canvas width=733 height=948>` 一创建就**占掉 2.7MB** backing store
+      //     （DPR=2 时 11MB），哪怕一个像素都没画 ——
+      //     36 页 = 100~400MB 照样把标签页撑爆。
+      //   → 「不画」必须等于「不占显存」。
+      //   ⚠ 版面尺寸不受影响：CSS 尺寸走 style.width/height（下面的两行），
+      //     与位图尺寸无关 → 页块高度、滚动位置、续读回位全部照旧。
+      canvas.width = 0;
+      canvas.height = 0;
       canvas.style.width = `${Math.floor(viewport.width)}px`;
       canvas.style.height = `${Math.floor(viewport.height)}px`;
       canvasWrapper.appendChild(canvas);
@@ -6433,8 +6687,22 @@
 
       listEl.appendChild(wrapper);
 
-      const ctx = canvas.getContext("2d");
-      await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
+      // ⚠⚠ 2026-11-25 审计 P1：**画布位图按需渲染**。
+      //   原来每页都直接画一张 DPR=2 的整页位图：
+      //   1100px 宽的页 × 2 倍设备像素 ≈ 2200×2800×4B ≈ **24MB/页**
+      //   → 36 页论文 ≈ **880MB** → 长论文直接把标签页撑爆（OOM/白屏）。
+      //   → 现在只有**靠近视口**的页才真的画；滚远了把位图**释放**
+      //     （DOM 结构、文本层、译文、批注坐标全都留着），
+      //     滚回来再画一次。
+      wrapper._pdfRender = {
+        pageNum, pdfPage: page, scale, dpr,
+        canvas, canvasWrapper, renderViewport,
+      };
+      wrapper._pdfPainted = false;
+      _pdfObserveCanvas(wrapper);
+      if (_pdfPageNearViewport(wrapper)) {
+        await _pdfPaintCanvas(wrapper);
+      }
 
       // Extract text via PDF.js (fast + no server roundtrip)
       const tc = await page.getTextContent();
@@ -6677,7 +6945,13 @@
           signal: ac.signal,
         });
         clearTimeout(acTimer);
-        const data = await r.json();
+        // ⚠ 2026-11-25 审计 P1：原来直接 `await r.json()`，而且**在检查
+        //   `r.ok` 之前**。服务端/网关返 HTML 错误页或纯文本 502 时，
+        //   JSON.parse 会抛 SyntaxError → 用户看到的是
+        //   「Unexpected token '<'」，真正的错误原因（限流/超时/校验失败）
+        //   **全被吞掉**，排查方向也被带偏。
+        // → 走 _readJsonSafe：先拿原文，解析不出来就用状态码 + 片段兜底。
+        const { data, text: resText } = await _readJsonSafe(r);
         const t1 = performance.now();
         _recordDiag({
           ts: new Date().toISOString(),
@@ -6693,13 +6967,10 @@
         });
         if (!r.ok) {
           // FastAPI Pydantic 校验错误返 detail: [{loc, msg, type}], 转 string
-          let detail = data.detail;
-          if (Array.isArray(detail)) {
-            detail = detail.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
-          } else if (typeof detail !== 'string') {
-            detail = JSON.stringify(detail);
-          }
-          throw new Error(detail || `HTTP ${r.status}`);
+          throw new Error(_httpErrorMessage(data, r, resText, "按页翻译失败"));
+        }
+        if (!data) {
+          throw new Error("按页翻译返回了非 JSON 内容（HTTP " + r.status + "）");
         }
 
         // 后端可能返回 200 + 空串（思考模型把 token 预算全花在思考上，
@@ -7012,7 +7283,10 @@
           signal: ac.signal,
         });
         clearTimeout(acTimer);
-        const data = await r.json();
+        // ⚠ 2026-11-25 审计 P1：同 translatePdfPage —— 原来 `await r.json()`
+        //   在检查 `r.ok` **之前**，服务端返非 JSON 时抛 SyntaxError，
+        //   真正的失败原因被吞掉 → 走 _readJsonSafe。
+        const { data, text: resText } = await _readJsonSafe(r);
         _recordDiag({
           ts: new Date().toISOString(),
           page: pageNum,
@@ -7026,13 +7300,10 @@
           error: null,
         });
         if (!r.ok) {
-          let detail = data.detail;
-          if (Array.isArray(detail)) {
-            detail = detail.map(e => `${(e.loc || []).join('.')} — ${e.msg}`).join('; ');
-          } else if (typeof detail !== 'string') {
-            detail = JSON.stringify(detail);
-          }
-          throw new Error(detail || `HTTP ${r.status}`);
+          throw new Error(_httpErrorMessage(data, r, resText, "对照翻译失败"));
+        }
+        if (!data) {
+          throw new Error("对照翻译返回了非 JSON 内容（HTTP " + r.status + "）");
         }
 
         // 回填：几何 + 每段译文
@@ -7044,6 +7315,7 @@
         pg.blocksVersion = data.blocks_version || 0;
         pg.blockTranslations = map;
         pg.blockTranslated = true;
+        pg.blockFailed = false;
         pg.translated = true;
         pg.translating = false;
         pg.failed = false;
@@ -7079,8 +7351,16 @@
         }
         pg.translating = false;
         pg.failed = true;
-        // 标记成"已处理"，免得队列每 3.2 秒又来翻一次
-        pg.blockTranslated = true;
+        // ⚠ 2026-11-25 审计 P1：原来这里写 `pg.blockTranslated = true`，
+        //   本意是「标记成已处理，免得队列每 3.2 秒又来翻一次」。
+        //   但 `blockTranslated` 同时被**替换版的补翻统计**当成
+        //   「这页已经翻好了」→ **失败的页被算进「已完成」**
+        //   → 用户以为全翻好了，实际那几页还是英文。
+        // → 拆成两个标志：
+        //     blockTranslated —— 只在**成功**时置 true（对外：这页翻好了）
+        //     blockFailed    —— 失败标记（对队列：别再翻这一页）
+        pg.blockTranslated = false;
+        pg.blockFailed = true;
       }
     }
 
@@ -7149,61 +7429,111 @@
      * 不额外调模型 → 一两秒出结果。
      */
     /**
-     * 哪些页「有整页译文、但没有段落级译文」？
+     * 「中译替换版」的**全量体检**：这篇论文有多少页能替换、多少页不能。
      *
-     * ⚠ 替换版要把中文**原地**贴回原页 → 必须有每个段落的**坐标**（blocks）。
-     *   而「整页译文」（普通模式翻的）没有坐标 → 那些页只能**原样保留英文**。
-     *   用户 2026-11-17：「我论文最后几页都没替换」—— 就是这个原因：
-     *   那几页是在普通模式翻的（只有整页译文），而替换版只认段落级。
+     * ⚠ 为什么必须「全量」（用户 2026-11-24 报「有的页数没翻到」）：
+     *   旧实现只查**快照里已有的页** → 「压根没翻过的页」根本不在名单里
+     *   → 那些页静默保留英文，用户**毫无提示**，只看到「几页还是英文」。
+     *   实测本机 8 份快照：6 份的每一页都只有「整页译文」（普通模式翻的），
+     *   其中 JAP 综述 36 页**全部**如此 → 替换版一份都替换不了。
      *
-     * 判据直接读**快照**（替换版端点读的就是它）→ 一次请求拿到真相，
-     * 不用逐页去抽段落块几何。
+     * → 这里拿 PDF 的**总页数**对照快照，分成三类：
+     *   ① ready        —— 有段落级译文 → 能替换
+     *   ② onlyFulltext —— 只有整页译文（普通模式翻的）→ 没有坐标，替换不了
+     *   ③ never        —— 压根没翻过 → 替换不了
      */
-    async function _pagesMissingParagraphTranslations() {
+    async function _replacedPdfHealth() {
+      const all = (_pdfState && _pdfState.pages) || [];
+      const total = all.reduce((m, p) => Math.max(m, p.num || 0), 0);
+      let snapPages = [];
       try {
         const snap = await getJson(
           `/api/pdf/snapshot/load?paper_id=${encodeURIComponent(_pdfState.paperId)}`);
-        const pages = snap.pages || [];
-        return pages
-          .filter(p => (p.translation || "").trim() && !(p.blocks && p.blocks.length))
-          .map(p => p.page_num)
-          .filter(n => Number.isFinite(n));
+        snapPages = snap.pages || [];
       } catch (e) {
-        return [];
+        snapPages = [];
       }
+      const withBlocks = new Set();
+      const onlyFulltext = new Set();
+      const seen = new Set();
+      for (const p of snapPages) {
+        const n = Number(p.page_num);
+        if (!Number.isFinite(n) || n < 1) continue;
+        seen.add(n);
+        const blocks = p.blocks || [];
+        const hasTranslatedBlock = blocks.some(b => b && (b.translation || "").trim());
+        if (hasTranslatedBlock) withBlocks.add(n);
+        else if ((p.translation || "").trim()) onlyFulltext.add(n);
+      }
+      const never = [];
+      const missing = [];
+      for (let n = 1; n <= total; n++) {
+        if (!withBlocks.has(n)) missing.push(n);
+        if (!seen.has(n)) never.push(n);
+      }
+      return {
+        total,
+        ready: Array.from(withBlocks).sort((a, b) => a - b),
+        onlyFulltext: Array.from(onlyFulltext).sort((a, b) => a - b),
+        never,
+        missing,
+      };
     }
 
     /**
      * 把缺段落级译文的页按段落重翻一遍（复用对照模式那套机器）。
      * 翻完的 blocks 会随快照存下来 → 下次构建不用再翻。
-     * @returns {{done: number[], failed: number[]}}
+     * @returns {{done: number[], failed: number[], skipped: number[], total: number}}
      */
     async function _ensureParagraphTranslations() {
-      const out = { done: [], failed: [] };
-      const missing = await _pagesMissingParagraphTranslations();
+      const out = { done: [], failed: [], skipped: [], total: 0 };
+      const h = await _replacedPdfHealth();
+      out.total = h.total;
+      const missing = h.missing;
       if (!missing.length) return out;
-      const nums = missing.join("、");
-      if (missing.length >= 2) {
-        const ok = confirm(
-          `第 ${nums} 页只有「整页译文」，没有「段落级译文」。\n\n` +
-          `替换版要把中文按段落原地贴回原页，必须有段落坐标 → ` +
-          `这几页现在只能保留英文。\n\n` +
-          `要按段落重翻这 ${missing.length} 页吗？\n` +
-          `（会调用模型 ${missing.length} 次，约 ${missing.length * 15} 秒，消耗 API 额度）`);
-        if (!ok) return out;
+      const brief = missing.length > 12
+        ? `${missing.slice(0, 12).join("、")} … 等 ${missing.length} 页`
+        : missing.join("、");
+      const detail = [
+        h.never.length ? `· ${h.never.length} 页从未翻过` : "",
+        h.onlyFulltext.length ? `· ${h.onlyFulltext.length} 页只有整页译文（没有段落坐标）` : "",
+      ].filter(Boolean).join("\n");
+      const ok = confirm(
+        `这篇论文共 ${h.total} 页，其中 ${missing.length} 页还没有「段落级译文」：\n${detail}\n\n` +
+        `替换版要把中文按段落原地贴回原页 → 必须有段落坐标，否则这些页只能保留英文。\n\n` +
+        `要现在按段落重翻这 ${missing.length} 页吗？\n` +
+        `（${brief}；约 ${missing.length * 12} 秒，消耗 API 额度）`);
+      if (!ok) {
+        out.skipped = missing.slice();
+        return out;
       }
-      showToast(`第 ${nums} 页缺段落级译文，正在按段落重翻（约 ${missing.length * 15} 秒）…`,
+      showToast(`正在按段落补翻 ${missing.length} 页（约 ${missing.length * 12} 秒）…`,
                 false, 8000);
-      for (const n of missing) {
-        try {
-          await translateBlocksForPage(n, true);
-          const pg = (_pdfState.pages || []).find(p => p.num === n);
-          if (pg && pg.blockTranslated) out.done.push(n);
-          else out.failed.push(n);
-        } catch (e) {
-          out.failed.push(n);
+      // ⚠ **并发**补翻：串行 26 页 × 15s ≈ 6.5 分钟，等不起。
+      //   限并发 3 路（再多会打爆模型端速率限制 → 触发降级）。
+      //   translateBlocksForPage 的 DOM 更新是**按页隔离**的
+      //   （pdf-page-tag-N / pdf-page-text-N）→ 并发安全。
+      const CONCURRENCY = 3;
+      let cursor = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= missing.length) return;
+          const n = missing[i];
+          try {
+            await translateBlocksForPage(n, true);
+            const pg = (_pdfState.pages || []).find(p => p.num === n);
+            if (pg && pg.blockTranslated) out.done.push(n);
+            else out.failed.push(n);
+          } catch (e) {
+            out.failed.push(n);
+          }
         }
-      }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(CONCURRENCY, missing.length) }, worker));
+      out.done.sort((a, b) => a - b);
+      out.failed.sort((a, b) => a - b);
       if (out.done.length) {
         // 把新翻的段落译文存进快照（不存的话下次构建又要重翻一遍）
         await savePdfSnapshot({ silent: true });
@@ -7217,7 +7547,9 @@
         return;
       }
       // ⚠ 先把缺段落级译文的页补上 —— 否则那些页会**原样保留英文**
-      //   （用户 2026-11-17：「我论文最后几页都没替换」）。
+      //   （用户 2026-11-17：「我论文最后几页都没替换」；
+      //    2026-11-24：「有的页数没翻到」—— 根因是**压根没翻过的页**
+      //    压根不在旧名单里，现在改成**全量体检**）。
       const fill = await _ensureParagraphTranslations();
       // ⚠ 源必须是**原论文**：生成完阅读器里打开的是替换版，
       //   `_pdfState` 也就变成了它 → 再点一次若还用它 = 找「替换版的快照」→ 必然 409。
@@ -7247,12 +7579,23 @@
         const total = (d.pages_total || 0) + (d.pages_replaced || 0);
         const warn = d.blocks_unfit ? ` · ${d.blocks_unfit} 段放不下（保留英文）` : "";
         // ⚠ 如实说明哪些页**没**被替换（用户 2026-11-17 报的「最后几页都没替换」）
-        const skipped = Array.isArray(d.pages_without_blocks) ? d.pages_without_blocks : [];
-        const skipNote = skipped.length
-          ? ` · ⚠ 第 ${skipped.join("、")} 页没有段落级译文，保留英文`
-          : "";
+        // ⚠ 2026-11-24：改成用**全量体检**的结果报，别只报「有整页译文」的页 ——
+        //   **压根没翻过的页**也要报出来（那才是「有的页数没翻到」的主因）。
+        const never = Array.isArray(d.pages_never_translated) ? d.pages_never_translated : [];
+        const onlyFt = Array.isArray(d.pages_only_fulltext) ? d.pages_only_fulltext : [];
+        const stillEnglish = Array.isArray(d.pages_missing) ? d.pages_missing : [];
+        const parts = [];
+        if (never.length) parts.push(`第 ${never.join("、")} 页从未翻过`);
+        if (onlyFt.length) parts.push(`第 ${onlyFt.join("、")} 页只有整页译文（无段落坐标）`);
+        const skipNote = parts.length ? ` · ⚠ ${parts.join("；")} → 保留英文` : "";
+        // 用户主动放弃了补翻 → 明确说出来，别让人以为「全翻了」
+        const declined = (fill.skipped && fill.skipped.length)
+          ? ` · ⚠ 已跳过 ${fill.skipped.length} 页补翻` : "";
+        const failedNote = (fill.failed && fill.failed.length)
+          ? ` · ⚠ 第 ${fill.failed.join("、")} 页补翻失败` : "";
         showToast(`✅ 已生成 ${total} 页（${d.pages_total} 原文 + ${d.pages_replaced} 替换），`
-          + `${d.blocks_written} 段已替换${warn}${skipNote} · ${sec}s`, false, 8000);
+          + `${d.blocks_written} 段已替换${warn}${skipNote}${declined}${failedNote} · ${sec}s`,
+          false, stillEnglish.length ? 12000 : 8000);
         // 记住源 → 再点一次还能重建
         _pdfReplacedSource = { paper_id: src.paper_id, relative_path: src.relative_path };
         // ⚠ 标题别叠成「（中译替换版）（中译替换版）」—— 再点一次就会叠一次
@@ -7902,11 +8245,30 @@
       }
       if (!rows.length) return null;
 
+      // ⚠⚠ 2026-11-25 审计 P1：含 `|` 的行内公式（$P(A|B)$、$|\alpha|$）
+      //   会把表格单元格**切碎**、公式本身也被劈成两半。
+      //   根因：行内公式在更早的步骤（步骤 6/7）已经还原成
+      //   `<span class="math-placeholder math-inline">P(A|B)</span>`，
+      //   而这里的 `split("|")` **不认这个占位** → 把公式里的竖线
+      //   当成了单元格分隔符。
+      //   （同型的还有行内代码 `<code class="md-code-inline">a | b</code>`。）
+      // → 切分前把公式/代码占位**整体换成不含 | 的 token**，切完再换回来。
+      const _ATOM_PH_RE = new RegExp(
+        '<span class="math-placeholder[^"]*">[\\s\\S]*?</span>' +
+        '|<div class="math-display-block">[\\s\\S]*?</div>' +
+        '|<code class="md-code-inline">[\\s\\S]*?</code>', "g");
       const splitCells = (row) => {
         let s = row.trim();
         if (s.startsWith("|")) s = s.slice(1);
         if (s.endsWith("|")) s = s.slice(0, -1);
-        return s.split("|").map(c => c.trim());
+        const stash = [];
+        s = s.replace(_ATOM_PH_RE, (m) => {
+          stash.push(m);
+          return "\u0007M" + (stash.length - 1) + "\u0008";
+        });
+        const cells = s.split("|").map(c => c.trim());
+        return cells.map(c => c.replace(/\u0007M(\d+)\u0008/g,
+                                       (_, k) => stash[Number(k)] || ""));
       };
       // 对齐方式来自分隔行（:--- 左对齐 / ---: 右对齐 / :---: 居中）
       const aligns = splitCells(sep).map(c => {
@@ -9166,6 +9528,7 @@
     function closeSyncModal() {
       const m = document.getElementById("sync-modal");
       if (m) m.style.display = "none";
+      _escUnbind(m);
       if (_syncReloadTimer) { clearTimeout(_syncReloadTimer); _syncReloadTimer = null; }
     }
 
@@ -9231,6 +9594,9 @@
       const reloadBtn = document.getElementById("sync-reload-btn");
       const btn = document.getElementById("sync-btn");
       if (modal) modal.style.display = "flex";
+      // ⚠ 2026-11-25 审计 P1：登记进 Esc 栈 ——
+      //   否则同步弹窗开着时按 Esc = 整个阅读器被关掉（内容全丢）。
+      _escBind(modal, closeSyncModal);
       if (btn) { btn.disabled = true; btn.innerText = "☁ 同步中…"; }
       if (reloadBtn) reloadBtn.style.display = "none";
       if (_syncReloadTimer) { clearTimeout(_syncReloadTimer); _syncReloadTimer = null; }
@@ -9439,7 +9805,7 @@
       // 对照模式开着 → 重译走**段落**那条路（否则对照视图和右栏会各说各话）
       if (_pdfState && _pdfState.bilingual) {
         const pg = _pdfState.pages.find(p => p.num === pageNum);
-        if (pg) { pg.blockTranslated = false; pg.translating = false; }
+        if (pg) { pg.blockTranslated = false; pg.translating = false; pg.blockFailed = false; }
         await translateBlocksForPage(pageNum, true, true, _pdfTransModel);
         return;
       }
@@ -9776,6 +10142,8 @@
       editor.style.left = Math.max(12, Math.min(x, window.innerWidth - 372)) + "px";
       editor.style.top = Math.max(12, Math.min(y, window.innerHeight - 300)) + "px";
       editor.style.display = "flex";
+      // ⚠ 2026-11-25 审计 P1：登记进 Esc 栈（否则 Esc 直接关掉整个阅读器）
+      _escBind(editor, closeAnnotationEditor);
       renderAnnoColorPicker();
       if (noteEl) noteEl.focus();
     }
@@ -9783,6 +10151,7 @@
     function closeAnnotationEditor() {
       const editor = document.getElementById("anno-editor");
       if (editor) editor.style.display = "none";
+      _escUnbind(editor);
       _annoState.editingId = null;
     }
 
@@ -9799,8 +10168,15 @@
         || ("a" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
 
       const existing = _annoState.items.find(x => x.id === id);
-      const rects = (sel.rects && sel.rects.length) ? sel.rects
-                   : (existing && existing.rects) ? existing.rects : [];
+      // ⚠ 2026-11-25 审计 P1：编辑**已有**批注时，原来拿「页面上当前的选区」
+      //   （sel.rects）去**覆盖** existing.rects —— 只要用户在批注编辑器
+      //   打开期间在别处划了一下字，这条已有批注的高亮位置就被改掉
+      //   （甚至被清成空）→ 批注和引文对不上，另一台设备同步过去也是错的。
+      // → 编辑已有批注：**坐标一律沿用原批注**；
+      //   只有「新建」批注才取当前选区。
+      const rects = existing
+        ? (existing.rects || [])
+        : ((sel.rects && sel.rects.length) ? sel.rects : []);
       if (existing) {
         existing.quote = quote;
         existing.note = note;
@@ -10064,6 +10440,8 @@
         });
       }
       drawer.style.display = "flex";
+      // ⚠ 2026-11-25 审计 P1：登记进 Esc 栈（否则 Esc 直接关掉整个阅读器）
+      _escBind(drawer, closeAnnoDrawer);
       if (pageNum) {
         // 定位到**当前页**的批注（不是每次都从第一页的第一条开始）：
         // 本页的第一条 → 本页没有就落在下一页的第一条 → 再没有就退回第一条。
@@ -10079,10 +10457,16 @@
       }
     }
 
+    function closeAnnoDrawer() {
+      const drawer = document.getElementById("anno-drawer");
+      if (drawer) drawer.style.display = "none";
+      _escUnbind(drawer);
+    }
+
     function toggleAnnoDrawer(pageNum) {
       const drawer = document.getElementById("anno-drawer");
       if (!drawer) return;
-      if (drawer.style.display === "flex") { drawer.style.display = "none"; return; }
+      if (drawer.style.display === "flex") { closeAnnoDrawer(); return; }
       openAnnoDrawer(pageNum);
     }
 
@@ -10884,6 +11268,12 @@
       //    + feedback so the LLM can avoid repeating the same content
       //    and steer toward what the user actually wants.
       const submitBtn = document.getElementById("qa-submit-btn");
+      // 浏览器那张截图只有当**当前选区还在同一页**时才发得出去
+      //   （否则截到的是用户后来划的别处 → 图文不符）。
+      // ⚠ 2026-11-25：截图是**异步**的（位图可能被释放 → 要先画回来），
+      //   所以必须先算出来再进 payload 对象字面量。
+      const _refinePageImage = (snapPageNum && (_readerSelState.pageNum === snapPageNum))
+        ? await _captureSelectionPageImage() : null;
       await askLLMStream(submitBtn, "/api/paper/explain_selection_stream", {
         // Backend caps: selected_text 15000 / question 1000 / paper_title 300
         // / feedback 2000 / prior_answer 8000.
@@ -10902,8 +11292,7 @@
         page_num: snapPageNum || null,
         // 浏览器那张截图只有当**当前选区还在同一页**时才发得出去
         //   （否则截到的是用户后来划的别处 → 图文不符）。
-        page_image: (snapPageNum && (_readerSelState.pageNum === snapPageNum))
-          ? _captureSelectionPageImage() : null,
+        page_image: _refinePageImage,
         // 该页公式的坐标 → 服务端按坐标裁**高清公式原图**给模型
         formula_rects: _collectPageFormulaRects(snapPageNum),
         feedback: (feedbackText || "").slice(0, 2000),
@@ -11344,18 +11733,31 @@
     // 实现：直接用已经渲染好的 PDF.js 画布裁剪 —— 不额外请求服务端，
     // 也没有编码/分辨率的往返损耗。选区矩形 (_readerSelState.rects) 是
     // 相对页面画布的归一化坐标，直接换算成像素即可。
-    function _captureSelectionPageImage() {
+    async function _captureSelectionPageImage(selOverride) {
       try {
-        const pageNum = _readerSelState.pageNum;
+        // ⚠ 2026-11-25 审计 P1：允许传入**选区快照**。
+        //   答疑流程要 await 大纲就绪 + 路由（数秒），期间用户可能重新划选
+        //   → 这里再读全局 `_readerSelState` 就会截到**新选区**的那一页，
+        //   与送给模型的文本对不上。
+        const sel = selOverride || _readerSelState || {};
+        const pageNum = sel.pageNum;
         if (!pageNum) return null;
         const block = document.getElementById(`pdf-page-block-${pageNum}`);
         if (!block) return null;
         const canvas = block.querySelector("canvas.pdf-page-canvas");
-        if (!canvas || !canvas.width || !canvas.height) return null;
+        if (!canvas) return null;
+        // ⚠ 2026-11-25：整页位图是**按需渲染**的（滚远了会把位图释放掉，
+        //   见 renderPdfPage 里的说明）→ 截图前发现画布是空的，
+        //   必须**先把这一页画回来**，否则截图直接返回 null →
+        //   模型少一张整页图（公式/图表全靠它）。
+        if (!canvas.width || !canvas.height) {
+          try { await _pdfPaintCanvas(block); } catch (e) { /* 画不回来就算了 */ }
+          if (!canvas.width || !canvas.height) return null;
+        }
 
         // 选区矩形（归一化）→ 包围盒；没有选区就发整页
         let box = null;
-        const rects = (_readerSelState.rects || []).filter(
+        const rects = (sel.rects || []).filter(
           r => r && r.w > 0 && r.h > 0
         );
         if (rects.length) {
@@ -11507,8 +11909,23 @@
       // ⚠ 例外（2026-11-18）：**选中的是标题**时直接走「小节全文」，
       //   不问路由 —— ① 省一次 3~8s 往返；② 「总结这一节」该给多少上下文
       //   是确定的（就是这一节），让模型去猜反而可能猜错。
+      // ⚠ 2026-11-25 审计 P1：**选区快照必须在任何 await 之前取**。
+      //   下面要 await 大纲就绪（数秒）+ 选区定位 + 路由（3~8s），
+      //   期间用户重新划一次选区 → `_readerSelState` 被改写 →
+      //   「问的是 A、答的却是 B」，而且 `_lastQAItem` 与「重新回答」
+      //   记下的也是**新选区** → 用户越修越乱。
+      // → 这里一次性冻结选区，后面全部用快照。
+      const _selSnapshot = {
+        text: (_readerSelState && _readerSelState.text) || "",
+        source: (_readerSelState && _readerSelState.source) || "general",
+        pageNum: (_readerSelState && _readerSelState.pageNum != null)
+                  ? _readerSelState.pageNum : null,
+        sectionIdx: (_readerSelState && _readerSelState.sectionIdx != null)
+                    ? _readerSelState.sectionIdx : null,
+        rects: ((_readerSelState && _readerSelState.rects) || []).slice(),
+      };
       await _ensureQaOutlineReady();
-      const headingHit = _matchQaHeading(_readerSelState.text || "");
+      const headingHit = _matchQaHeading(_selSnapshot.text);
       _qaHeadingHit = headingHit;
       // ⚠ 划的是**正文**时，也可能落在某个小节里（router 判 section 档时会用）
       //   页码 + 选区矩形是**位置证据**：同一句话可能在多个小节里出现
@@ -11516,9 +11933,9 @@
       //   只看文本会挑错小节 → AI 总结的是别人那一节（§4.6）。
       _qaSectionBySelection = headingHit ? null :
         await _findQaSectionBySelection(
-          _readerSelState.text || "",
-          _readerSelState.pageNum,
-          _readerSelState.rects || []);
+          _selSnapshot.text,
+          _selSnapshot.pageNum,
+          _selSnapshot.rects || []);
       let scope;
       if (headingHit) {
         scope = {
@@ -11529,7 +11946,7 @@
           reason: "选中的内容是章节标题 → 上下文换成本小节完整正文",
         };
       } else {
-        scope = await _routeQuestionScope(question, _currentQAPreset, _readerSelState.text || "");
+        scope = await _routeQuestionScope(question, _currentQAPreset, _selSnapshot.text);
       }
       const ctxBundle = _buildScopeContextBundle(scope);
       const surroundingContext = ctxBundle.text;
@@ -11562,27 +11979,27 @@
       //   实测（Playwright 拦截请求）：译文栏划选时 has_page_image=false。
       //   → 现在译文栏划选也带上**那一页的图**（服务端会按 PDF 坐标重渲染一张清晰的）。
       let pageImage = null;
-      if (_readerSelState.pageNum) {
-        pageImage = _captureSelectionPageImage();
+      if (_selSnapshot.pageNum) {
+        pageImage = await _captureSelectionPageImage(_selSnapshot);
       }
 
       const payload = {
         // Backend caps: selected_text 15000 / question 1000 / paper_title 300.
-        selected_text: (_readerSelState.text || "(用户未划选特定片段,提问全篇整体背景)").slice(0, 15000),
+        selected_text: (_selSnapshot.text || "(用户未划选特定片段,提问全篇整体背景)").slice(0, 15000),
         question: (question || "").slice(0, 1000),
         paper_title: (_readerState.title || "").slice(0, 300),
         surrounding_context: surroundingContext,
-        source_type: _readerSelState.source || "general",
+        source_type: _selSnapshot.source || "general",
         page_image: pageImage,
         pdf_relative_path: (_pdfState && _pdfState.relativePath) || null,
         // ⚠ 页码：服务端据此按 PDF 原始坐标**重渲染一张清晰整页图**给模型
         //   （浏览器那张是 PDF.js 画布，按栏宽渲染 → 整页只有 ~785px 宽，
         //     公式在上面只有几十像素，多模态模型读不出来）。
-        page_num: _readerSelState.pageNum || null,
+        page_num: _selSnapshot.pageNum || null,
         // ⚠ 该页公式的坐标（PDF 点）→ 服务端按坐标裁**高清公式原图**给模型。
         //   整页图只给布局上下文：一条 223pt 宽的公式在整页图上只有 ~18px 高，
         //   模型读不出来（用户原话：公式推导完全看不到，只能猜）。
-        formula_rects: _collectPageFormulaRects(_readerSelState.pageNum),
+        formula_rects: _collectPageFormulaRects(_selSnapshot.pageNum),
         // Tell the server which scope we used. Without it the backend
         // falls back to the mid cap (8000) and silently truncates the
         // wide (20K) / full (50K) contexts.
@@ -11641,7 +12058,10 @@
           _lastQAItem = {
             title: _readerState.title || "未命名论文",
             question: question,
-            selection: _readerSelState.text || "",
+            selection: _selSnapshot.text || "",
+            // ⚠ 2026-11-25 审计 P1：原来**漏了 page 字段** ——
+            //   存进会话历史/避坑库的答疑卡片没有页码，回头找不到出处。
+            page: _selSnapshot.pageNum,
             answer: full,
             mode: _currentQAPreset || "explain",
             topic_category: (document.getElementById("paper-category") && document.getElementById("paper-category").value) ||
@@ -11667,10 +12087,10 @@
           // ⚠ 存**提问当时**的快照（2026-11-22 修）：
           //   「重新回答」只读这里，**不读实时选区** ——
           //   否则用户问完又划了别的段落，模型会拿到「旧问题 + 新选区」。
-          answerBody.dataset.pageNum = String(_readerSelState.pageNum || "");
+          answerBody.dataset.pageNum = String(_selSnapshot.pageNum || "");
           answerBody.dataset.pdfPath = (_pdfState && _pdfState.relativePath) || "";
-          answerBody.dataset.selText = _readerSelState.text || "";
-          answerBody.dataset.sourceType = _readerSelState.source || "general";
+          answerBody.dataset.selText = _selSnapshot.text || "";
+          answerBody.dataset.sourceType = _selSnapshot.source || "general";
 
           // Render action buttons AFTER successful streaming. Order matters:
           //   1. Refinement (close to the answer it refines)

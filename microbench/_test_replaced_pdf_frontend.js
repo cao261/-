@@ -54,7 +54,7 @@ function sliceAll(src) {
     sliceFn(src, "function _applyReplacedPdfView(on) {"),
     sliceFn(src, "async function buildReplacedPdf() {"),
     sliceFn(src, "async function processNextInPdfQueue() {"),
-    sliceFn(src, "async function _pagesMissingParagraphTranslations() {"),
+    sliceFn(src, "async function _replacedPdfHealth() {"),
     sliceFn(src, "async function _ensureParagraphTranslations() {"),
   ].join("\n\n");
 }
@@ -208,7 +208,7 @@ return {
   _applyReplacedPdfView,
   buildReplacedPdf,
   processNextInPdfQueue,
-  _pagesMissingParagraphTranslations,
+  _replacedPdfHealth,
   _ensureParagraphTranslations,
   setPdfState: (v) => { _pdfState = v; __env.__pdfState = v; },
   getPdfState: () => _pdfState,
@@ -485,10 +485,70 @@ async function runSuite(src, label) {
     const fn = new Function("buildReplacedPdf", "return (" + onclickBody(tag).trim() + ")");
     await fn(api10.buildReplacedPdf);
     const blocks = env10.translated.filter(t => t.kind === "blocks");
-    assertEq(blocks.length, 1, "第 5 页该按段落重翻一次，实际 " + JSON.stringify(env10.translated));
-    assertEq(blocks[0].num, 5, "翻的不是缺段落译文的那一页");
+    const nums = blocks.map(t => t.num).sort((a, b) => a - b);
+    // ⚠ 2026-11-24：改成**全量体检** → 「压根没翻过的页」也要补翻。
+    //   这篇 5 页里，第 2/3/4 页压根不在快照里 → 它们也是缺段落译文的页。
+    assertEq(JSON.stringify(nums), JSON.stringify([2, 3, 4, 5]),
+      "该补翻的页不对（只有整页译文的 + 压根没翻过的都得补），实际 " +
+      JSON.stringify(env10.translated));
+    assert(!nums.includes(1), "第 1 页已有段落级译文，不该重翻（白烧额度）");
     assertEq(env10.snapshotsSaved.length, 1,
       "补翻完没存快照 → 下次构建还要再翻一遍");
+  });
+
+  // ---- 「压根没翻过的页」也要补翻（用户 2026-11-24 报的「有的页数没翻到」）----
+  await check("压根没翻过的页 → 也要按段落补翻（旧实现压根不统计这类页）", async () => {
+    const env14 = makeEnv();
+    const api14 = buildApi(src, env14);
+    // 快照里只有第 1 页；这篇 PDF 共 3 页 → 第 2、3 页从没翻过
+    env14.__snapshot = {
+      pages: [{ page_num: 1, translation: "第一页译文", blocks: [{ i: 0, translation: "段落" }] }],
+    };
+    api14.setPdfState({
+      paperId: "paper_abc123", relativePath: SRC_REL,
+      pages: [{ num: 1, text: "x" }, { num: 2, text: "x" }, { num: 3, text: "x" }],
+      rendering: { generation: 0, cancelled: false },
+    });
+    api14.setReaderTitle("某论文");
+    env14._fetchImpl = async () => ({ ok: true, status: 200, __data: OK_DATA });
+    const tag = buttonTag(src);
+    const fn = new Function("buildReplacedPdf", "return (" + onclickBody(tag).trim() + ")");
+    await fn(api14.buildReplacedPdf);
+    const nums = env14.translated.filter(t => t.kind === "blocks").map(t => t.num).sort((a, b) => a - b);
+    assertEq(JSON.stringify(nums), JSON.stringify([2, 3]),
+      "没翻过的页没被补翻 → 替换版里那两页还是英文，实际 " + JSON.stringify(nums));
+    assert(/从未翻过/.test(env14.confirms[0] || ""),
+      "确认框里没说明「有页压根没翻过」，用户会一头雾水：" + (env14.confirms[0] || ""));
+  });
+
+  // ---- 构建后要说清「哪几页仍是英文」 --------------------------------------
+  await check("构建后的提示要说清哪几页仍是英文（别让用户以为全翻了）", async () => {
+    const env15 = makeEnv();
+    const api15 = buildApi(src, env15);
+    env15.__snapshot = {
+      pages: [{ page_num: 1, translation: "第一页译文", blocks: [{ i: 0, translation: "段落" }] }],
+    };
+    api15.setPdfState({
+      paperId: "paper_abc123", relativePath: SRC_REL,
+      pages: [{ num: 1, text: "x" }, { num: 2, text: "x" }],
+      rendering: { generation: 0, cancelled: false },
+    });
+    api15.setReaderTitle("某论文");
+    env15._fetchImpl = async () => ({
+      ok: true, status: 200,
+      __data: Object.assign({}, OK_DATA, {
+        pdf_pages_total: 2,
+        pages_never_translated: [2],
+        pages_only_fulltext: [],
+        pages_missing: [2],
+      }),
+    });
+    const tag = buttonTag(src);
+    const fn = new Function("buildReplacedPdf", "return (" + onclickBody(tag).trim() + ")");
+    await fn(api15.buildReplacedPdf);
+    const msg = env15.toasts.map(t => t.msg).join(" | ");
+    assert(/第 2 页从未翻过/.test(msg),
+      "提示里没点明「第 2 页从未翻过」→ 用户会以为全文都翻了：" + msg);
   });
 
   await check("所有页都有段落级译文 → 不重翻（不白烧额度）", async () => {
@@ -530,8 +590,11 @@ async function runSuite(src, label) {
     const tag = buttonTag(src);
     const fn = new Function("buildReplacedPdf", "return (" + onclickBody(tag).trim() + ")");
     await fn(api12.buildReplacedPdf);
-    assertEq(env12.confirms.length, 1, "缺 2 页还没问用户就开翻（白烧额度）");
-    assert(/2/.test(env12.confirms[0]), "确认框里没写清要翻几页：" + env12.confirms[0]);
+    assertEq(env12.confirms.length, 1, "缺页还没问用户就开翻（白烧额度）");
+    assert(/6 页/.test(env12.confirms[0]),
+      "确认框里没写清一共要翻几页：" + env12.confirms[0]);
+    assert(/从未翻过/.test(env12.confirms[0]) && /只有整页译文/.test(env12.confirms[0]),
+      "确认框里没把两类缺页分开说：" + env12.confirms[0]);
   });
 
   await check("用户拒绝补翻 → 不翻（尊重用户的选择）", async () => {
@@ -585,8 +648,20 @@ const MUTATIONS = [
   },
   {
     name: "把「缺段落级译文」的判据改坏（整页译文也算有段落译文）",
-    from: '.filter(p => (p.translation || "").trim() && !(p.blocks && p.blocks.length))',
-    to: '.filter(p => false)',
+    from: "if (hasTranslatedBlock) withBlocks.add(n);",
+    to: "if (true) withBlocks.add(n);",
+  },
+  {
+    // ⚠ 2026-11-24：这条是「有的页数没翻到」的根因护栏 ——
+    //   「压根没翻过的页」旧实现压根不统计 → 用户毫无提示。
+    name: "把「压根没翻过的页」排除出缺失名单（那些页又不翻了）",
+    from: "if (!withBlocks.has(n)) missing.push(n);",
+    to: "if (!withBlocks.has(n) && seen.has(n)) missing.push(n);",
+  },
+  {
+    name: "把「构建后说清哪几页仍是英文」这段删掉",
+    from: 'if (never.length) parts.push(`第 ${never.join("、")} 页从未翻过`);',
+    to: '/* 不报 */;',
   },
   {
     name: "把补翻完存快照这一步删掉（下次构建还要再翻一遍）",
@@ -598,8 +673,8 @@ const MUTATIONS = [
     //   （删笔记 / 补翻缺段落译文 / 别处），只写这一句会改到第一处（删笔记），
     //   跟被测代码无关 → 变异"没被抓到"，看起来像断言恒真，其实是变异打偏了。
     name: "把「先问用户」这一步删掉（不问就白烧额度）",
-    from: "const ok = confirm(\n          `第 ${nums} 页只有「整页译文」",
-    to: "const ok = true || confirm(\n          `第 ${nums} 页只有「整页译文」",
+    from: "const ok = confirm(\n        `这篇论文共 ${h.total} 页，其中 ${missing.length} 页还没有「段落级译文」",
+    to: "const ok = true || confirm(\n        `这篇论文共 ${h.total} 页，其中 ${missing.length} 页还没有「段落级译文」",
   },
 ];
 

@@ -91,62 +91,75 @@ def find_playwright_chromium() -> str | None:
     return None
 
 
+_WORKING_PAIR: tuple[str, str] | None = None
+
+
 def dump_dom(html_path: Path, *, browser: str | None = None,
              window_size: str = "1400,1000", virtual_time_budget: int = 3000,
              timeout: int = 120) -> str:
     """把一个本地 HTML 用 headless 浏览器渲染，取回最终 DOM 文本。
 
-    依次尝试：系统浏览器（若给了）→ Playwright 的 Chromium。
+    优先使用缓存的可用 `(exe, flag)` 组合；若无缓存，依次尝试：
+    Playwright Chromium（专为 headless 优化，无系统 Edge 16s 卡顿）→ 系统浏览器。
     **返回空字符串视为失败**，继续试下一个；全都不行才抛错。
     """
+    global _WORKING_PAIR
     html_path = Path(html_path)
     uri = html_path.resolve().as_uri()
     candidates: list[str] = []
     if browser:
         candidates.append(browser)
-    sys_b = find_system_browser()
-    if sys_b and sys_b not in candidates:
-        candidates.append(sys_b)
     pw = find_playwright_chromium()
     if pw and pw not in candidates:
         candidates.append(pw)
+    sys_b = find_system_browser()
+    if sys_b and sys_b not in candidates:
+        candidates.append(sys_b)
 
     if not candidates:
         raise RuntimeError(
             "找不到可用的 headless 浏览器（系统 Edge/Chrome 与 Playwright Chromium 都没有）")
 
-    tried: list[str] = []
+    pairs: list[tuple[str, str]] = []
+    if _WORKING_PAIR is not None and _WORKING_PAIR[0] in candidates:
+        pairs.append(_WORKING_PAIR)
     for exe in candidates:
-        # ⚠ `--headless` 与 `--headless=new` 都试：
-        #   · Chromium <112：只有 `--headless`（旧版 headless，支持 --dump-dom）
-        #   · Chromium 132+：旧 headless 已移除，`--headless` 自动指向新版
-        #   → 两种都试，谁先吐出 DOM 用谁（对方设备 25353 上哪个能用就用哪个）
-        for headless_flag in ("--headless", "--headless=new"):
-            cmd = [
-                exe, headless_flag, "--disable-gpu", "--no-sandbox",
-                f"--window-size={window_size}",
-                f"--virtual-time-budget={virtual_time_budget}",
-                "--dump-dom", uri,
-            ]
-            try:
-                p = subprocess.run(cmd, capture_output=True, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                tried.append(f"{exe} {headless_flag}: 超时")
-                continue
-            except Exception as e:                      # 启动失败等
-                tried.append(f"{exe} {headless_flag}: {e}")
-                continue
-            dom = p.stdout.decode("utf-8", errors="replace")
-            if dom.strip():
-                return dom
-            tried.append(f"{exe} {headless_flag}: 无输出")
+        # ⚠ `--headless=new` 与 `--headless` 都试：
+        #   新版 Edge/Chrome 与 Playwright Chromium 上 `--headless=new` 更稳更快，
+        #   旧版 Chromium <112 才需要 `--headless`。
+        for headless_flag in ("--headless=new", "--headless"):
+            pair = (exe, headless_flag)
+            if pair not in pairs:
+                pairs.append(pair)
+
+    tried: list[str] = []
+    for exe, headless_flag in pairs:
+        cmd = [
+            exe, headless_flag, "--disable-gpu", "--no-sandbox",
+            f"--window-size={window_size}",
+            f"--virtual-time-budget={virtual_time_budget}",
+            "--dump-dom", uri,
+        ]
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            tried.append(f"{exe} {headless_flag}: 超时")
+            continue
+        except Exception as e:                      # 启动失败等
+            tried.append(f"{exe} {headless_flag}: {e}")
+            continue
+        dom = p.stdout.decode("utf-8", errors="replace")
+        if dom.strip():
+            _WORKING_PAIR = (exe, headless_flag)
+            return dom
+        tried.append(f"{exe} {headless_flag}: 无输出")
     raise RuntimeError("headless 浏览器都没吐出 DOM：" + "；".join(tried))
 
-def find_browser() -> str | None:
-    """首选系统 Edge/Chrome；没有就退到 Playwright 的 Chromium。
 
-    ⚠ 必须把 Playwright 一起算进来：各探针的 main() 里都有
-      「找不到浏览器 → SKIP 整个护栏」的判断 —— 只找系统浏览器的话，
-      系统浏览器一没，护栏就**静默失效**了（AGENTS §4.16）。
+def find_browser() -> str | None:
+    """优先 Playwright Chromium（稳且快）；缺失时回退系统 Edge/Chrome。
+
+    ⚠ 对方设备 25353 没装 playwright 时 `find_playwright_chromium()` 返回 None，
+      自动落回系统浏览器，两边都能用且不静默跳过护栏。
     """
-    return find_system_browser() or find_playwright_chromium()
+    return find_playwright_chromium() or find_system_browser()

@@ -37,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -269,8 +270,18 @@ def _save_window_state(window) -> None:
         return
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        with open(STATE_PATH, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, ensure_ascii=False)
+        fd, tmp_name = tempfile.mkstemp(dir=LOG_DIR, prefix=".window_state.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False)
+            os.replace(tmp_name, STATE_PATH)
+        except Exception:
+            try:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
     except Exception:
         pass
 
@@ -605,6 +616,10 @@ def main(argv: list[str] | None = None) -> int:
             server.should_exit = True
         except Exception:
             pass
+        # 等内置线程把监听端口彻底释放，再起分离进程（否则 bind 竞态直接失败）
+        wait_end = time.time() + 5.0
+        while _port_open(port) and time.time() < wait_end:
+            time.sleep(0.1)
         server = None
         owns_server = False
         if not _start_server_detached(port):

@@ -296,7 +296,10 @@ MUTATIONS = [
     ("提问当时根本没存 PDF 路径快照",
      [("          answerBody.dataset.pdfPath = (_pdfState && _pdfState.relativePath) || \"\";\n", "")]),
     ("提问当时根本没存选区快照",
-     [("          answerBody.dataset.selText = _readerSelState.text || \"\";\n", "")]),
+     # ⚠ 2026-11-25：选区快照改成在 submitReaderQA **开头**冻结（_selSnapshot），
+     #   这里存的行也跟着换了写法 —— 目标串必须跟着真代码走，
+     #   否则护栏会因为「目标串找不到」而红（假阳性）。
+     [("          answerBody.dataset.selText = _selSnapshot.text || \"\";\n", "")]),
 ]
 
 
