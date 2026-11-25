@@ -47,6 +47,8 @@ PY_SUITES = [
      "阅读进度续读（关掉应用下次回到上次看到的位置：页码 + 页内偏移 ±2px / 缩放变了按比例换算 / 缩放重排不丢位置）"),
     ("microbench/_test_qa_refine_payload.py",
      "「重新回答」请求载荷（重新回答也带 pdf 路径+页码+公式坐标 → 服务端才有图 / 用提问当时的快照而不是实时选区）"),
+    ("microbench/_test_reader_overlay_render.py",
+     "阅读器浮层（Toast 层级不被阅读器盖住 / 夜间深色卡片对比度 / Esc 栈只关最上层 / 缩放防抖）"),
 ]
 
 

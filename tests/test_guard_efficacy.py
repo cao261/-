@@ -277,6 +277,9 @@ def test_behavioural_guard_files_are_still_there():
         "microbench/_test_qa_refine_payload.py",         # 渲染：「重新回答」也带 pdf 路径/页码/公式坐标 + 用提问当时的快照
         "tests/test_files_meta_cas.py",                  # files/ 共享清单的 CAS 合并（跨设备并发写不丢数据）
         "tests/test_blocking_endpoints_off_event_loop.py",  # 6 个端点不许阻塞事件循环
+        # ↓ 2026-11-25：全代码库审计那一轮
+        "microbench/_test_reader_overlay_render.py",         # 渲染：Toast 层级 / 夜间对比度 / Esc 栈 / 缩放防抖
+        "tests/test_vault_pdf_scope.py",                     # vault 论文清单不收生成物
     ]
     missing = [r for r in required if not (REPO / r).exists()]
     assert not missing, f"行为级护栏文件不见了: {missing}"

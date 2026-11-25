@@ -163,24 +163,30 @@ def test_router_prompt_describes_modes_with_the_real_caps():
         assert cap > 0, mode
 
 
+@pytest.fixture(scope="module")
+def _js_scope_contracts_stdout():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("没装 node —— 跨端一致性检查跳过")
+    proc = subprocess.run([node, str(JS_TEST), "--contracts-only"],
+                          capture_output=True, text=True,
+                          encoding="utf-8", timeout=180)
+    assert proc.returncode == 0, (
+        "前端护栏失败:\n" + proc.stdout + "\n" + proc.stderr)
+    return proc.stdout
+
+
 # ---------------------------------------------------------------------------
 # 跨端一致性：前端的 _SCOPE_CAPS 必须与后端的 QA_SCOPE_CAPS 逐字一致
 # ---------------------------------------------------------------------------
-def test_frontend_scope_caps_match_the_backend():
+def test_frontend_scope_caps_match_the_backend(_js_scope_contracts_stdout):
     """⚠ 两端的档位上限必须逐字一致（§4.107：徽标显示的字数 = 真发出去的字数）。
 
     做法：真跑 node 护栏（它把前端 `_SCOPE_CAPS` 原样吐出来）→ 与后端常量比对。
     不是「grep 源码」—— 是**跑前端代码**拿到的运行时值。
     """
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("没装 node —— 跨端一致性检查跳过")
-    proc = subprocess.run([node, str(JS_TEST)], capture_output=True,
-                          text=True, encoding="utf-8", timeout=180)
-    assert proc.returncode == 0, (
-        "前端护栏失败:\n" + proc.stdout + "\n" + proc.stderr)
-    m = re.search(r"^SCOPE_CAPS_JSON: (\{.*\})$", proc.stdout, re.M)
-    assert m, "node 护栏没有输出 SCOPE_CAPS_JSON —— 跨端检查失效：\n" + proc.stdout
+    m = re.search(r"^SCOPE_CAPS_JSON: (\{.*\})$", _js_scope_contracts_stdout, re.M)
+    assert m, "node 护栏没有输出 SCOPE_CAPS_JSON —— 跨端检查失效：\n" + _js_scope_contracts_stdout
     front = json.loads(m.group(1))
 
     from microbench.app import QA_SCOPE_CAPS
@@ -188,20 +194,14 @@ def test_frontend_scope_caps_match_the_backend():
         "前后端的档位上限不一致：前端 %s / 后端 %s" % (front, QA_SCOPE_CAPS)
 
 
-def test_frontend_router_allowlist_matches_the_backend():
+def test_frontend_router_allowlist_matches_the_backend(_js_scope_contracts_stdout):
     """前端白名单必须与后端 `QA_SCOPE_MODES` 一致。
 
     不一致的后果：router 返回的档位在前端被判「非法」→ 抛错 →
     **静默**退回关键词启发式（用户看不出发生了什么）。
     """
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("没装 node —— 跨端一致性检查跳过")
-    proc = subprocess.run([node, str(JS_TEST)], capture_output=True,
-                          text=True, encoding="utf-8", timeout=180)
-    assert proc.returncode == 0, proc.stdout
-    m = re.search(r"^ROUTER_MODES_JSON: (\[.*\])$", proc.stdout, re.M)
-    assert m, "node 护栏没有输出 ROUTER_MODES_JSON：\n" + proc.stdout
+    m = re.search(r"^ROUTER_MODES_JSON: (\[.*\])$", _js_scope_contracts_stdout, re.M)
+    assert m, "node 护栏没有输出 ROUTER_MODES_JSON：\n" + _js_scope_contracts_stdout
     front = json.loads(m.group(1))
 
     from microbench.app import QA_SCOPE_MODES
