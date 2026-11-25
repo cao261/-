@@ -44,7 +44,7 @@
 >       `apply_table_map` 的兜底分支会把丢掉的表**追加到末尾**，
 >       所以判据必须卡**位置**（§4.147）；P0-1 的端点级护栏就是这么补上的。
 >    ⑤ **测试提速**：headless 优先用 Playwright Chromium（系统 Edge headless
->       卡 16s）→ 全量 11.5 分钟 → **6m15s**（1691 passed / 1 skipped）。
+>       卡 16s）→ 全量 11.5 分钟 → **5m16s**（**1742 passed** / 1 skipped）。
 >    ⑥ **平板/APK 解冻**：实测 `android/microbench-tablet.jks` **存在**且证书指纹
 >       与已装 APK **逐字相同**（`ac50efaf…64a55`）→ 2026-11-23 的「私钥丢了、
 >       不敢重打」前提是**错的**（密钥在仓库里但被 `.gitignore` 排除 → 别的设备
