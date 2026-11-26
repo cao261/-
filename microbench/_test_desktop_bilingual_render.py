@@ -25,8 +25,10 @@ import tempfile
 
 try:  # 作为脚本跑 / 作为包被导入，两种都要能用
     from _headless_browser import dump_dom, find_browser as _find_browser
+    from _frontend_bundle import load_desktop_source
 except ImportError:  # pragma: no cover
     from microbench._headless_browser import dump_dom, find_browser as _find_browser
+    from microbench._frontend_bundle import load_desktop_source
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -433,7 +435,7 @@ def main() -> int:
         print("SKIP: 找不到 Edge/Chrome，跳过渲染护栏")
         return 0
 
-    html = INDEX.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX)
     rules = extract_css(html)
     if ".bilingual-cols" not in rules:
         print("FAIL: 没从 index.html 提取到 .bilingual-cols 规则 —— 规则名变了？")

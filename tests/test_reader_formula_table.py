@@ -21,6 +21,8 @@ import subprocess
 
 import pytest
 
+from microbench._frontend_bundle import load_desktop_source
+
 VAULT = Path(__file__).resolve().parent.parent
 JACERS = (VAULT / "01_Literature" / "04_Survey_综述" / "01_论文原文_PDF" /
           "2008-JACERS-综述-Magnetoelectric laminate composites An overview.pdf")
@@ -108,7 +110,7 @@ def test_markdown_table_is_rendered_as_table():
 
 
 def test_reader_html_has_table_and_formula_styles():
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     assert ".md-table" in html, "缺少表格样式"
     assert ".formula-shot" in html, "缺少公式原图样式"
     assert "renderFormulaImages" in html, "公式原图渲染函数没接上"
@@ -127,7 +129,7 @@ def test_katex_render_is_idempotent():
     同一个占位符就被渲染了两遍。
     修法：渲染前先看有没有 .katex 节点，有就跳过（幂等）。
     """
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     start = html.index("async function renderMathIn(")
     end = html.index("\n    }\n", start)
     body = html[start:end]

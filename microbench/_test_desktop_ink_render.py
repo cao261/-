@@ -24,8 +24,10 @@ import tempfile
 
 try:  # 作为脚本跑 / 作为包被导入，两种都要能用
     from _headless_browser import dump_dom, find_browser as _find_browser
+    from _frontend_bundle import load_desktop_source
 except ImportError:  # pragma: no cover
     from microbench._headless_browser import dump_dom, find_browser as _find_browser
+    from microbench._frontend_bundle import load_desktop_source
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -188,7 +190,7 @@ def run_probe(browser: str, ink_block: str) -> list[dict]:
 
 
 def main() -> int:
-    src = INDEX.read_text(encoding="utf-8")
+    src = load_desktop_source(INDEX)
     browser = find_browser()
     if not browser:
         print("SKIP: 找不到 Edge/Chrome")

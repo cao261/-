@@ -1,0 +1,1328 @@
+/* 04-reader.css — Split Reader, Bilingual Layout, QA Panel, Annotations, Sync & Zen */
+
+/* ===================================================================
+   Reader modal
+   =================================================================== */
+.btn-mode-toggle, .btn-zoom-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 12px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-pill);
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--dur-1) var(--ease);
+}
+.btn-zoom-toggle { padding: 4px 9px; font-size: var(--t-sm); }
+.btn-mode-toggle:hover, .btn-zoom-toggle:hover { background: var(--surface-sunken); color: var(--fg-strong); }
+.btn-mode-toggle.active {
+  background: var(--surface-raised);
+  color: var(--fg-strong);
+  font-weight: 500;
+  box-shadow: var(--sh-1);
+}
+.btn-zoom-toggle:active { transform: scale(0.94); }
+
+.seg-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--line-hairline);
+  border-radius: var(--r-pill);
+}
+.seg-divider { display: inline-block; width: 1px; height: 14px; margin: 0 var(--s-1); background: var(--line-soft); }
+
+#reader-modal { background: var(--surface-canvas); }
+.reader-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-4);
+  padding: var(--s-3) var(--s-8);
+  background: color-mix(in srgb, var(--surface-canvas) 92%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--line-soft);
+  flex-shrink: 0;
+}
+.reader-topbar-title {
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--fg-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.reader-topbar-meta {
+  margin-top: 2px;
+  font-size: var(--t-xs);
+  color: var(--fg-subtle);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.reader-topbar-actions { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; justify-content: flex-end; }
+
+.reader-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr) minmax(0, 1fr);
+  min-height: 0;
+}
+/* Below ~1200px the 3-up split stops being readable: collapse to 1 column. */
+@media (max-width: 1200px) { .reader-body { grid-template-columns: 168px minmax(0, 1fr); } }
+@media (max-width: 860px)  { .reader-body { grid-template-columns: 1fr; } }
+
+.reader-nav {
+  overflow-y: auto;
+  padding: var(--s-3) var(--s-2);
+  background: var(--surface-sunken);
+  border-right: 1px solid var(--line-hairline);
+}
+.reader-pane { overflow-y: auto; padding: var(--s-8); min-width: 0; }
+.reader-pane + .reader-pane { border-left: 1px solid var(--line-hairline); }
+.reader-pane-alt { background: var(--surface-sunken); }
+.reader-pane-label {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-bottom: var(--s-4);
+  padding-bottom: var(--s-3);
+  border-bottom: 1px solid var(--line-hairline);
+  font-size: var(--t-label);
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+
+.reader-nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-bottom: 2px;
+  padding: 8px 12px;
+  border-radius: var(--r-sm);
+  color: var(--fg-muted);
+  font-size: var(--t-sm);
+  cursor: pointer;
+  transition: all var(--dur-1) var(--ease);
+}
+.reader-nav-item:hover { background: var(--surface-raised); color: var(--fg-strong); }
+.reader-nav-item.active { background: var(--accent); color: var(--accent-on); font-weight: 500; }
+.reader-nav-item.active span { color: inherit !important; }
+.reader-nav-item > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- Reader section typography ---------- */
+.reader-section-header { padding-bottom: var(--s-4); margin-bottom: var(--s-5); border-bottom: 1px solid var(--line-soft); }
+.reader-section-title {
+  font-family: var(--font-display);
+  font-size: 1.625rem;
+  font-weight: 500;
+  line-height: 1.25;
+  color: var(--fg-strong);
+  margin-bottom: var(--s-1);
+  text-wrap: balance;
+}
+.reader-section-meta { font-size: var(--t-label); letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-subtle); }
+.reader-section-body {
+  font-family: var(--font-display);
+  font-size: 1rem;
+  line-height: 1.82;
+  color: var(--fg-strong);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.reader-section-body p { margin-top: 0; }
+.reader-section-body.en-original { font-size: 0.9375rem; line-height: 1.74; letter-spacing: 0; }
+.reader-section-body.en-original p { margin: 0 0 var(--s-3) 0; text-indent: 1.5em; }
+pre.reader-section-body { font-family: var(--font-display); white-space: pre-wrap; }
+
+/* Chinese reading: sans body, generous leading, 2-em indent, centered measure */
+.reader-section-body.cn-translation,
+.reader-translation-cn {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 46em;
+  margin: 0 auto;
+  font-family: var(--font-cn);
+  font-size: 0.96875rem;
+  line-height: 1.95;
+  letter-spacing: 0.01em;
+  color: var(--fg-strong);
+}
+.reader-section-body.cn-translation p,
+.reader-translation-cn p { margin: 0 0 0.875em 0; text-indent: 2em; }
+.reader-section-body.cn-translation p:last-child,
+.reader-translation-cn p:last-child { margin-bottom: 0; }
+
+/* ---------- PDF page blocks ---------- */
+.pdf-page-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* 不再固定 760px：PDF 宽度按左栏实际可用宽度自适应，占满整栏 */
+  max-width: 1200px;
+  width: 100%;
+  margin: 0 auto var(--s-6) auto;
+}
+.pdf-page-canvas-wrapper {
+  position: relative;
+  display: inline-block;
+  background: #FFFFFF;
+  box-shadow: var(--sh-3);
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pdf-page-canvas { display: block; max-width: 100%; height: auto; background: #FFFFFF; }
+.pdf-page-label {
+  margin: var(--s-2) 0 var(--s-1) 0;
+  font-family: var(--font-mono);
+  font-size: var(--t-label);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+.pdf-translation-block {
+  box-sizing: border-box;
+  width: 100%;
+  /* 翻译卡片同样按栏宽铺满（超宽屏留白控制在可读范围内） */
+  max-width: 1200px;
+  margin: 0 auto var(--s-5) auto;
+  padding: var(--s-5) var(--s-6);
+  background: var(--surface-raised);
+  border: 1px solid var(--line-hairline);
+  border-left: 2px solid var(--accent-2);
+  border-radius: var(--r-md);
+}
+@media (max-width: 760px) { .pdf-translation-block { padding: var(--s-4) var(--s-4); } }
+.pdf-translation-block .page-num {
+  margin-bottom: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: var(--t-label);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+}
+.pdf-translation-block .page-text {
+  font-family: var(--font-cn);
+  font-size: 0.9375rem;
+  line-height: 1.95;
+  letter-spacing: 0.01em;
+  color: var(--fg-strong);
+}
+.pdf-translation-block .page-text p { margin: 0 0 var(--s-3) 0; text-indent: 2em; }
+.pdf-translation-block .page-text p:last-child { margin-bottom: 0; }
+.pdf-translation-loading { padding: var(--s-4); color: var(--fg-subtle); font-size: var(--t-sm); font-style: italic; }
+
+/* ---------- 对照模式：译文按原文排版 ----------
+   用户诉求（2026-11-12）："像沉浸式翻译那样，译文和原文的排版一模一样，
+   原文是双栏，译文也是双栏"。
+
+   为什么是**重排**而不是把译文贴回 canvas 上：
+   PDF 页在阅读器里是「按栏宽自适应」渲染的（612pt 的页塞进 ~420px 宽的栏，
+   缩放倍率约 0.69）→ 原文正文只有 ~6px 高。译文贴回原位也是 6px，
+   **根本读不了**。所以对照模式改成「按原文的分栏重排」：
+   左栏段落进左栏、右栏段落进右栏，字号恢复正常。
+   代价：图片/图表不在文本层里 → 重排后看不到（切回「原文」视图即可）。
+*/
+.bilingual-page {
+  box-sizing: border-box;
+  max-width: 1200px;
+  margin: 0 auto var(--s-4) auto;
+  padding: var(--s-5) var(--s-5) var(--s-4) var(--s-5);
+  background: var(--surface-raised);
+  border: 1px solid var(--line-hairline);
+  border-left: 2px solid var(--accent-2);
+  border-radius: var(--r-md);
+}
+.bilingual-span { margin: 0 0 var(--s-4) 0; }
+.bilingual-cols { display: flex; align-items: flex-start; gap: var(--s-5); }
+.bilingual-col { flex: 1 1 0; min-width: 0; }
+.bilingual-col + .bilingual-col {
+  border-left: 1px solid var(--line-hairline);
+  padding-left: var(--s-5);
+}
+.bilingual-block { margin: 0 0 var(--s-4) 0; }
+.bilingual-block:last-child { margin-bottom: 0; }
+.bb-orig {
+  font-family: var(--font-sans);
+  font-size: 0.76rem;
+  line-height: 1.55;
+  color: var(--fg-subtle);
+  margin: 0 0 3px 0;
+}
+.bb-trans {
+  font-family: var(--font-cn);
+  font-size: 0.9375rem;
+  line-height: 1.78;
+  color: var(--fg-strong);
+}
+.bb-trans p { margin: 0 0 4px 0; text-indent: 0; }
+.bilingual-block.kind-heading .bb-orig { font-weight: 600; color: var(--fg-muted); }
+.bilingual-block.kind-heading .bb-trans { font-weight: 600; }
+.bilingual-block.kind-formula { text-align: center; }
+.bilingual-block.kind-formula .bb-orig { display: none; }
+.bilingual-block.kind-table .bb-orig { display: none; }
+.bilingual-note {
+  padding: var(--s-3) var(--s-4);
+  color: var(--fg-subtle);
+  font-size: var(--t-sm);
+  text-align: center;
+}
+
+/* ---------- 对照模式 + 原页图（遗留项：对照视图里看不到图片/图表）----------
+   图片/图表不在 PDF 文本层里 → 译文重排后页面上只剩文字。
+   开着「🖼 原页图」→ 原页 canvas 不藏了：
+     宽度够 → 左「原页图」右「对照译文」并排（像沉浸式翻译）；
+     宽度不够 → 原页图在上、对照译文在下（默认的 flex column 布局）。
+
+   ⚠⚠ **并排与否不能只看视口宽度**（2026-11-13 实测踩过）：
+     原来的门槛是 `@media (min-width:900px)`（**视口**宽），
+     但真正决定「并排放不放得下」的是**阅读器栏**有多宽：
+     1600px 的窗口里，阅读器栏只有 ~790px，而原页 canvas 就有 733px
+     → 并排后对照译文只剩 **43px**（挤成一条竖线，根本没法读），
+     而且当时是**逐页按各自的 canvas 宽度算** → 同一篇里第 1 页全宽、
+     第 2 页被挤成一条，滚起来忽宽忽窄。
+
+   → 现在由 JS 按**所有页卡统一**判断（类名 `bilingual-orig-wide`）：
+     译文列至少要 `_BILINGUAL_MIN_TRANS_WIDTH` 宽，否则一律上下堆叠。
+   ⚠ canvas 已经有内联的 px 宽高，**不要**再给它加 max-width ——
+     那会把画布压扁（宽被 max-width 限住、高还是内联 px → 变形）。 */
+.pdf-page-block.bilingual-orig-wide {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--s-5);
+  align-items: start;
+}
+.pdf-page-block.bilingual-orig-wide > .pdf-page-label { grid-column: 1 / -1; }
+.pdf-page-block.bilingual-orig-wide > .bilingual-page {
+  max-width: none;
+  width: 100%;
+  margin: 0;
+}
+
+/* PDF.js text layer — must stay transparent so the canvas shows through. */
+.textLayer {
+  position: absolute;
+  top: 0; right: 0; bottom: 0; left: 0;
+  overflow: hidden;
+  opacity: 1;
+  line-height: 1;
+  text-align: initial;
+  user-select: text;
+  -webkit-user-select: text;
+  pointer-events: auto;
+}
+.textLayer span, .textLayer br {
+  position: absolute;
+  color: transparent !important;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.textLayer ::selection, .textLayer span::selection {
+  background: var(--accent-line) !important;
+  color: transparent !important;
+}
+
+/* ---------- Floating QA affordances ---------- */
+.reader-selection-bubble {
+  position: fixed;
+  z-index: 1200;
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: var(--fg-strong);
+  color: var(--surface-canvas);
+  border-radius: var(--r-pill);
+  box-shadow: var(--sh-4);
+  font-size: var(--t-sm);
+  font-family: var(--font-ui);
+  cursor: pointer;
+  user-select: none;
+  transition: transform var(--dur-1) var(--ease), opacity var(--dur-1) var(--ease);
+  animation: popInBubble var(--dur-2) var(--ease-in);
+}
+.reader-selection-bubble:hover { transform: translateY(-2px) scale(1.015); }
+.reader-selection-bubble .bubble-act {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  font-family: var(--font-sans);
+  padding: 0;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.reader-selection-bubble .bubble-act:hover { color: #E8C97A; }
+@keyframes popInBubble {
+  from { opacity: 0; transform: translateY(6px) scale(0.95); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.reader-floating-copilot-btn {
+  position: fixed;
+  right: var(--s-6);
+  bottom: var(--s-5);
+  z-index: 1055;
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 9px 18px;
+  background: var(--fg-strong);
+  color: var(--surface-canvas);
+  border: 1px solid var(--line-inverse);
+  border-radius: var(--r-pill);
+  box-shadow: var(--sh-3);
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--dur-2) var(--ease);
+}
+.reader-floating-copilot-btn:hover {
+  background: var(--accent);
+  color: var(--accent-on);
+  transform: translateY(-2px);
+  box-shadow: var(--sh-4);
+}
+
+.reader-qa-panel {
+  position: fixed;
+  right: var(--s-5);
+  bottom: var(--s-5);
+  /* ⚠️ 必须高于 .ai-panel（1400）：AI 活动浮层自动展开时会盖住 QA 面板
+     标题栏（模型徽标 / 最小化按钮），而 QA 面板要靠标题栏拖动 ——
+     盖住了就既点不动也拖不动（2026-10-25 独立审查 CDP 实测，
+     重叠 415×55px）。 */
+  z-index: 1460;
+  display: none;
+  flex-direction: column;
+  width: 460px;
+  max-width: calc(100vw - 32px);
+  height: min(600px, calc(100vh - 80px));
+  overflow: hidden;
+  background: var(--surface-raised);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  box-shadow: var(--sh-4);
+  font-family: var(--font-ui);
+  animation: slideUpPanel var(--dur-3) var(--ease-in);
+}
+@keyframes slideUpPanel {
+  from { opacity: 0; transform: translateY(20px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+/* ---------- QA panel: 最小化 = 收成侧边栏 ----------
+   用户原话（2026-10-23）："划线解答有点问题，最好点最小化能够缩小至
+   侧边栏"。
+
+   旧实现只是把高度压到 46px，面板仍然是 460px 宽 —— 屏幕上还是占着
+   一大块，挡着 PDF 原文。现在最小化 = 收成一条贴右边的窄竖条
+   （宽 44px），标题竖排显示，点一下就展开。
+
+   关键点：收起的条必须**跟随面板的位置**（面板被拖到左边时，条也要
+   在左边），所以这里不写死 right，而是用 JS 在 toggle 时补上
+   left/top 定位；同时用 .qa-collapsed 类而不是 .minimized，避免和
+   旧的 height 覆盖规则打架。 */
+.reader-qa-panel.qa-collapsed {
+  width: 44px !important;
+  min-width: 44px !important;
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: calc(var(--app-vh) - 120px);
+  right: auto !important;
+  bottom: auto !important;
+  overflow: hidden;
+  border-radius: var(--r-lg) 0 0 var(--r-lg);
+  box-shadow: var(--sh-3);
+}
+.reader-qa-panel.qa-collapsed .qa-body,
+.reader-qa-panel.qa-collapsed .qa-resize-tip { display: none !important; }
+.reader-qa-panel.qa-collapsed .qa-panel-head {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 4px;
+  cursor: pointer;
+  height: 100%;
+}
+.reader-qa-panel.qa-collapsed .qa-panel-title {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  letter-spacing: 2px;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+.reader-qa-panel.qa-collapsed .qa-panel-sub,
+.reader-qa-panel.qa-collapsed #qa-panel-model-pill { display: none !important; }
+.reader-qa-panel.qa-collapsed .qa-panel-head .row { flex-direction: column; }
+
+/* ---------- QA panel: 可拖动 + 可缩放 ----------
+   用户在 27 寸屏上嫌它"只在角落里一小块、只能看一部分"：
+   - resize:both 给右下角一个原生缩放手柄（overflow 必须不是 visible）
+   - 拖动由 JS 接管标题栏，位置/尺寸写进 localStorage，下次打开还在
+   拖动/缩放后会从 right/bottom 锚定切成 left/top 锚定。 */
+.reader-qa-panel {
+  resize: both;
+  overflow: hidden;
+  min-width: 340px;
+  min-height: 220px;
+}
+.reader-qa-panel .qa-panel-head { cursor: grab; }
+.reader-qa-panel.dragging { user-select: none; }
+.reader-qa-panel.dragging .qa-panel-head { cursor: grabbing; }
+.reader-qa-panel .qa-resize-tip {
+  position: absolute;
+  right: 4px; bottom: 2px;
+  font-size: 9px;
+  color: var(--fg-subtle);
+  opacity: .55;
+  pointer-events: none;
+}
+.reader-qa-panel.dragging .qa-resize-tip { opacity: 0; }
+
+/* ---------- 阅读批注（高亮 + 个人笔记） ---------- */
+.anno-mark {
+  background: var(--anno-bg, rgba(250, 204, 21, .38));
+  border-bottom: 2px solid var(--anno-line, rgba(202, 138, 4, .8));
+  border-radius: 2px;
+  padding: 0 1px;
+  cursor: pointer;
+  color: inherit;
+}
+.anno-mark:hover { background: var(--anno-bg-h, rgba(250, 204, 21, .62)); }
+.anno-mark[data-color="yellow"] { --anno-bg: rgba(250,204,21,.38); --anno-bg-h: rgba(250,204,21,.62); --anno-line: rgba(202,138,4,.85); }
+.anno-mark[data-color="green"]  { --anno-bg: rgba(74,222,128,.34); --anno-bg-h: rgba(74,222,128,.58); --anno-line: rgba(22,163,74,.85); }
+.anno-mark[data-color="blue"]   { --anno-bg: rgba(96,165,250,.34); --anno-bg-h: rgba(96,165,250,.58); --anno-line: rgba(37,99,235,.85); }
+.anno-mark[data-color="pink"]   { --anno-bg: rgba(244,114,182,.34); --anno-bg-h: rgba(244,114,182,.58); --anno-line: rgba(219,39,119,.85); }
+.anno-mark[data-color="purple"] { --anno-bg: rgba(192,132,252,.34); --anno-bg-h: rgba(192,132,252,.58); --anno-line: rgba(147,51,234,.85); }
+.anno-mark .anno-num {
+  font-size: 9px;
+  vertical-align: super;
+  margin-left: 1px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--anno-line);
+  user-select: none;
+}
+.anno-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: rgba(202, 138, 4, .14);
+  color: #8a5a00;
+  border: 1px solid rgba(202, 138, 4, .32);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  white-space: nowrap;
+}
+.anno-badge:hover { background: rgba(202, 138, 4, .26); }
+
+.anno-editor {
+  position: fixed;
+  z-index: 1400;
+  width: 360px;
+  max-width: calc(100vw - 24px);
+  background: var(--surface-raised);
+  border: 1px solid var(--line-hairline);
+  border-radius: var(--r-md);
+  box-shadow: var(--sh-4);
+  padding: var(--s-3);
+  display: none;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+.anno-editor-title { font-size: 0.9375rem; font-weight: 600; color: var(--fg-strong); }
+.anno-quote {
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--fg-muted);
+  background: var(--surface-quiet);
+  border-left: 3px solid rgba(202, 138, 4, .55);
+  border-radius: 3px;
+  padding: 6px 9px;
+  max-height: 92px;
+  overflow-y: auto;
+  word-break: break-word;
+}
+.anno-color-row { display: flex; gap: 6px; align-items: center; }
+.anno-swatch {
+  width: 20px; height: 20px; border-radius: 50%;
+  border: 2px solid transparent; cursor: pointer; padding: 0;
+}
+.anno-swatch[aria-pressed="true"] { border-color: var(--fg-strong); transform: scale(1.12); }
+.anno-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+.anno-drawer {
+  position: fixed;
+  left: var(--s-5);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 1350;
+  width: 380px;
+  max-width: calc(100vw - 32px);
+  max-height: min(70vh, 640px);
+  background: var(--surface-raised);
+  border: 1px solid var(--line-hairline);
+  border-radius: var(--r-md);
+  box-shadow: var(--sh-4);
+  display: none;
+  flex-direction: column;
+}
+.anno-drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--s-3);
+  border-bottom: 1px solid var(--line-hairline);
+  font-weight: 600; color: var(--fg-strong); font-size: 0.9375rem;
+}
+.anno-drawer-list { overflow-y: auto; padding: var(--s-2); display: flex; flex-direction: column; gap: 8px; }
+/* ---------- AI 活动面板：让"AI 正在干什么"可见 ---------- */
+/* 用户原话（2026-10-25）："他有可能等了半天然后什么也没输出" ——
+   一个不动的转圈 = 用户不知道是在跑还是卡了。 */
+.ai-activity-pill {
+  /* ⚠️ 不要 fixed：PDF 模式下 topbar 会折行到 ~104px，fixed 在右上角
+     会压住「关闭」按钮（真人点击点不动，2026-10-25 独立审查 CDP 实测）。
+     放回 topbar 的正常流里，两种模式都可见、也不压任何控件。 */
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--card-border); background: var(--bg-canvas-subtle);
+  color: var(--text-muted); font-size: 11px; font-family: var(--font-sans);
+  white-space: nowrap;
+}
+.ai-activity-pill[data-active="1"] {
+  color: var(--accent-olive); border-color: rgba(122,138,74,.45);
+  background: rgba(122,138,74,.10);
+}
+.ai-activity-pill[data-warn="1"] { color: var(--accent-terracotta); border-color: rgba(178,83,54,.45); background: rgba(178,83,54,.10); }
+.ai-panel {
+  position: fixed; right: var(--s-5); top: 90px; z-index: 1400;
+  width: min(420px, 92vw); max-height: min(60vh, 560px);
+  display: none; flex-direction: column;
+  background: var(--bg-canvas); border: 1px solid var(--card-border);
+  border-radius: 12px; box-shadow: 0 16px 40px rgba(0,0,0,.18);
+  font-family: var(--font-sans);
+}
+.ai-panel.open { display: flex; }
+.ai-panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border-bottom: 1px solid var(--line-hairline);
+  font-weight: 600; font-size: 13px; color: var(--fg-strong);
+}
+.ai-panel-body { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.ai-task-row {
+  border: 1px solid var(--line-hairline); border-radius: 8px;
+  padding: 8px 10px; background: var(--surface-canvas);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.ai-task-row[data-state="running"] { border-left: 3px solid var(--accent-olive); }
+.ai-task-row[data-state="error"] { border-left: 3px solid var(--accent-terracotta); }
+.ai-task-row[data-state="done"] { border-left: 3px solid var(--line-hairline); opacity: .72; }
+.ai-task-row[data-state="cancelled"] { border-left: 3px solid var(--text-subtle); opacity: .6; }
+.ai-task-top { display: flex; align-items: baseline; gap: 8px; }
+.ai-task-title { font-size: 12.5px; color: var(--fg-strong); font-weight: 600; }
+.ai-task-model { font-size: 10.5px; color: var(--text-subtle); }
+.ai-task-elapsed { margin-left: auto; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.ai-task-stage { font-size: 11.5px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }
+.ai-task-stage[data-warn="1"] { color: var(--accent-terracotta); }
+.ai-task-err { font-size: 11px; color: var(--accent-terracotta); }
+.ai-task-actions { display: flex; gap: 6px; justify-content: flex-end; }
+/* 心跳：证明"还活着"，不是卡死 */
+.ai-beat {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent-olive); animation: aiBeat 1.1s ease-in-out infinite;
+}
+@keyframes aiBeat { 0%,100% { opacity: .25; transform: scale(.8); } 50% { opacity: 1; transform: scale(1.15); } }
+@keyframes aiSpin { to { transform: rotate(360deg); } }
+.ai-spinner {
+  display: inline-block; width: 11px; height: 11px; border-radius: 50%;
+  border: 2px solid rgba(122,138,74,.28); border-top-color: var(--accent-olive);
+  animation: aiSpin .8s linear infinite;
+}
+.ai-empty { padding: 14px 10px; text-align: center; color: var(--text-subtle); font-size: 12px; }
+/* 页面上的翻译状态：带计时与心跳 */
+.ai-inline-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 10.5px; color: var(--text-muted);
+}
+.ai-inline-status[data-warn="1"] { color: var(--accent-terracotta); }
+.anno-item {
+  border: 1px solid var(--line-hairline);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--surface-canvas);
+  cursor: pointer;
+}
+.anno-item:hover { border-color: rgba(202,138,4,.5); }
+.anno-item-quote {
+  font-size: 11.5px; color: var(--fg-muted); font-style: italic;
+  border-left: 3px solid var(--anno-line, rgba(202,138,4,.7));
+  padding-left: 7px; margin-bottom: 5px;
+  max-height: 48px; overflow: hidden;
+}
+.anno-item-note { font-size: 12.5px; color: var(--fg-strong); line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.anno-item-meta { font-size: 10px; color: var(--fg-subtle); margin-top: 5px; display: flex; gap: 8px; }
+/* 位置失效的批注（该页重译后引文对不上了）：记录留着，笔记不丢，
+   只是标出来"高亮找不到了"，别让用户以为批注被删了。 */
+.anno-item-orphan { border-style: dashed; border-color: var(--accent-terracotta); }
+.anno-item-orphan .anno-item-quote { opacity: .75; }
+.anno-item-orphan-tip {
+  font-size: 11px; color: var(--accent-terracotta);
+  margin: 0 0 5px; line-height: 1.4;
+}
+.anno-orphan-warn {
+  font-size: 11.5px; color: var(--accent-terracotta);
+  background: rgba(178, 83, 54, .08);
+  border: 1px solid rgba(178, 83, 54, .3);
+  border-radius: 5px; padding: 6px 8px; margin-bottom: 8px;
+}
+.anno-empty { padding: var(--s-5); text-align: center; color: var(--fg-subtle); font-size: 12px; }
+
+/* ---------- 原文（PDF 侧）上的高亮覆盖层 ----------
+   PDF.js 的文本层每个 item 是绝对定位的 span，直接往里插 <mark> 会把
+   文字挤成两行、破坏版面。所以改成在画布上叠一层矩形（荧光笔效果），
+   矩形坐标按页面归一化存储，缩放时按比例还原。 */
+.anno-overlay-layer { position: absolute; inset: 0; pointer-events: none; z-index: 5; }
+    /* 手写笔迹（平板端画过来的）——SVG 叠加层，不干扰原文 canvas */
+    .anno-ink-svg {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      overflow: visible; pointer-events: none;
+    }
+    .anno-ink-stroke { pointer-events: none; }
+.anno-overlay {
+  position: absolute;
+  border-radius: 2px;
+  background: var(--anno-ov-bg, rgba(250, 204, 21, .34));
+  mix-blend-mode: multiply;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.anno-overlay:hover { background: var(--anno-ov-bg-h, rgba(250, 204, 21, .55)); }
+.anno-overlay[data-color="green"]  { --anno-ov-bg: rgba(74,222,128,.32);  --anno-ov-bg-h: rgba(74,222,128,.52); }
+.anno-overlay[data-color="blue"]   { --anno-ov-bg: rgba(96,165,250,.32);  --anno-ov-bg-h: rgba(96,165,250,.52); }
+.anno-overlay[data-color="pink"]   { --anno-ov-bg: rgba(244,114,182,.32); --anno-ov-bg-h: rgba(244,114,182,.52); }
+.anno-overlay[data-color="purple"] { --anno-ov-bg: rgba(192,132,252,.32); --anno-ov-bg-h: rgba(192,132,252,.52); }
+.anno-overlay-num {
+  position: absolute;
+  transform: translate(-20%, -125%);
+  font-size: 10px; font-weight: 700; line-height: 1.3;
+  color: #7a5200; background: #fff8e1;
+  border: 1px solid rgba(202,138,4,.55); border-radius: 8px;
+  padding: 0 4px;
+  pointer-events: auto; cursor: pointer;
+  z-index: 6; white-space: nowrap;
+}
+
+/* ---------- 同步过程面板 ---------- */
+.sync-modal {
+  position: fixed; inset: 0; z-index: 1600;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(20, 18, 16, .45);
+}
+.sync-modal-card {
+  width: 560px; max-width: calc(100vw - 32px);
+  background: var(--surface-raised);
+  border: 1px solid var(--line-hairline);
+  border-radius: 12px; box-shadow: var(--sh-4);
+  overflow: hidden;
+}
+.sync-modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--line-hairline);
+}
+.sync-modal-title { font-weight: 600; color: var(--fg-strong); font-size: 0.96875rem; }
+.sync-modal-dir {
+  padding: 8px 14px; font-size: 11px; color: var(--fg-subtle);
+  border-bottom: 1px solid var(--line-hairline);
+  word-break: break-all; font-family: var(--font-mono);
+}
+.sync-steps {
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
+  max-height: 46vh; overflow-y: auto;
+}
+.sync-step { display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: var(--fg-base); }
+.sync-step .ico { width: 18px; text-align: center; flex-shrink: 0; }
+/* 步骤名固定宽度不压缩，明细占剩余空间并省略 —— 否则长文件名会把
+   步骤名挤成竖排的一列字 */
+.sync-step .st-name { flex: 0 0 auto; white-space: nowrap; }
+.sync-step .st-detail {
+  flex: 1 1 auto; min-width: 0;
+  color: var(--fg-subtle); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sync-step.done .ico { color: #3f7d3f; }
+.sync-step.fail .ico { color: #b0403a; }
+.sync-step.run .ico { color: var(--accent-olive); }
+.sync-step.skip .ico { color: var(--fg-subtle); }
+.sync-modal-foot {
+  padding: 10px 14px; border-top: 1px solid var(--line-hairline);
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.sync-modal-note { font-size: 11.5px; color: var(--fg-subtle); flex: 1; }
+
+.qa-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: var(--s-3) var(--s-4);
+  background: var(--surface-canvas);
+  border-bottom: 1px solid var(--line-hairline);
+  user-select: none;
+}
+.qa-panel-title { font-family: var(--font-display); font-size: 0.96875rem; font-weight: 600; line-height: 1.2; color: var(--fg-strong); }
+.qa-panel-sub { font-size: var(--t-label); color: var(--fg-subtle); }
+.qa-chip-row { display: flex; flex-wrap: wrap; gap: 6px; padding: var(--s-2) var(--s-3); background: var(--surface-quiet); border-bottom: 1px solid var(--line-hairline); }
+.qa-chip {
+  padding: 3px 9px;
+  background: transparent;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-pill);
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--t-xs);
+  cursor: pointer;
+  transition: all var(--dur-1) var(--ease);
+}
+.qa-chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+/* ===================================================================
+   Markdown rendered by formatMarkdownLite() — these classes are emitted
+   by JS (previously had no rules at all, so headings fell back to UA
+   defaults inside AI answers).
+   =================================================================== */
+.md-h2, .md-h3, .md-h4 {
+  font-family: var(--font-cn);
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--fg-strong);
+  text-indent: 0;
+}
+.md-h2 {
+  margin: 1.1em 0 0.5em;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 1.05rem;
+  color: var(--accent-2);
+}
+.md-h3 { margin: 0.9em 0 0.4em; font-size: 0.97rem; }
+.md-h4 { margin: 0.75em 0 0.3em; font-size: 0.9rem; color: var(--fg-muted); }
+.md-h2:first-child, .md-h3:first-child, .md-h4:first-child { margin-top: 0; }
+/* -------------------------------------------------------------------
+   Markdown 表格：模型本来就把表格输出成 "| a | b |"，渲染层不支持
+   表格时用户看到的是一堆竖线（"表格的翻译很乱"+"占篇幅很大"）。
+   现在渲染成真正的表格：单元格不换行（nowrap）+ 横向滚动，
+   纵向占用比竖线文本少一大截。
+   ------------------------------------------------------------------- */
+.md-table-wrap {
+  overflow-x: auto;
+  margin: 0.6em 0 0.9em;
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--line-soft);
+}
+.md-table {
+  border-collapse: collapse;
+  width: auto;
+  min-width: 100%;
+  font-size: 0.86em;
+  line-height: 1.45;
+  font-family: var(--font-sans);
+}
+.md-table th, .md-table td {
+  border-right: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  padding: 3px 9px;
+  white-space: nowrap;
+  text-align: left;
+  vertical-align: top;
+}
+.md-table th:last-child, .md-table td:last-child { border-right: none; }
+.md-table tbody tr:last-child td { border-bottom: none; }
+.md-table thead th {
+  background: var(--surface-sunken);
+  font-weight: 600;
+  color: var(--fg-strong);
+  position: sticky;
+  top: 0;
+}
+.md-table tbody tr:nth-child(even) td { background: rgba(127, 127, 127, 0.06); }
+/* 公式原图：从 PDF 原页裁下来的图，贴进译文 */
+.formula-shot {
+  display: inline-block;
+  vertical-align: middle;
+  max-width: 100%;
+  margin: 2px 0;
+}
+.formula-shot-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 3px;
+  background: var(--surface-sunken);
+}
+.formula-fallback { color: var(--fg-muted); font-size: 0.9em; }
+/* formatMarkdownLite wraps prose in bare <p> (no class), so the answer
+   surfaces need their own paragraph rhythm. */
+.qa-answer p, .result-slot p, .reader-section-body p { margin: 0 0 0.7em 0; }
+.qa-answer p:last-child, .result-slot p:last-child,
+.reader-section-body p:last-child { margin-bottom: 0; }
+.md-code-inline {
+  padding: 1px 6px;
+  background: var(--surface-sunken);
+  border-radius: var(--r-xs);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+.cross-qa-section-cb { accent-color: var(--accent-2); cursor: pointer; }
+.cross-qa-tag {
+  display: inline-block;
+  margin-right: 4px;
+  padding: 2px 8px;
+  background: var(--accent-2-soft);
+  color: var(--accent-2);
+  border: 1px solid var(--accent-2-line);
+  border-radius: var(--r-pill);
+  font-family: var(--font-mono);
+  font-size: var(--t-label);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+.snap-modal-panel { max-height: 62vh; overflow-y: auto; }
+
+/* ===================================================================
+   KaTeX — align the math face with the editorial serif.
+   =================================================================== */
+.math-display-block {
+  display: block;
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: 0.7em 0 0.5em;
+  padding: 4px 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-size: 1.03em;
+}
+.math-display-block .katex-display { margin: 0 !important; }
+/* 行内公式占位符必须是 inline，不能是 inline-block。
+   inline-block 会开 BFC，KaTeX 的 MathML 节点(<math>)被算进内在宽度，
+   占位符实测比公式本身宽 34px —— 公式两侧就出现两道大空档，读起来像坏了。
+   实测（同一段文本）：inline-block 占位符 50.6px / inline 占位符 20.6px
+   （= 公式 16.6 + 左右内边距 4），后者才是贴合的。 */
+.math-placeholder.math-inline { display: inline; padding: 0 2px; color: var(--fg-strong); }
+.math-placeholder.math-inline .katex { font-size: 1.02em; }
+.katex { font-family: var(--font-display), "Latin Modern Math", KaTeX_Main, serif !important; color: var(--fg-strong); }
+.katex .mord, .katex .mrel, .katex .mbin,
+.katex .mopen, .katex .mclose, .katex .mpunct { color: var(--fg-strong); }
+
+/* --------------------- Reader modal: structural --------------------- */
+#reader-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-reader);
+  background: var(--surface-canvas);
+}
+/* ⚠️ width:100% 不能省 —— #reader-modal 打开时是 display:flex（行向 flex），
+   .reader-shell 是它的 flex item，width:auto 会走 **fit-content 收缩**：
+   壳的宽度 = 内容的 max-content，而不是视口宽度。
+   平时顶栏在文档流里、内容很宽，壳被撑满，看不出问题；
+   一旦顶栏脱离文档流（专注模式 position:fixed），壳里只剩 .pdf-split，
+   壳立刻缩成 616px（1280 屏上只占一半），右半屏全空。
+   min-width:0 同理：否则 min-content 撑大时 flex item 不肯缩。 */
+.reader-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; width: 100%; min-width: 0; }
+
+.seg-value {
+  min-width: 48px;
+  padding: 0 var(--s-1);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--fg-strong);
+}
+
+.chip { padding: 5px 11px; font-size: var(--t-xs); }
+.btn-pill.chip { padding: 5px 14px; }
+
+.result-slot { margin-top: var(--s-4); }
+
+.reader-aux {
+  margin-top: var(--s-10);
+  padding-top: var(--s-6);
+  border-top: 1px solid var(--line-soft);
+}
+.reader-aux-title {
+  margin: var(--s-1) 0 var(--s-3);
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  color: var(--fg-strong);
+}
+.section-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: var(--s-2) var(--s-3);
+  margin-bottom: var(--s-3);
+  padding: var(--s-3);
+  background: var(--surface-raised);
+  border: 1px solid var(--line-hairline);
+  border-radius: var(--r-md);
+}
+.section-picker label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--t-xs);
+  color: var(--fg-muted);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* PDF split view */
+#reader-pdf-view { flex: 1; min-height: 0; }
+.pdf-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); height: 100%; min-height: 0; }
+/* 「中译替换版」：右栏收起 → PDF 独占整栏。
+   ⚠ 只把右栏 display:none **不够** —— .pdf-split 是 grid（两列各 1fr），
+   藏掉第二列后第一列**仍然只占一半宽**（实测 1600px 视口里只有 785px，
+   白白浪费一半屏幕）。→ 必须把列数改成 1。 */
+.pdf-split.pdf-split-single { grid-template-columns: minmax(0, 1fr); }
+/* scrollbar-gutter: stable —— 滚动条位置**提前占好**。
+   不占的话：PDF 画布渲染时容器还没出现滚动条（宽度按"无滚动条"量），
+   画布一加进去、竖向滚动条冒出来 → 容器宽度少 15px → 画布比容器宽 →
+   底部多一条横向滚动条。占位之后宽度从一开始就稳定。 */
+.pdf-split-pane { overflow-y: auto; scrollbar-gutter: stable; padding: var(--s-5) var(--s-6) var(--s-12); background: var(--surface-sunken); }
+.pdf-split-pane + .pdf-split-pane { border-left: 1px solid var(--line-soft); }
+.pdf-split-pane-alt { background: var(--surface-canvas); }
+@media (max-width: 900px) { .pdf-split { grid-template-columns: 1fr; } }
+
+.empty-state-mark {
+  margin-bottom: var(--s-2);
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-style: italic;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  opacity: 0.55;
+}
+.empty-state-title { font-family: var(--font-display); font-size: var(--t-h3); color: var(--fg-base); }
+
+.bubble-count {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-xs);
+  opacity: 0.75;
+}
+.sel-tag {
+  padding: 1px 6px;
+  background: var(--accent);
+  color: var(--accent-on);
+  border-radius: var(--r-pill);
+  font-size: var(--t-label);
+  font-weight: 600;
+}
+
+/* QA panel internals */
+.qa-quote {
+  flex-shrink: 0;
+  padding: var(--s-3);
+  background: var(--surface-quiet);
+  border-bottom: 1px solid var(--line-hairline);
+}
+.qa-quote-label { font-size: var(--t-xs); font-weight: 600; color: var(--fg-muted); }
+.qa-quote-body {
+  max-height: 72px;
+  overflow-y: auto;
+  font-size: var(--t-xs);
+  font-style: italic;
+  line-height: 1.5;
+  color: var(--fg-base);
+  word-break: break-word;
+}
+.qa-body { display: flex; flex-direction: column; flex: 1; min-height: 0; background: var(--surface-raised); }
+.qa-answer {
+  flex: 1;
+  min-height: 140px;
+  overflow-y: auto;
+  padding: var(--s-4);
+  font-size: var(--t-sm);
+  line-height: 1.7;
+  color: var(--fg-strong);
+}
+.qa-composer {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  background: var(--surface-canvas);
+  border-top: 1px solid var(--line-hairline);
+}
+.qa-composer .field-textarea { min-height: 54px; max-height: 104px; padding: 8px 10px; font-size: var(--t-sm); resize: none; }
+
+/* ===================================================================
+   Tablet / touch adaptation
+   -------------------------------------------------------------------
+   The workbench was designed for a desktop browser on this PC. Three
+   things change when the same page runs on a tablet:
+
+     1. Touch targets. The desktop sizes (27-30px icon buttons, 11px
+        chips) are far below the 44pt that iOS HIG / 48dp that Material
+        ask for. Under a coarse pointer we scale them up.
+     2. Safe areas. A notched iPad has rounded corners and a home
+        indicator; fixed elements need to stay clear of both.
+     3. Viewport height. iOS Safari's collapsing toolbar makes 100vh
+        taller than what is actually visible, which pushes anything
+        anchored to the bottom off screen. dvh tracks the real height.
+   =================================================================== */
+
+:root {
+  --sa-top: env(safe-area-inset-top, 0px);
+  --sa-bottom: env(safe-area-inset-bottom, 0px);
+  --sa-left: env(safe-area-inset-left, 0px);
+  --sa-right: env(safe-area-inset-right, 0px);
+  --app-vh: 100vh;
+}
+@supports (height: 100dvh) {
+  :root { --app-vh: 100dvh; }
+}
+
+/* ---- 1. Touch targets (only for real touch input) ---------------- */
+@media (pointer: coarse) {
+  .icon-btn { width: 44px; height: 44px; }
+  .icon-btn .ico { width: 18px; height: 18px; }
+
+  .pill-badge[data-clickable="true"] {
+    padding: 10px 16px;
+    font-size: var(--t-sm);
+  }
+  .pill-badge .ico { width: 15px; height: 15px; }
+
+  .btn-pill { padding: 13px 24px; }
+  .btn-pill-outline { padding: 12px 20px; }
+  .btn-ghost { padding: 10px 12px; font-size: var(--t-sm); }
+
+  .chip, .btn-pill.chip { padding: 9px 14px; font-size: var(--t-sm); }
+  .qa-chip { padding: 8px 14px; font-size: var(--t-sm); }
+
+  .btn-mode-toggle, .btn-zoom-toggle { padding: 9px 13px; }
+
+  /* Inline modals build their own markup with inline styles, so the
+     form controls inside them are styled here rather than by class.
+     16px is the threshold below which iOS zooms the page on focus. */
+  .field-input, .field-select, .field-textarea {
+    padding: 12px 14px;
+    font-size: 16px;
+  }
+  input[type="text"]:not([data-pdfjs]),
+  input[type="password"],
+  input[type="search"],
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+  button, [role="button"] { touch-action: manipulation; }
+}
+
+/* ---- 2. Safe areas for fixed / sticky chrome -------------------- */
+.top-meta-banner { padding-top: var(--sa-top); }
+header {
+  padding-top: calc(var(--s-4) + var(--sa-top));
+  padding-left: calc(var(--s-12) + var(--sa-left));
+  padding-right: calc(var(--s-12) + var(--sa-right));
+}
+.container {
+  padding-left: calc(var(--s-12) + var(--sa-left));
+  padding-right: calc(var(--s-12) + var(--sa-right));
+}
+.reader-floating-copilot-btn {
+  right: calc(var(--s-6) + var(--sa-right));
+  bottom: calc(var(--s-5) + var(--sa-bottom));
+}
+.reader-qa-panel {
+  right: calc(var(--s-5) + var(--sa-right));
+  bottom: calc(var(--s-5) + var(--sa-bottom));
+  height: min(600px, calc(var(--app-vh) - 120px - var(--sa-bottom)));
+}
+/* The reader modal is a full-screen overlay; let it breathe around
+   the notch and the home indicator. */
+#reader-modal { padding: var(--sa-top) var(--sa-right) var(--sa-bottom) var(--sa-left); }
+
+/* ---- 3. Viewport height ---------------------------------------- */
+.reader-shell { height: var(--app-vh); }
+.reader-qa-panel { max-height: calc(var(--app-vh) - 40px); }
+
+/* ---- 4. Tablet breakpoints -------------------------------------- */
+/* iPad portrait is 768pt wide, landscape 1024pt. The desktop grid
+   switches to a single column at 1080px, so landscape iPad already
+   stacks — but the reading column gets too wide to scan comfortably,
+   so cap it. */
+@media (max-width: 1100px) {
+  .reader-body { grid-template-columns: 1fr; }
+  .pdf-split { grid-template-columns: 1fr; }
+}
+@media (min-width: 700px) and (max-width: 1100px) {
+  .container { max-width: 860px; }
+  /* A comfortable measure for long-form reading on a tablet. */
+  .reader-shell > * { max-width: 860px; margin-left: auto; margin-right: auto; }
+}
+@media (max-width: 700px) {
+  header { padding-left: calc(var(--s-6) + var(--sa-left)); padding-right: calc(var(--s-6) + var(--sa-right)); }
+  .container { padding-left: calc(var(--s-6) + var(--sa-left)); padding-right: calc(var(--s-6) + var(--sa-right)); }
+}
+
+/* A tablet in landscape has plenty of width; the 1280px cap plus the
+   generous side padding makes the board feel like a wide desktop. */
+@media (pointer: coarse) and (min-width: 1180px) {
+  .container { padding-top: var(--s-8); }
+}
+
+/* =====================================================================
+   专注模式（Zen / Focus）——小屏极简阅读
+   目标：屏幕上只剩「论文页 + 译文页」。顶栏工具条 / 章节导航 /
+   AI 提问区 / 划词答疑悬浮钮 默认全部收起，需要时从顶部滑出。
+
+   设计约束（改之前先读）：
+   1) 工具条**复用 .reader-topbar**，不另做一套按钮
+      → 既有功能一行不多地全部保留，也不会和顶栏分叉。
+   2) 顶栏在专注模式下改成 position:fixed + translateY(-101%)，
+      脱离文档流 → .reader-body 自然撑满，不需要额外的 padding 补偿。
+   3) **不给 .reader-shell 加 position:relative** ——
+      那会把里面 position:absolute 的浮层（批注编辑器 / 笔记抽屉）
+      的包含块从 .reader-modal 换成 .reader-shell，位置全乱。
+   4) 窄屏（<860px）本来就会塌成单列；专注模式保持一致，
+      且此时章节导航不参与（单列放不下第三栏）。
+   5) 选择器一律用 #reader-modal 前缀 —— 基础样式里的
+      @media (max-width:1200px) .reader-body 是「两列」，靠 id 权重压住它，
+      专注模式才不会被基础规则反覆盖。
+   ===================================================================== */
+#reader-modal.zen .reader-topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 1200;
+  transform: translateY(-101%);
+  /* ⚠ HIGH-4（2026-10-27 审计，实测复现）：transform **不会**把元素
+     移出焦点序。只靠 translateY 藏起来的话，工具条里 23 个可聚焦控件
+     仍然能用 Tab 走到 —— 而且它们的 boundingClientRect.top 是 -90
+     （在视口上方，屏幕上看不见）→ 键盘/读屏用户掉进一个看不见的
+     工具条里。visibility:hidden 才是真正的「藏」：同时移出焦点序
+     和可访问性树，而且不影响滑出/滑回的过渡动画。
+     收起时延迟 0.2s 再隐藏（等 transform 动画走完），展开时立即可见。 */
+  visibility: hidden;
+  transition: transform .2s var(--ease), visibility 0s linear .2s;
+  max-height: 56vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .22);
+}
+#reader-modal.zen.zen-bar-open .reader-topbar {
+  transform: translateY(0);
+  visibility: visible;
+  transition: transform .2s var(--ease), visibility 0s;
+}
+
+/* 章节导航：默认收起，只留论文页 + 译文页 */
+#reader-modal.zen .reader-nav { display: none; }
+#reader-modal.zen.zen-nav-open .reader-nav { display: block; }
+#reader-modal.zen .reader-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+#reader-modal.zen.zen-nav-open .reader-body { grid-template-columns: 200px minmax(0, 1fr) minmax(0, 1fr); }
+
+/* AI 提问区 / 划词答疑悬浮钮：默认收起（划词气泡不受影响，它是临时出现的）
+   ⚠️ 用 **id** 选（#reader-qa-floating-btn），别用类名 ——
+   这个按钮身上的类叫 .reader-floating-copilot-btn，
+   .reader-qa-floating-btn 是它的 id。写成类选择器会**静默失效**
+   （规则匹配不到任何元素，看着像生效了其实没生效）。 */
+#reader-modal.zen .reader-aux { display: none; }
+#reader-modal.zen.zen-aux-open .reader-aux { display: block; }
+#reader-modal.zen #reader-qa-floating-btn { display: none !important; }
+
+/* 专注模式要的是「整屏可用」—— 把基础样式里给平板准备的
+   `max-width: 860px + margin: auto` 取消掉。
+   ⚠️ 不取消的后果（浏览器实测抓到的）：
+   基础样式 `@media (700-1100px) .reader-shell > * { max-width:860px;
+   margin-left:auto; margin-right:auto; }` 在**交叉轴上用 auto 外边距
+   取消了 flex 的 stretch** → 变成 fit-content 收缩 →
+   单栏时 PDF 栏被收缩成「内容宽度」，右半屏全空。
+   专注模式本来就是为了「小屏多看字」，必须占满整屏。 */
+#reader-modal.zen .reader-shell > * {
+  max-width: none;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+/* 单栏模式：只显示一栏，论文页 / 译文页 二选一 */
+#reader-modal.zen.zen-single .reader-body { grid-template-columns: minmax(0, 1fr); }
+/* ⚠️ 章节视图里的两栏（原文 pane / 译文 pane-alt）必须**互斥**地二选一：
+   单栏默认显示译文栏；zen-show-orig 时显示原文栏。
+   浏览器实测抓到的 bug：原来的写法
+     .reader-pane:not(.reader-pane-alt){display:none}   ← 永远藏原文
+     .zen-show-orig .reader-pane-alt{display:none}     ← show-orig 时藏译文
+   两条同时生效 → 切到「论文页」时**两栏都没了**（一片空白）。
+   所以要显式地把 show-orig 下的原文 pane 放回来。 */
+#reader-modal.zen.zen-single .reader-pane { display: none; }
+#reader-modal.zen.zen-single .reader-pane-alt { display: block; }
+#reader-modal.zen.zen-single.zen-show-orig .reader-pane { display: none; }
+#reader-modal.zen.zen-single.zen-show-orig .reader-pane-alt { display: none; }
+#reader-modal.zen.zen-single.zen-show-orig .reader-pane:not(.reader-pane-alt) { display: block; }
+#reader-modal.zen.zen-single .pdf-split { grid-template-columns: minmax(0, 1fr); }
+/* ⚠️ 必须带 :not(.zen-show-orig) —— 否则「切到论文页」时这条规则
+   仍然把 PDF 容器藏起来 → 切过去是一片空白（浏览器实测抓到的）。
+   同理，下面那条在 zen-show-orig 时才藏译文栏。 */
+#reader-modal.zen.zen-single:not(.zen-show-orig) #pdf-viewer-container { display: none; }
+#reader-modal.zen.zen-single.zen-show-orig #pdf-translations-container { display: none; }
+
+@media (max-width: 860px) {
+  #reader-modal.zen .reader-body,
+  #reader-modal.zen.zen-nav-open .reader-body { grid-template-columns: 1fr; }
+  #reader-modal.zen.zen-nav-open .reader-nav { display: none; }
+}
+
+/* 顶部细把手：专注模式下唯一常驻的元素 */
+.zen-handle {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 7px;
+  z-index: 1199;
+  background: linear-gradient(180deg, rgba(130, 130, 150, .40), rgba(130, 130, 150, 0));
+  cursor: pointer;
+  display: none;
+  overflow: hidden;
+  transition: height .18s var(--ease);
+}
+#reader-modal.zen .zen-handle { display: block; }
+#reader-modal.zen.zen-bar-open .zen-handle { opacity: 0; pointer-events: none; }
+#reader-modal.zen .zen-handle:hover { height: 26px; }
+.zen-handle-title {
+  display: block;
+  padding: 4px 10px 0;
+  font-size: var(--t-xs);
+  color: var(--fg-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 专注模式专属按钮：非专注时藏起来（进入专注的按钮除外，它要一直可见） */
+#reader-modal:not(.zen) .zen-only { display: none !important; }
+#reader-modal:not(.zen-single) #zen-pane-btn { display: none !important; }

@@ -251,8 +251,16 @@ _PDF_REF_RES = [
 ]
 
 
+_REPLACED_PDF_DIR_NAMES = ("00_中译替换版_PDF", "05_译文替换版_PDF")
+
+
+def _is_replaced_output_pdf(pdf_path: Path) -> bool:
+    """与 app._is_replaced_output_pdf 同源判据：排除中译替换版生成物，不把它当论文原文。"""
+    return any(d in pdf_path.parts for d in _REPLACED_PDF_DIR_NAMES) or "_中译替换版" in pdf_path.stem
+
+
 def collect_pdfs() -> dict:
-    """扫描 vault 里所有 PDF。
+    """扫描 vault 里所有原文 PDF（排除中译替换版生成物）。
 
     返回 {pdf_id: {"id", "name", "size"}}，pdf_id 是相对 vault 根的正斜杠路径。
 
@@ -265,6 +273,8 @@ def collect_pdfs() -> dict:
         if not base.is_dir():
             continue
         for pdf in base.rglob("*.pdf"):
+            if _is_replaced_output_pdf(pdf):
+                continue
             try:
                 size = pdf.stat().st_size
             except OSError:
@@ -1322,53 +1332,56 @@ def current_blocks_version():
         return None
 
 
-def collect_translations() -> dict:
-    """导出平板工作台时，把**译文快照**一起烤进去。
+def _escape_inline_tag_close(text: str, tag: str) -> str:
+    """防止内联 CSS/JS 文本含 `</style` 或 `</script` 提前闭合外层 HTML 标签。"""
+    if not text:
+        return text
+    if tag.lower() == "style":
+        return re.sub(r"</(style\b)", r"<\/\1", text, flags=re.I)
+    if tag.lower() == "script":
+        return re.sub(r"</(script\b)", r"<\/\1", text, flags=re.I)
+    return text
 
-    平板上能看译文，是它跟「用微信直接打开一个 PDF」的根本区别 ——
-    没译文就只是个 PDF 阅读器。电脑端翻好的译文存在
-    `logs/_pdf_snapshots/`（也在坚果云的同步根里），这里按
-    **同步目录里的文件名**（safe paper key）索引：
 
-        { "2008-JACERS-综述-..._pgghcp": {"1": "第 1 页的译文", ...} }
-
-    平板用 paper_id 算出同样的 key 就能对上（见 app.js 的 paperIdFor /
-    safePaperKey —— 必须与 app.py:_paper_id_for 逐字一致）。
-
-    ⚠⚠ 只烤**当前抽取算法**翻出来的译文。
-    2026-10-25 合并两端改动时挖出来的：桌面端给快照加了
-    `extractor_version`（`paper_text.EXTRACTOR_VERSION`）——
-    抽取算法一改，旧快照里的译文就是**坏的**（那是按旧算法翻的，
-    可能整段栏序都是反的），桌面端读取时整份作废重翻。
-    平板端要是照搬，用户看到的就是**错的那一列** ——
-    正是用户最早报的那个问题。两端必须一致。
-
-    ⚠⚠ 取不到当前版本 ⇒ **一份都不烤**（fail closed）。
-    「宽松放行」在这里等于「把旧算法的坏译文发给用户」。
-    """
-    out: dict = {}
-    EXTRACTOR_VERSION = current_extractor_version()
-    if EXTRACTOR_VERSION is None:
-        # 保守：无法证明译文是好的 → 一份都不给
-        return out
+def _iter_valid_snapshots(extractor_version, *, warn_corrupt: bool = False) -> list[tuple[str, dict]]:
+    """读取 logs/_pdf_snapshots 下与当前 extractor_version 一致的合法快照。"""
+    if extractor_version is None:
+        return []
     snap_dir = REPO / "logs" / "_pdf_snapshots"
     if not snap_dir.is_dir():
-        return out
+        return []
+    valid: list[tuple[str, dict]] = []
     skipped = 0
     for fp in sorted(snap_dir.glob("*.json")):
         try:
             data = json.loads(fp.read_text(encoding="utf-8"))
-            # 合法 JSON 但顶层是 [] / 字符串时，下面的 data.get 会抛
-            # AttributeError 让整个导出崩（2026-11-09 审计）。
             if not isinstance(data, dict):
                 raise ValueError("顶层不是对象")
         except (OSError, ValueError):
             skipped += 1
             continue
-        if data.get("extractor_version") != EXTRACTOR_VERSION:
-            continue    # 旧算法翻的 —— 不给平板看
+        if data.get("extractor_version") != extractor_version:
+            continue
+        valid.append((fp.stem, data))
+    if skipped and warn_corrupt:
+        print(f"[导出器] ⚠ 跳过 {skipped} 份损坏 / 格式非法的译文快照"
+              f"（已烤入 {len(valid)} 篇；损坏文件请检查 logs/_pdf_snapshots/）",
+              file=sys.stderr)
+    return valid
+
+
+def collect_translations() -> dict:
+    """导出平板工作台时，把**译文快照**一起烤进去。
+
+    ⚠⚠ 只烤**当前抽取算法**翻出来的译文；取不到当前版本 ⇒ **一份都不烤**（fail closed）。
+    """
+    out: dict = {}
+    extractor_version = current_extractor_version()
+    for stem, data in _iter_valid_snapshots(extractor_version, warn_corrupt=True):
         pages: dict = {}
         for p in data.get("pages") or []:
+            if not isinstance(p, dict):
+                continue
             try:
                 pn = int(p.get("page_num"))
             except (TypeError, ValueError):
@@ -1377,11 +1390,32 @@ def collect_translations() -> dict:
             if t:
                 pages[str(pn)] = t
         if pages:
-            out[fp.stem] = pages
-    if skipped:
-        print(f"[导出器] ⚠ 跳过 {skipped} 份损坏 / 格式非法的译文快照"
-              f"（已烤入 {len(out)} 篇；损坏文件请检查 logs/_pdf_snapshots/）",
-              file=sys.stderr)
+            out[stem] = pages
+    return out
+
+
+def collect_block_translations() -> dict:
+    """把**版本匹配的段落级对照译文（blocks）**烤入平板包，离线即可看对照排版。"""
+    out: dict = {}
+    extractor_version = current_extractor_version()
+    blocks_version = current_blocks_version()
+    if extractor_version is None or blocks_version is None:
+        return out
+    for stem, data in _iter_valid_snapshots(extractor_version, warn_corrupt=False):
+        page_blocks: dict = {}
+        for p in data.get("pages") or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                pn = int(p.get("page_num"))
+            except (TypeError, ValueError):
+                continue
+            blk = p.get("blocks")
+            bver = p.get("blocks_version")
+            if isinstance(blk, list) and blk and bver is not None and int(bver) == int(blocks_version):
+                page_blocks[str(pn)] = {"blocks": blk, "version": int(bver)}
+        if page_blocks:
+            out[stem] = page_blocks
     return out
 
 
@@ -1432,6 +1466,7 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
     pdfs = getattr(notes[0], "_pdfs_all", {}) if notes else {}
     data_json = json.dumps({"notes": payload, "pdfs": pdfs,
                             "trans": collect_translations(),
+                            "blocks": collect_block_translations(),
                             "trans_ver": current_extractor_version(),
                             # ⚠ 段落切分版本（对照模式的独立闸门）——
                             #   2026-11-17 全面审查 P1-4：平板拿不到服务端，
@@ -1442,29 +1477,25 @@ def build_tablet_html(notes: list[Note], katex_css: str, pdfjs: dict | None = No
 
     out = index
     # ⚠ 占位符必须**先**替换, 再内联 CSS/JS。
-    #   顺序反了的话, 内联的 app.js 里只要出现 "__DATA__" 这个字面量
-    #   (哪怕只是注释里提了一句), 就会被整份数据 JSON 顶掉 ——
-    #   实测踩过: app.js 的注释里多了句 "(__DATA__.pdfs)",
-    #   导出的 HTML 直接从 72KB 涨到 332KB, 内联的 JS 全废。
     out = out.replace("__ICON__", icon_uri)
     out = out.replace("__DATA__", data_json)
-    out = out.replace("<!--INLINE_KATEX_CSS-->", "<style>\n" + katex_css + "\n</style>")
-    out = out.replace("<!--INLINE_APP_CSS-->", "<style>\n" + app_css + "\n</style>")
+    out = out.replace("<!--INLINE_KATEX_CSS-->", "<style>\n" + _escape_inline_tag_close(katex_css, "style") + "\n</style>")
+    out = out.replace("<!--INLINE_APP_CSS-->", "<style>\n" + _escape_inline_tag_close(app_css, "style") + "\n</style>")
     if pdfjs.get("css"):
         out = out.replace("<!--INLINE_PDFJS_CSS-->",
-                          "<style>\n" + pdfjs["css"] + "\n</style>")
+                          "<style>\n" + _escape_inline_tag_close(pdfjs["css"], "style") + "\n</style>")
     if pdfjs.get("worker"):
         # worker 源码放 text/plain 里，运行时取出来做成 Blob URL
         out = out.replace("<!--INLINE_PDFJS_WORKER-->",
                           '<script type="text/plain" id="mb-pdf-worker-src">\n'
-                          + pdfjs["worker"] + "\n</script>")
+                          + _escape_inline_tag_close(pdfjs["worker"], "script") + "\n</script>")
     if pdfjs.get("js"):
         out = out.replace("<!--INLINE_PDFJS_JS-->",
-                          "<script>\n" + pdfjs["js"] + "\n</script>")
+                          "<script>\n" + _escape_inline_tag_close(pdfjs["js"], "script") + "\n</script>")
     out = out.replace("<!--INLINE_KATEX_JS-->",
-                      "<script>\n" + katex_js + "\n</script>")
+                      "<script>\n" + _escape_inline_tag_close(katex_js, "script") + "\n</script>")
     out = out.replace("<!--INLINE_APP_JS-->",
-                      "<script>\n" + app_js + "\n</script>")
+                      "<script>\n" + _escape_inline_tag_close(app_js, "script") + "\n</script>")
     return out
 
 

@@ -26,11 +26,13 @@
 const fs = require("fs");
 const path = require("path");
 
+const { loadDesktopSource } = require("./_test_frontend_loader");
+
 const _posArg = process.argv.slice(2).find((a) => !a.startsWith("-"));
 const TARGET = _posArg
   ? path.resolve(_posArg)
   : require("path").join(__dirname, "static", "index.html");
-const SRC = fs.readFileSync(TARGET, "utf8").replace(/\r\n/g, "\n");
+const SRC = loadDesktopSource(TARGET);
 const NL = String.fromCharCode(10);
 
 // ---------------------------------------------------------------------------

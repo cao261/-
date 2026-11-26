@@ -22,8 +22,10 @@
 const fs = require("fs");
 const path = require("path");
 
+const { loadDesktopSource } = require("./_test_frontend_loader");
+
 const TARGET = path.join(__dirname, "static", "index.html");
-const SRC = fs.readFileSync(TARGET, "utf8").replace(/\r\n/g, "\n");
+const SRC = loadDesktopSource(TARGET);
 const SUITE_ONLY = process.argv.includes("--suite-only");
 
 /** 从源码里切出某个函数（按花括号配平）。 */

@@ -73,9 +73,12 @@ def _node() -> str:
     return exe
 
 
+from microbench._frontend_bundle import load_desktop_source
+
+
 def _extract_frontend_algorithm() -> str:
     """把 index.html 里的 paperId 计算抽成一个可独立调用的 JS 函数。"""
-    src = INDEX_HTML.read_text(encoding="utf-8")
+    src = load_desktop_source(INDEX_HTML)
     m = _FRONTEND_RE.search(src)
     assert m, (
         "无法从前端 index.html 提取 paper_id 算法 —— 前端重构过了。\n"

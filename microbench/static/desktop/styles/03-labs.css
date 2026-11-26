@@ -1,0 +1,135 @@
+/* ===================================================================
+   03-labs.css — 实验室、曲线对比、同步健康诊断与快捷键清单
+   =================================================================== */
+
+.labs-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-5);
+}
+@media (max-width: 920px) {
+  .labs-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.lab-panel {
+  background: var(--surface-raised);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  padding: var(--s-6);
+  box-shadow: var(--sh-1);
+}
+.lab-kv-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  margin-top: var(--s-3);
+}
+.lab-kv-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: 7px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-quiet);
+  border: 1px solid var(--line-hairline);
+  font-size: var(--t-sm);
+}
+.lab-kv-key {
+  color: var(--fg-muted);
+}
+.lab-kv-val {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--fg-strong);
+  word-break: break-all;
+}
+
+.lab-plot-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-3);
+  margin-top: var(--s-3);
+}
+@media (max-width: 640px) {
+  .lab-plot-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.lab-metrics-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: var(--s-2);
+  margin-top: var(--s-4);
+}
+.lab-metric-card {
+  padding: var(--s-3);
+  border-radius: var(--r-md);
+  background: var(--surface-sunken);
+  border: 1px solid var(--line-hairline);
+}
+.lab-metric-val {
+  font-family: var(--font-mono);
+  font-size: var(--t-h3);
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+.lab-metric-lbl {
+  font-size: var(--t-xs);
+  color: var(--fg-muted);
+  margin-top: 2px;
+}
+
+/* 快捷键帮助浮层（按 ? 呼出，纳入统一 Esc 栈） */
+#shortcuts-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  background: var(--surface-scrim);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: var(--s-4);
+}
+.shortcuts-card {
+  width: min(560px, 94vw);
+  background: var(--surface-raised);
+  color: var(--fg-strong);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  box-shadow: var(--sh-4);
+  padding: var(--s-6);
+}
+.shortcuts-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--s-4);
+}
+.shortcuts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--s-3);
+}
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-quiet);
+  border: 1px solid var(--line-hairline);
+  font-size: var(--t-sm);
+}
+.kbd-key {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  padding: 2px 7px;
+  border-radius: var(--r-xs);
+  background: var(--surface-canvas);
+  border: 1px solid var(--line-strong);
+  color: var(--fg-strong);
+}

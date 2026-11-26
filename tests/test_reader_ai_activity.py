@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from microbench._frontend_bundle import load_desktop_source
+
 REPO = Path(__file__).resolve().parents[1]
 INDEX_HTML = REPO / "microbench" / "static" / "index.html"
 JS_TEST = REPO / "microbench" / "_test_reader_ai_activity.js"
@@ -33,7 +35,7 @@ def test_ai_activity_registry_guardrail():
 
 def test_ui_has_activity_pill_and_panel():
     """工具栏徽标 + 浮层面板必须在 DOM 里。"""
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     assert 'id="ai-activity-pill"' in html, "工具栏缺少 AI 活动徽标"
     assert 'id="ai-panel"' in html, "缺少 AI 活动面板"
     assert "toggleAiPanel" in html, "面板没有开关函数"
@@ -46,7 +48,7 @@ def test_all_ai_entrypoints_register_and_close_tasks():
     漏了收尾 = 面板里永远挂着一个"还在跑"的任务；
     漏了登记 = 用户看不到这个 AI 请求在干什么。
     """
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
 
     def body_of(fn_name):
         start = html.index("function " + fn_name)
@@ -72,7 +74,7 @@ def test_all_ai_entrypoints_register_and_close_tasks():
 
 def test_translation_tag_shows_live_elapsed_time():
     """页面上的翻译状态必须显示实时已用时（不然又是一个不动的转圈）。"""
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     assert "ai-inline-status" in html, "没有行内实时状态样式"
     assert "_aiFormatMs(el)" in html, "翻译状态没有显示已用时"
     assert "ai-beat" in html, "实时状态没有心跳指示"
@@ -80,7 +82,7 @@ def test_translation_tag_shows_live_elapsed_time():
 
 def test_slow_tasks_get_warned():
     """慢到一定程度要变色预警，而不是让人干等。"""
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     assert "_AI_WARN_MS" in html and "_AI_DANGER_MS" in html, "缺少慢任务预警阈值"
     assert "很慢" in html or "没有动静" in html, "缺少慢任务提示文案"
 
@@ -92,7 +94,7 @@ def test_task_end_does_not_touch_ui():
     → translateSection 的 onStage 把 #reader-translation 整个覆盖成
     "done · 0s" → 用户看到 toast 说"翻译完成"，右侧译文却是空的。
     """
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     start = html.index("function _aiTaskEnd(")
     end = html.index("\n      }\n", start)
     body = html[start:end]
@@ -109,7 +111,7 @@ def test_qa_progress_and_model_badge_are_separate():
     「模型还在想（未产出内容）· 29s」—— 根因是进度文字写进了模型徽标，
     每 500ms 刷一次就把模型名吃掉，收尾后也没人恢复。
     """
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     assert 'data-qa-stage-badge' in html, "缺少独立的进度徽标"
     # onStage 里不许再查模型徽标
     idx = 0
@@ -127,7 +129,7 @@ def test_qa_progress_and_model_badge_are_separate():
 
 def test_section_translation_cancel_is_real():
     """章节翻译的「✕ 取消」必须真能中止请求（不能只弹一句 toast）。"""
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     start = html.index("async function translateSection(")
     end = html.index("\n    }\n", start)
     body = html[start:end]

@@ -416,8 +416,23 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
-    private void toast(String msg) {
-        Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+    private void toast(final String msg) {
+        runOnUiThread(new ToastTask(this, msg));
+    }
+
+    private static class ToastTask implements Runnable {
+        private final MainActivity act;
+        private final String msg;
+
+        ToastTask(MainActivity act, String msg) {
+            this.act = act;
+            this.msg = msg;
+        }
+
+        @Override
+        public void run() {
+            Toast.makeText(act, msg, Toast.LENGTH_LONG).show();
+        }
     }
 
     /** 打开原生设置页（填坚果云账号）。 */

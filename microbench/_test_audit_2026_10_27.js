@@ -22,8 +22,10 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
+const { loadDesktopSource } = require('./_test_frontend_loader');
+
 const INDEX = path.join(__dirname, 'static', 'index.html');
-const src = fs.readFileSync(INDEX, 'utf8');
+const src = loadDesktopSource(INDEX);
 
 let failures = 0;
 function check(ok, msg) {

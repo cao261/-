@@ -420,7 +420,12 @@ TABLET_CSS = REPO / "microbench" / "static" / "tablet" / "styles.css"
 DESKTOP_HTML = REPO / "microbench" / "static" / "index.html"
 
 
+from microbench._frontend_bundle import load_desktop_source
+
+
 def _read(p: Path) -> str:
+    if p == DESKTOP_HTML:
+        return load_desktop_source(p)
     return p.read_text(encoding="utf-8", errors="replace")
 
 

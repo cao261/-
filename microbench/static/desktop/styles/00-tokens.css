@@ -1,0 +1,205 @@
+/* 00-tokens.css — Design tokens & night theme */
+/* ===================================================================
+   MicroBench Design System v2 — "Ink & Linen"
+   Single source of truth. Token layer → primitives → components.
+   Legacy custom-property names are kept as aliases at the bottom of
+   :root so the ~120 inline style="" attributes and the JS templates
+   keep resolving without a rewrite.
+   =================================================================== */
+
+:root {
+  /* ---------- Neutral ramp (warm linen) ---------- */
+  --n-0:   #FFFFFF;
+  --n-25:  #FDFCF9;
+  --n-50:  #F7F4ED;
+  --n-100: #F1EDE3;
+  --n-150: #EAE4D6;
+  --n-200: #E1DACA;
+  --n-300: #CFC5B1;
+  --n-400: #A79C88;
+  --n-500: #8A8071;
+  --n-600: #6C6459;
+  --n-700: #4E483F;
+  --n-800: #332E28;
+  --n-900: #1C1A17;
+  --n-950: #121110;
+
+  /* ---------- Semantic surfaces ---------- */
+  --surface-canvas:  var(--n-50);
+  --surface-raised:  var(--n-0);
+  --surface-sunken:  var(--n-100);
+  --surface-quiet:   var(--n-25);
+  --surface-inverse: var(--n-900);
+  --surface-scrim:   rgba(18, 17, 16, 0.44);
+
+  /* ---------- Lines (hairline hierarchy) ---------- */
+  --line-hairline: rgba(51, 46, 40, 0.08);
+  --line-soft:     #E5DFD3;
+  --line-strong:   #CFC5B1;
+  --line-inverse:  rgba(239, 236, 230, 0.14);
+
+  /* ---------- Text ---------- */
+  --fg-strong: var(--n-900);
+  --fg-base:   var(--n-700);
+  --fg-muted:  var(--n-600);
+  --fg-subtle: var(--n-500);
+  --fg-inverse:      #EFECE6;
+  --fg-inverse-muted:#A8A094;
+
+  /* ---------- Z-index ladder（2026-11-25 审计 P0） ----------
+     ⚠ 原来 `#toast` 与 `#reader-modal` **都是 z-index:1000**，而
+       `#reader-modal` 在 DOM 里排在 `#toast` **后面** → 同层级下后画的
+       盖住先画的 → 阅读器一打开，**所有 toast 全部不可见**
+       （续读回位、保存批注、替换版提示、模型降级提醒…全被吞掉）。
+     ⚠ 同一层级的两个 fixed 元素，谁在 DOM 里靠后就盖住谁 —— 所以
+       **提示类浮层必须比任何容器都高**，不能靠"谁写在后面"侥幸。
+     → 这里定一份**唯一**的阶梯，各处只准用 token，不准再写裸数字。 */
+  --z-base:   100;    /* 常规层 */
+  --z-sticky: 1200;   /* 吸顶条 / 浮动条 */
+  --z-reader: 1000;   /* 阅读器全屏容器（内部层级由它自己封顶） */
+  --z-float:  1600;   /* 答疑浮层（可拖动） */
+  --z-modal:  2000;   /* 模态框 */
+  --z-toast:  2400;   /* 全局提示 —— 必须高于一切模态与浮层 */
+
+  /* ---------- Accent: terracotta (single primary) ---------- */
+  --accent:            #A8482C;
+  --accent-hover:      #8C3A22;
+  --accent-soft:       #F7EDE8;
+  --accent-line:       rgba(168, 72, 44, 0.28);
+  --accent-on:         #FFFFFF;
+
+  /* ---------- Accent 2: pine (secondary / "verified" state) ---------- */
+  --accent-2:      #4F6046;
+  --accent-2-soft: #EDF0EA;
+  --accent-2-line: rgba(79, 96, 70, 0.26);
+  --accent-3:      #C0A882;   /* sand — dividers, decorative */
+
+  /* ---------- Status ---------- */
+  --ok:   #4F6046;
+  --warn: #A8763C;
+  --bad:  #A8482C;
+
+  /* ---------- Type families (offline-first system & local serif/mono stacks) ---------- */
+  --font-display: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
+  --font-ui: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-cn: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", "Source Han Sans CN", "Noto Sans CJK SC", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+
+  /* ---------- Type scale (1.200 minor third, 16px base) ---------- */
+  --t-display: 3.25rem;   /* 52 */
+  --t-h1:      2.00rem;   /* 32 */
+  --t-h2:      1.50rem;   /* 24 */
+  --t-h3:      1.1875rem;/* 19 */
+  --t-body:    0.9375rem;/* 15 */
+  --t-sm:      0.8125rem;/* 13 */
+  --t-xs:      0.6875rem;/* 11 */
+  --t-label:   0.625rem; /* 10 — uppercase eyebrow */
+
+  /* ---------- Space (4px base) ---------- */
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px; --s-4: 16px;
+  --s-5: 20px; --s-6: 24px; --s-8: 32px; --s-10: 40px;
+  --s-12: 48px; --s-16: 64px; --s-20: 80px;
+
+  /* ---------- Radius ---------- */
+  --r-xs: 4px; --r-sm: 7px; --r-md: 10px; --r-lg: 14px;
+  --r-xl: 20px; --r-pill: 999px;
+
+  /* ---------- Elevation (warm-tinted, low contrast) ---------- */
+  --sh-1: 0 1px 2px rgba(51, 46, 40, 0.04);
+  --sh-2: 0 4px 14px rgba(51, 46, 40, 0.06);
+  --sh-3: 0 14px 40px rgba(51, 46, 40, 0.09);
+  --sh-4: 0 28px 72px rgba(18, 17, 16, 0.18);
+
+  /* ---------- Motion ---------- */
+  --ease: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-in: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-1: 120ms;
+  --dur-2: 200ms;
+  --dur-3: 320ms;
+
+  --focus-ring: 0 0 0 2px var(--surface-canvas), 0 0 0 4px var(--accent-line);
+
+  /* ---------- Legacy aliases (inline styles + JS templates) ---------- */
+  --bg-canvas: var(--surface-canvas);
+  --bg-canvas-subtle: var(--surface-sunken);
+  --card-bg: var(--surface-raised);
+  --card-bg-subtle: var(--surface-quiet);
+  --card-border: var(--line-soft);
+  --card-border-subtle: var(--line-hairline);
+  --text-main: var(--fg-strong);
+  --text-muted: var(--fg-muted);
+  --text-subtle: var(--fg-subtle);
+  --text-light: var(--n-0);
+  --accent-terracotta: var(--accent);
+  --accent-terracotta-hover: var(--accent-hover);
+  --accent-terracotta-subtle: var(--accent-soft);
+  --accent-olive: var(--accent-2);
+  --accent-sand: var(--accent-3);
+  --dark-bg: var(--surface-inverse);
+  --dark-surface: #221F1B;
+  --dark-surface-hover: #2B2723;
+  --dark-border: #332E27;
+  --dark-text: var(--fg-inverse);
+  --dark-text-muted: var(--fg-inverse-muted);
+  --font-serif: var(--font-display);
+  --font-sans: var(--font-ui);
+  --transition-smooth: all var(--dur-2) var(--ease);
+}
+
+/* ============================ Night theme ============================ */
+[data-theme="night"] {
+  --surface-canvas:  #15140F;
+  --surface-raised:  #1E1C17;
+  --surface-sunken:  #1A1814;
+  --surface-quiet:   #232019;
+  --surface-inverse: #EDEAE2;
+  --surface-scrim:   rgba(0, 0, 0, 0.62);
+
+  --line-hairline: rgba(239, 236, 230, 0.09);
+  --line-soft:     #34302A;
+  --line-strong:   #4A453C;
+  --line-inverse:  rgba(21, 20, 15, 0.16);
+
+  --fg-strong: #F0EDE6;
+  --fg-base:   #D3CEC4;
+  --fg-muted:  #A49D91;
+  --fg-subtle: #7E786D;
+  --fg-inverse:      #15140F;
+  --fg-inverse-muted:#5E5952;
+
+  --accent:       #D2704E;
+  --accent-hover: #E08562;
+  --accent-soft:  rgba(210, 112, 78, 0.13);
+  --accent-line:  rgba(210, 112, 78, 0.42);
+  --accent-on:    #171310;
+
+  --accent-2:      #9CB08E;
+  --accent-2-soft: rgba(156, 176, 142, 0.13);
+  --accent-2-line: rgba(156, 176, 142, 0.34);
+
+  --ok:   #9CB08E;
+  --warn: #D2A468;
+  --bad:  #D2704E;
+
+  --dark-bg: var(--surface-raised);
+  --dark-surface: #232019;
+  --dark-border: #34302A;
+
+  /* ⚠⚠ 2026-11-25 审计 P0：夜间模式下 `.studio-dark-card`
+     （组会周报 / 快速沉淀避坑经验 整张卡）**整张看不见**。
+     根因：`:root` 里 `--dark-text: var(--fg-inverse)`，而夜间主题把
+     `--fg-inverse` 改成了 **#15140F（近黑）**；同时夜间的
+     `--dark-bg` = `--surface-raised` = **#1E1C17（深）**
+     → **深底 + 深字**，对比度只剩 ~1.07:1（实测）。
+     ⚠ 这张卡在浅色主题下本来就是「深色卡」（底 = --surface-inverse），
+       所以夜间也必须用**浅色字** —— 不能跟着 --fg-inverse 走。
+     → 夜间显式重设：正文 #F0EDE6（≈14:1）/ 次要 #A49D91（≈6:1）。 */
+  --dark-text:       var(--fg-strong);   /* #F0EDE6 */
+  --dark-text-muted: var(--fg-muted);    /* #A49D91 */
+
+  --sh-1: 0 1px 2px rgba(0, 0, 0, 0.32);
+  --sh-2: 0 4px 14px rgba(0, 0, 0, 0.36);
+  --sh-3: 0 14px 40px rgba(0, 0, 0, 0.44);
+  --sh-4: 0 28px 72px rgba(0, 0, 0, 0.56);
+  color-scheme: dark;
+}

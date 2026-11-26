@@ -230,8 +230,11 @@ def test_empty_body_error_is_human_readable(monkeypatch):
 # 3) 重答不死锁（旧请求被替换，回调不许覆盖新请求）
 # ---------------------------------------------------------------------------
 
+from microbench._frontend_bundle import load_desktop_source
+
+
 def _index_src():
-    return INDEX.read_text(encoding="utf-8")
+    return load_desktop_source(INDEX)
 
 
 def test_new_request_replaces_old_instead_of_being_rejected():

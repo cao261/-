@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from microbench import llm
+from microbench._frontend_bundle import load_desktop_source
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "microbench" / "app.py"
@@ -146,7 +147,7 @@ def test_mask_paths_handles_spaces_and_keeps_urls():
 
 def test_badge_does_not_show_fallback_rpm():
     """徽标不能显示备用模型的限流 RPM（用户会读成自己被限流）。"""
-    src = (ROOT / "microbench" / "static" / "index.html").read_text(encoding="utf-8")
+    src = load_desktop_source(ROOT / "microbench" / "static" / "index.html")
     assert "降格 ${rpmInfo.rpm} RPM" not in src, \
         "徽标还在显示备用模型的限流 RPM"
     assert "kindLabel" in src, "徽标应该显示降格分类（配额/限流/无正文）"
@@ -475,7 +476,7 @@ def test_quota_message_is_still_detected():
 
 def test_frontend_does_not_hardcode_quota_message():
     """界面不能写死"额度用完了" —— 要照后端给的分类说人话。"""
-    src = (ROOT / "microbench" / "static" / "index.html").read_text(encoding="utf-8")
+    src = load_desktop_source(ROOT / "microbench" / "static" / "index.html")
     assert "主模型额度用完了" not in src, \
         "界面还写死了『主模型额度用完了』（真实原因可能是限流或没出正文）"
     assert "degraded_text" in src, "界面没有用后端给的 degraded_text"

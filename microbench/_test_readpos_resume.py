@@ -36,9 +36,11 @@ from pathlib import Path
 try:  # 作为脚本跑 / 作为包被导入，两种都要能用
     from _headless_browser import dump_dom, find_browser as _find_browser
     from _test_qa_panel_render import _scan_js
+    from _frontend_bundle import load_desktop_source
 except ImportError:  # pragma: no cover
     from microbench._headless_browser import dump_dom, find_browser as _find_browser
     from microbench._test_qa_panel_render import _scan_js
+    from microbench._frontend_bundle import load_desktop_source
 
 REPO = Path(__file__).resolve().parent.parent
 INDEX = REPO / "microbench" / "static" / "index.html"
@@ -513,7 +515,7 @@ def main() -> int:
         print("SKIP: 找不到 Edge/Chrome，跳过续读护栏")
         return 0
 
-    html = INDEX.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX)
     try:
         results = probe_from_html(browser, html)
     except (KeyError, ValueError) as e:

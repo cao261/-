@@ -57,7 +57,16 @@ from .generator import (
     _safe_path,             # exported once; used by all vault-file endpoints
     is_vault_content_path,  # vault 内容目录白名单（审计 2026-10-26 M-1）
     VAULT_REPLACED_PDF_DIR,  # 「中译替换版」输出目录名（生成物，不是论文原文）
+    _invalidate_vault_stats_cache,
 )
+from .core.security import (
+    AUTH_LIMITER,
+    assert_vault_pdf_scope,
+    escape_html_text,
+    extract_host_port,
+)
+from .services import vault_index
+from .routers.workbench import router as workbench_router
 from .translation import (
     chunk_section_text,
     get_cache,
@@ -412,14 +421,14 @@ async def csrf_origin_guard(request: Request, call_next):
             if origin:
                 if not _origin_matches_host(origin, host_header):
                     return HTMLResponse(
-                        f"<h1>403</h1><p>拒绝跨站请求 (Origin: {origin})。</p>",
+                        f"<h1>403</h1><p>拒绝跨站请求 (Origin: {escape_html_text(origin)})。</p>",
                         status_code=403,
                     )
             elif referer:
                 ref_origin = f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"
                 if not _origin_matches_host(ref_origin, host_header):
                     return HTMLResponse(
-                        f"<h1>403</h1><p>拒绝跨站请求 (Referer: {referer})。</p>",
+                        f"<h1>403</h1><p>拒绝跨站请求 (Referer: {escape_html_text(referer)})。</p>",
                         status_code=403,
                     )
         else:
@@ -435,27 +444,23 @@ async def csrf_origin_guard(request: Request, call_next):
             server = request.scope.get("server") or ()
             if len(server) > 1 and server[1]:
                 allowed_ports.add(int(server[1]))
-            try:
-                if ":" in host_header:
-                    allowed_ports.add(int(host_header.rsplit(":", 1)[1]))
-                elif host_header:
-                    allowed_ports.add(80)
-            except ValueError:
-                pass
+            hp = extract_host_port(host_header)
+            if hp is not None:
+                allowed_ports.add(hp)
             if not allowed_ports:
                 allowed_ports = {5000}
 
             if origin:
                 if not _origin_is_local(origin, allowed_ports):
                     return HTMLResponse(
-                        f"<h1>403</h1><p>拒绝跨站请求 (Origin: {origin})。</p>",
+                        f"<h1>403</h1><p>拒绝跨站请求 (Origin: {escape_html_text(origin)})。</p>",
                         status_code=403,
                     )
             elif referer:
                 ref_origin = f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"
                 if not _origin_is_local(ref_origin, allowed_ports):
                     return HTMLResponse(
-                        f"<h1>403</h1><p>拒绝跨站请求 (Referer: {referer})。</p>",
+                        f"<h1>403</h1><p>拒绝跨站请求 (Referer: {escape_html_text(referer)})。</p>",
                         status_code=403,
                     )
             # No Origin AND no Referer -> not a browser form post. Allow.
@@ -541,6 +546,23 @@ _PWA_ASSETS = {
 # (index.html, pair.html) keeps being served by the routes below, so the LAN
 # pairing gate and the PWA whitelist are unaffected.
 # ---------------------------------------------------------------------------
+class _NoCacheStaticFiles(StaticFiles):
+    """StaticFiles wrapper disabling stale browser/WebView cache for JS/CSS."""
+
+    async def get_response(self, path: str, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
+
+_DESKTOP_DIR = STATIC_DIR / "desktop"
+app.mount(
+    "/static/desktop",
+    _NoCacheStaticFiles(directory=str(_DESKTOP_DIR), check_dir=False),
+    name="static-desktop",
+)
+
 _VENDOR_DIR = STATIC_DIR / "vendor"
 if _VENDOR_DIR.is_dir():
     app.mount(
@@ -548,6 +570,8 @@ if _VENDOR_DIR.is_dir():
         StaticFiles(directory=str(_VENDOR_DIR)),
         name="static-vendor",
     )
+
+app.include_router(workbench_router)
 
 
 def _pairing_page_response(request: Request, error: str = ""):
@@ -601,29 +625,33 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return JSONResponse(status_code=422, content={"detail": detail})
 
 
-async def _stream_llm_event_gen(chunk_iter, meta=None):
+async def _stream_llm_event_gen(chunk_iter, meta=None, *, heartbeat_seconds: float = 15.0):
     """Wrap a chat_stream_async() iterator into SSE format.
 
     Yields lines like:
         data: {"meta": {...}}\\n\\n     (optional initial event with model info)
         data: {"text": "..."}\\n\\n     (per content chunk)
+        : heartbeat\\n\\n               (periodic keepalive while waiting)
         data: [DONE]\\n\\n              (on normal completion)
-        data: {"cancelled": true}\\n\\n (on asyncio.CancelledError)
-        data: {"error": "..."}\\n\\n    (on LLMError)
-
-    Always emits a final terminal event so the frontend can cleanly
-    close its ReadableStream without hanging on EOF.
-
-    Note: this generator runs inside the StreamingResponse body. When
-    the client disconnects, Starlette closes the response, which cancels
-    this generator — chat_stream_async() inside raises CancelledError
-    and the upstream httpx stream is closed.
+        data: {"error": "..."}\\n\\n    (on LLMError or unexpected failure)
     """
+    pending = None
     try:
         if meta:
             yield f"data: {json.dumps({'meta': meta}, ensure_ascii=False)}\n\n"
-        async for chunk in chunk_iter:
+        ait = chunk_iter.__aiter__()
+        pending = asyncio.ensure_future(ait.__anext__())
+        while True:
+            try:
+                chunk = await asyncio.wait_for(asyncio.shield(pending), timeout=heartbeat_seconds)
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+            except StopAsyncIteration:
+                pending = None
+                break
             yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            pending = asyncio.ensure_future(ait.__anext__())
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         # Client disconnected — Starlette already closed the response.
@@ -631,6 +659,15 @@ async def _stream_llm_event_gen(chunk_iter, meta=None):
         return
     except llm.LLMError as e:
         yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
+    except Exception as e:
+        yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (BaseException, Exception):
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1039,7 +1076,7 @@ GLYPH_DICT_PATH = Path(BASE_DIR) / "logs" / "glyph_dict.json"
 
 
 @app.get("/api/llm/translation_models")
-async def api_llm_translation_models():
+def api_llm_translation_models():
     """界面上的「换模型翻译」下拉框选项。"""
     active = llm.translation_active_model()
     return {
@@ -1110,7 +1147,7 @@ def qa_model_choices() -> list[dict]:
 
 
 @app.get("/api/llm/qa_models")
-async def api_llm_qa_models():
+def api_llm_qa_models():
     """界面上的「换模型答疑」下拉框选项（与翻译清单分开）。"""
     return {
         "models": qa_model_choices(),
@@ -1323,7 +1360,7 @@ class AuthVerifyBody(BaseModel):
 
 
 @app.get("/api/auth/status")
-async def api_auth_status(request: Request):
+def api_auth_status(request: Request):
     """Tell the client whether it needs the shared token, and whether it has it.
 
     The tablet calls this on boot. If `auth_required` is true and `ok` is
@@ -1349,7 +1386,7 @@ async def api_auth_status(request: Request):
 
 
 @app.post("/api/auth/verify")
-async def api_auth_verify(request: Request, payload: AuthVerifyBody):
+def api_auth_verify(request: Request, payload: AuthVerifyBody):
     """Accept a token the user typed in on the tablet.
 
     On success the token is stored in an HttpOnly, SameSite=Lax cookie so
@@ -1364,11 +1401,24 @@ async def api_auth_verify(request: Request, payload: AuthVerifyBody):
             },
             status_code=403,
         )
+    client_ip = request.client.host if request.client else "unknown"
+    blocked, retry_after = AUTH_LIMITER.is_blocked(client_ip)
+    if blocked:
+        return JSONResponse(
+            {
+                "detail": f"口令尝试过于频繁，请 {retry_after} 秒后再试",
+                "error": "rate_limited",
+            },
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
     supplied = (payload.token or "").strip()
     if supplied and hmac.compare_digest(supplied, _LAN_TOKEN):
+        AUTH_LIMITER.clear(client_ip)
         response = JSONResponse({"ok": True})
         _set_token_cookie(response, supplied)
         return response
+    AUTH_LIMITER.record_failure(client_ip)
     return JSONResponse(
         {"detail": "口令不正确", "error": "token_invalid"},
         status_code=401,
@@ -1648,9 +1698,10 @@ def api_fetch_paper(req: FetchPaperRequest):
         raise HTTPException(status_code=502, detail=f"抓取文献失败: {_safe_err(e)}")
 
 @app.post("/api/paper/save")
-async def api_save_paper(req: SavePaperRequest):
+def api_save_paper(req: SavePaperRequest):
     try:
         res = save_literature_card(req.model_dump())
+        vault_index._invalidate_index_cache(BASE_DIR)
         return res
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_err(e))
@@ -1695,13 +1746,14 @@ def api_paper_folders(
     return {"topic_category": topic_category, "kind": kind, "folders": folders}
 
 @app.post("/api/paper/export_bilingual")
-async def api_export_bilingual(req: ExportBilingualRequest):
+def api_export_bilingual(req: ExportBilingualRequest):
     """
     Export bilingual reading card with English + Chinese sections
     directly into 01_Literature in Obsidian vault.
     """
     try:
         res = save_bilingual_reading_card(req.model_dump())
+        vault_index._invalidate_index_cache(BASE_DIR)
         return res
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_err(e))
@@ -1710,12 +1762,13 @@ async def api_export_bilingual(req: ExportBilingualRequest):
 
 
 @app.post("/api/paper/export_qa")
-async def api_export_qa(req: ExportQARequest):
+def api_export_qa(req: ExportQARequest):
     """
     Export single selection Q&A note into 01_Literature/{category}/04_AI划词答疑/
     """
     try:
         res = save_qa_card(req.model_dump())
+        vault_index._invalidate_index_cache(BASE_DIR)
         return res
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_err(e))
@@ -1787,6 +1840,8 @@ async def api_download_pdf(
     try:
         # 下载走 arXiv 外网，放线程里执行
         info = await asyncio.to_thread(download_arxiv_pdf, identifier, save_to)
+        _invalidate_vault_stats_cache()
+        vault_index._invalidate_index_cache(BASE_DIR)
         return {
             "status": "success",
             "file_name": pdf_name,
@@ -1816,6 +1871,7 @@ async def api_serve_pdf(
         pdf_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, pdf_path)
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
     if pdf_path.suffix.lower() != ".pdf":
@@ -1907,6 +1963,7 @@ async def api_paper_outline(
         pdf_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, pdf_path)
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
 
@@ -2059,6 +2116,7 @@ async def api_read_table(req: ReadTableRequest):
         pdf_path = _safe_path(BASE_DIR, req.relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, pdf_path)
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
     try:
@@ -2097,6 +2155,7 @@ async def api_page_blocks(relative_path: str, page: int = 1):
         pdf_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, pdf_path)
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
     if page < 1 or page > 2000:
@@ -2189,6 +2248,7 @@ def api_build_replaced_pdf(req: ReplacedPdfRequest):
         src_path = _safe_path(BASE_DIR, req.relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, src_path)
     if not src_path.exists() or src_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
 
@@ -2327,6 +2387,7 @@ def api_build_replaced_pdf(req: ReplacedPdfRequest):
         out_path = _safe_path(BASE_DIR, out_rel)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法输出路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, out_path, detail="输出路径必须在 vault 内容目录下")
     if out_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="输出必须是 .pdf")
     # ⚠ 不允许覆盖源文件（会把原文搞没）
@@ -2435,6 +2496,7 @@ async def api_formula_image(
         pdf_path = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, pdf_path)
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {relative_path}")
 
@@ -2597,6 +2659,8 @@ def api_vault_delete_file(
             )
             file_path.unlink()
             deleted_to = "permanent"
+        _invalidate_vault_stats_cache()
+        vault_index._invalidate_index_cache(BASE_DIR)
         return {"status": "success", "path": rel_str, "deleted_to": deleted_to}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"删除失败: {_safe_err(e)}")
@@ -2860,6 +2924,8 @@ async def api_upload_pdf(
     _tmp_pdf = save_to.with_suffix(".pdf.tmp")
     await asyncio.to_thread(_tmp_pdf.write_bytes, pdf_bytes)
     os.replace(_tmp_pdf, save_to)
+    _invalidate_vault_stats_cache()
+    vault_index._invalidate_index_cache(BASE_DIR)
     pdf_saved_path = str(save_to.relative_to(BASE_DIR)).replace("\\", "/")
 
     sections_out = []
@@ -2950,23 +3016,18 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
         pdf_path = _safe_path(BASE_DIR, req.relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_err(e))
+    assert_vault_pdf_scope(BASE_DIR, pdf_path)
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"vault 中找不到该 PDF: {req.relative_path}")
 
+    pdf_bytes: Optional[bytes] = None
     try:
-        pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
-        # ⚠ 带缓存（2026-10-27 性能优化）：
-        #   pdfplumber 的页面解析是纯 CPU 且不可并行（实测线程池 0.97x），
-        #   全库 27 篇抽一遍 = 72 秒、平均 2.7 秒/篇、最慢 9.7 秒
-        #   → 唯一有效的优化是「别重复抽」。
-        #   缓存键含 (mtime, size) + EXTRACTOR_VERSION
-        #   → 文件改了/算法改了都会自动失效（见 microbench/pdf_cache.py）。
-        #   ⚠ 故意**不含**符号词典签名：抽取层不读词典，含进去会让后台
-        #     认字每保存一次词典就废掉全库缓存（详见该模块文档）。
+        # 优先读磁盘抽取缓存；命中且没有未识别符号时不读取整份 PDF 字节。
         cached = pdf_cache.read_cache(pdf_path)
         if cached is not None:
             pages = cached
         else:
+            pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
             pages = await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
             try:
                 pdf_cache.write_cache(pdf_path, pages, pdf_cache.cache_key(pdf_path))
@@ -2978,11 +3039,14 @@ async def api_open_vault_pdf(req: OpenVaultPdfRequest):
     if not pages:
         raise HTTPException(status_code=400, detail="未能从 PDF 中识别出有效文字 (可能是扫描图片版 PDF)")
 
-    # 解不出的数学符号（× ≈ ≥ …）：裁图让多模态认字，章节视图也能看到真符号
-    # ⚠️ 整篇一次（不是逐页）—— 逐页会让 36 页的论文发 35 次串行多模态请求
-    await _resolve_document_glyphs(pages, pdf_bytes)
-    # 后台慢慢把符号认进词典（不挡着用户打开；下次打开/翻译就是真符号）
-    _schedule_glyph_backfill(pdf_bytes)
+    needs_glyphs = any(p.get("glyphs") for p in pages)
+    if needs_glyphs:
+        if pdf_bytes is None:
+            pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
+        await _resolve_document_glyphs(pages, pdf_bytes)
+    if pdf_bytes is not None:
+        # 后台慢慢把符号认进词典（不挡着用户打开；下次打开/翻译就是真符号）
+        _schedule_glyph_backfill(pdf_bytes)
 
     sections = split_into_sections(pages)
     if not sections:
@@ -3044,9 +3108,10 @@ def api_export_bibtex(
         raise HTTPException(status_code=502, detail=f"生成 BibTeX 失败: {_safe_err(e)}")
 
 @app.post("/api/reproduction/create")
-async def api_create_reproduction(req: CreateReproductionRequest):
+def api_create_reproduction(req: CreateReproductionRequest):
     try:
         res = create_reproduction_workspace(req.model_dump())
+        vault_index._invalidate_index_cache(BASE_DIR)
         return res
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_err(e))
@@ -3054,9 +3119,10 @@ async def api_create_reproduction(req: CreateReproductionRequest):
         raise HTTPException(status_code=500, detail=f"创建复现工程失败: {_safe_err(e)}")
 
 @app.post("/api/troubleshoot/add")
-async def api_add_troubleshoot(req: TroubleshootRequest):
+def api_add_troubleshoot(req: TroubleshootRequest):
     try:
         res = record_troubleshoot(req.model_dump())
+        vault_index._invalidate_index_cache(BASE_DIR)
         return res
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_err(e))
@@ -3064,9 +3130,10 @@ async def api_add_troubleshoot(req: TroubleshootRequest):
         raise HTTPException(status_code=500, detail=f"记录排错日志失败: {_safe_err(e)}")
 
 @app.post("/api/weekly/generate")
-async def api_generate_weekly():
+def api_generate_weekly():
     try:
         res = generate_weekly_report()
+        vault_index._invalidate_index_cache(BASE_DIR)
         return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成周报失败: {_safe_err(e)}")
@@ -3076,7 +3143,7 @@ async def api_generate_weekly():
 # ---------------------------------------------------------------------------
 
 @app.get("/api/llm/status")
-async def api_llm_status():
+def api_llm_status():
     """Report full LLM dual-model configuration & failover status."""
     st = llm.get_llm_status()
     # Backward compatible fields + rich failover info
@@ -3254,7 +3321,7 @@ async def api_plot_extract(
         raise HTTPException(status_code=500, detail=f"图片解析失败: {_safe_err(e)}")
 
 @app.post("/api/plot/calibrate")
-async def api_plot_calibrate(req: CalibrateRequest):
+def api_plot_calibrate(req: CalibrateRequest):
     """
     Convert pixel-space points to real data coords using 2 reference points
     (the user clicks on the chart's axes and types in the value at each point).
@@ -3268,7 +3335,7 @@ async def api_plot_calibrate(req: CalibrateRequest):
         raise HTTPException(status_code=500, detail=f"标定失败: {_safe_err(e)}")
 
 @app.post("/api/plot/compare")
-async def api_plot_compare(req: CompareRequest):
+def api_plot_compare(req: CompareRequest):
     """
     Compare paper-reported data against reproduction data.
 
@@ -4108,7 +4175,11 @@ async def api_explain_stream(req: ExplainRequest, request: Request):
         except llm.LLMError as e:
             yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/paper/cross_qa_stream")
@@ -4173,7 +4244,11 @@ async def api_cross_qa_stream(req: CrossQARequest, request: Request):
         except llm.LLMError as e:
             yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _render_page_png_b64(pdf_path: Path, page: int, zoom: float = 2.0) -> str:
@@ -4617,17 +4692,21 @@ async def api_explain_selection_stream(req: ExplainSelectionRequest, request: Re
         except llm.LLMError as e:
             yield f'data: {json.dumps({"error": llm.friendly_error_text(e)}, ensure_ascii=False)}\n\n'
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/translation/cache_stats")
-async def api_translation_cache_stats():
+def api_translation_cache_stats():
     """Return translation cache stats (size/hits/misses) — useful for debug."""
     return get_cache().stats()
 
 
 @app.post("/api/translation/cache_clear")
-async def api_translation_cache_clear():
+def api_translation_cache_clear():
     """
     Clear the in-memory translation cache.
 
@@ -4700,17 +4779,7 @@ async def api_translate_page(req: TranslatePageRequest):
         try:
             from .generator import BASE_DIR, _safe_path
             pdf_path = _safe_path(BASE_DIR, req.relative_path)
-            # ⚠ H-2（2026-10-27 审计，实测）：原来这里直接调
-            #   extract_page_text_with_glyphs(pdf_path, req.page)
-            #   —— 那是**同步的 pdfplumber 解析**（实测 64~332 ms/页，
-            #   中位数 264 ms），而且**没有 await** → 每翻一页就把事件循环
-            #   整个卡住 0.1~0.35 秒，期间看板计数、3 个 SSE 答疑面板、
-            #   LAN 平板**全冻结**；36 页论文连翻 = 累计约 9 秒卡顿。
-            # 两步修：
-            #   ① 先查磁盘缓存（pdf_cache）→ 命中就是 ~0ms；
-            #   ② 没命中就丢进线程 → 事件循环不再被卡（代价不变，只是不再冻结全站）。
-            # ⚠ 缓存的读写两侧必须用**同一个签名**（pdf_cache.cache_key 单一真相），
-            #   否则一份写一份读 → 缓存永远命中不了。
+            assert_vault_pdf_scope(BASE_DIR, pdf_path)
             extracted, page_glyphs = await asyncio.to_thread(
                 _extract_page_cached, pdf_path, req.page)
             if extracted and len(extracted.strip()) >= 100:
@@ -4719,6 +4788,8 @@ async def api_translate_page(req: TranslatePageRequest):
                 if page_glyphs:
                     page_text = await _resolve_page_glyphs(
                         page_text, page_glyphs, pdf_path, req.page, req.model)
+        except HTTPException:
+            raise
         except Exception:
             pdf_path = None
             pass  # 取不到就用客户端传来的文本
@@ -4892,6 +4963,7 @@ async def api_translate_blocks(req: TranslateBlocksRequest):
         pdf_path = _safe_path(BASE_DIR, req.relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, pdf_path)
     if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail=f"PDF 不存在: {req.relative_path}")
 
@@ -5032,7 +5104,7 @@ async def api_translate_blocks(req: TranslateBlocksRequest):
 
 
 @app.post("/api/paper/translation_cache_batch_lookup")
-async def api_translation_cache_batch_lookup(req: TranslationCacheBatchRequest):
+def api_translation_cache_batch_lookup(req: TranslationCacheBatchRequest):
     """
     Batch lookup: returns `{section_key: result}` for cache hits only (misses are skipped).
     Used by the frontend to restore translation state after a page refresh — without
@@ -5061,7 +5133,7 @@ async def api_translation_cache_batch_lookup(req: TranslationCacheBatchRequest):
 
 
 @app.post("/api/paper/split_text")
-async def api_split_text(req: SplitTextRequest):
+def api_split_text(req: SplitTextRequest):
     """
     Split user-pasted raw text into sections (no PDF download needed).
     Useful for paywalled IEEE papers where the user has copied text from
@@ -5540,7 +5612,7 @@ def _read_json_or_quarantine(path: Path) -> Optional[dict]:
 
 
 @app.get("/api/pdf/snapshot/list")
-async def api_pdf_snapshot_list():
+def api_pdf_snapshot_list():
     """List all saved PDF translation snapshots, newest first."""
     base = _snapshot_dir()
     out = []
@@ -5565,7 +5637,7 @@ async def api_pdf_snapshot_list():
 
 
 @app.get("/api/pdf/snapshot/load")
-async def api_pdf_snapshot_load(
+def api_pdf_snapshot_load(
     paper_id: str = Query(..., min_length=3, max_length=128),
 ):
     """
@@ -5952,42 +6024,21 @@ _djb2_base36_utf16 = paperid.djb2_base36
 _js_base36 = paperid.js_base36
 
 
-def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
-    """合并两个快照文件（按 page_num），返回合并后的 JSON 文本。
-
-    dst 是「已有的一份」，src 是「要并进去的一份」，src 的页优先。
-    合并结果与 dst 相同（或没法合）时返回 None —— 不用写盘。
-
-    ⚠ 不能整份 copy：整份替换会让「页数更少的那一份」赢 ——
-      A 翻了 1–5 页、B 翻了 6–10 页，B 同步一次，A 的 1–5 页就没了。
-    """
-    try:
-        new = _safe_read_json(src) or {}
-        cur = _safe_read_json(dst) or {}
-    except OSError:
-        return None
+def _merge_snapshot_data(cur: dict | None, new: dict | None, dst: Path | None = None) -> str | None:
+    """按 page_num 合并两份已解析快照（src 的页优先），无变化或不可合则返回 None。"""
     if not isinstance(new, dict) or not new.get("pages"):
         return None
     old_sig = (cur or {}).get("paper_text_signature") or ""
     new_sig = new.get("paper_text_signature") or ""
     if old_sig and new_sig and old_sig != new_sig:
-        # 原文变了 —— 旧译文作废，整份以新的为准
         merged = dict(new)
-    elif not (_snapshot_extractor_ok(cur) and _snapshot_extractor_ok(new)):
-        # ⚠ 有一边是旧抽取算法翻出来的 —— 不能按页合并
-        #   （合并会把坏的旧译文合回来，读取时的作废逻辑管不到）。
+    elif not (_snapshot_extractor_ok(cur or {}) and _snapshot_extractor_ok(new)):
         if _snapshot_extractor_ok(new):
             merged = dict(new)
-        elif _snapshot_extractor_ok(cur):
+        elif _snapshot_extractor_ok(cur or {}):
             merged = dict(cur)
         else:
-            # ⚠⚠ 两边**都是**旧的 —— 别因为「都旧」就把内容丢了。
-            #   取**有内容**的那一份（本机刚建立、还没内容时，
-            #   旧写法会选中空的那份 → 拉一次同步就把本机快照写成 0 页，
-            #   看着像「这篇没翻过」，其实是被合并逻辑吃掉了）。
-            #   留着旧内容不危险：桌面端读取时会整份作废重翻，
-            #   平板端有版本闸门也会拒用 —— 它们都看版本，不看有没有内容。
-            merged = dict(new) if new.get("pages") else dict(cur)
+            merged = dict(new) if new.get("pages") else dict(cur or {})
     else:
         pages: dict = {}
         for src_pages in ((cur or {}).get("pages") or [], new.get("pages") or []):
@@ -6003,11 +6054,21 @@ def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
         merged["pages"] = [pages[k] for k in sorted(pages)]
     text = json.dumps(merged, ensure_ascii=False, indent=2)
     try:
-        if dst.exists() and dst.read_text(encoding="utf-8") == text:
+        if dst is not None and dst.exists() and dst.read_text(encoding="utf-8") == text:
             return None
     except OSError:
         pass
     return text
+
+
+def _merge_snapshot_files(dst: Path, src: Path) -> str | None:
+    """合并两个快照文件（按 page_num），返回合并后的 JSON 文本。"""
+    try:
+        new = _safe_read_json(src) or {}
+        cur = _safe_read_json(dst) or {}
+    except OSError:
+        return None
+    return _merge_snapshot_data(cur, new, dst=dst)
 
 
 def _current_extractor_version():
@@ -6574,6 +6635,9 @@ def _sync_pull_files() -> dict:
     return res
 
 
+_PROGRESS_LOCK = threading.Lock()
+
+
 def _local_progress_path() -> Path:
     return BASE_DIR / "logs" / "_reading_state.json"
 
@@ -6677,22 +6741,30 @@ def api_sync(req: SyncRequest, request: Request):
     local_snap_dir = BASE_DIR / "logs" / "_pdf_snapshots"
     if not req.pull_only and local_snap_dir.is_dir():
         dst_dir = _sync_dir("snapshots")
+        dst_dir.mkdir(parents=True, exist_ok=True)
         for fp in local_snap_dir.glob("*.json"):
             try:
                 if fp.stat().st_size > SYNC_MAX_FILE_BYTES:
                     continue
                 dst = dst_dir / fp.name
-                # ⚠ 按 page_num 合并，不整份覆盖 ——
-                #   否则「页数更少的那一份」会赢，另一台已翻的页被清空。
-                # ⚠ 「读 dst → 合并 → 写 dst」同样要持锁（2026-11-10 审计 F4）：
-                #   两个 /api/sync 并发、或同步与快照保存端点并发，
-                #   都会读到同一个旧基线，后写的把先写的页盖掉。
+                # 跨设备乐观 CAS + 进程内按 paper_id 持锁
+                def _build_snap_push(existing, _dst=dst, _fp=fp):
+                    if existing is not None:
+                        local_data = _safe_read_json(_fp)
+                        return _merge_snapshot_data(existing, local_data, dst=_dst)
+                    return _merge_snapshot_files(_dst, _fp)
+
                 with _snapshot_lock(fp.stem):
-                    merged = _merge_snapshot_files(dst, fp)
-                    if merged is None:
-                        continue
-                    _atomic_write_text(dst, merged)
-                pushed["snapshots"].append(fp.name)
+                    wrote = _cas_update_json(
+                        dst,
+                        _build_snap_push,
+                        reader=_read_json_or_quarantine,
+                    )
+                if wrote is not None:
+                    pushed["snapshots"].append(fp.name)
+            except HTTPException as e:
+                _record_error("snapshot_push", fp.name, RuntimeError(e.detail))
+                continue
             except (OSError, ValueError) as e:
                 _record_error("snapshot_push", fp.name, e)
                 continue
@@ -6723,13 +6795,19 @@ def api_sync(req: SyncRequest, request: Request):
             rec = dict(req.progress)
             rec["paper_id"] = pid
             rec["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-            # 阅读进度是唯一没有大小上限的落盘 JSON（快照 5MB、批注 2MB），
-            # 而它是从浏览器直接传来的。裁掉未知字段并限长，防止一次调用
-            # 把同步目录塞进几十 MB 垃圾。
             rec = _trim_progress_record(rec)
+            prog_dst = _sync_dir("progress") / f"{safe}.json"
             try:
-                _atomic_write_json(_sync_dir("progress") / f"{safe}.json", rec)
-                pushed["progress"].append(safe + ".json")
+                prog_dst.parent.mkdir(parents=True, exist_ok=True)
+                def _build_progress(existing):
+                    cur_ts = (existing or {}).get("updated_at", "")
+                    if existing and not _anno_is_newer(rec["updated_at"], cur_ts):
+                        return None
+                    return json.dumps(rec, ensure_ascii=False, indent=2)
+                if _cas_update_json(prog_dst, _build_progress, reader=_safe_read_json) is not None:
+                    pushed["progress"].append(safe + ".json")
+            except HTTPException as e:
+                _record_error("progress_push", safe + ".json", RuntimeError(e.detail))
             except OSError as e:
                 _record_error("progress_push", safe + ".json", e)
 
@@ -6807,20 +6885,21 @@ def api_sync(req: SyncRequest, request: Request):
                 continue
 
         # ---------- 拉取：阅读进度 ----------
-        prog = _read_local_progress()
-        target_pid = (req.paper_id or "").strip()
-        if target_pid:
-            safe = _safe_paper_key(target_pid, "progress")
-            src = _sync_dir("progress") / f"{safe}.json"
-            remote = _safe_read_json(src)
-            if remote and _anno_is_newer(remote.get("updated_at", ""),
-                                         (prog.get(safe) or {}).get("updated_at", "")):
-                prog[safe] = remote
-                pulled["progress"].append(safe + ".json")
-        try:
-            _write_local_progress(prog)
-        except OSError as e:
-            _record_error("progress_local", "reading_progress.json", e)
+        with _PROGRESS_LOCK:
+            prog = _read_local_progress()
+            target_pid = (req.paper_id or "").strip()
+            if target_pid:
+                safe = _safe_paper_key(target_pid, "progress")
+                src = _sync_dir("progress") / f"{safe}.json"
+                remote = _safe_read_json(src)
+                if remote and _anno_is_newer(remote.get("updated_at", ""),
+                                             (prog.get(safe) or {}).get("updated_at", "")):
+                    prog[safe] = remote
+                    pulled["progress"].append(safe + ".json")
+            try:
+                _write_local_progress(prog)
+            except OSError as e:
+                _record_error("progress_local", "reading_progress.json", e)
 
         # ---------- 拉取：论文 PDF 本体（还原到 vault 原来的相对路径） ----------
         if req.include_files and not req.push_only:
@@ -6906,8 +6985,9 @@ def api_sync_files_release(req: FileReleaseRequest):
         # ⚠ 走 CAS 合并：只补 blob/released_at，别把对方写的字段抹掉
         try:
             new_meta = _cas_update_file_meta(safe, _patch_release()) or meta
-        except HTTPException:
-            new_meta = meta
+        except HTTPException as e:
+            errors.append({"paper_id": safe, "error": e.detail})
+            continue
         released.append(new_meta.get("relative_path") or safe)
 
     return {
@@ -6922,7 +7002,7 @@ def api_sync_files_release(req: FileReleaseRequest):
 
 
 @app.post("/api/sync/files/propagate_delete")
-async def api_sync_files_propagate_delete(paper_id: str = Query(..., min_length=3,
+def api_sync_files_propagate_delete(paper_id: str = Query(..., min_length=3,
                                                                 max_length=300)):
     """把某篇论文标成「联动删除」：**对方**下次同步时也删掉本地 PDF。
 
@@ -6988,7 +7068,7 @@ def _sync_files_status() -> dict:
 
 
 @app.get("/api/sync/status")
-async def api_sync_status(request: Request):
+def api_sync_status(request: Request):
     """同步目录里有什么、什么时候更新的。"""
     root = _sync_root()
     out = {"root": _sync_root_display(root, request), "exists": root.is_dir(), "kinds": {}}
@@ -7137,7 +7217,7 @@ def _cas_update_json(path: Path, build, *, attempts: int = 3, reader=None):
 
 
 @app.get("/api/pdf/annotations/load")
-async def api_pdf_annotations_load(
+def api_pdf_annotations_load(
     paper_id: str = Query(..., min_length=3, max_length=128),
 ):
     """Load every annotation of one paper. Missing file -> empty list (not 404).
@@ -7298,7 +7378,7 @@ def api_pdf_annotations_delete(
 
 
 @app.get("/api/pdf/info")
-async def api_pdf_info(
+def api_pdf_info(
     relative_path: str = Query(..., min_length=3, max_length=500),
 ):
     """
@@ -7312,6 +7392,7 @@ async def api_pdf_info(
         fp = _safe_path(BASE_DIR, relative_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"非法路径: {_safe_err(e)}")
+    assert_vault_pdf_scope(BASE_DIR, fp)
     if not fp.exists() or not fp.is_file():
         raise HTTPException(status_code=404, detail="PDF 不存在")
     if fp.suffix.lower() != ".pdf":

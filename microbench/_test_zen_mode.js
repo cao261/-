@@ -24,12 +24,12 @@
 const fs = require("fs");
 const path = require("path");
 
+const { loadDesktopSource } = require("./_test_frontend_loader");
+
 const TARGET = process.argv[2]
   ? path.resolve(process.argv[2])
   : path.join(__dirname, "static", "index.html");
-// 归一化行尾：仓库约定 LF，但 Windows 上的脚本可能写成 CRLF，
-// 而下面按标记找边界 —— CRLF 会让它找不到。
-const SRC = fs.readFileSync(TARGET, "utf8").replace(/\r\n/g, "\n");
+const SRC = loadDesktopSource(TARGET);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

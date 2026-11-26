@@ -35,8 +35,11 @@ REQ = REPO / "requirements.txt"
 TOKEN = "audit-token-2026"
 
 
+from microbench._frontend_bundle import load_desktop_source
+
+
 def _index_src() -> str:
-    return INDEX.read_text(encoding="utf-8")
+    return load_desktop_source(INDEX)
 
 
 def _app_src() -> str:

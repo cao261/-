@@ -12,6 +12,8 @@ import re
 
 import pytest
 
+from microbench._frontend_bundle import load_desktop_source
+
 VAULT = Path(__file__).resolve().parent.parent
 INDEX = VAULT / "microbench" / "static" / "index.html"
 APP = VAULT / "microbench" / "app.py"
@@ -125,7 +127,7 @@ def test_render_page_png_works_on_real_pdf():
 
 def test_frontend_captures_and_sends_page_image():
     """前端必须真的截图并随请求发出。"""
-    src = INDEX.read_text(encoding="utf-8")
+    src = load_desktop_source(INDEX)
     assert "_captureSelectionPageImage" in src, "前端没有截图函数"
     assert "page_image: pageImage" in src, "截图没有随请求发出"
     # 截图失败不能挡住答疑
@@ -139,7 +141,7 @@ def test_frontend_captures_and_sends_page_image():
 
 def test_minimized_panel_becomes_narrow_rail():
     """最小化后必须是一条 44px 的窄竖条，不是 460x46 的大饼。"""
-    src = INDEX.read_text(encoding="utf-8")
+    src = load_desktop_source(INDEX)
     assert ".reader-qa-panel.qa-collapsed" in src, "没有收起态样式"
     # 收起态有多条规则（面板本体 + 标题竖排 + 隐藏正文），逐条检查
     blocks = re.findall(
@@ -160,7 +162,7 @@ def test_minimized_panel_becomes_narrow_rail():
 
 
 def test_minimize_toggle_uses_collapsed_class():
-    src = INDEX.read_text(encoding="utf-8")
+    src = load_desktop_source(INDEX)
     m = re.search(r"function minimizeReaderQAPanel\(\)\s*\{([\s\S]*?)\n    \}", src)
     assert m, "minimizeReaderQAPanel 没找到"
     body = m.group(1)
@@ -171,7 +173,7 @@ def test_minimize_toggle_uses_collapsed_class():
 
 
 def test_open_panel_clears_collapsed_state():
-    src = INDEX.read_text(encoding="utf-8")
+    src = load_desktop_source(INDEX)
     m = re.search(r"function openReaderQAPanel\([^)]*\)\s*\{([\s\S]*?)\n    \}", src)
     assert m, "openReaderQAPanel 没找到"
     assert 'classList.remove("qa-collapsed")' in m.group(1), \
@@ -180,7 +182,7 @@ def test_open_panel_clears_collapsed_state():
 
 def test_collapsed_head_is_clickable_to_expand():
     """竖条上不方便点小按钮，所以点标题栏也要能展开。"""
-    src = INDEX.read_text(encoding="utf-8")
+    src = load_desktop_source(INDEX)
     assert "_qaCollapsedHeadClick" in src, "没有收起态的点击处理"
     assert 'onclick="_qaCollapsedHeadClick(event)"' in src, \
         "标题栏没有绑定收起态的点击"

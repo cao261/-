@@ -17,23 +17,16 @@
 const fs = require("fs");
 const path = require("path");
 
+const { loadDesktopSource, extractTopFunction } = require("./_test_frontend_loader");
+
 const TARGET = process.argv[2]
   ? path.resolve(process.argv[2])
   : path.join(__dirname, "static", "index.html");
-// 归一化行尾：仓库约定 LF，但 Windows 上的脚本可能写成 CRLF，
-// 而下面按 "\n    }\n" 找函数结尾 —— CRLF 会让它找不到（测试报"找不到 xxx 的结尾"）。
-const SRC = fs.readFileSync(TARGET, "utf8").replace(/\r\n/g, "\n");
+const SRC = loadDesktopSource(TARGET);
 console.log("被测文件: " + TARGET + "\n");
 
-// Slice a top-level function out of index.html. The file uses 4-space
-// indentation for script-block-level functions, so the function ends at the
-// next "\n    }\n".
 function sliceFn(name) {
-  const start = SRC.indexOf("function " + name + "(");
-  if (start < 0) throw new Error("找不到函数 " + name);
-  const end = SRC.indexOf("\n    }\n", start);
-  if (end < 0) throw new Error("找不到 " + name + " 的结尾");
-  return SRC.slice(start, end + "\n    }\n".length);
+  return extractTopFunction(SRC, name);
 }
 
 const escapeHtml = (s) => String(s)

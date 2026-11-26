@@ -21,12 +21,14 @@
 const fs = require("fs");
 const path = require("path");
 
+const { loadDesktopSource } = require("./_test_frontend_loader");
+
 const REPO = process.env.MB_REPO || path.resolve(__dirname, "..");
 // MB_INDEX 可指向**临时副本** —— 反向验证时用（把真代码改坏，看护栏会不会红）
 const INDEX = process.env.MB_INDEX
   ? path.resolve(process.env.MB_INDEX)
   : path.join(REPO, "microbench", "static", "index.html");
-const html = fs.readFileSync(INDEX, "utf8");
+const html = loadDesktopSource(INDEX);
 
 /** 从 HTML 里按大括号配平抽出一个函数定义（含名字）。 */
 function extractFunc(name) {

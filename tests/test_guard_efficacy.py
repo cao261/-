@@ -280,6 +280,9 @@ def test_behavioural_guard_files_are_still_there():
         # ↓ 2026-11-25：全代码库审计那一轮
         "microbench/_test_reader_overlay_render.py",         # 渲染：Toast 层级 / 夜间对比度 / Esc 栈 / 缩放防抖
         "tests/test_vault_pdf_scope.py",                     # vault 论文清单不收生成物
+        # ↓ 2026-11-26：工作台模块化升级与行为护栏
+        "tests/test_upgrade_backend_guards.py",              # 路由/SQLite/并发/安全/导出回归护栏
+        "tests/test_upgrade_frontend_guards.py",             # 模块化桌面前端真浏览器端到端护栏
     ]
     missing = [r for r in required if not (REPO / r).exists()]
     assert not missing, f"行为级护栏文件不见了: {missing}"

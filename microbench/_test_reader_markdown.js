@@ -10,26 +10,9 @@
 const fs = require("fs");
 const path = require("path");
 
-// 归一化行尾：仓库约定 LF，但 Windows 上的脚本可能写成 CRLF，
-// 而下面按 "\n    }\n" 找函数结尾 —— CRLF 会让它找不到。
-const SRC = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8")
-  .replace(/\r\n/g, "\n");
+const { loadDesktopSource } = require("./_test_frontend_loader");
 
-// Slice a top-level function out of index.html. The file uses 4-space
-// indentation for functions declared at script-block level, so the function
-// ends at the next "\n    }\n". (A brace counter would trip over regex
-// quantifiers like /\n{2,}/ and template literals.)
-function sliceFn(name) {
-  const start = SRC.indexOf("function " + name + "(");
-  if (start < 0) throw new Error("找不到函数 " + name);
-  const end = SRC.indexOf("\n    }\n", start);
-  if (end < 0) throw new Error("找不到 " + name + " 的结尾");
-  return SRC.slice(start, end + "\n    }\n".length);
-}
-
-const escapeHtml = (s) => String(s)
-  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-  .replace(/"/g, "&quot;");
+const SRC = loadDesktopSource(path.join(__dirname, "static", "index.html"));
 
 function sliceFnFrom(src, name) {
   const start = src.indexOf("function " + name + "(");
@@ -38,6 +21,14 @@ function sliceFnFrom(src, name) {
   if (end < 0) throw new Error("找不到 " + name + " 的结尾");
   return src.slice(start, end + "\n    }\n".length);
 }
+
+function sliceFn(name) {
+  return sliceFnFrom(SRC, name);
+}
+
+const escapeHtml = (s) => String(s)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;");
 
 function buildFactory(src) {
   return new Function("escapeHtml",

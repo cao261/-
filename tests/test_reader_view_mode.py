@@ -10,61 +10,21 @@
 import re
 from pathlib import Path
 
+from microbench._frontend_bundle import load_desktop_source, strip_js_comments
+
 INDEX = Path(__file__).resolve().parents[1] / "microbench" / "static" / "index.html"
 
 
 def _src():
-    return INDEX.read_text(encoding="utf-8")
+    return load_desktop_source(INDEX)
 
 
 def _code_only():
-    """取**脚本代码**（剥掉注释，但保留字符串字面量）。
-
-    三层过滤，缺一不可：
-    1) 只取 `<script>` 块 —— HTML 注释（结构契约说明、修复说明）里
-       写着旧写法（nth-child），不排除就会误判"还在用位置型选择器"；
-    2) 剥 JS 注释（// 和 /* */）；
-    3) **保留字符串字面量** —— 剥字符串会把
-       `getElementById("reader-body")` 变成 `getElementById("")`，
-       断言全废；而用正则直接剥 `//` 又会把 `"http://x"` 里的 `//`
-       当注释起点，把后面整行吃掉（独立审查实测能骗过断言）。
-    所以这里用一个简易扫描器，自己识别字符串 / 行注释 / 块注释。
-    """
+    """取**脚本代码**（剥掉注释，但保留字符串字面量与正则字面量）。"""
     src = _src()
     blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", src, re.S)
     assert blocks, "没找到 <script> 块"
-    js = "\n".join(blocks)
-
-    out = []
-    i, n = 0, len(js)
-    while i < n:
-        c = js[i]
-        if c in "\"'`":
-            q = c
-            out.append(c)
-            i += 1
-            while i < n:
-                if js[i] == "\\":
-                    out.append(js[i:i + 2])
-                    i += 2
-                    continue
-                out.append(js[i])
-                if js[i] == q:
-                    i += 1
-                    break
-                i += 1
-            continue
-        if js.startswith("//", i):
-            j = js.find("\n", i)
-            i = n if j < 0 else j
-            continue
-        if js.startswith("/*", i):
-            j = js.find("*/", i + 2)
-            i = n if j < 0 else j + 2
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out)
+    return strip_js_comments("\n".join(blocks))
 
 
 def test_reader_body_has_id_anchor():

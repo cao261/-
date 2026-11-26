@@ -806,6 +806,7 @@
     //   全文件**从来没有写入过**（译文走 state.transSeed / state.transVer，
     //   批注走 pdfState.annos 和 DB.getAnnos）→ 纯死状态，删掉。
     transSeed: {},          // 导出版里烤进来的译文 {safeKey: {pageNum: 译文}}
+    blocksSeed: {},         // 导出版里烤进来的段落译文 {safeKey: {pageNum: {blocks, version}}}
     transVer: null,         // 当前的抽取算法版本（判断译文是不是旧的）
     transStale: false,      // 这篇的译文是旧算法翻的（已作废）
     // ⚠⚠ 2026-11-17 全面审查 P1-4：段落译文（对照模式）的**独立版本闸门**。
@@ -835,6 +836,7 @@
     if (raw && raw.pdfs) state.pdfs = trimPdfList(raw.pdfs);
     // 导出版里烤进来的译文（还没连云盘时也能看）
     if (raw && raw.trans) state.transSeed = raw.trans;
+    if (raw && raw.blocks) state.blocksSeed = raw.blocks;
     // 当前的抽取算法版本 —— 用来判断云盘上的译文是不是旧算法翻的
     if (raw && raw.trans_ver != null) state.transVer = raw.trans_ver;
     // ⚠ 段落切分算法版本（对照模式用）—— 2026-11-17 全面审查 P1-4
@@ -1372,7 +1374,11 @@
         if (cached) return cached;
         const r = await fetchWithTimeout(davUrl("file", path), {}, FETCH_TIMEOUT_MS);
         if (!r.ok) return null;
-        return r.blob();
+        const blob = await r.blob();
+        if (blob && blob.size && blob.size <= 32 * 1024 * 1024) {
+          try { await DB.cachePdf(path, blob); } catch (e) { /* 缓存满不阻断打开 */ }
+        }
+        return blob;
       },
       async writeText(path, text) {
         await nativeCall("put", [path, text]);
@@ -3237,6 +3243,7 @@
         // 段落译文（对照模式）也取本地缓存 —— 断网也能看对照视图
         // ⚠ 2026-11-17 全面审查 P1-4：缓存键要带**段落切分版本**
         //   （段落版本一升，缓存里的旧切分译文自动失效）。
+        let resolvedBlocks = null;
         try {
           const bver = state.blocksVer;
           if (bver != null) {
@@ -3250,11 +3257,25 @@
                 if (Number(rec.version) === Number(bver)) okBlocks[pn] = rec;
                 else bad = true;
               });
-              if (Object.keys(okBlocks).length) pdfState.blockTrans = okBlocks;
+              if (Object.keys(okBlocks).length) resolvedBlocks = okBlocks;
               state.blocksStale = bad;
+            }
+            if (!resolvedBlocks) {
+              const seedBlocks = (state.blocksSeed || {})[key];
+              if (seedBlocks && Object.keys(seedBlocks).length) {
+                const okSeed = {};
+                Object.keys(seedBlocks).forEach((pn) => {
+                  const rec = seedBlocks[pn] || {};
+                  if (Number(rec.version) === Number(bver) && Array.isArray(rec.blocks) && rec.blocks.length) {
+                    okSeed[pn] = rec;
+                  }
+                });
+                if (Object.keys(okSeed).length) resolvedBlocks = okSeed;
+              }
             }
           }
         } catch (e) { /* 段落缓存取不到不影响整页译文 */ }
+        pdfState.blockTrans = resolvedBlocks;
         return cached;
       }
     }
@@ -3310,6 +3331,19 @@
     }
     // ③ 导出版里烤进来的（还没连云盘时也有；导出时已按版本过滤过）
     const baked = (state.transSeed || {})[key];
+    const bakedBlocks = (state.blocksSeed || {})[key];
+    if (cur != null && state.blocksVer != null && bakedBlocks && Object.keys(bakedBlocks).length) {
+      const okBlocks = {};
+      Object.keys(bakedBlocks).forEach((pn) => {
+        const rec = bakedBlocks[pn] || {};
+        if (Number(rec.version) === Number(state.blocksVer) && Array.isArray(rec.blocks) && rec.blocks.length) {
+          okBlocks[pn] = rec;
+        }
+      });
+      pdfState.blockTrans = Object.keys(okBlocks).length ? okBlocks : null;
+    } else {
+      pdfState.blockTrans = null;
+    }
     if (cur != null && baked && Object.keys(baked).length) return baked;
     return null;
   }
@@ -3629,6 +3663,11 @@
       pdfState.numPages = pdfState.doc.numPages;
       pdfState.id = pdfId;
       pdfState.rendered.clear();
+      pdfState.blockTrans = null;
+      pdfState.formulaShots = {};
+      state.pendingSelectionImages = [];
+      state.transStale = false;
+      state.blocksStale = false;
       pdfState.currentPage = 1;
       pdfState.zoom = 1;
       $("pdf-body").innerHTML = "";

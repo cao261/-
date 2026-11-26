@@ -12,8 +12,10 @@ const fs = require("fs");
 const path = require("path");
 const assert = require("assert");
 
-const HTML = fs.readFileSync(
-  path.join(__dirname, "static", "index.html"), "utf8");
+const { loadDesktopSource } = require("./_test_frontend_loader");
+
+const HTML = loadDesktopSource(
+  path.join(__dirname, "static", "index.html"));
 
 // 从 index.html 里切出 helper 的源码
 function extractHelper(name) {

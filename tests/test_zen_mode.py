@@ -26,57 +26,23 @@ from pathlib import Path
 
 import pytest
 
+from microbench._frontend_bundle import load_desktop_source, strip_js_comments
+
 REPO = Path(__file__).resolve().parents[1]
 INDEX = REPO / "microbench" / "static" / "index.html"
 JS_TEST = REPO / "microbench" / "_test_zen_mode.js"
 
 
 def _src():
-    return INDEX.read_text(encoding="utf-8")
+    return load_desktop_source(INDEX)
 
 
 def _code_only():
-    """取**脚本代码**（剥掉 HTML 注释与 JS 注释，但保留字符串字面量）。
-
-    必须剥注释：index.html 里好几处**注释**写着旧写法
-    （`#reader-modal > div > div:nth-child(2)`），那是「不要再用位置型选择器」
-    的说明，不是代码 —— 不剥就会误判。
-    """
+    """取**脚本代码**（剥掉 HTML 注释与 JS 注释，但保留字符串字面量与正则字面量）。"""
     src = _src()
     blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", src, re.S)
     assert blocks, "没找到 <script> 块"
-    js = "\n".join(blocks)
-
-    out = []
-    i, n = 0, len(js)
-    while i < n:
-        c = js[i]
-        if c in "\"'`":
-            q = c
-            out.append(c)
-            i += 1
-            while i < n:
-                if js[i] == "\\":
-                    out.append(js[i:i + 2])
-                    i += 2
-                    continue
-                out.append(js[i])
-                if js[i] == q:
-                    i += 1
-                    break
-                i += 1
-            continue
-        if js.startswith("//", i):
-            j = js.find("\n", i)
-            i = n if j < 0 else j
-            continue
-        if js.startswith("/*", i):
-            j = js.find("*/", i + 2)
-            i = n if j < 0 else j + 2
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out)
+    return strip_js_comments("\n".join(blocks))
 
 
 def _css_block(selector: str, src: str = None) -> str:

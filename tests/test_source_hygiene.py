@@ -22,25 +22,38 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 
-SOURCE_GLOBS = ("*.py", "*.js", "*.html", "*.css", "*.md", "*.json", "*.ps1")
+SOURCE_GLOBS = ("*.py", "*.js", "*.html", "*.css", "*.md", "*.json", "*.ps1", "*.java")
 SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", ".pytest_cache",
-    "logs", "_vendor", "android", "vendor", ".obsidian",
+    "logs", "_vendor", "vendor", ".obsidian", "_stub", "res",
 }
 # 生成物 / 二进制产物不在管辖范围内
 SKIP_SUFFIX = {".apk", ".pdf", ".woff", ".woff2", ".ttf", ".png", ".gif",
-               ".jpg", ".ico", ".idsig", ".jks", ".zip"}
+               ".jpg", ".ico", ".idsig", ".jks", ".zip", ".class", ".dex"}
 
 
 def _tracked_files() -> list:
-    """只管 **git 跟踪** 的文件。
-
-    ⚠ 本地产物（`MicroBench_平板工作台.html` / `MicroBench_离线阅读版.html` /
-      `android/assets/`）是**生成物**（.gitignore 里），由导出器在 Windows 上生成，
-      行尾本来就是 CRLF —— 拿仓库约定去要求它们，护栏天天红、没人看。
-      它们的内容由源文件决定 → 源文件干净，产物就干净。
-    """
+    """扫描 git 已跟踪文件及新增未跟踪的桌面/路由/安卓源码文件（排除生成物）。"""
     import subprocess
+    seen: set[Path] = set()
+    names: list[Path] = []
+    allowed_suffix = {".py", ".js", ".html", ".css", ".md", ".json", ".ps1", ".bat", ".java"}
+
+    def _add(path: Path) -> None:
+        rp = path.resolve()
+        if rp in seen or not path.is_file():
+            return
+        if path.suffix.lower() not in allowed_suffix:
+            return
+        try:
+            parts = path.relative_to(REPO).parts
+        except ValueError:
+            return
+        if any(part in SKIP_DIRS for part in parts):
+            return
+        seen.add(rp)
+        names.append(path)
+
     try:
         out = subprocess.run(
             ["git", "ls-files", "-z"], cwd=str(REPO),
@@ -48,31 +61,23 @@ def _tracked_files() -> list:
         )
     except Exception:
         out = None
-    if out is None or out.returncode != 0:
-        # 没有 git（比如打包环境）→ 退回按 glob 扫，但排除已知的生成物
-        names = []
-        for glob in SOURCE_GLOBS:
-            for path in REPO.rglob(glob):
-                if any(part in SKIP_DIRS for part in path.relative_to(REPO).parts):
-                    continue
-                if path.suffix.lower() in SKIP_SUFFIX:
-                    continue
-                if path.is_file():
-                    names.append(path)
+    if out is not None and out.returncode == 0:
+        for raw in out.stdout.split(b"\x00"):
+            if raw:
+                _add(REPO / raw.decode("utf-8", "replace"))
+        # 同时纳管工作区中尚未 git add 的新源码目录与测试文件
+        for scan_root in (REPO / "microbench", REPO / "tests", REPO / "tools", REPO / "android" / "java"):
+            if scan_root.is_dir():
+                for path in sorted(scan_root.rglob("*")):
+                    if path.suffix.lower() in {".py", ".js", ".html", ".css", ".java", ".ps1"}:
+                        _add(path)
         return names
-    names = []
-    for raw in out.stdout.split(b"\x00"):
-        if not raw:
-            continue
-        path = REPO / raw.decode("utf-8", "replace")
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in {".py", ".js", ".html", ".css", ".md",
-                                       ".json", ".ps1", ".bat"}:
-            continue
-        if any(part in SKIP_DIRS for part in path.relative_to(REPO).parts):
-            continue
-        names.append(path)
+
+    for glob in SOURCE_GLOBS:
+        for path in REPO.rglob(glob):
+            if path.suffix.lower() in SKIP_SUFFIX:
+                continue
+            _add(path)
     return names
 
 
@@ -107,7 +112,7 @@ def test_source_file_uses_expected_line_endings(path: Path):
         # .bat 里出现 CRLF 即可（混合也算过，但要真的有 CRLF）
         assert b"\r\n" in data, f"{rel} 没有 CRLF —— cmd.exe 按 LF 解析会错位"
         return
-    if path.suffix.lower() not in {".py", ".js", ".html", ".css"}:
+    if path.suffix.lower() not in {".py", ".js", ".html", ".css", ".java"}:
         return
     assert b"\r\n" not in data, (
         f"{rel} 里有 CRLF —— 仓库约定 .py/.js/.html/.css 全 LF"

@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from microbench._frontend_bundle import load_desktop_source
+
 REPO = Path(__file__).resolve().parents[1]
 INDEX_HTML = REPO / "microbench" / "static" / "index.html"
 JS_TEST = REPO / "microbench" / "_test_reader_annotations.js"
@@ -32,7 +34,7 @@ def test_annotation_js_guardrail_passes():
 
 def test_annotation_orphan_marker_is_present_in_frontend():
     """失效标记的三个落点都要在：判定、列表样式、编辑器提示。"""
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     assert "a.orphan = !(a.rects && a.rects.length)" in html, "缺少失效判定"
     assert "anno-item-orphan" in html, "缺少失效条目的样式"
     assert "anno-orphan-warn" in html, "缺少编辑器里的失效提示块"
@@ -41,7 +43,7 @@ def test_annotation_orphan_marker_is_present_in_frontend():
 
 def test_anno_drawer_scrolls_to_current_page():
     """抽屉要定位到当前页的批注，而不是永远第一条。"""
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     assert "el.dataset.page = String(a.page || 0)" in html, "条目没有记录页码"
     assert "block: \"start\"" in html, "抽屉没有按页定位滚动"
     # 旧写法（永远滚第一条）不能还在
@@ -50,7 +52,7 @@ def test_anno_drawer_scrolls_to_current_page():
 
 def test_annotation_record_is_never_dropped_on_save():
     """保存批注时不能因为高亮失效就把记录删掉。"""
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     # 只看 saveAnnotation 这个函数本身（按顶层函数的结束位置切），
     # 别把用户主动「删除批注」的路径圈进来 —— 那是合法的删除。
     start = html.index("async function saveAnnotation()")
@@ -63,7 +65,7 @@ def test_annotation_record_is_never_dropped_on_save():
 
 def test_selection_origin_falls_back_to_range():
     """松手位置在文字外面时，要按选区本身定位（否则页码丢失 → 批注跑到章节视图）。"""
-    html = INDEX_HTML.read_text(encoding="utf-8")
+    html = load_desktop_source(INDEX_HTML)
     assert "function _resolveSelectionOrigin(" in html, "缺少选区归属解析函数"
     # 函数内部必须有"range 兜底"这一路
     start = html.index("function _resolveSelectionOrigin(")

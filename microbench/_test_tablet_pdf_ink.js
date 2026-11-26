@@ -121,8 +121,10 @@ ok("drawInkPage 会真的描线（beginPath/stroke）",
 // ---------------------------------------------------------------------------
 section("桌面端渲染手写笔迹（平板画的字，电脑上要能看见）");
 
+const { loadDesktopSource } = require("./_test_frontend_loader");
+
 const DESKTOP = path.join(__dirname, "static", "index.html");
-const desktop = fs.readFileSync(DESKTOP, "utf8");
+const desktop = loadDesktopSource(DESKTOP);
 ok("桌面端会渲染 strokes（原来只画 rects → 同步过来一个字都看不见）",
   /a\.strokes/.test(desktop));
 ok("桌面端按 strokes[].page 判断页码（手写批注的 page 是 0）",
